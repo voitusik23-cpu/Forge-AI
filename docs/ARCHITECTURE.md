@@ -41,5 +41,35 @@ Task
   -> TaskResult
 ```
 
-This version does not connect to real AI providers. Provider integrations and
+This version does not connect to real AI providers. Real API integrations and
 automatic routing remain future work.
+
+## Provider Layer v0.1
+
+The provider layer sits behind the existing Agent interface. The orchestrator
+continues to dispatch to an explicitly selected agent; a generic `ProviderAgent`
+adapts a task into a provider-neutral request and adapts the response back into
+a `TaskResult`.
+
+```text
+User
+  -> Orchestrator
+  -> Agent
+  -> Provider
+  -> AI API (future integration only)
+```
+
+- **Orchestrator** dispatches a task to the caller-selected agent and does not
+  contain provider-specific behavior.
+- **Agent** receives the task and owns the generic task-to-result contract.
+- **Provider** accepts a provider-neutral request and returns a provider-neutral
+  response; future provider-specific protocol and SDK details stay behind its
+  implementation.
+- **AI API** is a future integration point. The v0.1 provider placeholders make
+  no network requests.
+
+`ProviderFactory` creates a provider only when its name is explicitly supplied.
+`ProviderRegistry` manages provider instances separately from `AgentRegistry`.
+Provider settings store only an environment variable name as a credential
+reference; they never read or store the referenced secret. `MockProvider` is
+the deterministic, offline implementation for tests.

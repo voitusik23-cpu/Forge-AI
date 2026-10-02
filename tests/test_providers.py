@@ -1,0 +1,175 @@
+"""Deterministic tests for the provider layer and Agent integration."""
+
+import unittest
+from dataclasses import fields
+
+from app.agents.mock_agent import MockAgent
+from app.agents.provider_agent import ProviderAgent
+from app.agents.registry import AgentRegistry
+from app.agents.providers.anthropic import AnthropicProvider
+from app.agents.providers.base import (
+    Provider,
+    ProviderNotConfiguredError,
+    ProviderRequest,
+    ProviderResponse,
+)
+from app.agents.providers.config import ProviderConfig
+from app.agents.providers.factory import ProviderFactory, UnknownProviderError
+from app.agents.providers.google import GoogleProvider
+from app.agents.providers.mock import MockProvider
+from app.agents.providers.openai import OpenAIProvider
+from app.agents.providers.registry import (
+    DuplicateProviderError,
+    ProviderNotFoundError,
+    ProviderRegistry,
+)
+from app.agents.providers.xai import XAIProvider
+from app.orchestrator.models import Task
+from app.orchestrator.orchestrator import Orchestrator
+
+
+class ProviderInterfaceTests(unittest.TestCase):
+    def test_provider_implementations_use_common_interface(self) -> None:
+        for provider_type in (
+            OpenAIProvider,
+            AnthropicProvider,
+            GoogleProvider,
+            XAIProvider,
+            MockProvider,
+        ):
+            self.assertTrue(issubclass(provider_type, Provider))
+
+    def test_provider_metadata_and_unconfigured_behavior(self) -> None:
+        providers = (
+            (OpenAIProvider(), "openai", "OPENAI_API_KEY"),
+            (AnthropicProvider(), "anthropic", "ANTHROPIC_API_KEY"),
+            (GoogleProvider(), "google", "GEMINI_API_KEY"),
+            (XAIProvider(), "xai", "XAI_API_KEY"),
+        )
+        request = ProviderRequest(prompt="offline test")
+
+        for provider, expected_name, env_reference in providers:
+            with self.subTest(provider=expected_name):
+                self.assertEqual(provider.provider_name, expected_name)
+                self.assertEqual(provider.config.api_key_env_var, env_reference)
+                self.assertFalse(provider.config.enabled)
+                with self.assertRaisesRegex(
+                    ProviderNotConfiguredError, "integration not configured"
+                ):
+                    provider.generate(request)
+
+
+class ProviderFactoryTests(unittest.TestCase):
+    def test_factory_creates_each_named_provider(self) -> None:
+        factory = ProviderFactory()
+
+        expected = {
+            "openai": OpenAIProvider,
+            "anthropic": AnthropicProvider,
+            "google": GoogleProvider,
+            "xai": XAIProvider,
+        }
+        for name, provider_type in expected.items():
+            with self.subTest(provider=name):
+                self.assertIsInstance(factory.create(name), provider_type)
+
+    def test_factory_accepts_matching_configuration(self) -> None:
+        config = ProviderConfig(
+            provider_name="openai",
+            model_name="test-model",
+            api_key_env_var="OPENAI_API_KEY",
+        )
+
+        provider = ProviderFactory().create("openai", config)
+
+        self.assertEqual(provider.model_name, "test-model")
+
+    def test_factory_rejects_unknown_provider(self) -> None:
+        with self.assertRaisesRegex(UnknownProviderError, "Unknown provider"):
+            ProviderFactory().create("unknown")
+
+
+class ProviderRegistryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registry = ProviderRegistry()
+        self.provider = MockProvider()
+
+    def test_register_get_and_list_providers(self) -> None:
+        self.registry.register(self.provider)
+
+        self.assertIs(self.registry.get("mock"), self.provider)
+        self.assertEqual(self.registry.list_providers(), ["mock"])
+
+    def test_duplicate_provider_registration_is_rejected(self) -> None:
+        self.registry.register(self.provider)
+
+        with self.assertRaisesRegex(DuplicateProviderError, "already registered"):
+            self.registry.register(MockProvider())
+
+    def test_unknown_provider_has_clear_error(self) -> None:
+        with self.assertRaisesRegex(ProviderNotFoundError, "not registered"):
+            self.registry.get("missing")
+
+
+class MockProviderTests(unittest.TestCase):
+    def test_mock_provider_is_deterministic_and_offline(self) -> None:
+        provider = MockProvider()
+        request = ProviderRequest(
+            prompt="summarize this",
+            context={"section": "intro"},
+        )
+
+        first = provider.generate(request)
+        second = provider.generate(request)
+
+        self.assertEqual(first, second)
+        self.assertIsInstance(first, ProviderResponse)
+        self.assertEqual(first.provider_name, "mock")
+        self.assertEqual(first.output, "MockProvider response: summarize this")
+
+
+class ProviderConfigTests(unittest.TestCase):
+    def test_configuration_stores_only_an_environment_reference(self) -> None:
+        config = ProviderConfig(provider_name="openai", api_key_env_var="OPENAI_API_KEY")
+
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.api_key_env_var, "OPENAI_API_KEY")
+        self.assertNotIn("api_key", {item.name for item in fields(config)})
+
+    def test_configuration_rejects_non_reference_key_value(self) -> None:
+        with self.assertRaisesRegex(ValueError, "environment variable name"):
+            ProviderConfig(provider_name="openai", api_key_env_var="not a variable value")
+
+
+class ProviderAgentIntegrationTests(unittest.TestCase):
+    def test_provider_agent_adapts_provider_for_existing_orchestrator(self) -> None:
+        agent = ProviderAgent(MockProvider())
+
+        agent_registry = AgentRegistry()
+        agent_registry.register(agent)
+        orchestrator = Orchestrator(agent_registry)
+        task = Task(
+            id="provider-task",
+            description="review a small change",
+            context={"scope": "tests"},
+        )
+
+        result = orchestrator.dispatch(task, agent_name="mock")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.task_id, task.id)
+        self.assertEqual(result.output, "MockProvider response: review a small change")
+
+    def test_existing_mock_agent_remains_compatible(self) -> None:
+        registry = AgentRegistry()
+        registry.register(MockAgent())
+        result = Orchestrator(registry).dispatch(
+            Task(id="existing", description="existing path"), agent_name="mock"
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("MockAgent", result.output)
+
+
+if __name__ == "__main__":
+    unittest.main()

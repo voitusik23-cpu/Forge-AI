@@ -5,10 +5,13 @@ development, review, testing, and improvement across projects.
 
 ## Development stage
 
-This repository contains the initial scaffold only: a small Python startup
-health check, environment-backed settings placeholders, package structure, and
-architecture notes. It does not connect to AI providers or modify projects.
-The scaffold uses only the Python standard library.
+This repository contains the initial scaffold, Orchestrator v0.1, and Provider
+Layer v0.1. It includes a Python startup health check, provider-neutral task
+dispatch and provider interfaces, safe provider configuration placeholders,
+and an offline `MockProvider`. Provider placeholders for OpenAI, Anthropic,
+Google, and xAI do not make API calls; real integrations and SDKs are not
+configured. Forge AI does not modify projects. The scaffold uses only the
+Python standard library.
 
 ## Long-term purpose and architecture
 
@@ -48,10 +51,13 @@ Forge AI — это планируемая к созданию универса�
 
 ## Этап разработки
 
-В этом репозитории находится только начальный каркас: простая проверка запуска
-Python-приложения, заготовки настроек на основе переменных окружения, структура
-пакетов и заметки об архитектуре. Репозиторий не подключается к провайдерам ИИ и
-не изменяет проекты. Каркас использует только стандартную библиотеку Python.
+В этом репозитории находятся начальный каркас, Orchestrator v0.1 и Provider
+Layer v0.1. В него входят простая проверка запуска Python-приложения,
+провайдер-независимая диспетчеризация задач и интерфейсы провайдеров, безопасные
+заготовки конфигурации и автономный `MockProvider`. Заглушки для OpenAI,
+Anthropic, Google и xAI не выполняют API-запросы; реальные интеграции и SDK не
+подключены. Forge AI не изменяет проекты. Каркас использует только стандартную
+библиотеку Python.
 
 ## Долгосрочная цель и архитектура
 
