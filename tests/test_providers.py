@@ -17,6 +17,7 @@ from app.agents.providers.config import ProviderConfig
 from app.agents.providers.deepseek import DeepSeekProvider
 from app.agents.providers.factory import ProviderFactory, UnknownProviderError
 from app.agents.providers.google import GoogleProvider
+from app.agents.providers.groq import GroqProvider
 from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
 from app.agents.providers.openrouter import OpenRouterProvider
@@ -38,6 +39,7 @@ class ProviderInterfaceTests(unittest.TestCase):
             DeepSeekProvider,
             GoogleProvider,
             OpenRouterProvider,
+            GroqProvider,
             XAIProvider,
             MockProvider,
         ):
@@ -72,6 +74,8 @@ class ProviderInterfaceTests(unittest.TestCase):
         self.assertEqual(deepseek.config.api_key_env_var, "DEEPSEEK_API_KEY")
         openrouter = OpenRouterProvider()
         self.assertEqual(openrouter.config.api_key_env_var, "OPENROUTER_API_KEY")
+        groq = GroqProvider()
+        self.assertEqual(groq.config.api_key_env_var, "GROQ_API_KEY")
 
 
 class ProviderFactoryTests(unittest.TestCase):
@@ -85,6 +89,7 @@ class ProviderFactoryTests(unittest.TestCase):
             "google": GoogleProvider,
             "xai": XAIProvider,
             "openrouter": OpenRouterProvider,
+            "groq": GroqProvider,
         }
         for name, provider_type in expected.items():
             with self.subTest(provider=name):

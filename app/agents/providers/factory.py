@@ -7,6 +7,7 @@ from app.agents.providers.base import Provider
 from app.agents.providers.config import ProviderConfig
 from app.agents.providers.deepseek import DeepSeekProvider
 from app.agents.providers.google import GoogleProvider
+from app.agents.providers.groq import GroqProvider
 from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
 from app.agents.providers.openrouter import OpenRouterProvider
@@ -28,6 +29,7 @@ class ProviderFactory:
         "google": GoogleProvider,
         "xai": XAIProvider,
         "openrouter": OpenRouterProvider,
+        "groq": GroqProvider,
         "mock": MockProvider,
     }
 

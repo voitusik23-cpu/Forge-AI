@@ -8,6 +8,7 @@ from app.agents.providers.factory import ProviderFactory
 from app.agents.providers.registry import ProviderRegistry
 from app.agents.registry import AgentRegistry
 from app.config.settings import RuntimeSettings, load_settings
+from app.config.provider_accounts import load_provider_account_config
 from app.config.secrets import SecretStore
 from app.orchestrator.orchestrator import Orchestrator
 from app.runtime.context import RuntimeContext
@@ -38,6 +39,7 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
 
     return RuntimeContext(
         settings=resolved_settings,
+        provider_accounts=load_provider_account_config(),
         provider_registry=provider_registry,
         agent_registry=agent_registry,
         orchestrator=Orchestrator(

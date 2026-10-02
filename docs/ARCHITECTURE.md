@@ -63,7 +63,8 @@ Task(category, parameters)
 
 Coding prefers OpenAI then Anthropic; reasoning prefers Anthropic then OpenAI;
 large-context uses Google/Gemini; cheap/free uses OpenRouter; fast/cheap uses
-DeepSeek; other categories use `FORGE_DEFAULT_PROVIDER`. Candidate order is
+DeepSeek; other categories use `FORGE_DEFAULT_PROVIDER`. Groq is also available
+as an explicitly selectable provider. Candidate order is
 metadata for a future fallback policy: v0.2 executes only the first choice and
 returns a clear failed `TaskResult` when it is unavailable or unconfigured.
 Callers can override routing with `provider_name`; the existing explicit
@@ -126,6 +127,11 @@ Runtime settings do not load API keys, and provider configuration does not
 resolve the referenced variable. Secrets are not logged or stored in Git.
 Startup performs local dependency assembly only and makes no external API calls.
 
+`ProviderAccountConfig` separately holds optional local account email metadata
+for providers. It reads only `PROVIDER_*_EMAIL` values and does not put account
+emails in provider responses, task results, or logs. API keys continue to be
+resolved only through `SecretStore`.
+
 ## Execution Pipeline v0.1
 
 ```text
@@ -187,10 +193,12 @@ Startup and offline tests do not make requests.
 
 ## OpenAI-Compatible Providers v0.1
 
-`DeepSeekProvider` and `OpenRouterProvider` share the local
+`DeepSeekProvider`, `OpenRouterProvider`, and `GroqProvider` share the local
 `OpenAICompatibleProvider` adapter and the existing OpenAI Python SDK, using
 the Chat Completions interface with each service's configured base URL and
-SecretStore key reference. `ProviderConfig.model_name` accepts provider model
-IDs directly; OpenRouter's `openrouter/free` route is available as
+SecretStore key reference. Groq uses `GROQ_API_KEY` and
+`https://api.groq.com/openai/v1`. `ProviderConfig.model_name` accepts provider
+model IDs directly; OpenRouter's `openrouter/free` route is available as
 `OpenRouterProvider.FREE_MODEL_ID` and can be selected as the configured model.
-Neither provider is selected automatically, and tests use fake clients only.
+These adapters are invoked only by task dispatch, and tests use fake clients
+only.

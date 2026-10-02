@@ -19,6 +19,11 @@ OpenAI-compatible Chat Completions APIs. All provider keys are resolved through
 Runtime settings are validated from `FORGE_*` environment variables. Forge AI
 does not modify projects. The project requires the OpenAI and Anthropic SDKs.
 
+Groq uses the existing OpenAI-compatible client with the official Groq endpoint
+and `GROQ_API_KEY`. Optional provider account emails live in a separate local
+`ProviderAccountConfig`; they are not API credentials and are not included in
+provider results or logs.
+
 ## Dispatcher v0.2
 
 Tasks carry a category (`coding`, `reasoning`, `large-context`, `cheap/free`,
@@ -36,7 +41,7 @@ no real API calls.
 
 The planned system will coordinate multiple agents through a central
 orchestrator. Provider adapters isolate provider-specific behavior for
-OpenAI, Anthropic, Gemini, xAI, DeepSeek, and OpenRouter. Supporting modules
+OpenAI, Anthropic, Gemini, xAI, DeepSeek, OpenRouter, and Groq. Supporting modules
 will handle tasks, project memory, context and token use, reviews, testing, and
 controlled changes. See [the architecture plan](docs/ARCHITECTURE.md) and
 [planned agent roles](docs/AGENTS.md).

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from app.agents.providers.config import ProviderConfig
 from app.agents.providers.deepseek import DeepSeekProvider
 from app.agents.providers.factory import ProviderFactory
+from app.agents.providers.groq import GroqProvider
 from app.agents.providers.openai_compatible import (
     CompatibleAuthenticationError,
     CompatibleRateLimitError,
@@ -84,6 +85,7 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         factory = ProviderFactory()
         self.assertIsInstance(factory.create("deepseek"), DeepSeekProvider)
         self.assertIsInstance(factory.create("openrouter"), OpenRouterProvider)
+        self.assertIsInstance(factory.create("groq"), GroqProvider)
 
     def test_deepseek_url_key_prompt_usage_and_response(self):
         provider, completions = self.make_provider(
@@ -109,6 +111,25 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         self.assertEqual(result.usage.output_tokens, 5)
         self.assertIsNone(result.usage.estimated_cost)
 
+    def test_groq_uses_official_compatible_endpoint_and_key(self):
+        provider, completions = self.make_provider(
+            GroqProvider,
+            model="groq-test-model",
+            response=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Groq reply"))],
+                model="groq-test-model",
+                usage=SimpleNamespace(prompt_tokens=4, completion_tokens=2),
+            ),
+        )
+
+        result = provider.generate(ProviderRequest(prompt="offline"))
+
+        self.assertEqual(provider.BASE_URL, "https://api.groq.com/openai/v1")
+        self.assertEqual(provider.config.api_key_env_var, "GROQ_API_KEY")
+        self.assertEqual(completions.kwargs["model"], "groq-test-model")
+        self.assertEqual(result.output, "Groq reply")
+        self.assertEqual(result.provider_name, "groq")
+
     def test_openrouter_accepts_arbitrary_and_free_model_ids(self):
         model_ids = ("vendor/model:variant", OpenRouterProvider.FREE_MODEL_ID)
         for model_id in model_ids:
@@ -133,7 +154,7 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
                 self.assertEqual(result.output, "Routed")
 
     def test_sdk_client_uses_expected_key_reference_and_base_url(self):
-        for provider_type in (DeepSeekProvider, OpenRouterProvider):
+        for provider_type in (DeepSeekProvider, OpenRouterProvider, GroqProvider):
             with self.subTest(provider=provider_type.PROVIDER_NAME):
                 completions = FakeCompletions(
                     response=SimpleNamespace(
@@ -172,7 +193,7 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
                 )
 
     def test_missing_key_fails_without_calling_client(self):
-        for provider_type in (DeepSeekProvider, OpenRouterProvider):
+        for provider_type in (DeepSeekProvider, OpenRouterProvider, GroqProvider):
             provider, completions = self.make_provider(provider_type)
             provider.secret_store = SecretStore(
                 env_file="missing-compatible-test-env", environ={}
@@ -192,7 +213,7 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
             (FakeAPIConnectionError("sensitive"), CompatibleRequestError),
             (FakeAPIError("sensitive"), CompatibleRequestError),
         )
-        for provider_type in (DeepSeekProvider, OpenRouterProvider):
+        for provider_type in (DeepSeekProvider, OpenRouterProvider, GroqProvider):
             for sdk_error, expected_error in cases:
                 with self.subTest(provider=provider_type.PROVIDER_NAME, error=type(sdk_error).__name__):
                     provider, _ = self.make_provider(provider_type, error=sdk_error)
