@@ -28,3 +28,9 @@
 - Application startup does not make external API calls.
 - Runtime components are assembled through an explicit bootstrap function.
 - The configured default provider is not an automatic task-routing mechanism.
+- Execution flow is separated from provider-specific implementation.
+- The Orchestrator does not execute provider-specific code.
+- Providers return provider-neutral responses.
+- Usage metadata is carried with the task result.
+- MockProvider is used for deterministic end-to-end testing in v0.1.
+- Automatic agent/provider routing is not implemented in v0.1.

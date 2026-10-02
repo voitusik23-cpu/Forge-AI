@@ -98,3 +98,30 @@ including only the name of an environment variable that may hold a credential.
 Runtime settings do not load API keys, and provider configuration does not
 resolve the referenced variable. Secrets are not logged or stored in Git.
 Startup performs local dependency assembly only and makes no external API calls.
+
+## Execution Pipeline v0.1
+
+```text
+User
+  -> Task
+  -> Orchestrator
+  -> ExecutionService (TaskExecutor)
+  -> Agent
+  -> Provider
+  -> ProviderResponse
+  -> TaskResult
+  -> User
+```
+
+The user supplies a `Task` and explicitly names `agent_name`. The Orchestrator
+delegates to `TaskExecutor`, which validates the task, looks up that one agent,
+and normalizes expected domain/provider failures and empty results. It does not
+select or route agents automatically. `ProviderAgent` adapts the task to a
+provider-neutral request; the provider returns a `ProviderResponse` with output
+and `Usage`. The agent carries provider, agent, and usage metadata into the
+`TaskResult` returned to the caller. Unknown agents and invalid tasks raise
+clear domain exceptions; unexpected exceptions are not swallowed.
+
+`MockProvider` runs synchronously and offline, returning deterministic output
+and zero token/cost usage. Provider-specific implementations remain behind the
+Provider interface and outside the execution service.

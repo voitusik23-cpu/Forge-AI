@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from app.usage import Usage
+
 
 class TaskPriority(Enum):
     """Relative priority assigned to a task by its caller."""
@@ -25,15 +27,6 @@ class Task:
 
 
 @dataclass
-class Usage:
-    """Token and optional estimated-cost information for a result."""
-
-    input_tokens: int = 0
-    output_tokens: int = 0
-    estimated_cost: Optional[float] = None
-
-
-@dataclass
 class TaskResult:
     """Outcome returned by an agent after processing a task."""
 
@@ -42,3 +35,5 @@ class TaskResult:
     output: str = ""
     error: Optional[str] = None
     usage: Optional[Usage] = None
+    provider: Optional[str] = None
+    agent: Optional[str] = None

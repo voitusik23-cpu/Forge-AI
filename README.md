@@ -13,7 +13,9 @@ Runtime settings are validated from `FORGE_*` environment variables; API keys
 are not loaded. Provider placeholders for OpenAI, Anthropic,
 Google, and xAI do not make API calls; real integrations and SDKs are not
 configured. Forge AI does not modify projects. The scaffold uses only the
-Python standard library.
+Python standard library. The synchronous Execution Pipeline v0.1 connects Task,
+Orchestrator, Agent, and Provider, and can complete an offline task through
+`MockProvider`.
 
 ## Long-term purpose and architecture
 
@@ -61,7 +63,9 @@ runtime валидируются из переменных окружения `F
 Заглушки для OpenAI,
 Anthropic, Google и xAI не выполняют API-запросы; реальные интеграции и SDK не
 подключены. Forge AI не изменяет проекты. Каркас использует только стандартную
-библиотеку Python.
+библиотеку Python. Синхронный Execution Pipeline v0.1 связывает Task,
+Orchestrator, Agent и Provider и выполняет автономную тестовую задачу через
+`MockProvider`.
 
 ## Долгосрочная цель и архитектура
 

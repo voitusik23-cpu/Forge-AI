@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from app.agents.providers.config import ProviderConfig
+from app.usage import Usage
 
 
 @dataclass
@@ -22,6 +23,7 @@ class ProviderResponse:
     provider_name: str
     model_name: str
     output: str
+    usage: Usage = field(default_factory=Usage)
 
 
 class ProviderNotConfiguredError(RuntimeError):

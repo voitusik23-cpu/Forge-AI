@@ -4,6 +4,7 @@ from typing import Optional
 
 from app.agents.providers.base import Provider, ProviderRequest, ProviderResponse
 from app.agents.providers.config import ProviderConfig
+from app.usage import Usage
 
 
 class MockProvider(Provider):
@@ -25,4 +26,5 @@ class MockProvider(Provider):
             provider_name=self.provider_name,
             model_name=self.model_name,
             output=f"MockProvider response: {request.prompt}",
+            usage=Usage(input_tokens=0, output_tokens=0, estimated_cost=0.0),
         )
