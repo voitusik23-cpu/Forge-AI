@@ -48,6 +48,17 @@ def main() -> int:
     )
     print(f"  status: {'success' if primary.success else 'failure'}")
 
+    revision = result.revision_result
+    if revision is not None:
+        revision_provider = revision.provider or revision.agent
+        print("revision:")
+        print(f"  provider: {_safe_text(revision_provider or 'unknown', secrets)}")
+        print(
+            "  model: "
+            f"{_safe_text(_model_name(runtime, revision_provider, revision.model_name), secrets)}"
+        )
+        print(f"  status: {'success' if revision.success else 'failure'}")
+
     review = result.review_result
     print("review:")
     if review is None:
@@ -62,6 +73,19 @@ def main() -> int:
             f"{_safe_text(_model_name(runtime, review_provider, review.model_name), secrets)}"
         )
         print(f"  status: {review.status.value}")
+
+    final_review = result.final_review_result
+    if final_review is not None:
+        final_review_provider = final_review.provider
+        print("final review:")
+        print(
+            f"  provider: {_safe_text(final_review_provider or 'unknown', secrets)}"
+        )
+        print(
+            "  model: "
+            f"{_safe_text(_model_name(runtime, final_review_provider, final_review.model_name), secrets)}"
+        )
+        print(f"  status: {final_review.status.value}")
 
     print("overall:")
     print(f"  status: {result.status.value}")

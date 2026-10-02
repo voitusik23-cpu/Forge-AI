@@ -33,6 +33,8 @@ class ProviderReviewer:
 
     def review(self, task: Task, primary_result: TaskResult) -> ReviewResult:
         """Ask the automatically routed REVIEW task for a single decision."""
+        revision_context = task.context.get("forge_revision", {})
+        is_revision = isinstance(revision_context, dict) and bool(revision_context)
         primary_provider = primary_result.provider or "unknown"
         primary_model = primary_result.model_name
         if primary_model is None and primary_provider != "unknown":
@@ -41,20 +43,43 @@ class ProviderReviewer:
             except LookupError:
                 primary_model = "unknown"
 
+        review_instruction = (
+            "Evaluate the primary response for correctness, completeness, obvious "
+            "errors, and whether it addresses the task."
+        )
+        if is_revision and revision_context:
+            review_instruction += (
+                " This is the single permitted revision; check whether it addresses "
+                "the previous review feedback and still fulfills the task."
+            )
+        review_instruction += (
+            " Return exactly one first line: APPROVED or CHANGES_REQUESTED. "
+            "Follow it with concise findings."
+        )
         review_task = Task(
             id=f"{task.id}-review",
-            description=(
-                "Evaluate the primary response for correctness, completeness, obvious "
-                "errors, and whether it addresses the task. Return exactly one first "
-                "line: APPROVED or CHANGES_REQUESTED. Follow it with concise findings."
-            ),
+            description=review_instruction,
             context={
-                "task_description": task.description,
+                "task_description": (
+                    revision_context.get("original_task_description", task.description)
+                    if is_revision
+                    else task.description
+                ),
                 "task_category": classify_task(task).value,
                 "primary_provider": primary_provider,
                 "primary_model": primary_model or "unknown",
                 "primary_response": primary_result.output,
                 "original_task_context": task.context,
+                "prior_review_feedback": (
+                    revision_context.get("review_feedback")
+                    if is_revision
+                    else None
+                ),
+                "previous_primary_response": (
+                    revision_context.get("previous_primary_response")
+                    if is_revision
+                    else None
+                ),
             },
             priority=task.priority,
             category=TaskCategory.REVIEW,

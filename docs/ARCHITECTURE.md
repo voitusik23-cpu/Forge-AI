@@ -98,13 +98,17 @@ real request for each new category.
 
 `MultiAgentExecutor` sends the task through the existing Orchestrator/Dispatcher
 for one primary execution. On success, a provider-neutral `ProviderReviewer`
-submits one `review` category task through the same routing path, with the
-original task details and primary response in structured context. The reviewer
-only evaluates text and cannot modify files. There is exactly one review pass;
-there is no autonomous correction loop. Primary failure skips review, while
-review failure retains the primary result and marks the overall result
-`review_failed`. An explicit primary `provider_name` is preserved, and the
-reviewer is routed independently, so the two providers may differ.
+submits a `review` category task through the same routing path, with the
+original task details and primary response in structured context. If the review
+requests changes, the primary is invoked once more with the previous response
+and review feedback, followed by one final review. The workflow never revises
+more than once. The reviewer only evaluates text and cannot modify files.
+Primary failure skips review; revision failure preserves the initial primary
+result; reviewer failure preserves the available primary/revision results.
+Statuses distinguish `approved`, `changes_requested`, `review_failed`, and
+`revision_failed`. An explicit primary `provider_name` is preserved for the
+revision, while each review is routed independently. No correction loop runs
+after the final review.
 
 ## Provider Layer v0.1
 
