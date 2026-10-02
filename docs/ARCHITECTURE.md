@@ -202,3 +202,16 @@ model IDs directly; OpenRouter's `openrouter/free` route is available as
 `OpenRouterProvider.FREE_MODEL_ID` and can be selected as the configured model.
 These adapters are invoked only by task dispatch, and tests use fake clients
 only.
+
+## Provider Capabilities v0.1
+
+`ProviderCapabilitiesRegistry` exposes immutable metadata for each built-in
+provider: canonical name, API-key environment-variable name, streaming and tool
+support, coarse `free`/`cheap`/`paid` cost tier, and `enabled_by_config`. The
+key field contains only a variable name, never the key. `enabled_by_config`
+mirrors the existing `ProviderConfig.enabled` flag. Capability metadata is
+separate from provider request/response types and is not consumed by Dispatcher
+yet. Streaming/tool declarations describe provider API capability in general;
+tool support can depend on model, and they do not claim those features are
+implemented by Forge AI's current text-only adapter. Cost tiers are labels,
+not price data or calculated estimates.

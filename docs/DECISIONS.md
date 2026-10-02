@@ -57,3 +57,9 @@
 - Task parameters are provider-neutral; the optional `model` parameter overrides the configured model for the chosen provider.
 - Groq uses the common OpenAI-compatible adapter and existing OpenAI SDK with Groq's official OpenAI-compatible endpoint; its key is resolved by `SecretStore` under `GROQ_API_KEY`.
 - Provider account email metadata is handled by `ProviderAccountConfig`, independently of `SecretStore`. It is local-only metadata and is never copied into `ProviderResponse` or `TaskResult` or written to logs.
+
+## Provider Capabilities v0.1
+
+- Provider capabilities are immutable declarative metadata kept outside the provider interface. The registry mirrors `ProviderConfig.enabled` and API-key variable names without resolving secrets.
+- Streaming/tool booleans describe general provider API support and may vary by model; they do not imply that Forge AI's current adapter implements streaming or tool execution.
+- Cost is represented only by a coarse `free`, `cheap`, or `paid` label. No API cost calculation or cost-based dispatch is performed.

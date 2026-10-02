@@ -24,6 +24,14 @@ class RuntimeBootstrapTests(unittest.TestCase):
         expected = ["openai", "anthropic", "deepseek", "google", "xai", "openrouter", "groq", "mock"]
         self.assertEqual(runtime.provider_registry.list_providers(), expected)
         self.assertEqual(runtime.agent_registry.list_agents(), expected)
+        capability_names = {
+            item.provider_name
+            for item in runtime.provider_capabilities.list_capabilities()
+        }
+        self.assertEqual(capability_names, set(expected))
+        self.assertEqual(
+            runtime.provider_capabilities.get("mock").cost_tier.value, "free"
+        )
         provider = runtime.provider_registry.get("mock")
         self.assertIsInstance(provider, MockProvider)
         self.assertEqual(provider.model_name, "offline-test")

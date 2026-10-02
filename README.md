@@ -37,6 +37,14 @@ choice, without automatic fallback or multiple agents. Missing or unconfigured
 providers return a structured task failure. Startup and dispatcher tests make
 no real API calls.
 
+## Provider Capabilities v0.1
+
+The runtime exposes declarative capabilities for each provider: key variable
+name, general streaming/tool support, a coarse cost tier, and the existing
+configuration enabled flag. These labels do not calculate cost or affect
+Dispatcher routing. Tool support can vary by model, and metadata does not mean
+the current Forge AI adapter implements streaming or tool execution.
+
 ## Long-term purpose and architecture
 
 The planned system will coordinate multiple agents through a central
