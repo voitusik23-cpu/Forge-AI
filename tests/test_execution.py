@@ -1,12 +1,14 @@
 """End-to-end tests for the offline execution pipeline."""
 
 import unittest
+from pathlib import Path
 
 from app.agents.base import AgentExecutionError
 from app.agents.provider_agent import ProviderAgent
 from app.agents.providers.openai import OpenAIProvider
 from app.agents.registry import AgentNotFoundError, AgentRegistry
 from app.config.settings import RuntimeSettings
+from app.config.secrets import SecretStore
 from app.orchestrator.executor import InvalidTaskError
 from app.orchestrator.models import Task, TaskResult, Usage
 from app.orchestrator.orchestrator import Orchestrator
@@ -50,7 +52,16 @@ class ExecutionPipelineTests(unittest.TestCase):
 
     def test_provider_error_returns_structured_failure(self) -> None:
         registry = AgentRegistry()
-        registry.register(ProviderAgent(OpenAIProvider()))
+        registry.register(
+            ProviderAgent(
+                OpenAIProvider(
+                    secret_store=SecretStore(
+                        env_file=Path(__file__).with_name(".missing-test-env"),
+                        environ={},
+                    )
+                )
+            )
+        )
         orchestrator = Orchestrator(registry)
 
         result = orchestrator.dispatch(

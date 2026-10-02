@@ -6,6 +6,7 @@ import logging
 import traceback
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import patch
 
 from app.agents.providers.base import ProviderNotConfiguredError, ProviderRequest
@@ -18,6 +19,7 @@ from app.agents.providers.openai import (
     OpenAIResponseError,
     OpenAITimeoutError,
 )
+from app.config.secrets import SecretStore
 
 
 class FakeAuthenticationError(Exception):
@@ -128,6 +130,9 @@ class OpenAIProviderTests(unittest.TestCase):
     def test_missing_key_is_clear_and_does_not_call_client(self):
         provider, responses = self.make_provider(
             SimpleNamespace(output_text="no", model="test-model", usage=None)
+        )
+        provider.secret_store = SecretStore(
+            env_file=Path(__file__).with_name(".missing-test-env"), environ={}
         )
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ProviderNotConfiguredError, "OPENAI_API_KEY"):
