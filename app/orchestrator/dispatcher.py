@@ -1,6 +1,6 @@
 """Simple, provider-neutral task routing for Orchestrator v0.2."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Optional, Sequence, Tuple
 
 from app.agents.base import AgentExecutionError
@@ -12,6 +12,7 @@ from app.agents.providers.capabilities import (
 from app.agents.providers.registry import ProviderNotFoundError, ProviderRegistry
 from app.agents.registry import AgentNotFoundError, AgentRegistry
 from app.orchestrator.executor import TaskExecutor
+from app.orchestrator.classification import classify_task
 from app.orchestrator.models import Task, TaskCategory, TaskResult
 
 
@@ -29,11 +30,23 @@ class DispatchPolicy:
     """Basic ordered provider preference policy without scoring."""
 
     _PREFERENCES: Dict[TaskCategory, Tuple[str, ...]] = {
+        TaskCategory.CODE: ("openrouter", "deepseek", "openai", "anthropic", "groq"),
+        TaskCategory.ANALYSIS: (
+            "openrouter", "deepseek", "anthropic", "openai", "google", "xai"
+        ),
+        TaskCategory.REVIEW: (
+            "openrouter", "anthropic", "openai", "google", "xai"
+        ),
         TaskCategory.CODING: ("openai", "anthropic"),
         TaskCategory.REASONING: ("anthropic", "openai"),
         TaskCategory.LARGE_CONTEXT: ("google",),
         TaskCategory.CHEAP_FREE: ("openrouter",),
         TaskCategory.FAST_CHEAP: ("deepseek",),
+    }
+    _SPECIALIZED_CATEGORIES = {
+        TaskCategory.CODE,
+        TaskCategory.ANALYSIS,
+        TaskCategory.REVIEW,
     }
 
     def decide(
@@ -47,6 +60,35 @@ class DispatchPolicy:
         allow_paid_providers: bool = False,
     ) -> DispatchDecision:
         """Return the preferred provider and retain the remaining candidates."""
+        if task.category in self._SPECIALIZED_CATEGORIES and capabilities is not None:
+            provider_names = set(registered_provider_names or ())
+            agent_names = set(registered_agent_names or ())
+            cost_order = {
+                CostTier.FREE: 0,
+                CostTier.CHEAP: 1,
+                CostTier.PAID: 2,
+            }
+            eligible = [
+                capability
+                for capability in capabilities.list_capabilities()
+                if capability.provider_name in provider_names
+                and capability.provider_name in agent_names
+                and task.category.value in capability.task_categories
+                and (allow_paid_providers or capability.cost_tier != CostTier.PAID)
+            ]
+            eligible.sort(key=lambda item: cost_order[item.cost_tier])
+            candidates = tuple(item.provider_name for item in eligible)
+            selected = candidates[0] if candidates else None
+            return DispatchDecision(
+                category=task.category,
+                candidates=candidates,
+                selected_provider=selected,
+                reason=(
+                    f"Category '{task.category.value}' uses provider capability "
+                    "and cost-tier metadata"
+                ),
+            )
+
         if task.category == TaskCategory.OTHER and capabilities is not None:
             provider_names = set(registered_provider_names or ())
             agent_names = set(registered_agent_names or ())
@@ -88,6 +130,8 @@ class DispatchPolicy:
 class Dispatcher:
     """Choose one registered provider agent and delegate execution."""
 
+    _SPECIALIZED_CATEGORIES = DispatchPolicy._SPECIALIZED_CATEGORIES
+
     def __init__(
         self,
         agent_registry: AgentRegistry,
@@ -116,6 +160,7 @@ class Dispatcher:
     def dispatch(self, task: Task, provider_name: Optional[str] = None) -> TaskResult:
         """Route to the primary and optional fallbacks unless provider is explicit."""
         self._executor.validate_task(task)
+        task = replace(task, category=classify_task(task))
         decision = self._policy.decide(
             task,
             self._default_provider,
@@ -140,8 +185,8 @@ class Dispatcher:
         allow_fallback = provider_name is None
         cost_aware = (
             task.category == TaskCategory.OTHER
-            and self._capabilities_registry is not None
-        )
+            or task.category in self._SPECIALIZED_CATEGORIES
+        ) and self._capabilities_registry is not None
         if provider_name is not None:
             attempts = [selected]
         elif cost_aware:
@@ -160,7 +205,10 @@ class Dispatcher:
 
         if (
             allow_fallback
-            and task.category == TaskCategory.OTHER
+            and (
+                task.category == TaskCategory.OTHER
+                or task.category in self._SPECIALIZED_CATEGORIES
+            )
             and self._capabilities_registry is not None
         ):
             permitted_fallbacks = []

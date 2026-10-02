@@ -26,6 +26,7 @@ class ProviderCapabilities:
     cost_tier: CostTier
     enabled_by_config: bool
     supports_large_context: bool = False
+    task_categories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.provider_name.strip():
@@ -42,6 +43,11 @@ class ProviderCapabilities:
             raise ValueError("enabled_by_config must be a boolean")
         if not isinstance(self.supports_large_context, bool):
             raise ValueError("supports_large_context must be a boolean")
+        if not isinstance(self.task_categories, tuple) or any(
+            category not in {"code", "analysis", "review"}
+            for category in self.task_categories
+        ):
+            raise ValueError("task_categories must contain supported category names")
 
 
 # Traits describe provider API capability in general. Tool support may depend
@@ -56,6 +62,18 @@ _DECLARATIONS = {
     "openrouter": (True, True, CostTier.CHEAP, False),
     "groq": (True, True, CostTier.CHEAP, False),
     "mock": (False, False, CostTier.FREE, False),
+}
+
+_TASK_CATEGORIES = {
+    "openai": ("code", "analysis", "review"),
+    "anthropic": ("code", "analysis", "review"),
+    "google": ("analysis", "review"),
+    "xai": ("analysis", "review"),
+    "deepseek": ("code", "analysis"),
+    # The configured Cohere free model supports the three text task intents.
+    "openrouter": ("code", "analysis", "review"),
+    "groq": ("code", "analysis"),
+    "mock": (),
 }
 
 
@@ -84,6 +102,7 @@ def capabilities_for(provider: Provider) -> ProviderCapabilities:
         cost_tier=cost_tier,
         enabled_by_config=provider.config.enabled,
         supports_large_context=large_context,
+        task_categories=_TASK_CATEGORIES[provider.provider_name],
     )
 
 

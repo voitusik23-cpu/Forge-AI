@@ -75,6 +75,25 @@ Explicit `provider_name` bypasses automatic choice and fallback; the caller's
 selection is never replaced. Dispatcher uses only common registries, metadata,
 and SecretStore presence checks, not provider SDKs.
 
+## Task Classification + Specialized Routing v0.1
+
+`TaskCategory` is shared by task models and routing. A caller-supplied category
+is honored unchanged. When omitted, a small deterministic classifier examines
+the task description, context, and parameters and assigns `code`, `analysis`,
+`review`, or `other`. Review patterns take precedence over code patterns, then
+analysis; unmatched tasks remain `other`. No model or external service is used
+for classification.
+
+For `code`, `analysis`, and `review`, the dispatcher filters providers by the
+declarative `task_categories` capability metadata and then orders eligible
+providers by the existing free, cheap, and permitted paid tiers. Other tasks
+retain the existing cost-aware route, and legacy `TaskCategory` values remain
+supported. The same configuration yields the same classification and provider
+order. Explicit `provider_name` continues to override automatic routing, and
+the configured finite fallback chain remains in effect after automatic
+candidates. The `python -m app.smoke_classified_routing` command exercises one
+real request for each new category.
+
 ## Provider Layer v0.1
 
 The provider layer sits behind the existing Agent interface. The orchestrator

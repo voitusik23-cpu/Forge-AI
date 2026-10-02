@@ -40,6 +40,9 @@ class ProviderCapabilitiesTests(unittest.TestCase):
                 self.assertIsInstance(values[name].supports_streaming, bool)
                 self.assertIsInstance(values[name].supports_tools, bool)
                 self.assertEqual(values[name].enabled_by_config, name == "mock")
+        self.assertIn("code", values["openrouter"].task_categories)
+        self.assertIn("analysis", values["google"].task_categories)
+        self.assertNotIn("code", values["mock"].task_categories)
 
     def test_cost_tier_values_are_coarse_and_fixed(self) -> None:
         self.assertEqual([tier.value for tier in CostTier], ["free", "cheap", "paid"])
