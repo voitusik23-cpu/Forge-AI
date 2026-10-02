@@ -2,6 +2,10 @@
 
 import unittest
 
+from app.agents.base import AgentExecutionError
+from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
+from app.agents.providers.factory import ProviderFactory
+from app.agents.providers.registry import ProviderRegistry
 from app.agents.registry import AgentRegistry
 from app.orchestrator.dispatcher import DispatchPolicy, Dispatcher
 from app.orchestrator.models import Task, TaskCategory, TaskResult
@@ -17,6 +21,12 @@ class StubAgent:
     def run(self, task: Task) -> TaskResult:
         self.calls += 1
         return TaskResult(task_id=task.id, success=True, output=f"handled by {self.name}")
+
+
+class UnavailableAgent(StubAgent):
+    def run(self, task: Task) -> TaskResult:
+        self.calls += 1
+        raise AgentExecutionError(f"{self.name} is not configured")
 
 
 class DispatchPolicyTests(unittest.TestCase):
@@ -98,6 +108,90 @@ class DispatcherTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.provider, "anthropic")
+
+    def test_successful_primary_does_not_use_fallback(self) -> None:
+        dispatcher = Dispatcher(
+            self.registry,
+            default_provider="xai",
+            fallback_chain=("anthropic",),
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="primary-ok", description="task", category=TaskCategory.CODING)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "openai")
+        self.assertEqual(self.agents["anthropic"].calls, 0)
+
+    def test_unavailable_primary_uses_next_configured_provider(self) -> None:
+        registry = AgentRegistry()
+        primary = UnavailableAgent("openai")
+        secondary = StubAgent("anthropic")
+        registry.register(primary)
+        registry.register(secondary)
+        dispatcher = Dispatcher(registry, fallback_chain=("anthropic",))
+
+        result = dispatcher.dispatch(
+            Task(id="primary-fails", description="task", category=TaskCategory.CODING)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "anthropic")
+        self.assertEqual(primary.calls, 1)
+        self.assertEqual(secondary.calls, 1)
+
+    def test_exhausted_chain_returns_combined_failure_reason(self) -> None:
+        registry = AgentRegistry()
+        registry.register(UnavailableAgent("openai"))
+        dispatcher = Dispatcher(registry, fallback_chain=("missing", "also-missing"))
+
+        result = dispatcher.dispatch(
+            Task(id="chain-fails", description="task", category=TaskCategory.CODING)
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("Provider fallback chain exhausted", result.error)
+        self.assertIn("openai is not configured", result.error)
+        self.assertIn("missing", result.error)
+        self.assertEqual(result.provider, "openai")
+
+    def test_explicit_provider_failure_does_not_switch_provider(self) -> None:
+        registry = AgentRegistry()
+        selected = UnavailableAgent("openai")
+        fallback = StubAgent("anthropic")
+        registry.register(selected)
+        registry.register(fallback)
+        dispatcher = Dispatcher(registry, fallback_chain=("anthropic",))
+
+        result = dispatcher.dispatch(
+            Task(id="explicit", description="task"), provider_name="openai"
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("openai is not configured", result.error)
+        self.assertEqual(fallback.calls, 0)
+
+    def test_provider_and_capability_registries_guard_dispatch(self) -> None:
+        agents = AgentRegistry()
+        openai_agent = StubAgent("openai")
+        agents.register(openai_agent)
+        providers = ProviderRegistry()
+        providers.register(ProviderFactory().create("openai"))
+        capabilities = ProviderCapabilitiesRegistry()
+        dispatcher = Dispatcher(
+            agents,
+            provider_registry=providers,
+            capabilities_registry=capabilities,
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="missing-capability", description="task", category=TaskCategory.CODING)
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("capabilities are not registered", result.error)
+        self.assertEqual(openai_agent.calls, 0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 """Task dispatch with category policy and explicit provider override."""
 
+from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
+from app.agents.providers.registry import ProviderRegistry
 from app.agents.registry import AgentRegistry
 from app.orchestrator.dispatcher import Dispatcher
 from app.orchestrator.executor import TaskExecutor
@@ -10,9 +12,22 @@ from typing import Optional
 class Orchestrator:
     """Dispatch tasks by simple category policy or explicit caller selection."""
 
-    def __init__(self, registry: AgentRegistry, default_provider: str = "mock") -> None:
+    def __init__(
+        self,
+        registry: AgentRegistry,
+        default_provider: str = "mock",
+        fallback_chain: tuple[str, ...] = (),
+        provider_registry: Optional[ProviderRegistry] = None,
+        capabilities_registry: Optional[ProviderCapabilitiesRegistry] = None,
+    ) -> None:
         self._executor = TaskExecutor(registry)
-        self._dispatcher = Dispatcher(registry, default_provider=default_provider)
+        self._dispatcher = Dispatcher(
+            registry,
+            default_provider=default_provider,
+            fallback_chain=fallback_chain,
+            provider_registry=provider_registry,
+            capabilities_registry=capabilities_registry,
+        )
 
     def dispatch(
         self,

@@ -33,6 +33,7 @@ class RuntimeSettingsTests(unittest.TestCase):
                 "FORGE_REQUEST_TIMEOUT": "45",
                 "FORGE_RETRY_COUNT": "4",
                 "FORGE_LOG_LEVEL": "debug",
+                "FORGE_PROVIDER_FALLBACK_CHAIN": "anthropic, deepseek",
             }
         )
 
@@ -42,6 +43,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.request_timeout, 45)
         self.assertEqual(settings.retry_count, 4)
         self.assertEqual(settings.log_level, "DEBUG")
+        self.assertEqual(settings.provider_fallback_chain, ("anthropic", "deepseek"))
 
     def test_boolean_parsing_accepts_documented_forms(self) -> None:
         for value, expected in (("yes", True), ("1", True), ("OFF", False), ("0", False)):
@@ -97,6 +99,10 @@ class RuntimeSettingsTests(unittest.TestCase):
 
     def test_missing_optional_environment_variables_use_defaults(self) -> None:
         self.assertEqual(load_settings(environ={}), RuntimeSettings())
+
+    def test_fallback_chain_rejects_duplicate_providers(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "must not contain duplicates"):
+            RuntimeSettings(provider_fallback_chain=("anthropic", "anthropic"))
 
     def test_settings_are_immutable_and_contain_no_api_keys(self) -> None:
         settings = RuntimeSettings()

@@ -20,8 +20,14 @@ class TaskExecutor:
     def __init__(self, agent_registry: AgentRegistry) -> None:
         self._agent_registry = agent_registry
 
-    def execute(self, task: Task, agent_name: str) -> TaskResult:
-        """Run a task through one explicitly named agent."""
+    def execute(
+        self,
+        task: Task,
+        agent_name: str,
+        *,
+        raise_execution_errors: bool = False,
+    ) -> TaskResult:
+        """Run a task through one named agent, optionally propagating run errors."""
         self.validate_task(task)
         if not isinstance(agent_name, str) or not agent_name.strip():
             raise ValueError("agent_name must not be empty")
@@ -31,6 +37,8 @@ class TaskExecutor:
         try:
             result = agent.run(task)
         except (AgentExecutionError, ProviderNotConfiguredError) as exc:
+            if raise_execution_errors:
+                raise
             return TaskResult(
                 task_id=task.id,
                 success=False,

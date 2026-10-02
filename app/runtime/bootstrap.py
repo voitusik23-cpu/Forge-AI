@@ -47,6 +47,10 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
         provider_capabilities=capabilities_registry,
         agent_registry=agent_registry,
         orchestrator=Orchestrator(
-            agent_registry, default_provider=resolved_settings.default_provider
+            agent_registry,
+            default_provider=resolved_settings.default_provider,
+            fallback_chain=resolved_settings.provider_fallback_chain,
+            provider_registry=provider_registry,
+            capabilities_registry=capabilities_registry,
         ),
     )

@@ -159,6 +159,20 @@ clear domain exceptions; unexpected exceptions are not swallowed.
 and zero token/cost usage. Provider-specific implementations remain behind the
 Provider interface and outside the execution service.
 
+## Provider Fallback v0.1
+
+`RuntimeSettings.provider_fallback_chain`, loaded from the optional
+`FORGE_PROVIDER_FALLBACK_CHAIN` comma-separated setting, supplies an ordered,
+finite list tried after the category policy's primary provider. Dispatcher
+checks each candidate through `ProviderRegistry` and its existing capability
+metadata, then invokes its adapter through the registered agent. Dispatcher
+attempts the primary once, then each distinct configured fallback at most once,
+sequentially. Missing providers/agents and normalized provider execution
+failures move to the next entry; success stops the chain. Exhaustion returns a
+failed `TaskResult` containing the reasons. Explicit `provider_name` and legacy
+`agent_name` dispatch bypass fallback. No scoring, retry loop, parallel calls,
+or fallback based on cost/quality is involved.
+
 ## OpenAI Provider v0.1
 
 `OpenAIProvider` uses the official OpenAI Python SDK and its Responses API. It

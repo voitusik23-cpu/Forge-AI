@@ -32,10 +32,19 @@ dispatcher prefers OpenAI then Anthropic for coding, Anthropic then OpenAI for
 reasoning, Gemini for large-context, OpenRouter for cheap/free, and DeepSeek
 for fast/cheap. Other tasks use `FORGE_DEFAULT_PROVIDER`. A caller can select a
 provider explicitly with `provider_name`; the existing `agent_name` interface
-also remains available. The dispatcher currently invokes only its first
-choice, without automatic fallback or multiple agents. Missing or unconfigured
-providers return a structured task failure. Startup and dispatcher tests make
-no real API calls.
+also remains available. The dispatcher starts with its first choice. When a
+fallback chain is configured, missing or failed providers advance through that
+finite sequence; exhaustion returns a structured task failure. Startup and
+dispatcher tests make no real API calls.
+
+## Provider Fallback v0.1
+
+An optional ordered `FORGE_PROVIDER_FALLBACK_CHAIN` environment setting lists
+providers tried after an unavailable or failed primary, for example
+`anthropic,deepseek`. The chain is finite, sequential, and does not score by
+cost or quality. An explicit `provider_name` or `agent_name` is never switched
+to another provider. When every configured choice fails, dispatch returns a
+failed `TaskResult` with the reasons from the attempts.
 
 ## Provider Capabilities v0.1
 

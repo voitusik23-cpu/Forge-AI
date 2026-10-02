@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 
 
 class ConfigurationError(ValueError):
@@ -33,6 +33,7 @@ class RuntimeSettings:
     request_timeout: int = 30
     retry_count: int = 2
     log_level: str = "INFO"
+    provider_fallback_chain: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.environment, str):
@@ -73,6 +74,21 @@ class RuntimeSettings:
         object.__setattr__(self, "log_level", log_level)
         object.__setattr__(self, "default_provider", self.default_provider.strip())
         object.__setattr__(self, "default_model", self.default_model.strip())
+        chain = self.provider_fallback_chain
+        if isinstance(chain, str):
+            chain = tuple(name.strip() for name in chain.split(",") if name.strip())
+        if not isinstance(chain, (tuple, list)) or any(
+            not isinstance(name, str) or not name.strip() for name in chain
+        ):
+            raise ConfigurationError(
+                "FORGE_PROVIDER_FALLBACK_CHAIN must be a comma-separated provider list"
+            )
+        normalized_chain = tuple(name.strip() for name in chain)
+        if len(set(normalized_chain)) != len(normalized_chain):
+            raise ConfigurationError(
+                "FORGE_PROVIDER_FALLBACK_CHAIN must not contain duplicates"
+            )
+        object.__setattr__(self, "provider_fallback_chain", normalized_chain)
 
 
 def _parse_bool(name: str, value: Optional[str], default: bool) -> bool:
@@ -117,4 +133,7 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> RuntimeSetting
             "FORGE_RETRY_COUNT", source.get("FORGE_RETRY_COUNT"), defaults.retry_count
         ),
         log_level=source.get("FORGE_LOG_LEVEL", defaults.log_level),
+        provider_fallback_chain=source.get(
+            "FORGE_PROVIDER_FALLBACK_CHAIN", defaults.provider_fallback_chain
+        ),
     )
