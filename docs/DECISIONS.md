@@ -49,6 +49,10 @@
   isolated in their small provider modules.
 - OpenRouter model IDs are passed through `ProviderConfig`; `openrouter/free`
   is an explicit configurable model choice, not an automatic routing default.
+- OpenRouter has a dedicated `FORGE_OPENROUTER_MODEL` runtime setting, defaulting
+  to `cohere/north-mini-code:free`, independent of the general default model.
+  `python -m app.smoke_openrouter` is an explicit opt-in real-request check;
+  automated tests use fake clients and do not contact the provider.
 
 ## Dispatcher v0.2
 

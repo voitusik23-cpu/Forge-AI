@@ -28,11 +28,16 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
     agent_registry = AgentRegistry()
     for provider_name in provider_factory.list_providers():
         provider = provider_factory.create(provider_name, secret_store=secret_store)
-        if provider_name == resolved_settings.default_provider:
+        configured_model = None
+        if provider_name == "openrouter":
+            configured_model = resolved_settings.openrouter_model
+        elif provider_name == resolved_settings.default_provider:
+            configured_model = resolved_settings.default_model
+        if configured_model is not None:
             provider = provider_factory.create(
                 provider_name,
                 config=replace(
-                    provider.config, model_name=resolved_settings.default_model
+                    provider.config, model_name=configured_model
                 ),
                 secret_store=secret_store,
             )

@@ -131,7 +131,11 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         self.assertEqual(result.provider_name, "groq")
 
     def test_openrouter_accepts_arbitrary_and_free_model_ids(self):
-        model_ids = ("vendor/model:variant", OpenRouterProvider.FREE_MODEL_ID)
+        model_ids = (
+            "vendor/model:variant",
+            OpenRouterProvider.FREE_MODEL_ID,
+            OpenRouterProvider.DEFAULT_MODEL_ID,
+        )
         for model_id in model_ids:
             with self.subTest(model=model_id):
                 provider, completions = self.make_provider(

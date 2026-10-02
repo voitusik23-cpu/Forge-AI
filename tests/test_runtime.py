@@ -56,6 +56,19 @@ class RuntimeBootstrapTests(unittest.TestCase):
         self.assertEqual(provider.config.api_key_env_var, "OPENAI_API_KEY")
         self.assertFalse(hasattr(provider.config, "api_key"))
 
+    def test_openrouter_uses_its_model_setting_independent_of_default_model(self) -> None:
+        runtime = create_runtime(
+            RuntimeSettings(
+                default_provider="openrouter",
+                default_model="unrelated-default-model",
+                openrouter_model="cohere/north-mini-code:free",
+            )
+        )
+
+        provider = runtime.provider_registry.get("openrouter")
+        self.assertEqual(provider.model_name, "cohere/north-mini-code:free")
+        self.assertEqual(provider.config.api_key_env_var, "OPENROUTER_API_KEY")
+
     def test_logging_uses_configured_level_and_standard_formatter(self) -> None:
         logger = configure_logging(RuntimeSettings(log_level="WARNING"))
 

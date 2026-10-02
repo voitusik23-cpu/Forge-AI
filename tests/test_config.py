@@ -19,6 +19,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertFalse(settings.debug)
         self.assertEqual(settings.default_provider, "mock")
         self.assertEqual(settings.default_model, "mock")
+        self.assertEqual(settings.openrouter_model, "cohere/north-mini-code:free")
         self.assertEqual(settings.request_timeout, 30)
         self.assertEqual(settings.retry_count, 2)
         self.assertEqual(settings.log_level, "INFO")
@@ -30,6 +31,7 @@ class RuntimeSettingsTests(unittest.TestCase):
                 "FORGE_DEBUG": "true",
                 "FORGE_DEFAULT_PROVIDER": "mock",
                 "FORGE_DEFAULT_MODEL": "test-model",
+                "FORGE_OPENROUTER_MODEL": "cohere/test-model:free",
                 "FORGE_REQUEST_TIMEOUT": "45",
                 "FORGE_RETRY_COUNT": "4",
                 "FORGE_LOG_LEVEL": "debug",
@@ -41,6 +43,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.environment, ApplicationEnvironment.TEST)
         self.assertTrue(settings.debug)
         self.assertEqual(settings.default_model, "test-model")
+        self.assertEqual(settings.openrouter_model, "cohere/test-model:free")
         self.assertEqual(settings.request_timeout, 45)
         self.assertEqual(settings.retry_count, 4)
         self.assertEqual(settings.log_level, "DEBUG")
@@ -103,6 +106,10 @@ class RuntimeSettingsTests(unittest.TestCase):
     def test_empty_provider_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "FORGE_DEFAULT_PROVIDER"):
             load_settings(environ={"FORGE_DEFAULT_PROVIDER": "  "})
+
+    def test_empty_openrouter_model_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "FORGE_OPENROUTER_MODEL"):
+            load_settings(environ={"FORGE_OPENROUTER_MODEL": "  "})
 
     def test_missing_optional_environment_variables_use_defaults(self) -> None:
         self.assertEqual(load_settings(environ={}), RuntimeSettings())

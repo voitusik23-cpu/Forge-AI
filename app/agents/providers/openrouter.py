@@ -10,3 +10,4 @@ class OpenRouterProvider(OpenAICompatibleProvider):
     API_KEY_ENV_VAR = "OPENROUTER_API_KEY"
     BASE_URL = "https://openrouter.ai/api/v1"
     FREE_MODEL_ID = "openrouter/free"
+    DEFAULT_MODEL_ID = "cohere/north-mini-code:free"

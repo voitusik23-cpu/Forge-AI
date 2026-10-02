@@ -30,6 +30,7 @@ class RuntimeSettings:
     debug: bool = False
     default_provider: str = "mock"
     default_model: str = "mock"
+    openrouter_model: str = "cohere/north-mini-code:free"
     request_timeout: int = 30
     retry_count: int = 2
     log_level: str = "INFO"
@@ -57,6 +58,8 @@ class RuntimeSettings:
             raise ConfigurationError("FORGE_DEFAULT_PROVIDER must not be empty")
         if not isinstance(self.default_model, str) or not self.default_model.strip():
             raise ConfigurationError("FORGE_DEFAULT_MODEL must not be empty")
+        if not isinstance(self.openrouter_model, str) or not self.openrouter_model.strip():
+            raise ConfigurationError("FORGE_OPENROUTER_MODEL must not be empty")
         if isinstance(self.request_timeout, bool) or not isinstance(
             self.request_timeout, int
         ):
@@ -77,6 +80,7 @@ class RuntimeSettings:
         object.__setattr__(self, "log_level", log_level)
         object.__setattr__(self, "default_provider", self.default_provider.strip())
         object.__setattr__(self, "default_model", self.default_model.strip())
+        object.__setattr__(self, "openrouter_model", self.openrouter_model.strip())
         chain = self.provider_fallback_chain
         if isinstance(chain, str):
             chain = tuple(name.strip() for name in chain.split(",") if name.strip())
@@ -127,6 +131,9 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> RuntimeSetting
             "FORGE_DEFAULT_PROVIDER", defaults.default_provider
         ),
         default_model=source.get("FORGE_DEFAULT_MODEL", defaults.default_model),
+        openrouter_model=source.get(
+            "FORGE_OPENROUTER_MODEL", defaults.openrouter_model
+        ),
         request_timeout=_parse_int(
             "FORGE_REQUEST_TIMEOUT",
             source.get("FORGE_REQUEST_TIMEOUT"),

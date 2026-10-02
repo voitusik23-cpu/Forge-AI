@@ -99,6 +99,19 @@ To run a real OpenAI request manually, install `requirements.txt`, set
 set `FORGE_DEFAULT_MODEL` to an available model, then dispatch a task explicitly
 to agent `openai`. Do not put the key in source files or commit it.
 
+To check the OpenRouter integration with one real request through Forge AI, set
+`OPENROUTER_API_KEY` in the ignored local `.env` or process environment, then
+run:
+
+```bash
+python -m app.smoke_openrouter
+```
+
+The command explicitly dispatches to OpenRouter and uses
+`FORGE_OPENROUTER_MODEL`, which defaults to `cohere/north-mini-code:free`.
+Unlike unit tests and normal startup, this smoke command sends a real API
+request. It prints only a static pass/fail message, not the response or secret.
+
 ---
 
 # Forge AI — Русская версия

@@ -214,6 +214,11 @@ SecretStore key reference. Groq uses `GROQ_API_KEY` and
 `https://api.groq.com/openai/v1`. `ProviderConfig.model_name` accepts provider
 model IDs directly; OpenRouter's `openrouter/free` route is available as
 `OpenRouterProvider.FREE_MODEL_ID` and can be selected as the configured model.
+The runtime separately loads `FORGE_OPENROUTER_MODEL`, defaulting to
+`cohere/north-mini-code:free`, without changing other providers' model settings.
+The explicit `python -m app.smoke_openrouter` command sends one real request
+through the runtime, dispatcher, `ProviderAgent`, and OpenRouter adapter. Tests
+use fake clients; ordinary startup makes no request.
 These adapters are invoked only by task dispatch, and tests use fake clients
 only.
 
