@@ -8,7 +8,9 @@ development, review, testing, and improvement across projects.
 This repository contains the initial scaffold, Orchestrator v0.1, and Provider
 Layer v0.1. It includes a Python startup health check, provider-neutral task
 dispatch and provider interfaces, safe provider configuration placeholders,
-and an offline `MockProvider`. Provider placeholders for OpenAI, Anthropic,
+an explicit Runtime & Configuration Layer v0.1, and an offline `MockProvider`.
+Runtime settings are validated from `FORGE_*` environment variables; API keys
+are not loaded. Provider placeholders for OpenAI, Anthropic,
 Google, and xAI do not make API calls; real integrations and SDKs are not
 configured. Forge AI does not modify projects. The scaffold uses only the
 Python standard library.
@@ -53,8 +55,10 @@ Forge AI — это планируемая к созданию универса�
 
 В этом репозитории находятся начальный каркас, Orchestrator v0.1 и Provider
 Layer v0.1. В него входят простая проверка запуска Python-приложения,
-провайдер-независимая диспетчеризация задач и интерфейсы провайдеров, безопасные
-заготовки конфигурации и автономный `MockProvider`. Заглушки для OpenAI,
+провайдер-независимая диспетчеризация задач и интерфейсы провайдеров, явный
+Runtime & Configuration Layer v0.1 и автономный `MockProvider`. Настройки
+runtime валидируются из переменных окружения `FORGE_*`; API keys не загружаются.
+Заглушки для OpenAI,
 Anthropic, Google и xAI не выполняют API-запросы; реальные интеграции и SDK не
 подключены. Forge AI не изменяет проекты. Каркас использует только стандартную
 библиотеку Python.

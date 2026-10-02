@@ -6,6 +6,7 @@ from app.agents.providers.anthropic import AnthropicProvider
 from app.agents.providers.base import Provider
 from app.agents.providers.config import ProviderConfig
 from app.agents.providers.google import GoogleProvider
+from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
 from app.agents.providers.xai import XAIProvider
 
@@ -22,6 +23,7 @@ class ProviderFactory:
         "anthropic": AnthropicProvider,
         "google": GoogleProvider,
         "xai": XAIProvider,
+        "mock": MockProvider,
     }
 
     def create(

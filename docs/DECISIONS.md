@@ -23,3 +23,8 @@
 - Real SDK and API integrations are deferred to a later stage.
 - Secrets are not stored in code or Git; provider configuration may hold only an environment variable name reference.
 - MockProvider is used for deterministic tests without network access.
+- Runtime configuration is separate from provider-specific configuration.
+- Secrets are never stored in Git.
+- Application startup does not make external API calls.
+- Runtime components are assembled through an explicit bootstrap function.
+- The configured default provider is not an automatic task-routing mechanism.

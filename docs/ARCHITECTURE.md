@@ -73,3 +73,28 @@ User
 Provider settings store only an environment variable name as a credential
 reference; they never read or store the referenced secret. `MockProvider` is
 the deterministic, offline implementation for tests.
+
+## Runtime & Configuration Layer v0.1
+
+The runtime is assembled explicitly and has no global singleton:
+
+```text
+Runtime
+  -> Settings
+  -> Registries
+  -> Orchestrator
+  -> Agent
+  -> Provider
+```
+
+`RuntimeSettings` contains application-wide values such as environment, debug
+mode, default provider/model, timeout, retry count, and log level. It is loaded
+from the `FORGE_*` environment variables and validated before runtime assembly.
+The configured default provider is used to construct the initial provider and
+agent; it does not automatically route individual tasks.
+
+`ProviderConfig` remains separate and contains provider-specific metadata,
+including only the name of an environment variable that may hold a credential.
+Runtime settings do not load API keys, and provider configuration does not
+resolve the referenced variable. Secrets are not logged or stored in Git.
+Startup performs local dependency assembly only and makes no external API calls.
