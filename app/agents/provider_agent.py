@@ -51,4 +51,5 @@ class ProviderAgent:
             usage=response.usage,
             provider=response.provider_name,
             agent=self.name,
+            model_name=response.model_name,
         )

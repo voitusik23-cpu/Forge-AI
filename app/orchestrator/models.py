@@ -82,3 +82,4 @@ class TaskResult:
     usage: Optional[Usage] = None
     provider: Optional[str] = None
     agent: Optional[str] = None
+    model_name: Optional[str] = None

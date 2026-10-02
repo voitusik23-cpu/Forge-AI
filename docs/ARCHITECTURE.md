@@ -94,6 +94,18 @@ the configured finite fallback chain remains in effect after automatic
 candidates. The `python -m app.smoke_classified_routing` command exercises one
 real request for each new category.
 
+## Multi-Agent Execution v0.1
+
+`MultiAgentExecutor` sends the task through the existing Orchestrator/Dispatcher
+for one primary execution. On success, a provider-neutral `ProviderReviewer`
+submits one `review` category task through the same routing path, with the
+original task details and primary response in structured context. The reviewer
+only evaluates text and cannot modify files. There is exactly one review pass;
+there is no autonomous correction loop. Primary failure skips review, while
+review failure retains the primary result and marks the overall result
+`review_failed`. An explicit primary `provider_name` is preserved, and the
+reviewer is routed independently, so the two providers may differ.
+
 ## Provider Layer v0.1
 
 The provider layer sits behind the existing Agent interface. The orchestrator

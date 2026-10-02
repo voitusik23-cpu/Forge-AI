@@ -1,5 +1,7 @@
 """Real-request smoke check for classification-aware automatic routing."""
 
+import sys
+
 from app.orchestrator.classification import classify_task
 from app.orchestrator.models import Task
 from app.runtime.bootstrap import create_runtime
@@ -20,6 +22,14 @@ _SMOKE_TASKS = (
         "Review this code and find bugs: def add(a, b): return a - b",
     ),
 )
+
+
+def _console_safe(value: str) -> str:
+    """Replace characters that the current terminal encoding cannot display."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return value
+    return value.encode(encoding, errors="replace").decode(encoding)
 
 
 def main() -> int:
@@ -51,6 +61,7 @@ def main() -> int:
             if result.success:
                 answer = _safe_text(result.output, secrets)
                 answer = answer.replace("\r", " ").replace("\n", " ")
+                answer = _console_safe(answer)
                 print(f"response: {answer[:240]}")
             else:
                 print("response: unavailable")
