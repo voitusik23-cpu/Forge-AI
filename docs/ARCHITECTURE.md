@@ -26,5 +26,20 @@ knowledge, reviews, tools, and shared utilities. Changes should be reviewed and
 validated before controlled application to a project. Git will keep the
 authoritative project history and make significant changes traceable.
 
-This document describes a plan only; provider integrations and orchestration
-are not implemented in the initial scaffold.
+## Orchestrator v0.1
+
+The initial orchestration core uses provider-neutral task and result models, an
+agent interface, an in-memory registry, and a local mock agent. Dispatch is
+explicit: the caller supplies `agent_name`; the orchestrator does not choose an
+agent or automatically route between providers.
+
+```text
+Task
+  -> Orchestrator
+  -> Registry
+  -> Agent
+  -> TaskResult
+```
+
+This version does not connect to real AI providers. Provider integrations and
+automatic routing remain future work.

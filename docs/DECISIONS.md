@@ -17,3 +17,4 @@
 - Autonomous production changes must be controlled.
 - New functionality should be developed in small, understandable modules.
 - Tests should accompany important functionality.
+- "В Orchestrator v0.1 выбор агента выполняется явно через agent_name. Автоматическая маршрутизация между AI-провайдерами откладывается до отдельного этапа."
