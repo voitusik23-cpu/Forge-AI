@@ -86,9 +86,17 @@ failures preserve the available primary result without implying approval.
 
 ## Phase 4 — Planning
 
+**CURRENT**
+
+- [x] Deterministic Project Planner v0.1 templates
+- [x] Planned tasks with explicit dependencies and initial readiness status
+
+Planner v0.1 supports Telegram bot, web application, data/analysis, and generic
+software goals. It creates a static plan only; tasks are not queued, executed,
+or automatically updated as work completes.
+
 **FUTURE**
 
-- [ ] Project planner
 - [ ] Large-task decomposition
 - [ ] Task dependency graph
 - [ ] Task queue
@@ -116,8 +124,9 @@ USER APPROVAL
 CONTROLLED CHANGE (GIT / DEPLOY)
 ```
 
-The complete flow is a future direction. Today, Forge AI accepts a task,
-classifies and routes it deterministically, executes one primary agent, and
-can run one review pass. Project planning, dependency management, parallel
-execution, applying project changes, and deployment are not implemented.
+The complete flow is a future direction. Today, Forge AI can create a static
+deterministic plan, or accept an individual task, classify and route it,
+execute one primary agent, and run a bounded review/revision workflow. Plan
+execution, runtime dependency management, parallel execution, applying project
+changes, and deployment are not implemented.
 Changes to Git or production remain subject to explicit authorization.

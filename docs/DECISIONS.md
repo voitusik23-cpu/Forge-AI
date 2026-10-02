@@ -91,3 +91,9 @@
 - Multi-agent execution permits at most one primary revision after the reviewer returns `CHANGES_REQUESTED`, followed by one final review.
 - The revision receives the original task, initial primary response, and review feedback. The task category and any explicit primary provider selection are retained.
 - A further `CHANGES_REQUESTED` ends the workflow without another revision. Revision and reviewer failures preserve the available primary result and never imply approval.
+
+## Planner v0.1
+
+- Project plans are generated locally from deterministic templates; no provider or LLM is called.
+- Planner reuses `TaskCategory` and assigns stable task IDs and a deterministic plan ID from the normalized goal.
+- Template tasks form an explicit sequential dependency chain. The first task starts `READY`; dependent tasks start `PENDING`. Planner v0.1 creates plans only and does not execute or update task statuses.

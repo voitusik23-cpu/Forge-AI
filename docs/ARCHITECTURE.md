@@ -110,6 +110,17 @@ Statuses distinguish `approved`, `changes_requested`, `review_failed`, and
 revision, while each review is routed independently. No correction loop runs
 after the final review.
 
+## Planner v0.1
+
+`Planner` maps a plain-text goal to a provider-neutral `ProjectPlan` using
+deterministic templates for Telegram bots, web applications, data/analysis,
+and generic software. Plans contain ordered `PlannedTask` items with stable
+IDs, existing `TaskCategory` values, explicit dependencies, and `READY` or
+`PENDING` initial status. The first task is ready; later tasks depend on the
+previous task in the selected template. Plan IDs are stable for the same
+normalized goal. This component only creates plans: it does not call a model,
+dispatch tasks, track execution, or manage dependencies at runtime.
+
 ## Provider Layer v0.1
 
 The provider layer sits behind the existing Agent interface. The orchestrator
