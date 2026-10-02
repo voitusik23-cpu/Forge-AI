@@ -1,6 +1,7 @@
 """Gemini provider using Google's official Gen AI Python SDK."""
 
 import json
+import re
 from typing import Any, Optional
 
 from app.agents.providers.base import (
@@ -17,6 +18,32 @@ from app.usage import Usage
 
 class GeminiRequestError(ProviderError):
     """A Gemini request failed without exposing SDK error details."""
+
+
+class GeminiAPIError(GeminiRequestError):
+    """A sanitized Google API failure with structured status information."""
+
+    def __init__(
+        self,
+        *,
+        http_status: Optional[int],
+        google_code: Optional[int],
+        google_status: Optional[str],
+        safe_message: str,
+    ) -> None:
+        self.http_status = http_status
+        self.google_code = google_code
+        self.google_status = google_status
+        self.safe_message = safe_message
+        details = []
+        if http_status is not None:
+            details.append(f"HTTP {http_status}")
+        if google_status:
+            details.append(google_status)
+        elif google_code is not None:
+            details.append(f"Google code {google_code}")
+        prefix = ", ".join(details) or "Google API error"
+        super().__init__(f"Gemini API error ({prefix}): {safe_message}")
 
 
 class GeminiClientError(GeminiRequestError):
@@ -76,8 +103,14 @@ class GoogleProvider(Provider):
                 request.context, ensure_ascii=False, sort_keys=True
             )
         try:
-            response = client.models.generate_content(model=model_name, contents=prompt)
-        except Exception:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config={"automatic_function_calling": {"disable": True}},
+            )
+        except Exception as exc:
+            if self._is_google_api_error(exc, sdk):
+                raise self._api_error(exc, api_key) from None
             raise GeminiRequestError("Gemini API request failed") from None
 
         output = getattr(response, "text", None)
@@ -112,6 +145,65 @@ class GoogleProvider(Provider):
                 "Google Gen AI SDK is unavailable; install project requirements"
             ) from exc
         return genai
+
+    @staticmethod
+    def _is_google_api_error(error: Exception, sdk: Any) -> bool:
+        errors = getattr(sdk, "errors", None)
+        api_error = getattr(errors, "APIError", None)
+        if isinstance(api_error, type) and isinstance(error, api_error):
+            return True
+        # SDK releases expose APIError from google.genai.errors. Keep this
+        # fallback lazy so offline provider tests do not require the SDK.
+        try:
+            from google.genai.errors import APIError
+        except ImportError:
+            return False
+        return isinstance(error, APIError)
+
+    @classmethod
+    def _api_error(cls, error: Exception, api_key: str) -> GeminiAPIError:
+        response = getattr(error, "response", None)
+        response_status = getattr(response, "status_code", None)
+        code = cls._status_code(getattr(error, "code", None))
+        http_status = cls._status_code(response_status) or code
+        status = getattr(error, "status", None)
+        status = status if isinstance(status, str) and status else None
+        message = getattr(error, "message", None)
+        if not isinstance(message, str) or not message.strip():
+            message = "Google API request failed"
+        safe_message = cls._sanitize_message(message, api_key)
+        return GeminiAPIError(
+            http_status=http_status,
+            google_code=code,
+            google_status=status,
+            safe_message=safe_message,
+        )
+
+    @staticmethod
+    def _status_code(value: Any) -> Optional[int]:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.isdecimal():
+            return int(value)
+        return None
+
+    @staticmethod
+    def _sanitize_message(message: str, api_key: str) -> str:
+        """Remove credentials and URLs before retaining an SDK error message."""
+        safe = message.replace(api_key, "[REDACTED]") if api_key else message
+        safe = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", safe)
+        safe = re.sub(
+            r"(?im)\b(authorization|x-goog-api-key)\s*[:=]\s*[^\r\n,;]+",
+            r"\1: [REDACTED]",
+            safe,
+        )
+        safe = re.sub(
+            r"(?i)(?:AIza[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z_-]{16,})",
+            "[REDACTED]",
+            safe,
+        )
+        safe = re.sub(r"https?://\S+", "[URL REDACTED]", safe)
+        return safe.strip() or "Google API request failed"
 
     @staticmethod
     def _valid_count(value: Any) -> bool:
