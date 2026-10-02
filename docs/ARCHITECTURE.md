@@ -7,7 +7,7 @@ Forge AI Orchestrator
   ↓
 Agent adapters
   ↓
-OpenAI / Claude / Gemini / Grok
+OpenAI / Anthropic / Gemini / xAI / DeepSeek / OpenRouter
   ↓
 Review / Testing
   ↓
@@ -146,7 +146,8 @@ not load secrets into `RuntimeSettings`, `ProviderConfig`, or process-wide
 environment state. Providers receive the shared store through `ProviderFactory`
 and request their own key only when generating. `.env` is ignored by Git;
 `.env.example` contains blank key fields and remains tracked as documentation.
-The same lookup flow supports OpenAI, Anthropic, Gemini, and xAI adapters.
+The same lookup flow supports OpenAI, Anthropic, Gemini, xAI, DeepSeek, and
+OpenRouter adapters.
 
 ## Anthropic Provider v0.1
 
@@ -155,3 +156,13 @@ explicitly dispatched to it. It resolves `ANTHROPIC_API_KEY` through the shared
 `SecretStore` at generation time, sends the prompt and serialized context as a
 user message, and maps text blocks and token usage into `ProviderResponse`.
 Startup and offline tests do not make requests.
+
+## OpenAI-Compatible Providers v0.1
+
+`DeepSeekProvider` and `OpenRouterProvider` share the local
+`OpenAICompatibleProvider` adapter and the existing OpenAI Python SDK, using
+the Chat Completions interface with each service's configured base URL and
+SecretStore key reference. `ProviderConfig.model_name` accepts provider model
+IDs directly; OpenRouter's `openrouter/free` route is available as
+`OpenRouterProvider.FREE_MODEL_ID` and can be selected as the configured model.
+Neither provider is selected automatically, and tests use fake clients only.

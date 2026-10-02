@@ -5,9 +5,11 @@ from typing import Dict, Optional, Type
 from app.agents.providers.anthropic import AnthropicProvider
 from app.agents.providers.base import Provider
 from app.agents.providers.config import ProviderConfig
+from app.agents.providers.deepseek import DeepSeekProvider
 from app.agents.providers.google import GoogleProvider
 from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
+from app.agents.providers.openrouter import OpenRouterProvider
 from app.agents.providers.xai import XAIProvider
 from app.config.secrets import SecretStore
 
@@ -22,8 +24,10 @@ class ProviderFactory:
     _provider_types: Dict[str, Type[Provider]] = {
         "openai": OpenAIProvider,
         "anthropic": AnthropicProvider,
+        "deepseek": DeepSeekProvider,
         "google": GoogleProvider,
         "xai": XAIProvider,
+        "openrouter": OpenRouterProvider,
         "mock": MockProvider,
     }
 

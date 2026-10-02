@@ -8,6 +8,8 @@ from app.agents.providers.base import (
     ProviderResponse,
 )
 from app.agents.providers.config import ProviderConfig
+from app.agents.providers.deepseek import DeepSeekProvider
+from app.agents.providers.openrouter import OpenRouterProvider
 
 __all__ = [
     "Provider",
@@ -16,4 +18,6 @@ __all__ = [
     "ProviderNotConfiguredError",
     "ProviderRequest",
     "ProviderResponse",
+    "DeepSeekProvider",
+    "OpenRouterProvider",
 ]

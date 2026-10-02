@@ -44,3 +44,8 @@
   `.env` file. Secret values never enter runtime/provider configuration.
 - Anthropic v0.1 uses the official Python SDK Messages API; inference happens
   only when a task is explicitly dispatched to its provider.
+- DeepSeek and OpenRouter share an OpenAI-compatible Chat Completions adapter
+  and the existing OpenAI SDK; their endpoint, key name, and provider name are
+  isolated in their small provider modules.
+- OpenRouter model IDs are passed through `ProviderConfig`; `openrouter/free`
+  is an explicit configurable model choice, not an automatic routing default.

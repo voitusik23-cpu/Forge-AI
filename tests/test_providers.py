@@ -14,10 +14,12 @@ from app.agents.providers.base import (
     ProviderResponse,
 )
 from app.agents.providers.config import ProviderConfig
+from app.agents.providers.deepseek import DeepSeekProvider
 from app.agents.providers.factory import ProviderFactory, UnknownProviderError
 from app.agents.providers.google import GoogleProvider
 from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
+from app.agents.providers.openrouter import OpenRouterProvider
 from app.agents.providers.registry import (
     DuplicateProviderError,
     ProviderNotFoundError,
@@ -33,7 +35,9 @@ class ProviderInterfaceTests(unittest.TestCase):
         for provider_type in (
             OpenAIProvider,
             AnthropicProvider,
+            DeepSeekProvider,
             GoogleProvider,
+            OpenRouterProvider,
             XAIProvider,
             MockProvider,
         ):
@@ -64,6 +68,10 @@ class ProviderInterfaceTests(unittest.TestCase):
         self.assertEqual(anthropic.provider_name, "anthropic")
         self.assertEqual(anthropic.config.api_key_env_var, "ANTHROPIC_API_KEY")
         self.assertFalse(anthropic.config.enabled)
+        deepseek = DeepSeekProvider()
+        self.assertEqual(deepseek.config.api_key_env_var, "DEEPSEEK_API_KEY")
+        openrouter = OpenRouterProvider()
+        self.assertEqual(openrouter.config.api_key_env_var, "OPENROUTER_API_KEY")
 
 
 class ProviderFactoryTests(unittest.TestCase):
@@ -73,8 +81,10 @@ class ProviderFactoryTests(unittest.TestCase):
         expected = {
             "openai": OpenAIProvider,
             "anthropic": AnthropicProvider,
+            "deepseek": DeepSeekProvider,
             "google": GoogleProvider,
             "xai": XAIProvider,
+            "openrouter": OpenRouterProvider,
         }
         for name, provider_type in expected.items():
             with self.subTest(provider=name):

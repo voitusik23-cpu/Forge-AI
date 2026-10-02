@@ -11,18 +11,19 @@ It includes provider-neutral task dispatch, provider interfaces, and an offline
 `MockProvider`. The OpenAI Provider v0.1 uses the official OpenAI Python SDK
 and Responses API when an OpenAI task is explicitly dispatched. It reads
 `OPENAI_API_KEY` from the local process environment only during generation;
-startup and offline tests make no API calls. Anthropic, Google, and xAI remain
-Google and xAI remain unconfigured. Anthropic Provider v0.1 uses the official
-Anthropic Python SDK Messages API only when explicitly dispatched and reads
-`ANTHROPIC_API_KEY` through `SecretStore`. Runtime settings are validated from
-`FORGE_*` environment variables. Forge AI does not modify projects. The
-project requires the OpenAI and Anthropic SDKs for their provider integrations.
+startup and offline tests make no API calls. Anthropic Provider v0.1 uses the
+official Anthropic Python SDK Messages API when explicitly dispatched. The
+DeepSeek and OpenRouter providers use the existing OpenAI SDK with their
+OpenAI-compatible Chat Completions APIs. All provider keys are resolved through
+`SecretStore` at generation time. Google/Gemini and xAI remain unconfigured.
+Runtime settings are validated from `FORGE_*` environment variables. Forge AI
+does not modify projects. The project requires the OpenAI and Anthropic SDKs.
 
 ## Long-term purpose and architecture
 
 The planned system will coordinate multiple agents through a central
-orchestrator. Provider adapters will isolate provider-specific behavior for
-OpenAI/Codex, Anthropic/Claude, Google/Gemini, and xAI/Grok. Supporting modules
+orchestrator. Provider adapters isolate provider-specific behavior for
+OpenAI, Anthropic, Gemini, xAI, DeepSeek, and OpenRouter. Supporting modules
 will handle tasks, project memory, context and token use, reviews, testing, and
 controlled changes. See [the architecture plan](docs/ARCHITECTURE.md) and
 [planned agent roles](docs/AGENTS.md).
@@ -71,17 +72,18 @@ v0.1, Runtime & Configuration Layer v0.1 и Execution Pipeline v0.1. Здесь 
 Responses API, когда задача явно направлена провайдеру OpenAI. Ключ
 `OPENAI_API_KEY` читается из локального окружения процесса только во время
 генерации; запуск приложения и автономные тесты не выполняют API-запросов.
-Google и xAI пока не настроены. Anthropic Provider v0.1 использует официальный
-Python SDK Anthropic и Messages API только при явной диспетчеризации задачи;
-ключ `ANTHROPIC_API_KEY` он получает через `SecretStore`. Настройки runtime
-проверяются по переменным `FORGE_*`. Forge AI не изменяет проекты. Для
-провайдеров OpenAI и Anthropic требуются их SDK.
+Anthropic Provider v0.1 использует официальный Python SDK Anthropic и Messages
+API при явной диспетчеризации. Провайдеры DeepSeek и OpenRouter используют
+имеющийся OpenAI SDK и совместимые с ним Chat Completions API. Все ключи
+провайдеров разрешаются через `SecretStore` во время генерации. Google/Gemini и
+xAI пока не настроены. Настройки runtime проверяются по переменным `FORGE_*`.
+Forge AI не изменяет проекты. Для проекта требуются SDK OpenAI и Anthropic.
 
 ## Долгосрочная цель и архитектура
 
 Планируется, что система будет координировать работу нескольких агентов через
-центральный оркестратор. Адаптеры провайдеров будут изолировать особенности
-работы с OpenAI/Codex, Anthropic/Claude, Google/Gemini и xAI/Grok. Вспомогательные
+центральный оркестратор. Адаптеры провайдеров изолируют особенности работы с
+OpenAI, Anthropic, Gemini, xAI, DeepSeek и OpenRouter. Вспомогательные
 модули будут отвечать за задачи, память проектов, контекст и расход токенов,
 проверки, тестирование и контролируемое внесение изменений. См. [план
 архитектуры](docs/ARCHITECTURE.md) и [планируемые роли агентов](docs/AGENTS.md).
