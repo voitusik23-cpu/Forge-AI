@@ -6,7 +6,7 @@ from typing import Optional
 from app.agents.base import AgentExecutionError
 from app.agents.providers.base import ProviderNotConfiguredError
 from app.agents.registry import AgentRegistry
-from app.orchestrator.models import Task, TaskPriority, TaskResult
+from app.orchestrator.models import Task, TaskCategory, TaskPriority, TaskResult
 from app.usage import Usage
 
 
@@ -22,7 +22,7 @@ class TaskExecutor:
 
     def execute(self, task: Task, agent_name: str) -> TaskResult:
         """Run a task through one explicitly named agent."""
-        self._validate_task(task)
+        self.validate_task(task)
         if not isinstance(agent_name, str) or not agent_name.strip():
             raise ValueError("agent_name must not be empty")
 
@@ -69,7 +69,7 @@ class TaskExecutor:
         )
 
     @staticmethod
-    def _validate_task(task: Task) -> None:
+    def validate_task(task: Task) -> None:
         if not isinstance(task, Task):
             raise InvalidTaskError("task must be a Task instance")
         if not isinstance(task.id, str) or not task.id.strip():
@@ -80,6 +80,15 @@ class TaskExecutor:
             raise InvalidTaskError("task context must be a dictionary")
         if not isinstance(task.priority, TaskPriority):
             raise InvalidTaskError("task priority must be a TaskPriority")
+        if not isinstance(task.category, TaskCategory):
+            raise InvalidTaskError("task category must be a TaskCategory")
+        if not isinstance(task.parameters, dict):
+            raise InvalidTaskError("task parameters must be a dictionary")
+        model_name = task.parameters.get("model")
+        if model_name is not None and (
+            not isinstance(model_name, str) or not model_name.strip()
+        ):
+            raise InvalidTaskError("task model parameter must be a non-empty string")
 
     @staticmethod
     def _failure(

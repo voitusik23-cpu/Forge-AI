@@ -31,6 +31,10 @@ class ProviderFactory:
         "mock": MockProvider,
     }
 
+    def list_providers(self) -> list[str]:
+        """List supported canonical provider names in stable order."""
+        return list(self._provider_types)
+
     def create(
         self,
         name: str,

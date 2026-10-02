@@ -15,6 +15,7 @@ class ProviderRequest:
 
     prompt: str
     context: Dict[str, Any] = field(default_factory=dict)
+    model_name: Optional[str] = None
 
 
 @dataclass

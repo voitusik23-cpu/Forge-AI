@@ -69,7 +69,8 @@ class OpenAIProvider(Provider):
             raise ProviderNotConfiguredError(
                 f"Set {api_key_env_var} in the local environment to use OpenAI"
             )
-        if not self.model_name or self.model_name == "unconfigured":
+        model_name = request.model_name or self.model_name
+        if not model_name or model_name == "unconfigured":
             raise ProviderNotConfiguredError("OpenAI model is not configured")
 
         sdk = self._load_sdk()
@@ -82,7 +83,7 @@ class OpenAIProvider(Provider):
             )
 
         try:
-            kwargs = {"model": self.model_name, "input": api_input}
+            kwargs = {"model": model_name, "input": api_input}
             if self._timeout is not None:
                 kwargs["timeout"] = self._timeout
             raw_response = client.responses.create(**kwargs)
@@ -96,7 +97,7 @@ class OpenAIProvider(Provider):
 
         response_model = getattr(raw_response, "model", None)
         if not isinstance(response_model, str) or not response_model.strip():
-            response_model = self.model_name
+            response_model = model_name
         raw_usage = getattr(raw_response, "usage", None)
         try:
             input_tokens = getattr(raw_usage, "input_tokens", 0) if raw_usage else 0

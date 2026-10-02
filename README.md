@@ -19,6 +19,19 @@ OpenAI-compatible Chat Completions APIs. All provider keys are resolved through
 Runtime settings are validated from `FORGE_*` environment variables. Forge AI
 does not modify projects. The project requires the OpenAI and Anthropic SDKs.
 
+## Dispatcher v0.2
+
+Tasks carry a category (`coding`, `reasoning`, `large-context`, `cheap/free`,
+`fast/cheap`, or `other`) and optional provider-neutral parameters. The
+dispatcher prefers OpenAI then Anthropic for coding, Anthropic then OpenAI for
+reasoning, Gemini for large-context, OpenRouter for cheap/free, and DeepSeek
+for fast/cheap. Other tasks use `FORGE_DEFAULT_PROVIDER`. A caller can select a
+provider explicitly with `provider_name`; the existing `agent_name` interface
+also remains available. The dispatcher currently invokes only its first
+choice, without automatic fallback or multiple agents. Missing or unconfigured
+providers return a structured task failure. Startup and dispatcher tests make
+no real API calls.
+
 ## Long-term purpose and architecture
 
 The planned system will coordinate multiple agents through a central

@@ -21,17 +21,18 @@ class RuntimeBootstrapTests(unittest.TestCase):
         self.assertIsInstance(runtime, RuntimeContext)
         self.assertIs(runtime.settings, settings)
         self.assertIsInstance(runtime.orchestrator, Orchestrator)
-        self.assertEqual(runtime.provider_registry.list_providers(), ["mock"])
-        self.assertEqual(runtime.agent_registry.list_agents(), ["mock"])
+        expected = ["openai", "anthropic", "deepseek", "google", "xai", "openrouter", "mock"]
+        self.assertEqual(runtime.provider_registry.list_providers(), expected)
+        self.assertEqual(runtime.agent_registry.list_agents(), expected)
         provider = runtime.provider_registry.get("mock")
         self.assertIsInstance(provider, MockProvider)
         self.assertEqual(provider.model_name, "offline-test")
 
-    def test_default_provider_is_configuration_and_dispatch_is_explicit(self) -> None:
+    def test_default_provider_is_used_for_other_category(self) -> None:
         runtime = create_runtime(RuntimeSettings(default_provider="mock"))
         task = Task(id="runtime-task", description="offline task")
 
-        result = runtime.orchestrator.dispatch(task, agent_name="mock")
+        result = runtime.orchestrator.dispatch(task)
 
         self.assertTrue(result.success)
         self.assertEqual(result.output, "MockProvider response: offline task")

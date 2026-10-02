@@ -21,27 +21,26 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
 
     provider_factory = ProviderFactory()
     secret_store = SecretStore()
-    provider_template = provider_factory.create(
-        resolved_settings.default_provider, secret_store=secret_store
-    )
-    provider_config = replace(
-        provider_template.config, model_name=resolved_settings.default_model
-    )
-    provider = provider_factory.create(
-        resolved_settings.default_provider,
-        config=provider_config,
-        secret_store=secret_store,
-    )
-
     provider_registry = ProviderRegistry()
-    provider_registry.register(provider)
-
     agent_registry = AgentRegistry()
-    agent_registry.register(ProviderAgent(provider))
+    for provider_name in provider_factory.list_providers():
+        provider = provider_factory.create(provider_name, secret_store=secret_store)
+        if provider_name == resolved_settings.default_provider:
+            provider = provider_factory.create(
+                provider_name,
+                config=replace(
+                    provider.config, model_name=resolved_settings.default_model
+                ),
+                secret_store=secret_store,
+            )
+        provider_registry.register(provider)
+        agent_registry.register(ProviderAgent(provider))
 
     return RuntimeContext(
         settings=resolved_settings,
         provider_registry=provider_registry,
         agent_registry=agent_registry,
-        orchestrator=Orchestrator(agent_registry),
+        orchestrator=Orchestrator(
+            agent_registry, default_provider=resolved_settings.default_provider
+        ),
     )

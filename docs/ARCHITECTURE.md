@@ -41,8 +41,36 @@ Task
   -> TaskResult
 ```
 
-Automatic routing and real integrations for providers other than OpenAI and
-Anthropic remain future work.
+Automatic routing is introduced separately in Dispatcher v0.2. Real
+integrations for providers other than OpenAI and Anthropic remain future work.
+
+## Dispatcher v0.2
+
+`Task` carries a coarse `TaskCategory` and a provider-neutral `parameters`
+mapping (including an optional model override). `Dispatcher` applies a small,
+deterministic preference policy and routes to the first candidate through the
+existing `AgentRegistry` and `Provider` adapter:
+
+```text
+Task(category, parameters)
+  -> Orchestrator
+  -> Dispatcher / DispatchPolicy
+  -> AgentRegistry
+  -> ProviderAgent
+  -> Provider interface
+  -> TaskResult
+```
+
+Coding prefers OpenAI then Anthropic; reasoning prefers Anthropic then OpenAI;
+large-context uses Google/Gemini; cheap/free uses OpenRouter; fast/cheap uses
+DeepSeek; other categories use `FORGE_DEFAULT_PROVIDER`. Candidate order is
+metadata for a future fallback policy: v0.2 executes only the first choice and
+returns a clear failed `TaskResult` when it is unavailable or unconfigured.
+Callers can override routing with `provider_name`; the existing explicit
+`agent_name` dispatch remains supported. Dispatcher depends only on the shared
+agent execution contract and does not inspect provider SDKs. Cost, limits,
+quality, latency, fallback execution, and multi-agent execution remain future
+extensions.
 
 ## Provider Layer v0.1
 
@@ -89,8 +117,8 @@ Runtime
 `RuntimeSettings` contains application-wide values such as environment, debug
 mode, default provider/model, timeout, retry count, and log level. It is loaded
 from the `FORGE_*` environment variables and validated before runtime assembly.
-The configured default provider is used to construct the initial provider and
-agent; it does not automatically route individual tasks.
+The configured default provider is used for tasks in the `other` category;
+the v0.2 dispatcher applies the category policy for other task categories.
 
 `ProviderConfig` remains separate and contains provider-specific metadata,
 including only the name of an environment variable that may hold a credential.

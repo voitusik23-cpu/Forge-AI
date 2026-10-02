@@ -49,3 +49,9 @@
   isolated in their small provider modules.
 - OpenRouter model IDs are passed through `ProviderConfig`; `openrouter/free`
   is an explicit configurable model choice, not an automatic routing default.
+
+## Dispatcher v0.2
+
+- Task routing uses a small deterministic category policy: coding prefers OpenAI then Anthropic; reasoning prefers Anthropic then OpenAI; large-context selects Google/Gemini; cheap/free selects OpenRouter; fast/cheap selects DeepSeek; other tasks use the configured default.
+- Callers may explicitly choose a provider. Dispatcher v0.2 executes only one selected provider and does not add scoring, automatic fallback execution, or multi-agent execution.
+- Task parameters are provider-neutral; the optional `model` parameter overrides the configured model for the chosen provider.

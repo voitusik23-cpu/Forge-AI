@@ -16,14 +16,43 @@ class TaskPriority(Enum):
     CRITICAL = "critical"
 
 
+class TaskCategory(str, Enum):
+    """Coarse routing category used by the v0.2 dispatcher policy."""
+
+    CODING = "coding"
+    REASONING = "reasoning"
+    LARGE_CONTEXT = "large-context"
+    CHEAP_FREE = "cheap/free"
+    FAST_CHEAP = "fast/cheap"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object):
+        """Accept the common spelling variants used in task descriptions."""
+        if isinstance(value, str):
+            normalized = value.strip().lower().replace("_", "-")
+            aliases = {
+                "large context": cls.LARGE_CONTEXT,
+                "large-context": cls.LARGE_CONTEXT,
+                "cheap/free": cls.CHEAP_FREE,
+                "cheap-free": cls.CHEAP_FREE,
+                "fast/cheap": cls.FAST_CHEAP,
+                "fast-cheap": cls.FAST_CHEAP,
+            }
+            return aliases.get(normalized)
+        return None
+
+
 @dataclass
 class Task:
-    """A unit of work submitted to a specifically selected agent."""
+    """A unit of work with routing category and provider-neutral parameters."""
 
     id: str
     description: str
     context: Dict[str, Any] = field(default_factory=dict)
     priority: TaskPriority = TaskPriority.NORMAL
+    category: TaskCategory = TaskCategory.OTHER
+    parameters: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

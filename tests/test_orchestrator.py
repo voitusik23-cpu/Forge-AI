@@ -8,7 +8,7 @@ from app.agents.registry import (
     AgentNotFoundError,
     AgentRegistry,
 )
-from app.orchestrator.models import Task, TaskPriority, TaskResult, Usage
+from app.orchestrator.models import Task, TaskCategory, TaskPriority, TaskResult, Usage
 from app.orchestrator.orchestrator import Orchestrator
 
 
@@ -19,6 +19,8 @@ class TaskModelTests(unittest.TestCase):
         self.assertEqual(task.id, "task-1")
         self.assertEqual(task.context, {})
         self.assertEqual(task.priority, TaskPriority.NORMAL)
+        self.assertEqual(task.category, TaskCategory.OTHER)
+        self.assertEqual(task.parameters, {})
 
     def test_task_priority_values(self) -> None:
         self.assertEqual(

@@ -70,7 +70,8 @@ class OpenAICompatibleProvider(Provider):
             raise ProviderNotConfiguredError(
                 f"Set {api_key_env_var} in the local environment to use {self.PROVIDER_NAME}"
             )
-        if not self.model_name or self.model_name == "unconfigured":
+        model_name = request.model_name or self.model_name
+        if not model_name or model_name == "unconfigured":
             raise ProviderNotConfiguredError(
                 f"{self.PROVIDER_NAME} model is not configured"
             )
@@ -85,7 +86,7 @@ class OpenAICompatibleProvider(Provider):
 
         try:
             kwargs = {
-                "model": self.model_name,
+                "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
             }
             if self._timeout is not None:
@@ -102,7 +103,7 @@ class OpenAICompatibleProvider(Provider):
             )
         response_model = getattr(response, "model", None)
         if not isinstance(response_model, str) or not response_model.strip():
-            response_model = self.model_name
+            response_model = model_name
 
         raw_usage = getattr(response, "usage", None)
         input_tokens = getattr(raw_usage, "prompt_tokens", 0) if raw_usage else 0

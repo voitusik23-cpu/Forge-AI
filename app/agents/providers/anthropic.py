@@ -74,7 +74,8 @@ class AnthropicProvider(Provider):
             raise ProviderNotConfiguredError(
                 f"Set {api_key_env_var} in the local environment to use Anthropic"
             )
-        if not self.model_name or self.model_name == "unconfigured":
+        model_name = request.model_name or self.model_name
+        if not model_name or model_name == "unconfigured":
             raise ProviderNotConfiguredError("Anthropic model is not configured")
 
         sdk = self._load_sdk()
@@ -87,7 +88,7 @@ class AnthropicProvider(Provider):
 
         try:
             kwargs = {
-                "model": self.model_name,
+                "model": model_name,
                 "max_tokens": self._max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             }
@@ -106,7 +107,7 @@ class AnthropicProvider(Provider):
 
         response_model = getattr(message, "model", None)
         if not isinstance(response_model, str) or not response_model.strip():
-            response_model = self.model_name
+            response_model = model_name
         raw_usage = getattr(message, "usage", None)
         input_tokens = getattr(raw_usage, "input_tokens", None)
         output_tokens = getattr(raw_usage, "output_tokens", None)

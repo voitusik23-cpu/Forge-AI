@@ -30,7 +30,11 @@ class ProviderAgent:
         """Convert a task into a provider request and adapt its response."""
         try:
             response = self._provider.generate(
-                ProviderRequest(prompt=task.description, context=task.context)
+                ProviderRequest(
+                    prompt=task.description,
+                    context=task.context,
+                    model_name=task.parameters.get("model"),
+                )
             )
         except ProviderError as exc:
             raise AgentExecutionError(
