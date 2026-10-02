@@ -29,6 +29,9 @@ Git will be the source of truth for project history, and significant changes
 should be traceable. Secrets must never be committed to Git; keep credentials
 in environment variables or an appropriately secured local environment. The
 `.env.example` file contains empty placeholders only.
+Store local provider keys in the ignored root `.env` file. The shared
+`SecretStore` reads them only when a provider requests a key; process
+environment variables take precedence. Never commit `.env`.
 
 ## Getting started
 
@@ -83,6 +86,9 @@ Git будет источником достоверной истории про
 быть отслеживаемыми. Секреты нельзя добавлять в Git; храните учетные данные в
 переменных окружения или в надлежащим образом защищенном локальном окружении.
 Файл `.env.example` содержит только пустые поля-заполнители.
+Локальные ключи провайдеров храните в игнорируемом корневом файле `.env`.
+Общий `SecretStore` читает их только по запросу провайдера; переменные
+окружения процесса имеют приоритет. Не коммитьте `.env`.
 
 ## Начало работы
 

@@ -8,6 +8,7 @@ from app.agents.providers.factory import ProviderFactory
 from app.agents.providers.registry import ProviderRegistry
 from app.agents.registry import AgentRegistry
 from app.config.settings import RuntimeSettings, load_settings
+from app.config.secrets import SecretStore
 from app.orchestrator.orchestrator import Orchestrator
 from app.runtime.context import RuntimeContext
 from app.runtime.logging import configure_logging
@@ -19,12 +20,17 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
     configure_logging(resolved_settings)
 
     provider_factory = ProviderFactory()
-    provider_template = provider_factory.create(resolved_settings.default_provider)
+    secret_store = SecretStore()
+    provider_template = provider_factory.create(
+        resolved_settings.default_provider, secret_store=secret_store
+    )
     provider_config = replace(
         provider_template.config, model_name=resolved_settings.default_model
     )
     provider = provider_factory.create(
-        resolved_settings.default_provider, config=provider_config
+        resolved_settings.default_provider,
+        config=provider_config,
+        secret_store=secret_store,
     )
 
     provider_registry = ProviderRegistry()

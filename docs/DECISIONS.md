@@ -39,3 +39,6 @@
   generation time and is never stored in configuration or logged.
 - OpenAI uses `client.responses.create`; startup and ordinary offline tests do
   not perform inference.
+- Provider credentials are resolved lazily by a shared `SecretStore`, with
+  process environment values taking precedence over the ignored repository-root
+  `.env` file. Secret values never enter runtime/provider configuration.

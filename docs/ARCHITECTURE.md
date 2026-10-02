@@ -137,3 +137,13 @@ input/output token counts, and estimated cost remains unset. Authentication,
 rate-limit, timeout, connection/API, and malformed-response failures become
 safe provider errors; unexpected exceptions continue to propagate. Other
 provider adapters remain unconfigured, and task routing stays explicit.
+
+## Local secrets
+
+`SecretStore` lazily resolves a provider's environment-variable reference from
+the process environment first, then the repository-root `.env` file. It does
+not load secrets into `RuntimeSettings`, `ProviderConfig`, or process-wide
+environment state. Providers receive the shared store through `ProviderFactory`
+and request their own key only when generating. `.env` is ignored by Git;
+`.env.example` contains blank key fields and remains tracked as documentation.
+The same lookup flow supports OpenAI, Anthropic, Gemini, and xAI adapters.

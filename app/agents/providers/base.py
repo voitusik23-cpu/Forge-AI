@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from app.config.secrets import SecretStore
 from app.agents.providers.config import ProviderConfig
 from app.usage import Usage
 
@@ -37,8 +38,11 @@ class ProviderNotConfiguredError(ProviderError):
 class Provider(ABC):
     """Common interface implemented by each provider adapter."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(
+        self, config: ProviderConfig, *, secret_store: Optional[SecretStore] = None
+    ) -> None:
         self.config = config
+        self.secret_store = secret_store or SecretStore()
 
     @property
     def provider_name(self) -> str:
@@ -59,7 +63,12 @@ class UnconfiguredProvider(Provider):
     PROVIDER_NAME = ""
     API_KEY_ENV_VAR = ""
 
-    def __init__(self, config: Optional[ProviderConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[ProviderConfig] = None,
+        *,
+        secret_store: Optional[SecretStore] = None,
+    ) -> None:
         resolved_config = config or ProviderConfig(
             provider_name=self.PROVIDER_NAME,
             api_key_env_var=self.API_KEY_ENV_VAR,
@@ -69,7 +78,7 @@ class UnconfiguredProvider(Provider):
                 f"Expected config for '{self.PROVIDER_NAME}', "
                 f"got '{resolved_config.provider_name}'"
             )
-        super().__init__(resolved_config)
+        super().__init__(resolved_config, secret_store=secret_store)
 
     def generate(self, request: ProviderRequest) -> ProviderResponse:
         """Fail predictably until this provider has a real integration."""

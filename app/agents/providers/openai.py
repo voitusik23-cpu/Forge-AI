@@ -1,7 +1,6 @@
 """OpenAI Responses API adapter, loaded lazily for explicit inference only."""
 
 import json
-import os
 from typing import Any, Optional
 
 from app.agents.providers.base import (
@@ -12,6 +11,7 @@ from app.agents.providers.base import (
     ProviderResponse,
 )
 from app.agents.providers.config import ProviderConfig
+from app.config.secrets import SecretStore
 from app.usage import Usage
 
 
@@ -48,6 +48,7 @@ class OpenAIProvider(Provider):
         client: Any = None,
         sdk_module: Any = None,
         timeout: Optional[float] = None,
+        secret_store: Optional[SecretStore] = None,
     ) -> None:
         resolved_config = config or ProviderConfig(
             provider_name=self.PROVIDER_NAME,
@@ -55,7 +56,7 @@ class OpenAIProvider(Provider):
         )
         if resolved_config.provider_name != self.PROVIDER_NAME:
             raise ValueError("Expected config for 'openai'")
-        super().__init__(resolved_config)
+        super().__init__(resolved_config, secret_store=secret_store)
         self._client = client
         self._sdk_module = sdk_module
         self._timeout = timeout
@@ -63,7 +64,7 @@ class OpenAIProvider(Provider):
     def generate(self, request: ProviderRequest) -> ProviderResponse:
         """Generate text only when explicitly called with a configured model/key."""
         api_key_env_var = self.config.api_key_env_var or self.API_KEY_ENV_VAR
-        api_key = os.environ.get(api_key_env_var)
+        api_key = self.secret_store.get_secret(api_key_env_var)
         if not api_key or not api_key.strip():
             raise ProviderNotConfiguredError(
                 f"Set {api_key_env_var} in the local environment to use OpenAI"

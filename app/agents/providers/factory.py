@@ -9,6 +9,7 @@ from app.agents.providers.google import GoogleProvider
 from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
 from app.agents.providers.xai import XAIProvider
+from app.config.secrets import SecretStore
 
 
 class UnknownProviderError(LookupError):
@@ -27,11 +28,15 @@ class ProviderFactory:
     }
 
     def create(
-        self, name: str, config: Optional[ProviderConfig] = None
+        self,
+        name: str,
+        config: Optional[ProviderConfig] = None,
+        *,
+        secret_store: Optional[SecretStore] = None,
     ) -> Provider:
         """Create a supported provider by its explicit canonical name."""
         try:
             provider_type = self._provider_types[name]
         except KeyError as exc:
             raise UnknownProviderError(f"Unknown provider '{name}'") from exc
-        return provider_type(config)
+        return provider_type(config, secret_store=secret_store)
