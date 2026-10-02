@@ -34,6 +34,7 @@ class RuntimeSettingsTests(unittest.TestCase):
                 "FORGE_RETRY_COUNT": "4",
                 "FORGE_LOG_LEVEL": "debug",
                 "FORGE_PROVIDER_FALLBACK_CHAIN": "anthropic, deepseek",
+                "FORGE_ALLOW_PAID_PROVIDERS": "true",
             }
         )
 
@@ -44,6 +45,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.retry_count, 4)
         self.assertEqual(settings.log_level, "DEBUG")
         self.assertEqual(settings.provider_fallback_chain, ("anthropic", "deepseek"))
+        self.assertTrue(settings.allow_paid_providers)
 
     def test_boolean_parsing_accepts_documented_forms(self) -> None:
         for value, expected in (("yes", True), ("1", True), ("OFF", False), ("0", False)):
@@ -54,6 +56,11 @@ class RuntimeSettingsTests(unittest.TestCase):
     def test_invalid_boolean_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "FORGE_DEBUG.*boolean"):
             load_settings(environ={"FORGE_DEBUG": "sometimes"})
+
+    def test_paid_provider_policy_defaults_to_disabled(self) -> None:
+        self.assertFalse(load_settings(environ={}).allow_paid_providers)
+        with self.assertRaisesRegex(ConfigurationError, "FORGE_ALLOW_PAID_PROVIDERS"):
+            load_settings(environ={"FORGE_ALLOW_PAID_PROVIDERS": "sometimes"})
 
     def test_integer_values_are_parsed(self) -> None:
         settings = load_settings(

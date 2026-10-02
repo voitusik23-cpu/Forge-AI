@@ -68,4 +68,10 @@
 
 - Provider capabilities are immutable declarative metadata kept outside the provider interface. The registry mirrors `ProviderConfig.enabled` and API-key variable names without resolving secrets.
 - Streaming/tool booleans describe general provider API support and may vary by model; they do not imply that Forge AI's current adapter implements streaming or tool execution.
-- Cost is represented only by a coarse `free`, `cheap`, or `paid` label. No API cost calculation or cost-based dispatch is performed.
+- Cost metadata is represented only by a coarse `free`, `cheap`, or `paid` label; it does not calculate API cost.
+
+## Cost-aware Provider Routing v0.1
+
+- Ordinary tasks use existing `ProviderCapabilitiesRegistry` cost tiers in `free`, `cheap`, `paid` order, limited to providers registered with both provider and agent registries.
+- Paid providers are excluded by default and may be permitted with `FORGE_ALLOW_PAID_PROVIDERS=true`. This policy does not calculate token prices or apply cost/quality scoring.
+- Explicit `provider_name` selection overrides cost ordering. The existing bounded fallback chain runs after cost-ordered candidates and remains sequential.

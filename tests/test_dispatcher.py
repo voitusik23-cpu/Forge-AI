@@ -59,6 +59,32 @@ class DispatcherTests(unittest.TestCase):
             self.registry.register(agent)
         self.orchestrator = Orchestrator(self.registry, default_provider="xai")
 
+    def make_cost_dispatcher(
+        self, names, *, allow_paid=False, fallback_chain=(), unavailable=()
+    ) -> tuple[Dispatcher, dict[str, StubAgent]]:
+        agents = AgentRegistry()
+        providers = ProviderRegistry()
+        capabilities = ProviderCapabilitiesRegistry()
+        factory = ProviderFactory()
+        agent_map = {}
+        for name in names:
+            agent = UnavailableAgent(name) if name in unavailable else StubAgent(name)
+            agent_map[name] = agent
+            agents.register(agent)
+            provider = factory.create(name)
+            providers.register(provider)
+            capabilities.register_provider(provider)
+        return (
+            Dispatcher(
+                agents,
+                provider_registry=providers,
+                capabilities_registry=capabilities,
+                fallback_chain=fallback_chain,
+                allow_paid_providers=allow_paid,
+            ),
+            agent_map,
+        )
+
     def test_category_dispatches_to_first_policy_choice_only(self) -> None:
         task = Task(id="coding", description="write a function", category=TaskCategory.CODING)
 
@@ -192,6 +218,71 @@ class DispatcherTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("capabilities are not registered", result.error)
         self.assertEqual(openai_agent.calls, 0)
+
+    def test_ordinary_task_prefers_available_free_provider(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("openai", "deepseek", "mock")
+        )
+
+        result = dispatcher.dispatch(Task(id="free", description="ordinary task"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "mock")
+        self.assertEqual(agents["openai"].calls, 0)
+        self.assertEqual(agents["deepseek"].calls, 0)
+
+    def test_cheap_provider_precedes_paid_when_no_free_is_registered(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(("openai", "deepseek"))
+
+        result = dispatcher.dispatch(Task(id="cheap", description="ordinary task"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(agents["openai"].calls, 0)
+
+    def test_unavailable_free_provider_advances_to_cheap_tier(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("mock", "deepseek", "openai"), unavailable=("mock",)
+        )
+
+        result = dispatcher.dispatch(Task(id="free-fails", description="ordinary task"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(agents["mock"].calls, 1)
+        self.assertEqual(agents["openai"].calls, 0)
+
+    def test_paid_provider_is_selected_only_when_policy_allows(self) -> None:
+        forbidden, forbidden_agents = self.make_cost_dispatcher(("openai",))
+        forbidden_result = forbidden.dispatch(
+            Task(id="paid-forbidden", description="ordinary task")
+        )
+        self.assertFalse(forbidden_result.success)
+        self.assertEqual(forbidden_agents["openai"].calls, 0)
+
+        permitted, permitted_agents = self.make_cost_dispatcher(
+            ("openai",), allow_paid=True
+        )
+        permitted_result = permitted.dispatch(
+            Task(id="paid-permitted", description="ordinary task")
+        )
+        self.assertTrue(permitted_result.success)
+        self.assertEqual(permitted_result.provider, "openai")
+        self.assertEqual(permitted_agents["openai"].calls, 1)
+
+    def test_explicit_paid_provider_overrides_cost_policy(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("mock", "openai"), allow_paid=False, fallback_chain=("mock",)
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="explicit-paid", description="ordinary task"),
+            provider_name="openai",
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "openai")
+        self.assertEqual(agents["mock"].calls, 0)
 
 
 if __name__ == "__main__":

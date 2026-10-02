@@ -19,6 +19,7 @@ class Orchestrator:
         fallback_chain: tuple[str, ...] = (),
         provider_registry: Optional[ProviderRegistry] = None,
         capabilities_registry: Optional[ProviderCapabilitiesRegistry] = None,
+        allow_paid_providers: bool = False,
     ) -> None:
         self._executor = TaskExecutor(registry)
         self._dispatcher = Dispatcher(
@@ -27,6 +28,7 @@ class Orchestrator:
             fallback_chain=fallback_chain,
             provider_registry=provider_registry,
             capabilities_registry=capabilities_registry,
+            allow_paid_providers=allow_paid_providers,
         )
 
     def dispatch(

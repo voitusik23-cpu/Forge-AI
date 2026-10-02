@@ -34,6 +34,7 @@ class RuntimeSettings:
     retry_count: int = 2
     log_level: str = "INFO"
     provider_fallback_chain: Tuple[str, ...] = ()
+    allow_paid_providers: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.environment, str):
@@ -50,6 +51,8 @@ class RuntimeSettings:
             )
         if not isinstance(self.debug, bool):
             raise ConfigurationError("FORGE_DEBUG must be a boolean")
+        if not isinstance(self.allow_paid_providers, bool):
+            raise ConfigurationError("FORGE_ALLOW_PAID_PROVIDERS must be a boolean")
         if not isinstance(self.default_provider, str) or not self.default_provider.strip():
             raise ConfigurationError("FORGE_DEFAULT_PROVIDER must not be empty")
         if not isinstance(self.default_model, str) or not self.default_model.strip():
@@ -135,5 +138,10 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> RuntimeSetting
         log_level=source.get("FORGE_LOG_LEVEL", defaults.log_level),
         provider_fallback_chain=source.get(
             "FORGE_PROVIDER_FALLBACK_CHAIN", defaults.provider_fallback_chain
+        ),
+        allow_paid_providers=_parse_bool(
+            "FORGE_ALLOW_PAID_PROVIDERS",
+            source.get("FORGE_ALLOW_PAID_PROVIDERS"),
+            defaults.allow_paid_providers,
         ),
     )

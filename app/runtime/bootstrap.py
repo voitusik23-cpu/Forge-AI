@@ -52,5 +52,6 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
             fallback_chain=resolved_settings.provider_fallback_chain,
             provider_registry=provider_registry,
             capabilities_registry=capabilities_registry,
+            allow_paid_providers=resolved_settings.allow_paid_providers,
         ),
     )

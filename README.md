@@ -51,8 +51,17 @@ failed `TaskResult` with the reasons from the attempts.
 The runtime exposes declarative capabilities for each provider: key variable
 name, general streaming/tool support, a coarse cost tier, and the existing
 configuration enabled flag. These labels do not calculate cost or affect
-Dispatcher routing. Tool support can vary by model, and metadata does not mean
-the current Forge AI adapter implements streaming or tool execution.
+actual token billing. Tool support can vary by model, and metadata does not
+mean the current Forge AI adapter implements streaming or tool execution.
+
+## Cost-aware Provider Routing v0.1
+
+For ordinary (`other`) tasks, registered providers are considered in `free`,
+`cheap`, then `paid` order using their capability metadata. Paid providers are
+excluded unless `FORGE_ALLOW_PAID_PROVIDERS=true`. The configured fallback
+chain remains in effect after eligible cost-tier candidates. An explicit
+`provider_name` takes priority over the cost policy. This policy uses only
+coarse tiers; it does not calculate token costs or score quality or latency.
 
 ## Long-term purpose and architecture
 

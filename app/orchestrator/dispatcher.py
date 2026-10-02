@@ -5,7 +5,10 @@ from typing import Dict, Optional, Sequence, Tuple
 
 from app.agents.base import AgentExecutionError
 from app.agents.providers.base import ProviderNotConfiguredError
-from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
+from app.agents.providers.capabilities import (
+    CostTier,
+    ProviderCapabilitiesRegistry,
+)
 from app.agents.providers.registry import ProviderNotFoundError, ProviderRegistry
 from app.agents.registry import AgentNotFoundError, AgentRegistry
 from app.orchestrator.executor import TaskExecutor
@@ -18,7 +21,7 @@ class DispatchDecision:
 
     category: TaskCategory
     candidates: Tuple[str, ...]
-    selected_provider: str
+    selected_provider: Optional[str]
     reason: str
 
 
@@ -33,8 +36,42 @@ class DispatchPolicy:
         TaskCategory.FAST_CHEAP: ("deepseek",),
     }
 
-    def decide(self, task: Task, default_provider: str) -> DispatchDecision:
+    def decide(
+        self,
+        task: Task,
+        default_provider: str,
+        *,
+        capabilities: Optional[ProviderCapabilitiesRegistry] = None,
+        registered_provider_names: Optional[Sequence[str]] = None,
+        registered_agent_names: Optional[Sequence[str]] = None,
+        allow_paid_providers: bool = False,
+    ) -> DispatchDecision:
         """Return the preferred provider and retain the remaining candidates."""
+        if task.category == TaskCategory.OTHER and capabilities is not None:
+            provider_names = set(registered_provider_names or ())
+            agent_names = set(registered_agent_names or ())
+            cost_order = {
+                CostTier.FREE: 0,
+                CostTier.CHEAP: 1,
+                CostTier.PAID: 2,
+            }
+            eligible = [
+                capability
+                for capability in capabilities.list_capabilities()
+                if capability.provider_name in provider_names
+                and capability.provider_name in agent_names
+                and (allow_paid_providers or capability.cost_tier != CostTier.PAID)
+            ]
+            eligible.sort(key=lambda item: cost_order[item.cost_tier])
+            candidates = tuple(item.provider_name for item in eligible)
+            selected = candidates[0] if candidates else None
+            return DispatchDecision(
+                category=task.category,
+                candidates=candidates,
+                selected_provider=selected,
+                reason="Cost tier preference: free, then cheap, then permitted paid",
+            )
+
         candidates = self._PREFERENCES.get(task.category, (default_provider,))
         return DispatchDecision(
             category=task.category,
@@ -59,6 +96,7 @@ class Dispatcher:
         fallback_chain: Sequence[str] = (),
         provider_registry: Optional[ProviderRegistry] = None,
         capabilities_registry: Optional[ProviderCapabilitiesRegistry] = None,
+        allow_paid_providers: bool = False,
     ) -> None:
         self._registry = agent_registry
         self._default_provider = default_provider
@@ -66,6 +104,7 @@ class Dispatcher:
         self._executor = TaskExecutor(agent_registry)
         self._provider_registry = provider_registry
         self._capabilities_registry = capabilities_registry
+        self._allow_paid_providers = allow_paid_providers
         if isinstance(fallback_chain, str):
             fallback_chain = tuple(
                 name.strip() for name in fallback_chain.split(",") if name.strip()
@@ -77,7 +116,18 @@ class Dispatcher:
     def dispatch(self, task: Task, provider_name: Optional[str] = None) -> TaskResult:
         """Route to the primary and optional fallbacks unless provider is explicit."""
         self._executor.validate_task(task)
-        decision = self._policy.decide(task, self._default_provider)
+        decision = self._policy.decide(
+            task,
+            self._default_provider,
+            capabilities=self._capabilities_registry,
+            registered_provider_names=(
+                self._provider_registry.list_providers()
+                if self._provider_registry is not None
+                else None
+            ),
+            registered_agent_names=self._registry.list_agents(),
+            allow_paid_providers=self._allow_paid_providers,
+        )
         if provider_name is not None and (
             not isinstance(provider_name, str) or not provider_name.strip()
         ):
@@ -88,13 +138,51 @@ class Dispatcher:
             )
         selected = provider_name if provider_name is not None else decision.selected_provider
         allow_fallback = provider_name is None
-        attempts = [selected]
+        cost_aware = (
+            task.category == TaskCategory.OTHER
+            and self._capabilities_registry is not None
+        )
+        if provider_name is not None:
+            attempts = [selected]
+        elif cost_aware:
+            attempts = list(decision.candidates)
+        else:
+            attempts = [selected] if selected is not None else []
         if allow_fallback:
-            attempts.extend(
-                name
-                for name in self._fallback_chain
-                if name != selected and name not in attempts
-            )
+            if not cost_aware:
+                if not attempts:
+                    attempts.append(self._default_provider)
+                attempts.extend(
+                    name
+                    for name in self._fallback_chain
+                    if name != selected and name not in attempts
+                )
+
+        if (
+            allow_fallback
+            and task.category == TaskCategory.OTHER
+            and self._capabilities_registry is not None
+        ):
+            permitted_fallbacks = []
+            for name in self._fallback_chain:
+                if name in attempts:
+                    continue
+                try:
+                    fallback_capability = self._capabilities_registry.get(name)
+                except LookupError:
+                    if (
+                        self._provider_registry is not None
+                        and name not in self._provider_registry.list_providers()
+                    ):
+                        permitted_fallbacks.append(name)
+                    continue
+                if (
+                    fallback_capability.cost_tier == CostTier.PAID
+                    and not self._allow_paid_providers
+                ):
+                    continue
+                permitted_fallbacks.append(name)
+            attempts.extend(permitted_fallbacks)
 
         failures = []
         for name in attempts:
@@ -131,7 +219,11 @@ class Dispatcher:
                 return result
             failures.append(f"{name}: {result.error or 'provider returned failure'}")
 
-        error = "Provider fallback chain exhausted: " + "; ".join(failures)
+        error = (
+            "No provider candidates are permitted by the cost policy"
+            if not attempts
+            else "Provider fallback chain exhausted: " + "; ".join(failures)
+        )
         return TaskResult(
             task_id=task.id,
             success=False,

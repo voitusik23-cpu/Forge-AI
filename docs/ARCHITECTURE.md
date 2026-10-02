@@ -224,8 +224,23 @@ provider: canonical name, API-key environment-variable name, streaming and tool
 support, coarse `free`/`cheap`/`paid` cost tier, and `enabled_by_config`. The
 key field contains only a variable name, never the key. `enabled_by_config`
 mirrors the existing `ProviderConfig.enabled` flag. Capability metadata is
-separate from provider request/response types and is not consumed by Dispatcher
-yet. Streaming/tool declarations describe provider API capability in general;
-tool support can depend on model, and they do not claim those features are
-implemented by Forge AI's current text-only adapter. Cost tiers are labels,
-not price data or calculated estimates.
+separate from provider request/response types. Dispatcher uses cost tiers for
+the ordinary-task policy described below, while streaming/tool declarations
+describe provider API capability in general. Tool support can depend on model,
+and these declarations do not claim those features are implemented by Forge
+AI's current text-only adapter. Cost tiers are labels, not price data or
+calculated estimates.
+
+## Cost-aware Provider Routing v0.1
+
+For ordinary `TaskCategory.OTHER` tasks, `DispatchPolicy` orders registered
+providers by the existing `ProviderCapabilitiesRegistry`: `free`, then
+`cheap`, then `paid`. Candidates must be present in both provider and agent
+registries. Paid candidates are omitted unless the
+`RuntimeSettings.allow_paid_providers` policy is enabled through
+`FORGE_ALLOW_PAID_PROVIDERS=true`; its default is false. Each candidate is
+tried through the existing bounded execution/fallback flow, so a missing
+key/model moves to the next permitted candidate. A configured fallback chain
+is retained after cost-ordered candidates. Explicit `provider_name` bypasses
+cost selection and retains absolute priority. No actual costs are calculated,
+and Dispatcher does not score by quality, latency, or budget.
