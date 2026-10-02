@@ -41,8 +41,8 @@ Task
   -> TaskResult
 ```
 
-Automatic routing and real integrations for providers other than OpenAI remain
-future work.
+Automatic routing and real integrations for providers other than OpenAI and
+Anthropic remain future work.
 
 ## Provider Layer v0.1
 
@@ -135,8 +135,8 @@ copies it into `ProviderConfig`. The SDK key and request data are not logged.
 `output_text` becomes the provider-neutral output, Responses usage supplies
 input/output token counts, and estimated cost remains unset. Authentication,
 rate-limit, timeout, connection/API, and malformed-response failures become
-safe provider errors; unexpected exceptions continue to propagate. Other
-provider adapters remain unconfigured, and task routing stays explicit.
+safe provider errors; unexpected exceptions continue to propagate. Google and
+xAI provider adapters remain unconfigured, and task routing stays explicit.
 
 ## Local secrets
 
@@ -147,3 +147,11 @@ environment state. Providers receive the shared store through `ProviderFactory`
 and request their own key only when generating. `.env` is ignored by Git;
 `.env.example` contains blank key fields and remains tracked as documentation.
 The same lookup flow supports OpenAI, Anthropic, Gemini, and xAI adapters.
+
+## Anthropic Provider v0.1
+
+`AnthropicProvider` uses the official Python SDK Messages API when a task is
+explicitly dispatched to it. It resolves `ANTHROPIC_API_KEY` through the shared
+`SecretStore` at generation time, sends the prompt and serialized context as a
+user message, and maps text blocks and token usage into `ProviderResponse`.
+Startup and offline tests do not make requests.

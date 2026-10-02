@@ -12,9 +12,11 @@ It includes provider-neutral task dispatch, provider interfaces, and an offline
 and Responses API when an OpenAI task is explicitly dispatched. It reads
 `OPENAI_API_KEY` from the local process environment only during generation;
 startup and offline tests make no API calls. Anthropic, Google, and xAI remain
-unconfigured. Runtime settings are validated from `FORGE_*` environment
-variables. Forge AI does not modify projects. The project requires the OpenAI
-SDK for its real provider integration.
+Google and xAI remain unconfigured. Anthropic Provider v0.1 uses the official
+Anthropic Python SDK Messages API only when explicitly dispatched and reads
+`ANTHROPIC_API_KEY` through `SecretStore`. Runtime settings are validated from
+`FORGE_*` environment variables. Forge AI does not modify projects. The
+project requires the OpenAI and Anthropic SDKs for their provider integrations.
 
 ## Long-term purpose and architecture
 
@@ -69,9 +71,11 @@ v0.1, Runtime & Configuration Layer v0.1 и Execution Pipeline v0.1. Здесь 
 Responses API, когда задача явно направлена провайдеру OpenAI. Ключ
 `OPENAI_API_KEY` читается из локального окружения процесса только во время
 генерации; запуск приложения и автономные тесты не выполняют API-запросов.
-Anthropic, Google и xAI пока не настроены. Настройки runtime проверяются по
-переменным `FORGE_*`. Forge AI не изменяет проекты. Для реальной интеграции
-провайдера OpenAI требуется установить SDK.
+Google и xAI пока не настроены. Anthropic Provider v0.1 использует официальный
+Python SDK Anthropic и Messages API только при явной диспетчеризации задачи;
+ключ `ANTHROPIC_API_KEY` он получает через `SecretStore`. Настройки runtime
+проверяются по переменным `FORGE_*`. Forge AI не изменяет проекты. Для
+провайдеров OpenAI и Anthropic требуются их SDK.
 
 ## Долгосрочная цель и архитектура
 

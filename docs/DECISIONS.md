@@ -42,3 +42,5 @@
 - Provider credentials are resolved lazily by a shared `SecretStore`, with
   process environment values taking precedence over the ignored repository-root
   `.env` file. Secret values never enter runtime/provider configuration.
+- Anthropic v0.1 uses the official Python SDK Messages API; inference happens
+  only when a task is explicitly dispatched to its provider.

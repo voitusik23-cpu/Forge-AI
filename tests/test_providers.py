@@ -41,7 +41,6 @@ class ProviderInterfaceTests(unittest.TestCase):
 
     def test_placeholder_metadata_and_openai_provider_metadata(self) -> None:
         providers = (
-            (AnthropicProvider(), "anthropic", "ANTHROPIC_API_KEY"),
             (GoogleProvider(), "google", "GEMINI_API_KEY"),
             (XAIProvider(), "xai", "XAI_API_KEY"),
         )
@@ -61,6 +60,10 @@ class ProviderInterfaceTests(unittest.TestCase):
         self.assertEqual(openai.provider_name, "openai")
         self.assertEqual(openai.config.api_key_env_var, "OPENAI_API_KEY")
         self.assertFalse(openai.config.enabled)
+        anthropic = AnthropicProvider()
+        self.assertEqual(anthropic.provider_name, "anthropic")
+        self.assertEqual(anthropic.config.api_key_env_var, "ANTHROPIC_API_KEY")
+        self.assertFalse(anthropic.config.enabled)
 
 
 class ProviderFactoryTests(unittest.TestCase):
