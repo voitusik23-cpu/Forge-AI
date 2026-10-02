@@ -61,7 +61,7 @@ class ExecutionPipelineTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.provider, "openai")
         self.assertEqual(result.agent, "openai")
-        self.assertIn("Provider integration not configured", result.error)
+        self.assertIn("OPENAI_API_KEY", result.error)
 
     def test_agent_domain_error_returns_structured_failure(self) -> None:
         class FailingAgent:

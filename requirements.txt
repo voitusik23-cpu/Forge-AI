@@ -1,1 +1,2 @@
-# Forge AI currently uses only the Python standard library.
+# OpenAI's official Python SDK; no other provider SDKs are installed.
+openai>=1.66.0,<4.0.0

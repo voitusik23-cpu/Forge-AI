@@ -3,7 +3,7 @@
 from app.agents.base import AgentExecutionError
 from app.agents.providers.base import (
     Provider,
-    ProviderNotConfiguredError,
+    ProviderError,
     ProviderRequest,
     ProviderResponse,
 )
@@ -32,7 +32,7 @@ class ProviderAgent:
             response = self._provider.generate(
                 ProviderRequest(prompt=task.description, context=task.context)
             )
-        except ProviderNotConfiguredError as exc:
+        except ProviderError as exc:
             raise AgentExecutionError(
                 f"Provider '{self.provider_name}' failed: {exc}"
             ) from exc

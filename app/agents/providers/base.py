@@ -26,7 +26,11 @@ class ProviderResponse:
     usage: Usage = field(default_factory=Usage)
 
 
-class ProviderNotConfiguredError(RuntimeError):
+class ProviderError(RuntimeError):
+    """A safe, expected provider execution failure."""
+
+
+class ProviderNotConfiguredError(ProviderError):
     """Raised when a provider has no real integration configured."""
 
 

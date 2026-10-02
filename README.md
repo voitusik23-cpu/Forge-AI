@@ -5,17 +5,16 @@ development, review, testing, and improvement across projects.
 
 ## Development stage
 
-This repository contains the initial scaffold, Orchestrator v0.1, and Provider
-Layer v0.1. It includes a Python startup health check, provider-neutral task
-dispatch and provider interfaces, safe provider configuration placeholders,
-an explicit Runtime & Configuration Layer v0.1, and an offline `MockProvider`.
-Runtime settings are validated from `FORGE_*` environment variables; API keys
-are not loaded. Provider placeholders for OpenAI, Anthropic,
-Google, and xAI do not make API calls; real integrations and SDKs are not
-configured. Forge AI does not modify projects. The scaffold uses only the
-Python standard library. The synchronous Execution Pipeline v0.1 connects Task,
-Orchestrator, Agent, and Provider, and can complete an offline task through
-`MockProvider`.
+This repository contains the initial scaffold, Orchestrator v0.1, Provider
+Layer v0.1, Runtime & Configuration Layer v0.1, and Execution Pipeline v0.1.
+It includes provider-neutral task dispatch, provider interfaces, and an offline
+`MockProvider`. The OpenAI Provider v0.1 uses the official OpenAI Python SDK
+and Responses API when an OpenAI task is explicitly dispatched. It reads
+`OPENAI_API_KEY` from the local process environment only during generation;
+startup and offline tests make no API calls. Anthropic, Google, and xAI remain
+unconfigured. Runtime settings are validated from `FORGE_*` environment
+variables. Forge AI does not modify projects. The project requires the OpenAI
+SDK for its real provider integration.
 
 ## Long-term purpose and architecture
 
@@ -45,6 +44,11 @@ Run the basic test with:
 python -m unittest discover -s tests
 ```
 
+To run a real OpenAI request manually, install `requirements.txt`, set
+`OPENAI_API_KEY` and `FORGE_DEFAULT_PROVIDER=openai` in your local environment,
+set `FORGE_DEFAULT_MODEL` to an available model, then dispatch a task explicitly
+to agent `openai`. Do not put the key in source files or commit it.
+
 ---
 
 # Forge AI — Русская версия
@@ -55,17 +59,16 @@ Forge AI — это планируемая к созданию универса�
 
 ## Этап разработки
 
-В этом репозитории находятся начальный каркас, Orchestrator v0.1 и Provider
-Layer v0.1. В него входят простая проверка запуска Python-приложения,
-провайдер-независимая диспетчеризация задач и интерфейсы провайдеров, явный
-Runtime & Configuration Layer v0.1 и автономный `MockProvider`. Настройки
-runtime валидируются из переменных окружения `FORGE_*`; API keys не загружаются.
-Заглушки для OpenAI,
-Anthropic, Google и xAI не выполняют API-запросы; реальные интеграции и SDK не
-подключены. Forge AI не изменяет проекты. Каркас использует только стандартную
-библиотеку Python. Синхронный Execution Pipeline v0.1 связывает Task,
-Orchestrator, Agent и Provider и выполняет автономную тестовую задачу через
-`MockProvider`.
+В репозитории находятся начальный каркас, Orchestrator v0.1, Provider Layer
+v0.1, Runtime & Configuration Layer v0.1 и Execution Pipeline v0.1. Здесь есть
+провайдер-независимая диспетчеризация задач, интерфейсы провайдеров и автономный
+`MockProvider`. OpenAI Provider v0.1 использует официальный Python SDK OpenAI и
+Responses API, когда задача явно направлена провайдеру OpenAI. Ключ
+`OPENAI_API_KEY` читается из локального окружения процесса только во время
+генерации; запуск приложения и автономные тесты не выполняют API-запросов.
+Anthropic, Google и xAI пока не настроены. Настройки runtime проверяются по
+переменным `FORGE_*`. Forge AI не изменяет проекты. Для реальной интеграции
+провайдера OpenAI требуется установить SDK.
 
 ## Долгосрочная цель и архитектура
 
@@ -94,3 +97,9 @@ python -m app
 ```bash
 python -m unittest discover -s tests
 ```
+
+Чтобы вручную выполнить реальный запрос OpenAI, установите зависимости из
+`requirements.txt`, задайте `OPENAI_API_KEY` и `FORGE_DEFAULT_PROVIDER=openai` в
+локальном окружении, а в `FORGE_DEFAULT_MODEL` укажите доступную модель. Затем
+явно направьте задачу агенту `openai`. Не помещайте ключ в исходники и не
+коммитьте его.

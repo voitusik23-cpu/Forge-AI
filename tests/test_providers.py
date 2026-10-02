@@ -39,9 +39,8 @@ class ProviderInterfaceTests(unittest.TestCase):
         ):
             self.assertTrue(issubclass(provider_type, Provider))
 
-    def test_provider_metadata_and_unconfigured_behavior(self) -> None:
+    def test_placeholder_metadata_and_openai_provider_metadata(self) -> None:
         providers = (
-            (OpenAIProvider(), "openai", "OPENAI_API_KEY"),
             (AnthropicProvider(), "anthropic", "ANTHROPIC_API_KEY"),
             (GoogleProvider(), "google", "GEMINI_API_KEY"),
             (XAIProvider(), "xai", "XAI_API_KEY"),
@@ -57,6 +56,11 @@ class ProviderInterfaceTests(unittest.TestCase):
                     ProviderNotConfiguredError, "integration not configured"
                 ):
                     provider.generate(request)
+
+        openai = OpenAIProvider()
+        self.assertEqual(openai.provider_name, "openai")
+        self.assertEqual(openai.config.api_key_env_var, "OPENAI_API_KEY")
+        self.assertFalse(openai.config.enabled)
 
 
 class ProviderFactoryTests(unittest.TestCase):

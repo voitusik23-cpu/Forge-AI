@@ -41,8 +41,8 @@ Task
   -> TaskResult
 ```
 
-This version does not connect to real AI providers. Real API integrations and
-automatic routing remain future work.
+Automatic routing and real integrations for providers other than OpenAI remain
+future work.
 
 ## Provider Layer v0.1
 
@@ -63,10 +63,9 @@ User
   contain provider-specific behavior.
 - **Agent** receives the task and owns the generic task-to-result contract.
 - **Provider** accepts a provider-neutral request and returns a provider-neutral
-  response; future provider-specific protocol and SDK details stay behind its
+  response; provider-specific protocol and SDK details stay behind its
   implementation.
-- **AI API** is a future integration point. The v0.1 provider placeholders make
-  no network requests.
+- **AI API** integrations remain isolated inside provider implementations.
 
 `ProviderFactory` creates a provider only when its name is explicitly supplied.
 `ProviderRegistry` manages provider instances separately from `AgentRegistry`.
@@ -125,3 +124,16 @@ clear domain exceptions; unexpected exceptions are not swallowed.
 `MockProvider` runs synchronously and offline, returning deterministic output
 and zero token/cost usage. Provider-specific implementations remain behind the
 Provider interface and outside the execution service.
+
+## OpenAI Provider v0.1
+
+`OpenAIProvider` uses the official OpenAI Python SDK and its Responses API. It
+is called only when an explicitly dispatched task reaches the provider; runtime
+startup, normal health checks, and offline tests make no API requests. The
+provider reads the API key from `OPENAI_API_KEY` at generation time and never
+copies it into `ProviderConfig`. The SDK key and request data are not logged.
+`output_text` becomes the provider-neutral output, Responses usage supplies
+input/output token counts, and estimated cost remains unset. Authentication,
+rate-limit, timeout, connection/API, and malformed-response failures become
+safe provider errors; unexpected exceptions continue to propagate. Other
+provider adapters remain unconfigured, and task routing stays explicit.

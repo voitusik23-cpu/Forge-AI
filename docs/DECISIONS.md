@@ -20,7 +20,8 @@
 - "В Orchestrator v0.1 выбор агента выполняется явно через agent_name. Автоматическая маршрутизация между AI-провайдерами откладывается до отдельного этапа."
 - Provider-specific code is isolated from the orchestrator.
 - Every provider implementation uses the common provider interface.
-- Real SDK and API integrations are deferred to a later stage.
+- OpenAI v0.1 uses the official Python SDK and Responses API; other real provider
+  SDK integrations remain deferred.
 - Secrets are not stored in code or Git; provider configuration may hold only an environment variable name reference.
 - MockProvider is used for deterministic tests without network access.
 - Runtime configuration is separate from provider-specific configuration.
@@ -34,3 +35,7 @@
 - Usage metadata is carried with the task result.
 - MockProvider is used for deterministic end-to-end testing in v0.1.
 - Automatic agent/provider routing is not implemented in v0.1.
+- The OpenAI API key is read only from the local process environment at explicit
+  generation time and is never stored in configuration or logged.
+- OpenAI uses `client.responses.create`; startup and ordinary offline tests do
+  not perform inference.
