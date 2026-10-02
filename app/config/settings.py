@@ -31,6 +31,8 @@ class RuntimeSettings:
     default_provider: str = "mock"
     default_model: str = "mock"
     openrouter_model: str = "cohere/north-mini-code:free"
+    gemini_model: str = "gemini-3.8-flash"
+    enabled_providers: Tuple[str, ...] = ("mock", "openrouter")
     request_timeout: int = 30
     retry_count: int = 2
     log_level: str = "INFO"
@@ -60,6 +62,8 @@ class RuntimeSettings:
             raise ConfigurationError("FORGE_DEFAULT_MODEL must not be empty")
         if not isinstance(self.openrouter_model, str) or not self.openrouter_model.strip():
             raise ConfigurationError("FORGE_OPENROUTER_MODEL must not be empty")
+        if not isinstance(self.gemini_model, str) or not self.gemini_model.strip():
+            raise ConfigurationError("FORGE_GEMINI_MODEL must not be empty")
         if isinstance(self.request_timeout, bool) or not isinstance(
             self.request_timeout, int
         ):
@@ -81,6 +85,18 @@ class RuntimeSettings:
         object.__setattr__(self, "default_provider", self.default_provider.strip())
         object.__setattr__(self, "default_model", self.default_model.strip())
         object.__setattr__(self, "openrouter_model", self.openrouter_model.strip())
+        object.__setattr__(self, "gemini_model", self.gemini_model.strip())
+        enabled = self.enabled_providers
+        if isinstance(enabled, str):
+            enabled = tuple(name.strip() for name in enabled.split(",") if name.strip())
+        if not isinstance(enabled, (tuple, list)) or any(
+            not isinstance(name, str) or not name.strip() for name in enabled
+        ):
+            raise ConfigurationError(
+                "FORGE_ENABLED_PROVIDERS must be a comma-separated provider list"
+            )
+        enabled = tuple(dict.fromkeys(name.strip().lower() for name in enabled))
+        object.__setattr__(self, "enabled_providers", enabled)
         chain = self.provider_fallback_chain
         if isinstance(chain, str):
             chain = tuple(name.strip() for name in chain.split(",") if name.strip())
@@ -133,6 +149,10 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> RuntimeSetting
         default_model=source.get("FORGE_DEFAULT_MODEL", defaults.default_model),
         openrouter_model=source.get(
             "FORGE_OPENROUTER_MODEL", defaults.openrouter_model
+        ),
+        gemini_model=source.get("FORGE_GEMINI_MODEL", defaults.gemini_model),
+        enabled_providers=source.get(
+            "FORGE_ENABLED_PROVIDERS", defaults.enabled_providers
         ),
         request_timeout=_parse_int(
             "FORGE_REQUEST_TIMEOUT",

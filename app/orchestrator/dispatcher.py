@@ -186,6 +186,11 @@ class Dispatcher:
 
         failures = []
         for name in attempts:
+            if provider_name is None:
+                unavailable_reason = self._automatic_route_rejection(name, task)
+                if unavailable_reason is not None:
+                    failures.append(f"{name}: {unavailable_reason}")
+                    continue
             if self._provider_registry is not None:
                 try:
                     provider = self._provider_registry.get(name)
@@ -231,3 +236,40 @@ class Dispatcher:
             provider=selected,
             agent=selected,
         )
+
+    def _automatic_route_rejection(self, name: str, task: Task) -> Optional[str]:
+        """Reject auto-route candidates that are disabled, unconfigured, or incapable."""
+        if self._provider_registry is None or self._capabilities_registry is None:
+            return None
+        try:
+            provider = self._provider_registry.get(name)
+        except ProviderNotFoundError:
+            return "provider is unavailable or not registered"
+        try:
+            capability = self._capabilities_registry.get(name)
+        except LookupError:
+            return "provider capabilities are not registered"
+
+        if not capability.enabled_by_config:
+            return "provider is disabled by configuration"
+        if capability.cost_tier == CostTier.PAID and not self._allow_paid_providers:
+            return "paid provider is disabled by cost policy"
+        if capability.api_key_env:
+            try:
+                key_available = provider.secret_store.get_secret(capability.api_key_env)
+            except (OSError, RuntimeError):
+                key_available = None
+            if not key_available:
+                return f"required key {capability.api_key_env} is not configured"
+
+        requirements = {
+            "requires_tools": capability.supports_tools,
+            "requires_streaming": capability.supports_streaming,
+            "requires_large_context": capability.supports_large_context,
+        }
+        if task.category == TaskCategory.LARGE_CONTEXT:
+            requirements["requires_large_context"] = capability.supports_large_context
+        for parameter, supported in requirements.items():
+            if task.parameters.get(parameter) is True and not supported:
+                return f"provider does not support {parameter.removeprefix('requires_')}"
+        return None

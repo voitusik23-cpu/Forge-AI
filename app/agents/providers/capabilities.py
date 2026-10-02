@@ -25,6 +25,7 @@ class ProviderCapabilities:
     supports_tools: bool
     cost_tier: CostTier
     enabled_by_config: bool
+    supports_large_context: bool = False
 
     def __post_init__(self) -> None:
         if not self.provider_name.strip():
@@ -39,31 +40,42 @@ class ProviderCapabilities:
             raise ValueError("cost_tier must be a CostTier")
         if not isinstance(self.enabled_by_config, bool):
             raise ValueError("enabled_by_config must be a boolean")
+        if not isinstance(self.supports_large_context, bool):
+            raise ValueError("supports_large_context must be a boolean")
 
 
 # Traits describe provider API capability in general. Tool support may depend
 # on the selected model; these flags do not claim the current adapter executes
 # streaming or tool calls. Per-token or per-request pricing is out of scope.
 _DECLARATIONS = {
-    "openai": (True, True, CostTier.PAID),
-    "anthropic": (True, True, CostTier.PAID),
-    "google": (True, True, CostTier.PAID),
-    "xai": (True, True, CostTier.PAID),
-    "deepseek": (True, True, CostTier.CHEAP),
-    "openrouter": (True, True, CostTier.CHEAP),
-    "groq": (True, True, CostTier.CHEAP),
-    "mock": (False, False, CostTier.FREE),
+    "openai": (True, True, CostTier.PAID, False),
+    "anthropic": (True, True, CostTier.PAID, False),
+    "google": (True, True, CostTier.PAID, True),
+    "xai": (True, True, CostTier.PAID, False),
+    "deepseek": (True, True, CostTier.CHEAP, False),
+    "openrouter": (True, True, CostTier.CHEAP, False),
+    "groq": (True, True, CostTier.CHEAP, False),
+    "mock": (False, False, CostTier.FREE, False),
 }
 
 
 def capabilities_for(provider: Provider) -> ProviderCapabilities:
     """Build metadata for a provider using its canonical config references."""
     try:
-        streaming, tools, cost_tier = _DECLARATIONS[provider.provider_name]
+        streaming, tools, cost_tier, large_context = _DECLARATIONS[
+            provider.provider_name
+        ]
     except KeyError as exc:
         raise ValueError(
             f"No capability declaration for provider '{provider.provider_name}'"
         ) from exc
+    # OpenRouter model IDs carry the actual routing price class. The provider
+    # can route free models even though its broader catalog has paid models.
+    if provider.provider_name == "openrouter" and (
+        provider.model_name.endswith(":free")
+        or provider.model_name == "openrouter/free"
+    ):
+        cost_tier = CostTier.FREE
     return ProviderCapabilities(
         provider_name=provider.provider_name,
         api_key_env=provider.config.api_key_env_var,
@@ -71,6 +83,7 @@ def capabilities_for(provider: Provider) -> ProviderCapabilities:
         supports_tools=tools,
         cost_tier=cost_tier,
         enabled_by_config=provider.config.enabled,
+        supports_large_context=large_context,
     )
 
 

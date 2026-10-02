@@ -15,9 +15,10 @@ startup and offline tests make no API calls. Anthropic Provider v0.1 uses the
 official Anthropic Python SDK Messages API when explicitly dispatched. The
 DeepSeek and OpenRouter providers use the existing OpenAI SDK with their
 OpenAI-compatible Chat Completions APIs. All provider keys are resolved through
-`SecretStore` at generation time. Google/Gemini and xAI remain unconfigured.
-Runtime settings are validated from `FORGE_*` environment variables. Forge AI
-does not modify projects. The project requires the OpenAI and Anthropic SDKs.
+`SecretStore` at generation time. Gemini uses Google's official `google-genai`
+SDK; xAI remains unconfigured. Runtime settings are validated from `FORGE_*`
+environment variables. Forge AI does not modify projects. The project requires
+the OpenAI, Anthropic, and Google Gen AI SDKs.
 
 Groq uses the existing OpenAI-compatible client with the official Groq endpoint
 and `GROQ_API_KEY`. Optional provider account emails live in a separate local
@@ -32,10 +33,16 @@ dispatcher prefers OpenAI then Anthropic for coding, Anthropic then OpenAI for
 reasoning, Gemini for large-context, OpenRouter for cheap/free, and DeepSeek
 for fast/cheap. Other tasks use `FORGE_DEFAULT_PROVIDER`. A caller can select a
 provider explicitly with `provider_name`; the existing `agent_name` interface
-also remains available. The dispatcher starts with its first choice. When a
-fallback chain is configured, missing or failed providers advance through that
-finite sequence; exhaustion returns a structured task failure. Startup and
-dispatcher tests make no real API calls.
+also remains available. Automatic routing skips providers disabled by
+`FORGE_ENABLED_PROVIDERS`, providers without their configured API key, providers
+that lack task-required capabilities, and paid providers unless
+`FORGE_ALLOW_PAID_PROVIDERS=true`. The default enabled set is `mock,openrouter`;
+OpenRouter's configured free model is treated as free for routing. Set
+`FORGE_ENABLED_PROVIDERS=mock,openrouter,google` to enable Gemini routing too,
+and set `FORGE_GEMINI_MODEL` to choose its model. Large-context tasks use Gemini
+only when enabled, configured with `GEMINI_API_KEY`, and permitted by cost
+policy. Provider preferences and the bounded fallback chain are deterministic;
+startup and unit tests make no real API calls.
 
 ## Provider Fallback v0.1
 
@@ -111,6 +118,17 @@ The command explicitly dispatches to OpenRouter and uses
 `FORGE_OPENROUTER_MODEL`, which defaults to `cohere/north-mini-code:free`.
 Unlike unit tests and normal startup, this smoke command sends a real API
 request. It prints only a static pass/fail message, not the response or secret.
+
+To send one real Gemini request through Forge AI, enable Google in
+`FORGE_ENABLED_PROVIDERS`, set `GEMINI_API_KEY` through the ignored local `.env`
+or process environment, and run:
+
+```bash
+python -m app.smoke_gemini
+```
+
+The model comes from `FORGE_GEMINI_MODEL` (default `gemini-3.8-flash`). The
+smoke command prints only a static pass/fail message.
 
 ---
 

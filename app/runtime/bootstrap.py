@@ -26,19 +26,25 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
     provider_registry = ProviderRegistry()
     capabilities_registry = ProviderCapabilitiesRegistry()
     agent_registry = AgentRegistry()
+    enabled_providers = set(resolved_settings.enabled_providers)
     for provider_name in provider_factory.list_providers():
         provider = provider_factory.create(provider_name, secret_store=secret_store)
         configured_model = None
         if provider_name == "openrouter":
             configured_model = resolved_settings.openrouter_model
+        elif provider_name == "google":
+            configured_model = resolved_settings.gemini_model
         elif provider_name == resolved_settings.default_provider:
             configured_model = resolved_settings.default_model
-        if configured_model is not None:
+        provider_config = replace(
+            provider.config,
+            enabled=provider_name in enabled_providers,
+            **({"model_name": configured_model} if configured_model else {}),
+        )
+        if provider_config != provider.config:
             provider = provider_factory.create(
                 provider_name,
-                config=replace(
-                    provider.config, model_name=configured_model
-                ),
+                config=provider_config,
                 secret_store=secret_store,
             )
         provider_registry.register(provider)

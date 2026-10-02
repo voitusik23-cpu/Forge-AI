@@ -20,6 +20,8 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.default_provider, "mock")
         self.assertEqual(settings.default_model, "mock")
         self.assertEqual(settings.openrouter_model, "cohere/north-mini-code:free")
+        self.assertEqual(settings.gemini_model, "gemini-3.8-flash")
+        self.assertEqual(settings.enabled_providers, ("mock", "openrouter"))
         self.assertEqual(settings.request_timeout, 30)
         self.assertEqual(settings.retry_count, 2)
         self.assertEqual(settings.log_level, "INFO")
@@ -32,6 +34,8 @@ class RuntimeSettingsTests(unittest.TestCase):
                 "FORGE_DEFAULT_PROVIDER": "mock",
                 "FORGE_DEFAULT_MODEL": "test-model",
                 "FORGE_OPENROUTER_MODEL": "cohere/test-model:free",
+                "FORGE_GEMINI_MODEL": "gemini-test-model",
+                "FORGE_ENABLED_PROVIDERS": "mock,google,openrouter",
                 "FORGE_REQUEST_TIMEOUT": "45",
                 "FORGE_RETRY_COUNT": "4",
                 "FORGE_LOG_LEVEL": "debug",
@@ -44,6 +48,8 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertTrue(settings.debug)
         self.assertEqual(settings.default_model, "test-model")
         self.assertEqual(settings.openrouter_model, "cohere/test-model:free")
+        self.assertEqual(settings.gemini_model, "gemini-test-model")
+        self.assertEqual(settings.enabled_providers, ("mock", "google", "openrouter"))
         self.assertEqual(settings.request_timeout, 45)
         self.assertEqual(settings.retry_count, 4)
         self.assertEqual(settings.log_level, "DEBUG")

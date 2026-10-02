@@ -47,9 +47,10 @@ integrations for providers other than OpenAI and Anthropic remain future work.
 ## Dispatcher v0.2
 
 `Task` carries a coarse `TaskCategory` and a provider-neutral `parameters`
-mapping (including an optional model override). `Dispatcher` applies a small,
-deterministic preference policy and routes to the first candidate through the
-existing `AgentRegistry` and `Provider` adapter:
+mapping (including an optional model override and required capabilities).
+`Dispatcher` applies a deterministic preference order, checks candidate
+availability/configuration/capabilities, and tries each eligible candidate at
+most once through the existing `AgentRegistry` and `Provider` adapter:
 
 ```text
 Task(category, parameters)
@@ -63,15 +64,16 @@ Task(category, parameters)
 
 Coding prefers OpenAI then Anthropic; reasoning prefers Anthropic then OpenAI;
 large-context uses Google/Gemini; cheap/free uses OpenRouter; fast/cheap uses
-DeepSeek; other categories use `FORGE_DEFAULT_PROVIDER`. Groq is also available
-as an explicitly selectable provider. Candidate order is
-metadata for a future fallback policy: v0.2 executes only the first choice and
-returns a clear failed `TaskResult` when it is unavailable or unconfigured.
-Callers can override routing with `provider_name`; the existing explicit
-`agent_name` dispatch remains supported. Dispatcher depends only on the shared
-agent execution contract and does not inspect provider SDKs. Cost, limits,
-quality, latency, fallback execution, and multi-agent execution remain future
-extensions.
+DeepSeek; other categories use `FORGE_DEFAULT_PROVIDER` and cost tiers. A
+candidate must be enabled in `FORGE_ENABLED_PROVIDERS`, registered, have its
+required API key, and support the requested task capabilities. OpenRouter's
+model ID determines whether its capability tier is free (`:free` or
+`openrouter/free`) or cheap. Paid candidates require
+`FORGE_ALLOW_PAID_PROVIDERS=true`. After category candidates fail or are
+unavailable, the finite `FORGE_PROVIDER_FALLBACK_CHAIN` is tried sequentially.
+Explicit `provider_name` bypasses automatic choice and fallback; the caller's
+selection is never replaced. Dispatcher uses only common registries, metadata,
+and SecretStore presence checks, not provider SDKs.
 
 ## Provider Layer v0.1
 
@@ -116,7 +118,8 @@ Runtime
 ```
 
 `RuntimeSettings` contains application-wide values such as environment, debug
-mode, default provider/model, timeout, retry count, and log level. It is loaded
+mode, default provider/model, enabled providers, model overrides, timeout,
+retry count, and log level. It is loaded
 from the `FORGE_*` environment variables and validated before runtime assembly.
 The configured default provider is used for tasks in the `other` category;
 the v0.2 dispatcher applies the category policy for other task categories.
@@ -222,11 +225,21 @@ use fake clients; ordinary startup makes no request.
 These adapters are invoked only by task dispatch, and tests use fake clients
 only.
 
+## Gemini provider
+
+`GoogleProvider` implements Gemini through Google's official `google-genai`
+SDK. It resolves `GEMINI_API_KEY` lazily through `SecretStore`, uses the model
+from `FORGE_GEMINI_MODEL` (default `gemini-3.8-flash`), and maps text and usage
+to the shared `ProviderResponse`. Startup and automated tests do not make API
+requests. The explicit `python -m app.smoke_gemini` command performs one real
+request.
+
 ## Provider Capabilities v0.1
 
 `ProviderCapabilitiesRegistry` exposes immutable metadata for each built-in
 provider: canonical name, API-key environment-variable name, streaming and tool
-support, coarse `free`/`cheap`/`paid` cost tier, and `enabled_by_config`. The
+support, large-context support, coarse `free`/`cheap`/`paid` cost tier, and
+`enabled_by_config`. The
 key field contains only a variable name, never the key. `enabled_by_config`
 mirrors the existing `ProviderConfig.enabled` flag. Capability metadata is
 separate from provider request/response types. Dispatcher uses cost tiers for
@@ -240,8 +253,9 @@ calculated estimates.
 
 For ordinary `TaskCategory.OTHER` tasks, `DispatchPolicy` orders registered
 providers by the existing `ProviderCapabilitiesRegistry`: `free`, then
-`cheap`, then `paid`. Candidates must be present in both provider and agent
-registries. Paid candidates are omitted unless the
+`cheap`, then `paid`. Candidates must be present in provider and agent
+registries, enabled by configuration, have their required key, and satisfy
+task capability requirements. Paid candidates are omitted unless the
 `RuntimeSettings.allow_paid_providers` policy is enabled through
 `FORGE_ALLOW_PAID_PROVIDERS=true`; its default is false. Each candidate is
 tried through the existing bounded execution/fallback flow, so a missing

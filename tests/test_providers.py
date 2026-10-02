@@ -27,6 +27,7 @@ from app.agents.providers.registry import (
     ProviderRegistry,
 )
 from app.agents.providers.xai import XAIProvider
+from app.config.secrets import SecretStore
 from app.orchestrator.models import Task
 from app.orchestrator.orchestrator import Orchestrator
 
@@ -47,7 +48,15 @@ class ProviderInterfaceTests(unittest.TestCase):
 
     def test_placeholder_metadata_and_openai_provider_metadata(self) -> None:
         providers = (
-            (GoogleProvider(), "google", "GEMINI_API_KEY"),
+            (
+                GoogleProvider(
+                    secret_store=SecretStore(
+                        env_file="missing-provider-interface-env", environ={}
+                    )
+                ),
+                "google",
+                "GEMINI_API_KEY",
+            ),
             (XAIProvider(), "xai", "XAI_API_KEY"),
         )
         request = ProviderRequest(prompt="offline test")
@@ -57,9 +66,12 @@ class ProviderInterfaceTests(unittest.TestCase):
                 self.assertEqual(provider.provider_name, expected_name)
                 self.assertEqual(provider.config.api_key_env_var, env_reference)
                 self.assertFalse(provider.config.enabled)
-                with self.assertRaisesRegex(
-                    ProviderNotConfiguredError, "integration not configured"
-                ):
+                expected = (
+                    "GEMINI_API_KEY"
+                    if expected_name == "google"
+                    else "integration not configured"
+                )
+                with self.assertRaisesRegex(ProviderNotConfiguredError, expected):
                     provider.generate(request)
 
         openai = OpenAIProvider()

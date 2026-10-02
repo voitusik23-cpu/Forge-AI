@@ -4,12 +4,14 @@ import unittest
 
 from app.agents.base import AgentExecutionError
 from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
+from app.agents.providers.config import ProviderConfig
 from app.agents.providers.factory import ProviderFactory
 from app.agents.providers.registry import ProviderRegistry
 from app.agents.registry import AgentRegistry
 from app.orchestrator.dispatcher import DispatchPolicy, Dispatcher
 from app.orchestrator.models import Task, TaskCategory, TaskResult
 from app.orchestrator.orchestrator import Orchestrator
+from app.config.secrets import SecretStore
 
 
 class StubAgent:
@@ -60,7 +62,14 @@ class DispatcherTests(unittest.TestCase):
         self.orchestrator = Orchestrator(self.registry, default_provider="xai")
 
     def make_cost_dispatcher(
-        self, names, *, allow_paid=False, fallback_chain=(), unavailable=()
+        self,
+        names,
+        *,
+        allow_paid=False,
+        fallback_chain=(),
+        unavailable=(),
+        disabled=(),
+        missing_key=(),
     ) -> tuple[Dispatcher, dict[str, StubAgent]]:
         agents = AgentRegistry()
         providers = ProviderRegistry()
@@ -71,7 +80,30 @@ class DispatcherTests(unittest.TestCase):
             agent = UnavailableAgent(name) if name in unavailable else StubAgent(name)
             agent_map[name] = agent
             agents.register(agent)
-            provider = factory.create(name)
+            provider_type_config = ProviderConfig(
+                provider_name=name,
+                model_name=(
+                    "cohere/north-mini-code:free"
+                    if name == "openrouter"
+                    else "test-model"
+                ),
+                enabled=name not in disabled,
+                api_key_env_var=(
+                    None if name == "mock" else factory.create(name).config.api_key_env_var
+                ),
+            )
+            secrets = {
+                factory.create(name).config.api_key_env_var: "offline-placeholder"
+            }
+            if name in missing_key and provider_type_config.api_key_env_var:
+                secrets.pop(provider_type_config.api_key_env_var, None)
+            provider = factory.create(
+                name,
+                config=provider_type_config,
+                secret_store=SecretStore(
+                    env_file="missing-dispatcher-test-env", environ=secrets
+                ),
+            )
             providers.register(provider)
             capabilities.register_provider(provider)
         return (
@@ -283,6 +315,94 @@ class DispatcherTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.provider, "openai")
         self.assertEqual(agents["mock"].calls, 0)
+
+    def test_disabled_provider_is_skipped_during_automatic_routing(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("openrouter", "deepseek"),
+            disabled=("openrouter",),
+            fallback_chain=("deepseek",),
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="disabled", description="ordinary task", category=TaskCategory.CHEAP_FREE)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(agents["openrouter"].calls, 0)
+
+    def test_provider_without_key_is_skipped_to_fallback(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("openrouter", "deepseek"),
+            missing_key=("openrouter",),
+            fallback_chain=("deepseek",),
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="no-key", description="ordinary task", category=TaskCategory.CHEAP_FREE)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(agents["openrouter"].calls, 0)
+
+    def test_capability_mismatch_is_rejected_for_automatic_route(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(("mock",))
+
+        result = dispatcher.dispatch(
+            Task(
+                id="capability-mismatch",
+                description="use tools",
+                parameters={"requires_tools": True},
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("does not support tools", result.error)
+        self.assertEqual(agents["mock"].calls, 0)
+
+    def test_free_openrouter_model_is_selected_automatically(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("openrouter", "deepseek", "openai")
+        )
+
+        result = dispatcher.dispatch(Task(id="free-openrouter", description="task"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "openrouter")
+        self.assertEqual(agents["deepseek"].calls, 0)
+        self.assertEqual(agents["openai"].calls, 0)
+
+    def test_explicit_provider_keeps_priority_over_auto_availability(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("openrouter", "deepseek"),
+            disabled=("openrouter",),
+            fallback_chain=("deepseek",),
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="explicit-disabled", description="task"),
+            provider_name="openrouter",
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "openrouter")
+        self.assertEqual(agents["deepseek"].calls, 0)
+
+    def test_category_failure_uses_bounded_fallback_chain(self) -> None:
+        dispatcher, agents = self.make_cost_dispatcher(
+            ("openrouter", "deepseek"),
+            unavailable=("openrouter",),
+            fallback_chain=("deepseek",),
+        )
+
+        result = dispatcher.dispatch(
+            Task(id="fallback", description="task", category=TaskCategory.CHEAP_FREE)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertLessEqual(agents["openrouter"].calls, 1)
 
 
 if __name__ == "__main__":

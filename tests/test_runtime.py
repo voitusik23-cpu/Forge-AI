@@ -37,7 +37,9 @@ class RuntimeBootstrapTests(unittest.TestCase):
         self.assertEqual(provider.model_name, "offline-test")
 
     def test_default_provider_is_used_for_other_category(self) -> None:
-        runtime = create_runtime(RuntimeSettings(default_provider="mock"))
+        runtime = create_runtime(
+            RuntimeSettings(default_provider="mock", enabled_providers=("mock",))
+        )
         task = Task(id="runtime-task", description="offline task")
 
         result = runtime.orchestrator.dispatch(task)
@@ -68,6 +70,22 @@ class RuntimeBootstrapTests(unittest.TestCase):
         provider = runtime.provider_registry.get("openrouter")
         self.assertEqual(provider.model_name, "cohere/north-mini-code:free")
         self.assertEqual(provider.config.api_key_env_var, "OPENROUTER_API_KEY")
+        self.assertTrue(provider.config.enabled)
+
+    def test_gemini_model_and_enabled_provider_configuration(self) -> None:
+        runtime = create_runtime(
+            RuntimeSettings(
+                gemini_model="gemini-test-model",
+                enabled_providers=("mock", "google"),
+            )
+        )
+
+        provider = runtime.provider_registry.get("google")
+        capabilities = runtime.provider_capabilities.get("google")
+        self.assertEqual(provider.model_name, "gemini-test-model")
+        self.assertEqual(provider.config.api_key_env_var, "GEMINI_API_KEY")
+        self.assertTrue(capabilities.enabled_by_config)
+        self.assertTrue(capabilities.supports_large_context)
 
     def test_logging_uses_configured_level_and_standard_formatter(self) -> None:
         logger = configure_logging(RuntimeSettings(log_level="WARNING"))
