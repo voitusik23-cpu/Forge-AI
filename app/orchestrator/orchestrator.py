@@ -5,8 +5,8 @@ from app.agents.providers.registry import ProviderRegistry
 from app.agents.registry import AgentRegistry
 from app.orchestrator.dispatcher import Dispatcher
 from app.orchestrator.executor import TaskExecutor
-from app.orchestrator.models import Task, TaskResult
-from typing import Optional
+from app.orchestrator.models import EventType, Task, TaskResult
+from typing import Callable, Dict, Optional
 
 
 class Orchestrator:
@@ -37,6 +37,7 @@ class Orchestrator:
         agent_name: Optional[str] = None,
         *,
         provider_name: Optional[str] = None,
+        observer: Optional[Callable[[EventType, Dict[str, object]], None]] = None,
     ) -> TaskResult:
         """Dispatch automatically, or use a legacy agent/provider override."""
         if agent_name is not None and provider_name is not None:
@@ -48,4 +49,6 @@ class Orchestrator:
             )
         if agent_name is not None:
             return self._executor.execute(task, agent_name)
-        return self._dispatcher.dispatch(task, provider_name=provider_name)
+        return self._dispatcher.dispatch(
+            task, provider_name=provider_name, observer=observer
+        )

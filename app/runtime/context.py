@@ -1,6 +1,7 @@
 """Application runtime dependencies assembled by the bootstrap function."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 from app.agents.providers.registry import ProviderRegistry
 from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
@@ -8,6 +9,7 @@ from app.agents.registry import AgentRegistry
 from app.config.settings import RuntimeSettings
 from app.config.provider_accounts import ProviderAccountConfig
 from app.orchestrator.orchestrator import Orchestrator
+from app.orchestrator.run import RunExecutor
 
 
 @dataclass(frozen=True)
@@ -20,3 +22,4 @@ class RuntimeContext:
     provider_capabilities: ProviderCapabilitiesRegistry
     agent_registry: AgentRegistry
     orchestrator: Orchestrator
+    run_executor: Optional[RunExecutor] = None

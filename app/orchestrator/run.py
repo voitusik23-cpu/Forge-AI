@@ -1,0 +1,147 @@
+"""In-memory Run wrapper around the existing Orchestrator dispatch flow."""
+
+import time
+from dataclasses import replace
+from typing import Iterable, Optional
+
+from app.agents.base import AgentExecutionError
+from app.context import (
+    ContextAssembler,
+    ContextFreshness,
+    ContextItem,
+    ContextTrust,
+    ExecutionContext,
+)
+from app.orchestrator.models import (
+    Event,
+    EventType,
+    Run,
+    RunError,
+    RunState,
+    Task,
+    TaskResult,
+)
+from app.orchestrator.orchestrator import Orchestrator
+
+
+class RunExecutor:
+    """Create a Run record while leaving routing and fallback to Dispatcher."""
+
+    def __init__(
+        self,
+        orchestrator: Orchestrator,
+        context_assembler: Optional[ContextAssembler] = None,
+    ) -> None:
+        self._orchestrator = orchestrator
+        self._context_assembler = context_assembler or ContextAssembler()
+
+    def execute(
+        self,
+        task: Task,
+        *,
+        provider_name: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        explicit_inputs: Iterable[str | ContextItem] = (),
+    ) -> Run:
+        """Execute through Orchestrator and retain a safe in-memory event trace."""
+        run = Run(task=task)
+        started = time.perf_counter()
+        self._record(run, EventType.RUN_STARTED, task_id=getattr(task, "id", None))
+        run.state = RunState.RUNNING
+
+        try:
+            execution_context = self._context_assembler.assemble(
+                task, run.id, explicit_inputs
+            )
+            self._record_context_assembled(run, execution_context)
+            dispatch_task = self._task_with_execution_context(task, execution_context)
+            result = self._orchestrator.dispatch(
+                dispatch_task,
+                agent_name=agent_name,
+                provider_name=provider_name,
+                observer=lambda event_type, data: self._record(
+                    run, event_type, **data
+                ),
+            )
+            run.result = result
+            if result.success:
+                run.state = RunState.COMPLETED
+                run.error = None
+                self._record(
+                    run,
+                    EventType.RUN_COMPLETED,
+                    provider=result.provider,
+                    model=result.model_name,
+                    duration_seconds=max(0.0, time.perf_counter() - started),
+                    usage=self._usage_data(result),
+                )
+            else:
+                message = result.error or "Task execution failed"
+                run.state = RunState.FAILED
+                run.error = RunError("TaskExecutionError", message)
+                self._record(
+                    run,
+                    EventType.RUN_FAILED,
+                    error_type=run.error.error_type,
+                    error=run.error.message,
+                    duration_seconds=max(0.0, time.perf_counter() - started),
+                )
+        except Exception as exc:
+            run.state = RunState.FAILED
+            message = (
+                str(exc) or type(exc).__name__
+                if isinstance(exc, (ValueError, LookupError, AgentExecutionError))
+                else f"Execution failed ({type(exc).__name__})"
+            )
+            run.error = RunError(type(exc).__name__, message)
+            self._record(
+                run,
+                EventType.RUN_FAILED,
+                error_type=run.error.error_type,
+                error=run.error.message,
+                duration_seconds=max(0.0, time.perf_counter() - started),
+            )
+        return run
+
+    @staticmethod
+    def _record(run: Run, event_type: EventType, **data: object) -> None:
+        run.events.append(Event(run_id=run.id, type=event_type, data=data))
+
+    @classmethod
+    def _record_context_assembled(
+        cls, run: Run, execution_context: ExecutionContext
+    ) -> None:
+        items = execution_context.items
+        cls._record(
+            run,
+            EventType.CONTEXT_ASSEMBLED,
+            item_count=len(items),
+            context_fingerprint=execution_context.fingerprint,
+            kinds=sorted({item.kind for item in items}),
+            sources=sorted({item.source.value for item in items}),
+            trust={
+                trust.value: sum(item.trust == trust for item in items)
+                for trust in ContextTrust
+            },
+            freshness={
+                freshness.value: sum(item.freshness == freshness for item in items)
+                for freshness in ContextFreshness
+            },
+        )
+
+    @staticmethod
+    def _task_with_execution_context(
+        task: Task, execution_context: ExecutionContext
+    ) -> Task:
+        return replace(task, context={"forge_execution_context": execution_context.to_dict()})
+
+    @staticmethod
+    def _usage_data(result: TaskResult) -> Optional[dict[str, object]]:
+        usage = result.usage
+        if usage is None:
+            return None
+        return {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "estimated_cost": usage.estimated_cost,
+        }

@@ -12,6 +12,7 @@ from app.config.settings import RuntimeSettings, load_settings
 from app.config.provider_accounts import load_provider_account_config
 from app.config.secrets import SecretStore
 from app.orchestrator.orchestrator import Orchestrator
+from app.orchestrator.run import RunExecutor
 from app.runtime.context import RuntimeContext
 from app.runtime.logging import configure_logging
 
@@ -51,18 +52,20 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
         capabilities_registry.register_provider(provider)
         agent_registry.register(ProviderAgent(provider))
 
+    orchestrator = Orchestrator(
+        agent_registry,
+        default_provider=resolved_settings.default_provider,
+        fallback_chain=resolved_settings.provider_fallback_chain,
+        provider_registry=provider_registry,
+        capabilities_registry=capabilities_registry,
+        allow_paid_providers=resolved_settings.allow_paid_providers,
+    )
     return RuntimeContext(
         settings=resolved_settings,
         provider_accounts=load_provider_account_config(),
         provider_registry=provider_registry,
         provider_capabilities=capabilities_registry,
         agent_registry=agent_registry,
-        orchestrator=Orchestrator(
-            agent_registry,
-            default_provider=resolved_settings.default_provider,
-            fallback_chain=resolved_settings.provider_fallback_chain,
-            provider_registry=provider_registry,
-            capabilities_registry=capabilities_registry,
-            allow_paid_providers=resolved_settings.allow_paid_providers,
-        ),
+        orchestrator=orchestrator,
+        run_executor=RunExecutor(orchestrator),
     )

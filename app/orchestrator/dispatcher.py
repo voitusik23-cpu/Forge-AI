@@ -1,7 +1,8 @@
 """Simple, provider-neutral task routing for Orchestrator v0.2."""
 
+import time
 from dataclasses import dataclass, replace
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from app.agents.base import AgentExecutionError
 from app.agents.providers.base import ProviderNotConfiguredError
@@ -13,7 +14,7 @@ from app.agents.providers.registry import ProviderNotFoundError, ProviderRegistr
 from app.agents.registry import AgentNotFoundError, AgentRegistry
 from app.orchestrator.executor import TaskExecutor
 from app.orchestrator.classification import classify_task
-from app.orchestrator.models import Task, TaskCategory, TaskResult
+from app.orchestrator.models import EventType, Task, TaskCategory, TaskResult
 
 
 @dataclass(frozen=True)
@@ -157,7 +158,13 @@ class Dispatcher:
             raise ValueError("fallback_chain must contain non-empty provider names")
         self._fallback_chain = tuple(dict.fromkeys(name.strip() for name in fallback_chain))
 
-    def dispatch(self, task: Task, provider_name: Optional[str] = None) -> TaskResult:
+    def dispatch(
+        self,
+        task: Task,
+        provider_name: Optional[str] = None,
+        *,
+        observer: Optional[Callable[[EventType, Dict[str, object]], None]] = None,
+    ) -> TaskResult:
         """Route to the primary and optional fallbacks unless provider is explicit."""
         self._executor.validate_task(task)
         task = replace(task, category=classify_task(task))
@@ -182,6 +189,13 @@ class Dispatcher:
                 error="provider_name must not be empty",
             )
         selected = provider_name if provider_name is not None else decision.selected_provider
+        self._emit(
+            observer,
+            EventType.PROVIDER_SELECTED,
+            provider=selected,
+            category=task.category.value,
+            reason=("explicit provider selection" if provider_name is not None else decision.reason),
+        )
         allow_fallback = provider_name is None
         cost_aware = (
             task.category == TaskCategory.OTHER
@@ -233,31 +247,83 @@ class Dispatcher:
             attempts.extend(permitted_fallbacks)
 
         failures = []
-        for name in attempts:
+        previous_name = None
+        for attempt_number, name in enumerate(attempts, start=1):
+            if previous_name is not None:
+                self._emit(
+                    observer,
+                    EventType.FALLBACK,
+                    source=previous_name,
+                    target=name,
+                    attempt=attempt_number,
+                )
+            attempt_started = time.perf_counter()
+            model_name = None
+            if self._provider_registry is not None:
+                try:
+                    model_name = self._provider_registry.get(name).model_name
+                except ProviderNotFoundError:
+                    pass
+            self._emit(
+                observer,
+                EventType.PROVIDER_ATTEMPT,
+                provider=name,
+                model=model_name,
+                attempt=attempt_number,
+            )
             if provider_name is None:
                 unavailable_reason = self._automatic_route_rejection(name, task)
                 if unavailable_reason is not None:
                     failures.append(f"{name}: {unavailable_reason}")
+                    self._emit_provider_result(
+                        observer, name, model_name, attempt_number,
+                        attempt_started, False, unavailable_reason,
+                    )
+                    previous_name = name
                     continue
             if self._provider_registry is not None:
                 try:
                     provider = self._provider_registry.get(name)
                 except ProviderNotFoundError:
-                    failures.append(f"{name}: provider is unavailable or not registered")
+                    reason = "provider is unavailable or not registered"
+                    failures.append(f"{name}: {reason}")
+                    self._emit_provider_result(
+                        observer, name, model_name, attempt_number,
+                        attempt_started, False, reason,
+                    )
+                    previous_name = name
                     continue
                 if self._capabilities_registry is not None:
                     try:
                         capability = self._capabilities_registry.get(name)
                     except LookupError:
-                        failures.append(f"{name}: provider capabilities are not registered")
+                        reason = "provider capabilities are not registered"
+                        failures.append(f"{name}: {reason}")
+                        self._emit_provider_result(
+                            observer, name, model_name, attempt_number,
+                            attempt_started, False, reason,
+                        )
+                        previous_name = name
                         continue
                     if capability.provider_name != provider.provider_name:
-                        failures.append(f"{name}: provider capability metadata does not match")
+                        reason = "provider capability metadata does not match"
+                        failures.append(f"{name}: {reason}")
+                        self._emit_provider_result(
+                            observer, name, model_name, attempt_number,
+                            attempt_started, False, reason,
+                        )
+                        previous_name = name
                         continue
             try:
                 self._registry.get(name)
             except AgentNotFoundError:
-                failures.append(f"{name}: provider is unavailable or not registered")
+                reason = "provider is unavailable or not registered"
+                failures.append(f"{name}: {reason}")
+                self._emit_provider_result(
+                    observer, name, model_name, attempt_number,
+                    attempt_started, False, reason,
+                )
+                previous_name = name
                 continue
 
             try:
@@ -265,12 +331,49 @@ class Dispatcher:
                     task, name, raise_execution_errors=True
                 )
             except (AgentExecutionError, ProviderNotConfiguredError) as exc:
-                failures.append(f"{name}: {str(exc) or 'provider execution failed'}")
+                reason = str(exc) or "provider execution failed"
+                failures.append(f"{name}: {reason}")
+                self._emit_provider_result(
+                    observer, name, model_name, attempt_number,
+                    attempt_started, False, reason,
+                )
+                previous_name = name
                 continue
+            except Exception as exc:
+                # Preserve the dispatch exception while recording a non-secret
+                # failure marker for the Run observer.
+                reason = f"Execution raised {type(exc).__name__}"
+                self._emit_provider_result(
+                    observer, name, model_name, attempt_number,
+                    attempt_started, False, reason,
+                )
+                raise
 
             if result.success:
+                self._emit_provider_result(
+                    observer,
+                    name,
+                    result.model_name or model_name,
+                    attempt_number,
+                    attempt_started,
+                    True,
+                    None,
+                    result,
+                )
                 return result
-            failures.append(f"{name}: {result.error or 'provider returned failure'}")
+            reason = result.error or "provider returned failure"
+            failures.append(f"{name}: {reason}")
+            self._emit_provider_result(
+                observer,
+                name,
+                result.model_name or model_name,
+                attempt_number,
+                attempt_started,
+                False,
+                reason,
+                result,
+            )
+            previous_name = name
 
         error = (
             "No provider candidates are permitted by the cost policy"
@@ -284,6 +387,44 @@ class Dispatcher:
             provider=selected,
             agent=selected,
         )
+
+    @staticmethod
+    def _emit(
+        observer: Optional[Callable[[EventType, Dict[str, object]], None]],
+        event_type: EventType,
+        **data: object,
+    ) -> None:
+        if observer is not None:
+            observer(event_type, data)
+
+    @classmethod
+    def _emit_provider_result(
+        cls,
+        observer: Optional[Callable[[EventType, Dict[str, object]], None]],
+        provider: str,
+        model: Optional[str],
+        attempt: int,
+        started: float,
+        success: bool,
+        error: Optional[str],
+        result: Optional[TaskResult] = None,
+    ) -> None:
+        data: Dict[str, object] = {
+            "provider": provider,
+            "model": model,
+            "attempt": attempt,
+            "duration_seconds": max(0.0, time.perf_counter() - started),
+            "success": success,
+        }
+        if result is not None and result.usage is not None:
+            data["usage"] = {
+                "input_tokens": result.usage.input_tokens,
+                "output_tokens": result.usage.output_tokens,
+                "estimated_cost": result.usage.estimated_cost,
+            }
+        if error is not None:
+            data["error"] = error
+        cls._emit(observer, EventType.PROVIDER_RESULT, **data)
 
     def _automatic_route_rejection(self, name: str, task: Task) -> Optional[str]:
         """Reject auto-route candidates that are disabled, unconfigured, or incapable."""

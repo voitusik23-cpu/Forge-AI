@@ -1,8 +1,10 @@
 """Small provider-neutral models used by the orchestrator."""
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
 from app.usage import Usage
 
@@ -83,3 +85,56 @@ class TaskResult:
     provider: Optional[str] = None
     agent: Optional[str] = None
     model_name: Optional[str] = None
+
+
+class RunState(str, Enum):
+    """Lifecycle state for one observed task execution."""
+
+    CREATED = "CREATED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class EventType(str, Enum):
+    """Small event vocabulary for reconstructing a Run's execution path."""
+
+    RUN_STARTED = "run_started"
+    CONTEXT_ASSEMBLED = "context_assembled"
+    PROVIDER_SELECTED = "provider_selected"
+    PROVIDER_ATTEMPT = "provider_attempt"
+    PROVIDER_RESULT = "provider_result"
+    FALLBACK = "fallback"
+    RUN_COMPLETED = "run_completed"
+    RUN_FAILED = "run_failed"
+
+
+@dataclass(frozen=True)
+class RunError:
+    """Structured, provider-neutral failure information."""
+
+    error_type: str
+    message: str
+
+
+@dataclass
+class Event:
+    """One timestamped observation; it never contains model reasoning."""
+
+    run_id: str
+    type: EventType
+    data: Dict[str, Any] = field(default_factory=dict)
+    event_id: str = field(default_factory=lambda: str(uuid4()))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class Run:
+    """In-memory execution record around an existing Task dispatch."""
+
+    task: Task
+    id: str = field(default_factory=lambda: str(uuid4()))
+    state: RunState = RunState.CREATED
+    events: list[Event] = field(default_factory=list)
+    result: Optional[TaskResult] = None
+    error: Optional[RunError] = None

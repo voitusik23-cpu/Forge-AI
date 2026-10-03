@@ -7,6 +7,7 @@ from app.agents.providers.mock import MockProvider
 from app.config.settings import RuntimeSettings
 from app.orchestrator.models import Task
 from app.orchestrator.orchestrator import Orchestrator
+from app.orchestrator.run import RunExecutor
 from app.runtime.bootstrap import create_runtime
 from app.runtime.context import RuntimeContext
 from app.runtime.logging import configure_logging
@@ -21,6 +22,7 @@ class RuntimeBootstrapTests(unittest.TestCase):
         self.assertIsInstance(runtime, RuntimeContext)
         self.assertIs(runtime.settings, settings)
         self.assertIsInstance(runtime.orchestrator, Orchestrator)
+        self.assertIsInstance(runtime.run_executor, RunExecutor)
         expected = ["openai", "anthropic", "deepseek", "google", "xai", "openrouter", "groq", "mock"]
         self.assertEqual(runtime.provider_registry.list_providers(), expected)
         self.assertEqual(runtime.agent_registry.list_agents(), expected)

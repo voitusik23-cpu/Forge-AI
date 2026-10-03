@@ -309,3 +309,91 @@ key/model moves to the next permitted candidate. A configured fallback chain
 is retained after cost-ordered candidates. Explicit `provider_name` bypasses
 cost selection and retains absolute priority. No actual costs are calculated,
 and Dispatcher does not score by quality, latency, or budget.
+
+## Context Assembly v0.1
+
+`ContextAssembler` builds an `ExecutionContext` from the user task, its existing
+`Task.context`, and optional caller-supplied text or `ContextItem` values. Each
+item has an ID, kind, content, source, trust, and freshness. Task data is marked
+`USER_TASK`; caller-supplied materials are marked `EXPLICIT_INPUT`. Plain text
+inputs default to `UNTRUSTED` and `UNKNOWN`; trust/freshness supplied with a
+`ContextItem` are preserved, while its source is normalized to
+`EXPLICIT_INPUT`.
+
+The assembler performs no filesystem, network, provider, agent, or memory
+access. It applies configurable item and character limits and fails the Run
+before agent dispatch instead of truncating content. The defaults are 16 items
+and 20,000 content characters; callers can configure them by injecting
+`ContextAssembler(max_items=..., max_characters=...)` into `RunExecutor`. The
+assembled value is passed in the dispatched task under `forge_execution_context`;
+the original
+`Run.task` remains unchanged. The `context_assembled` event contains only item
+count and kind/source/trust/freshness summaries, never item content. This is a
+small explicit-input boundary, not RAG, project memory, repository discovery,
+or a secret scanner. Context metadata does not grant tool permissions.
+
+For traceability, `context_assembled` also records a deterministic SHA-256
+fingerprint of the canonical assembled items. The fingerprint can be correlated
+with the event's `run_id` without copying context contents into the event
+journal. Item IDs and metadata are part of the fingerprint; the per-Run ID is
+excluded so identical assembled items have the same fingerprint.
+
+## Context Assembly v0.1 — русская версия
+
+`ContextAssembler` формирует `ExecutionContext` из пользовательской задачи,
+существующего `Task.context` и необязательных строк или объектов `ContextItem`,
+переданных вызывающей стороной. У каждого элемента есть ID, тип, содержимое,
+источник, уровень доверия и актуальность. Данные задачи получают источник
+`USER_TASK`, а переданные материалы — `EXPLICIT_INPUT`. Для строк по умолчанию
+устанавливаются `UNTRUSTED` и `UNKNOWN`; значения trust/freshness из
+`ContextItem` сохраняются, а его source нормализуется в `EXPLICIT_INPUT`.
+
+Assembler не обращается к файловой системе, сети, провайдерам, агентам или
+памяти. Он проверяет настраиваемые лимиты количества элементов и символов и
+при превышении завершает Run ошибкой до вызова агента, не обрезая содержимое.
+Значения по умолчанию — 16 элементов и 20 000 символов содержимого; вызывающая
+сторона может изменить их, передав в `RunExecutor` объект
+`ContextAssembler(max_items=..., max_characters=...)`.
+Собранный объект передаётся в копии задачи под ключом
+`forge_execution_context`; исходный `Run.task` не меняется. Событие
+`context_assembled` содержит только количество элементов и сводки по
+kind/source/trust/freshness, но не само содержимое. Это минимальная граница для
+явных входных данных, а не RAG, память проекта, поиск по репозиторию или
+сканер секретов. Метаданные контекста не выдают разрешений на инструменты.
+
+## Run + Events v0.1
+
+`RunExecutor` wraps the existing `Orchestrator.dispatch()` call. It creates an
+in-memory `Run` with a unique ID, the original task, a `CREATED` state, an event
+list, and slots for the existing `TaskResult` and structured error. Execution
+transitions through `RUNNING` to `COMPLETED` or `FAILED`. Routing, candidate
+selection, and fallback remain owned by the existing Dispatcher.
+
+The Dispatcher can notify the Run observer about `run_started`,
+`context_assembled`, `provider_selected`, `provider_attempt`, `provider_result`,
+`fallback`,
+`run_completed`, and `run_failed` events. Events record only available
+execution metadata such as provider/model, attempt number, duration, usage, and
+failure reason; they do not record task prompts, model output, chain-of-thought,
+or credentials. Runs and events currently exist only in process memory. There
+is no durable event store, checkpoint/resume, distributed tracing, or telemetry
+service.
+
+## Run + Events v0.1 — русская версия
+
+`RunExecutor` оборачивает существующий вызов `Orchestrator.dispatch()`. Он
+создаёт хранящийся в памяти `Run` с уникальным ID, исходной задачей, состоянием
+`CREATED`, списком событий и полями для существующего `TaskResult` и
+структурированной ошибки. Выполнение проходит состояния `RUNNING`, а затем
+`COMPLETED` или `FAILED`. Маршрутизация, выбор кандидатов и fallback остаются
+ответственностью существующего Dispatcher.
+
+Dispatcher может передавать наблюдателю Run события `run_started`,
+`context_assembled`, `provider_selected`, `provider_attempt`, `provider_result`,
+`fallback`,
+`run_completed` и `run_failed`. События содержат только доступные метаданные
+выполнения, например provider/model, номер попытки, длительность, usage и
+причину сбоя. Они не сохраняют текст задачи, ответ модели, chain-of-thought или
+учётные данные. Run и события существуют только в памяти процесса. Постоянного
+хранилища событий, контрольных точек и возобновления, распределённой трассировки
+или сервиса телеметрии пока нет.
