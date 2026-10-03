@@ -33,3 +33,4 @@ class ToolResult:
     status: ToolStatus
     output: Any = None
     error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)

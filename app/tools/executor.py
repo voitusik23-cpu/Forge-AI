@@ -18,6 +18,7 @@ from app.tools.permissions import (
     ToolExecutionContext,
 )
 from app.tools.registry import ToolNotFoundError, ToolRegistry
+from app.tools.workspace import Workspace, WorkspacePathError
 
 
 class ToolExecutor:
@@ -154,7 +155,7 @@ class ToolExecutor:
             tool_id=permission.tool_id,
         )
         try:
-            result = tool.execute(invocation)
+            result = tool.execute(invocation, context=context)
             if (
                 not isinstance(result, ToolResult)
                 or result.invocation_id != permission.invocation_id
@@ -174,6 +175,7 @@ class ToolExecutor:
                 if isinstance(result.output, bytes)
                 else str(result.output or "").encode("utf-8")
             )
+            safe_metadata = self._safe_metadata(result.metadata)
             self._emit(
                 observer,
                 EventType.TOOL_EXECUTION_COMPLETED,
@@ -181,6 +183,7 @@ class ToolExecutor:
                 invocation_id=permission.invocation_id,
                 tool_id=permission.tool_id,
                 output_sha256=sha256(output_bytes).hexdigest(),
+                **safe_metadata,
             )
         else:
             self._emit(
@@ -190,8 +193,35 @@ class ToolExecutor:
                 invocation_id=permission.invocation_id,
                 tool_id=permission.tool_id,
                 status=result.status.value,
+                **self._safe_metadata(result.metadata),
             )
         return result
+
+    @staticmethod
+    def _safe_metadata(metadata: object) -> dict[str, object]:
+        """Copy only the write tool's small, non-content result metadata."""
+        if not isinstance(metadata, dict):
+            return {}
+        safe: dict[str, object] = {}
+        relative_path = metadata.get("relative_path")
+        bytes_written = metadata.get("bytes_written")
+        content_sha256 = metadata.get("content_sha256")
+        if isinstance(relative_path, str):
+            try:
+                safe["relative_path"] = "/".join(
+                    Workspace.normalize_relative_path(relative_path)
+                )
+            except WorkspacePathError:
+                pass
+        if isinstance(bytes_written, int) and not isinstance(bytes_written, bool) and bytes_written >= 0:
+            safe["bytes_written"] = bytes_written
+        if (
+            isinstance(content_sha256, str)
+            and len(content_sha256) == 64
+            and all(char in "0123456789abcdef" for char in content_sha256)
+        ):
+            safe["content_sha256"] = content_sha256
+        return safe
 
     @staticmethod
     def _emit_permission_check(

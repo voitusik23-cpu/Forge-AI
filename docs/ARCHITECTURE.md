@@ -502,3 +502,68 @@ Dispatcher может передавать наблюдателю Run событ
 учётные данные. Run и события существуют только в памяти процесса. Постоянного
 хранилища событий, контрольных точек и возобновления, распределённой трассировки
 или сервиса телеметрии пока нет.
+
+## Workspace Boundary v0.1 — controlled writes
+
+Workspace is an existing absolute directory explicitly supplied to
+RunExecutor.execute(..., workspace=...). The root is carried in the
+Run-scoped ToolExecutionContext; it is never inferred from the process
+working directory, the user's home directory, or agent input. Without that
+context, WriteProjectFile fails closed.
+
+WriteProjectFile accepts only relative_path, UTF-8 content, and optional
+boolean overwrite. ApprovalPolicy always requires approval for this mutation
+tool, even if the caller's additional required-tool list omits it. The
+execution order remains Permission → Approval → Workspace validation →
+write. PermissionPolicy must return ALLOW, and only an independent APPROVED
+decision can reach the filesystem operation. An unresolved invocation leaves
+the Run waiting; a rejected or denied invocation does not write.
+
+The workspace boundary normalizes both slash styles, rejects absolute paths,
+drive/stream paths, and parent traversal, resolves targets semantically under
+the canonical root, and rejects existing symlink, junction, or reparse-point
+components. Missing parent directories are created one level at a time inside
+the workspace. Writes use a temporary sibling file followed by an atomic
+filesystem operation. By default, an existing file is denied; explicit
+overwrite=true atomically replaces it. This is a path boundary, not an OS
+sandbox, and it does not protect against a hostile process racing filesystem
+changes between checks and the final operation.
+
+Tool results and completion events expose only a normalized relative path,
+byte count, and SHA-256 fingerprint. They never copy the written content into
+the event journal. The offline integration tests use isolated temporary
+workspaces and make no network/API calls.
+
+## Граница Workspace v0.1 — контролируемая запись
+
+Workspace — существующий абсолютный каталог, явно переданный в
+RunExecutor.execute(..., workspace=...). Корень передаётся в Run-scoped
+ToolExecutionContext; он не определяется по текущему каталогу процесса,
+домашнему каталогу пользователя или входным данным агента. Без такого
+контекста WriteProjectFile завершает операцию без записи.
+
+WriteProjectFile принимает только relative_path, текст content в UTF-8
+и необязательный логический параметр overwrite. ApprovalPolicy всегда
+требует подтверждения для этого инструмента изменения файлов, даже если
+дополнительный список обязательного подтверждения его не содержит. Порядок
+остаётся таким: Permission → Approval → проверка Workspace → запись.
+PermissionPolicy должен вернуть ALLOW, и до файловой операции допускает
+только независимое решение APPROVED. Если решение ожидается, Run остаётся в
+состоянии ожидания; при отказе или запрете запись не выполняется.
+
+Граница Workspace нормализует оба вида разделителей, отклоняет абсолютные
+пути, пути с диском или потоком данных и обход через .., семантически
+проверяет расположение цели относительно канонического корня и отклоняет
+существующие символические ссылки, junction и reparse points в пути. Новые
+родительские каталоги создаются по одному уровню только внутри Workspace.
+Запись сначала выполняется во временный файл рядом с целью, затем
+производится атомарная операция файловой системы. По умолчанию запись поверх
+существующего файла запрещена; явный overwrite=true атомарно заменяет его.
+Это ограничение пути, а не изоляция на уровне ОС; оно не защищает от
+враждебного процесса, который меняет файловую систему между проверкой пути
+и финальной операцией.
+
+Результаты инструмента и событие завершения содержат только нормализованный
+относительный путь, число байтов и SHA-256 fingerprint. Полный записанный
+текст в журнал событий не копируется. Offline integration tests используют
+изолированные временные Workspace и не выполняют сетевых/API-запросов.

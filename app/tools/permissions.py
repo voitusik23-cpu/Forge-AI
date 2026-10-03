@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from app.tools.contracts import ToolInvocation
+from app.tools.workspace import Workspace
 
 
 class PermissionDecision(str, Enum):
@@ -26,6 +27,7 @@ class ToolExecutionContext:
     context_fingerprint: str
     allowed_tool_ids: frozenset[str]
     round_number: int = 0
+    workspace: Workspace | None = None
 
 
 @dataclass(frozen=True)

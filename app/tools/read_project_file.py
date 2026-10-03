@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable
 
 from app.tools.contracts import ToolDefinition, ToolInvocation, ToolResult, ToolStatus
+from app.tools.permissions import ToolExecutionContext
 
 
 class ReadProjectFile:
@@ -44,7 +45,12 @@ class ReadProjectFile:
             and ".." not in requested.parts
         )
 
-    def execute(self, invocation: ToolInvocation) -> ToolResult:
+    def execute(
+        self,
+        invocation: ToolInvocation,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         relative_path = invocation.input.get("path")
         if not isinstance(relative_path, str) or not relative_path.strip():
             return ToolResult(

@@ -26,6 +26,7 @@ from app.tools.executor import ToolExecutor
 from app.tools.contracts import ToolResult, ToolStatus
 from app.tools.permissions import ToolExecutionContext
 from app.tools.registry import ToolRegistry
+from app.tools.workspace import Workspace
 
 
 class RunExecutor:
@@ -49,6 +50,7 @@ class RunExecutor:
         agent_name: Optional[str] = None,
         explicit_inputs: Iterable[str | ContextItem] = (),
         allowed_tool_ids: Iterable[str] = (),
+        workspace: Optional[Workspace] = None,
     ) -> Run:
         """Execute through Orchestrator and retain a safe in-memory event trace."""
         run = Run(task=task)
@@ -75,6 +77,7 @@ class RunExecutor:
                     run_id=run.id,
                     context_fingerprint=execution_context.fingerprint,
                     allowed_tool_ids=frozenset(allowed_tool_ids),
+                    workspace=workspace,
                 )
                 initial_invocations = list(result.tool_invocations)
                 tool_results = [
@@ -112,6 +115,7 @@ class RunExecutor:
                     context_fingerprint=execution_context.fingerprint,
                     allowed_tool_ids=permission_context.allowed_tool_ids,
                     round_number=1,
+                    workspace=workspace,
                 )
                 tool_results.extend(
                     self._tool_executor.execute(

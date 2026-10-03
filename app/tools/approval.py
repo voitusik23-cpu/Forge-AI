@@ -25,8 +25,10 @@ class ApprovalRequest:
 class ApprovalPolicy:
     """Require approval for explicitly listed tool IDs."""
 
+    MANDATORY_APPROVAL_TOOLS = frozenset({"write_project_file"})
+
     def __init__(self, approval_required_tools=()) -> None:
-        self._required_tools = frozenset(approval_required_tools)
+        self._required_tools = frozenset(approval_required_tools) | self.MANDATORY_APPROVAL_TOOLS
 
     def evaluate(self, tool_id: str) -> ApprovalState:
         if tool_id in self._required_tools:

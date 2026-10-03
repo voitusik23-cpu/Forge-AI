@@ -1,1 +1,1 @@
-"""Provider-neutral, explicitly bounded read-only tools."""
+"""Provider-neutral tools with explicit execution boundaries."""

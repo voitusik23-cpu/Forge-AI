@@ -1,6 +1,6 @@
-"""Explicit registry for available read-only tools."""
+"""Explicit registry for available provider-neutral tools."""
 
-from app.tools.base import ReadOnlyTool
+from app.tools.base import Tool
 from app.tools.contracts import ToolDefinition
 
 
@@ -14,15 +14,15 @@ class DuplicateToolError(ValueError):
 
 class ToolRegistry:
     def __init__(self) -> None:
-        self._tools: dict[str, ReadOnlyTool] = {}
+        self._tools: dict[str, Tool] = {}
 
-    def register(self, tool: ReadOnlyTool) -> None:
+    def register(self, tool: Tool) -> None:
         tool_id = tool.definition.id
         if tool_id in self._tools:
             raise DuplicateToolError(f"Tool '{tool_id}' is already registered")
         self._tools[tool_id] = tool
 
-    def get(self, tool_id: str) -> ReadOnlyTool:
+    def get(self, tool_id: str) -> Tool:
         try:
             return self._tools[tool_id]
         except KeyError as exc:
