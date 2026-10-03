@@ -120,6 +120,7 @@ class EventType(str, Enum):
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_RESOLVED = "approval_resolved"
     VERIFICATION_COMPLETED = "verification_completed"
+    ACCEPTANCE_COMPLETED = "acceptance_completed"
 
 
 @dataclass(frozen=True)
