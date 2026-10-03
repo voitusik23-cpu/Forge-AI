@@ -128,6 +128,8 @@ class EventType(str, Enum):
     REVISION_COMPLETED = "revision_completed"
     CHANGESET_CREATED = "changeset_created"
     SNAPSHOT_CREATED = "snapshot_created"
+    ENGINEERING_RUN_STARTED = "engineering_run_started"
+    ENGINEERING_RUN_COMPLETED = "engineering_run_completed"
 
 
 @dataclass(frozen=True)

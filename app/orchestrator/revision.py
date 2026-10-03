@@ -8,6 +8,7 @@ from enum import Enum
 
 from app.orchestrator.models import Event, EventType, Run, RunState, Task
 from app.orchestrator.run import RunExecutor
+from app.artifacts import ChangeSet
 from app.tools.acceptance import (
     AcceptanceCriterion,
     AcceptanceGate,
@@ -23,6 +24,7 @@ from app.tools.verification import (
 )
 from app.tools.workspace import Workspace
 from app.tools.project_snapshots import ProjectSnapshotter
+from app.snapshots import ProjectSnapshot
 
 
 class RevisionStatus(str, Enum):
@@ -47,11 +49,21 @@ class RevisionRequest:
 
 
 @dataclass(frozen=True)
+class RevisionAttemptResult:
+    attempt_number: int
+    snapshots: tuple[ProjectSnapshot, ...]
+    changesets: tuple[ChangeSet, ...]
+    verification_results: tuple[VerificationResult, ...]
+    acceptance_result: AcceptanceResult | None
+
+
+@dataclass(frozen=True)
 class RevisionResult:
     status: RevisionStatus
     attempt_number: int
     acceptance_result: AcceptanceResult | None
     run: Run = field(compare=False, repr=False)
+    attempts: tuple[RevisionAttemptResult, ...] = ()
 
 
 class RevisionLoopExecutor:
@@ -90,6 +102,7 @@ class RevisionLoopExecutor:
         allowed_tool_ids=(),
         workspace: Workspace | None = None,
         snapshot_paths: Iterable[str] | None = None,
+        max_revision_attempts: int | None = None,
     ) -> RevisionResult:
         """Execute once, then revise only after a safe, observed Acceptance FAIL."""
         criteria = tuple(criteria)
@@ -99,9 +112,13 @@ class RevisionLoopExecutor:
         requested_snapshot_paths = (
             None if snapshot_paths is None else tuple(snapshot_paths)
         )
+        max_attempts = self.max_revision_attempts if max_revision_attempts is None else max_revision_attempts
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 0:
+            raise ValueError("max_revision_attempts must be a non-negative integer")
         run = Run(task=task)
+        initial_before = None
         if requested_snapshot_paths is not None:
-            self._snapshotter.create(
+            initial_before = self._snapshotter.create(
                 requested_snapshot_paths,
                 run=run,
                 attempt_number=0,
@@ -117,26 +134,30 @@ class RevisionLoopExecutor:
             _run=run,
             _attempt_number=0,
         )
+        initial_after = None
         if requested_snapshot_paths is not None:
-            self._snapshotter.create(
+            initial_after = self._snapshotter.create(
                 requested_snapshot_paths,
                 run=run,
                 attempt_number=0,
                 workspace=workspace,
             )
-        acceptance, can_revise = self._verify_and_accept(
+        acceptance, can_revise, verification_results = self._verify_and_accept(
             run, criteria, expectations, workspace, attempt_number=0
         )
+        attempts = [self._attempt_result(
+            run, 0, (initial_before, initial_after), verification_results, acceptance
+        )]
         attempt = 0
         if acceptance is None or not can_revise:
-            return RevisionResult(RevisionStatus.FAILED, attempt, acceptance, run)
+            return RevisionResult(RevisionStatus.FAILED, attempt, acceptance, run, tuple(attempts))
         if acceptance.status == AcceptanceStatus.PASS:
-            return RevisionResult(RevisionStatus.COMPLETED, attempt, acceptance, run)
-        if self.max_revision_attempts == 0:
-            return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run)
+            return RevisionResult(RevisionStatus.COMPLETED, attempt, acceptance, run, tuple(attempts))
+        if max_attempts == 0:
+            return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run, tuple(attempts))
 
         failed = self._failed_criteria(acceptance)
-        for attempt in range(1, self.max_revision_attempts + 1):
+        for attempt in range(1, max_attempts + 1):
             request = RevisionRequest(
                 run_id=run.id,
                 revision_id=f"{run.id}:revision:{attempt}",
@@ -151,8 +172,9 @@ class RevisionLoopExecutor:
                 "reason": request.reason,
             })
             run.state = RunState.REVISING
+            revision_before = None
             if requested_snapshot_paths is not None:
-                self._snapshotter.create(
+                revision_before = self._snapshotter.create(
                     requested_snapshot_paths,
                     run=run,
                     attempt_number=attempt,
@@ -169,39 +191,44 @@ class RevisionLoopExecutor:
                 _run=run,
                 _attempt_number=attempt,
             )
+            revision_after = None
             if requested_snapshot_paths is not None:
-                self._snapshotter.create(
+                revision_after = self._snapshotter.create(
                     requested_snapshot_paths,
                     run=run,
                     attempt_number=attempt,
                     workspace=workspace,
                 )
-            next_acceptance, can_revise = self._verify_and_accept(
+            next_acceptance, can_revise, verification_results = self._verify_and_accept(
                 run, criteria, expectations, workspace, attempt_number=attempt
             )
+            attempts.append(self._attempt_result(
+                run, attempt, (revision_before, revision_after),
+                verification_results, next_acceptance,
+            ))
             if next_acceptance is None or not can_revise:
                 self._emit_revision_completed(run, request, RevisionStatus.FAILED, next_acceptance)
-                return RevisionResult(RevisionStatus.FAILED, attempt, next_acceptance, run)
+                return RevisionResult(RevisionStatus.FAILED, attempt, next_acceptance, run, tuple(attempts))
             acceptance = next_acceptance
             if acceptance.status == AcceptanceStatus.PASS:
                 self._emit_revision_completed(run, request, RevisionStatus.COMPLETED, acceptance)
-                return RevisionResult(RevisionStatus.COMPLETED, attempt, acceptance, run)
+                return RevisionResult(RevisionStatus.COMPLETED, attempt, acceptance, run, tuple(attempts))
             failed = self._failed_criteria(acceptance)
-            if attempt == self.max_revision_attempts:
+            if attempt == max_attempts:
                 self._emit_revision_completed(run, request, RevisionStatus.LIMIT_REACHED, acceptance)
-                return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run)
+                return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run, tuple(attempts))
 
-        return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run)
+        return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run, tuple(attempts))
 
     def _verify_and_accept(
         self, run, criteria, expectations, workspace, *, attempt_number
     ):
         # Hard execution/policy failures and unresolved approvals stop before acceptance.
         if run.state != RunState.COMPLETED or run.result is None:
-            return None, False
+            return None, False, ()
         tool_results = run.result.tool_results
         if any(result.status != ToolStatus.COMPLETED for result in tool_results):
-            return None, False
+            return None, False, ()
 
         verification_results: dict[str, VerificationResult] = {}
         denied = False
@@ -235,7 +262,20 @@ class RevisionLoopExecutor:
             verification_status=verification_status,
             acceptance_status=acceptance.status.value,
         )
-        return acceptance, not denied
+        return acceptance, not denied, tuple(verification_results.values())
+
+    @staticmethod
+    def _attempt_result(run, attempt_number, snapshots, verification_results, acceptance):
+        return RevisionAttemptResult(
+            attempt_number=attempt_number,
+            snapshots=tuple(item for item in snapshots if item is not None),
+            changesets=tuple(
+                item for item in run.change_sets
+                if item.attempt_number == attempt_number
+            ),
+            verification_results=verification_results,
+            acceptance_result=acceptance,
+        )
 
     @staticmethod
     def _failed_criteria(result: AcceptanceResult) -> tuple[FailedCriterion, ...]:

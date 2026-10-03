@@ -742,3 +742,42 @@ ID, поэтому Snapshot содержит `run_id` и `attempt_number`.
 описывает наблюдаемое состояние; ChangeSet — изменение; Verification проверяет
 ожидания; Acceptance решает, выполнены ли обязательные критерии задачи.
 Snapshot — read-only артефакт в памяти, а не резервная копия или история версий.
+
+## Engineering Run v0.1
+
+`EngineeringRunExecutor` is a provider-neutral facade over the existing
+`RevisionLoopExecutor`. Its request combines a task, Workspace, explicit
+snapshot paths, verification expectations, acceptance criteria, routing and
+permission inputs, and a bounded revision limit. It does not create a second
+execution or revision engine: every attempt still passes through the existing
+`RunExecutor`, tool permission and approval checks, Workspace boundary,
+ChangeSet collector, verifier, and acceptance gate.
+
+The result retains the existing `Run` plus an attempt-indexed record of
+snapshots, ChangeSets, verification results, and acceptance results. It also
+provides flattened collections for callers that need a run-wide view. The
+terminal status is `SUCCESS`, `FAILED`, `WAITING_FOR_APPROVAL`, or
+`LIMIT_REACHED`. Safe `engineering_run_started` and
+`engineering_run_completed` events bracket the lifecycle; the completion event
+contains only the status, counts, and a stable reason code. All records remain
+in memory. Persistence, rollback, Git operations, provider selection policy,
+and autonomous deployment are outside this boundary.
+
+## Engineering Run v0.1 — русская версия
+
+`EngineeringRunExecutor` — provider-neutral фасад поверх существующего
+`RevisionLoopExecutor`. Запрос объединяет задачу, Workspace, явно перечисленные
+пути для Snapshot, ожидания Verification, критерии Acceptance, параметры
+маршрутизации и разрешений, а также ограничение числа revision. Он не создаёт
+второй механизм выполнения или revision: каждая попытка по-прежнему проходит
+через существующие `RunExecutor`, проверки разрешений и подтверждения
+инструментов, границу Workspace, сборщик ChangeSet, verifier и Acceptance gate.
+
+Результат сохраняет существующий `Run` и запись по каждой попытке с Snapshot,
+ChangeSet, результатами Verification и Acceptance. Также доступны объединённые
+коллекции для просмотра всего Run. Итоговый статус: `SUCCESS`, `FAILED`,
+`WAITING_FOR_APPROVAL` или `LIMIT_REACHED`. Безопасные события
+`engineering_run_started` и `engineering_run_completed` ограничивают жизненный
+цикл; событие завершения содержит только статус, количества и стабильный код
+причины. Все записи остаются в памяти. Хранение, откат, операции Git, политика
+выбора провайдера и автономный деплой не входят в эту границу.
