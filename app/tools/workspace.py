@@ -66,6 +66,7 @@ class Workspace:
         return parts
 
     def resolve_target(self, relative_path: object) -> tuple[Path, str, tuple[str, ...]]:
+        self.assert_available()
         parts = self.normalize_relative_path(relative_path)
         target = self.root.joinpath(*parts)
         self._check_contained(target)
@@ -73,6 +74,7 @@ class Workspace:
         return target, "/".join(parts), parts
 
     def create_parent_directories(self, parts: tuple[str, ...]) -> Path:
+        self.assert_available()
         if (
             not isinstance(parts, tuple)
             or not parts
@@ -111,10 +113,29 @@ class Workspace:
             raise
 
     def verify_target(self, parts: tuple[str, ...]) -> Path:
+        self.assert_available()
         target = self.root.joinpath(*parts)
         self._check_contained(target)
         self._reject_link_components(parts)
         return target
+
+    def assert_available(self) -> None:
+        """Fail closed if the supplied workspace root disappeared or changed type."""
+        try:
+            info = self.root.lstat()
+            attributes = getattr(info, "st_file_attributes", 0)
+            is_reparse_point = bool(
+                attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or self.root.is_symlink()
+                or getattr(self.root, "is_junction", lambda: False)()
+                or is_reparse_point
+            ):
+                raise WorkspacePathError("workspace root is unavailable")
+        except (OSError, RuntimeError) as exc:
+            raise WorkspacePathError("workspace root is unavailable") from exc
 
     def _check_contained(self, path: Path) -> None:
         try:

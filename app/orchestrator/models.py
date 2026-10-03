@@ -119,6 +119,7 @@ class EventType(str, Enum):
     TOOL_INVOCATION_DENIED = "tool_invocation_denied"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_RESOLVED = "approval_resolved"
+    VERIFICATION_COMPLETED = "verification_completed"
 
 
 @dataclass(frozen=True)

@@ -567,3 +567,18 @@ PermissionPolicy должен вернуть ALLOW, и до файловой о�
 относительный путь, число байтов и SHA-256 fingerprint. Полный записанный
 текст в журнал событий не копируется. Offline integration tests используют
 изолированные временные Workspace и не выполняют сетевых/API-запросов.
+
+## Verification Boundary v0.1
+
+`WorkspaceVerifier` checks one caller-supplied `VerificationExpectation` against an explicitly
+provided `Workspace`. It reuses the Workspace normalizer, containment checks, and link/reparse
+point rejection. Expectations cover file existence or absence and, optionally, a content SHA-256.
+It reads only a regular file inside the workspace when content verification is requested; it
+never creates directories, changes files, invokes a write tool, or repairs a failed result.
+
+Mutation != Verification. `WriteProjectFile` performs an approved mutation; the verifier
+independently observes the resulting workspace state. The intended sequence is **Write → Observe
+→ Verify**. A safe `verification_completed` event records the run and verification IDs, normalized
+target when valid, outcome code, and content fingerprint when computed. It does not record file
+contents. This boundary is read-only and is not an OS sandbox; a hostile concurrent filesystem
+change between checks and open remains a limitation of the existing Workspace boundary.
