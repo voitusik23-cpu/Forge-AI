@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+from app.artifacts import Artifact, ChangeSet
 from app.usage import Usage
 from app.tools.contracts import ToolInvocation, ToolResult
 
@@ -124,6 +125,7 @@ class EventType(str, Enum):
     ACCEPTANCE_COMPLETED = "acceptance_completed"
     REVISION_STARTED = "revision_started"
     REVISION_COMPLETED = "revision_completed"
+    CHANGESET_CREATED = "changeset_created"
 
 
 @dataclass(frozen=True)
@@ -155,3 +157,5 @@ class Run:
     events: list[Event] = field(default_factory=list)
     result: Optional[TaskResult] = None
     error: Optional[RunError] = None
+    change_sets: list[ChangeSet] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)

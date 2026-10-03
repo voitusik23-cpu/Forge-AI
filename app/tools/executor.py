@@ -11,6 +11,7 @@ from app.tools.approval import (
     ApprovalState,
 )
 from app.tools.contracts import ToolInvocation, ToolResult, ToolStatus
+from app.tools.changesets import ChangeSetCollector
 from app.tools.permissions import (
     PermissionCheck,
     PermissionDecision,
@@ -28,11 +29,13 @@ class ToolExecutor:
         permission_policy: PermissionPolicy | None = None,
         approval_policy: ApprovalPolicy | None = None,
         approval_resolver: ApprovalResolver | None = None,
+        change_set_collector: ChangeSetCollector | None = None,
     ) -> None:
         self._registry = registry
         self._permission_policy = permission_policy or PermissionPolicy()
         self._approval_policy = approval_policy or ApprovalPolicy()
         self._approval_resolver = approval_resolver
+        self.change_set_collector = change_set_collector or ChangeSetCollector()
 
     def execute(
         self,
@@ -154,6 +157,9 @@ class ToolExecutor:
             invocation_id=permission.invocation_id,
             tool_id=permission.tool_id,
         )
+        mutation_snapshot = None
+        if tool is not None and getattr(tool, "mutates", False):
+            mutation_snapshot = self.change_set_collector.capture_before(invocation, context)
         try:
             result = tool.execute(invocation, context=context)
             if (
@@ -170,6 +176,8 @@ class ToolExecutor:
             )
 
         if result.status == ToolStatus.COMPLETED:
+            if mutation_snapshot is not None:
+                self.change_set_collector.record_after(mutation_snapshot)
             output_bytes = (
                 result.output
                 if isinstance(result.output, bytes)

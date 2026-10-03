@@ -27,6 +27,7 @@ class ToolExecutionContext:
     context_fingerprint: str
     allowed_tool_ids: frozenset[str]
     round_number: int = 0
+    attempt_number: int = 0
     workspace: Workspace | None = None
 
 

@@ -659,3 +659,45 @@ Acceptance FAIL → ограниченная Revision → Verification → Accep
 управляемый цикл в памяти процесса. Revision не может сама одобрить изменение
 или объявить Acceptance. Offline-интеграционные тесты используют детерминированные
 фикстуры и временные workspace.
+
+## ChangeSet / Artifact Boundary v0.1
+
+`ChangeSetCollector` observes only explicitly targeted mutating tool calls after
+Permission and Approval pass. It fingerprints the target before and after the
+tool operation through the provided Workspace boundary and groups net file
+changes by `run_id` and attempt number. Created files have no before fingerprint;
+modified files record both SHA-256 fingerprints; unchanged targets are omitted.
+Paths outside Workspace and files whose safe state cannot be read are not added.
+No file contents or workspace-wide scan are used. Delete remains a reserved
+change type because no delete tool exists.
+
+Each non-empty ChangeSet has a linked in-memory `Artifact` of type `CHANGESET`.
+Revision attempts retain separate ChangeSets; the ChangeSet can also carry that
+attempt's Verification and Acceptance status. The safe `changeset_created` event
+records the Run, attempt, change count, artifact ID, and per-file relative path,
+type, and fingerprints. ChangeSet describes the actual mutation; Artifact points
+to that result; Verification checks the result; Acceptance decides whether the
+required task criteria are met. This is in-memory traceability, not Git or an
+artifact storage service.
+
+## Граница ChangeSet / Artifact v0.1
+
+`ChangeSetCollector` наблюдает только явно указанные вызовы инструмента
+изменения файлов после прохождения Permission и Approval. Он вычисляет
+fingerprint цели до и после операции через переданную границу Workspace и
+группирует итоговые изменения по `run_id` и номеру попытки. Для созданного
+файла fingerprint до записи отсутствует; для изменённого сохраняются оба
+SHA-256 fingerprint; неизменённые цели исключаются. Пути за пределами Workspace
+и файлы, безопасное состояние которых нельзя прочитать, не добавляются.
+Содержимое файлов и полный обход workspace не используются. Тип удаления
+зарезервирован, поскольку инструмента удаления пока нет.
+
+Для каждого непустого ChangeSet создаётся связанный in-memory `Artifact` типа
+`CHANGESET`. Для каждой revision сохраняется отдельный ChangeSet; в нём также
+могут быть статусы Verification и Acceptance этой попытки. Безопасное событие
+`changeset_created` содержит Run, номер попытки, число изменений, ID Artifact
+и по каждому файлу относительный путь, тип и fingerprints. ChangeSet описывает
+фактическое изменение; Artifact ссылается на этот результат; Verification
+проверяет результат; Acceptance решает, выполнены ли обязательные критерии
+задачи. Это трассируемость в памяти процесса, а не Git или сервис хранения
+артефактов.

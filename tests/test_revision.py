@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.artifacts import FileChangeType
 from app.agents.registry import AgentRegistry
 from app.orchestrator.models import EventType, RunState, Task, TaskResult
 from app.orchestrator.orchestrator import Orchestrator
@@ -131,6 +132,18 @@ class RevisionLoopTests(unittest.TestCase):
         self.assertEqual(result.attempt_number, 1)
         self.assertEqual(result.acceptance_result.status, AcceptanceStatus.PASS)
         self.assertEqual((self.root / "result.txt").read_text(encoding="utf-8"), self.good)
+        self.assertEqual([item.attempt_number for item in run.change_sets], [0, 1])
+        self.assertEqual(len({item.changeset_id for item in run.change_sets}), 2)
+        self.assertEqual(run.change_sets[0].changes[0].change_type, FileChangeType.CREATED)
+        self.assertEqual(run.change_sets[1].changes[0].change_type, FileChangeType.MODIFIED)
+        self.assertEqual(run.change_sets[0].verification_status, "fail")
+        self.assertEqual(run.change_sets[0].acceptance_status, "fail")
+        self.assertEqual(run.change_sets[1].verification_status, "pass")
+        self.assertEqual(run.change_sets[1].acceptance_status, "pass")
+        self.assertEqual(
+            [artifact.changeset_id for artifact in run.artifacts],
+            [item.changeset_id for item in run.change_sets],
+        )
         self.assertEqual(types.count(EventType.ACCEPTANCE_COMPLETED), 2)
         self.assertEqual(types.count(EventType.REVISION_STARTED), 1)
         self.assertEqual(types.count(EventType.REVISION_COMPLETED), 1)

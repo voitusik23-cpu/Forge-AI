@@ -11,6 +11,7 @@ from app.tools.workspace import Workspace, WorkspacePathError
 
 class WriteProjectFile:
     TOOL_ID = "write_project_file"
+    mutates = True
 
     @property
     def definition(self) -> ToolDefinition:

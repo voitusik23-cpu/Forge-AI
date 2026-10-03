@@ -101,7 +101,7 @@ class RevisionLoopExecutor:
             workspace=workspace,
         )
         acceptance, can_revise = self._verify_and_accept(
-            run, criteria, expectations, workspace
+            run, criteria, expectations, workspace, attempt_number=0
         )
         attempt = 0
         if acceptance is None or not can_revise:
@@ -136,9 +136,10 @@ class RevisionLoopExecutor:
                 allowed_tool_ids=allowed_tool_ids,
                 workspace=workspace,
                 _run=run,
+                _attempt_number=attempt,
             )
             next_acceptance, can_revise = self._verify_and_accept(
-                run, criteria, expectations, workspace
+                run, criteria, expectations, workspace, attempt_number=attempt
             )
             if next_acceptance is None or not can_revise:
                 self._emit_revision_completed(run, request, RevisionStatus.FAILED, next_acceptance)
@@ -154,7 +155,9 @@ class RevisionLoopExecutor:
 
         return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run)
 
-    def _verify_and_accept(self, run, criteria, expectations, workspace):
+    def _verify_and_accept(
+        self, run, criteria, expectations, workspace, *, attempt_number
+    ):
         # Hard execution/policy failures and unresolved approvals stop before acceptance.
         if run.state != RunState.COMPLETED or run.result is None:
             return None, False
@@ -181,6 +184,18 @@ class RevisionLoopExecutor:
             verification_results,
             run_id=run.id,
             observer=lambda event_type, data: self._emit(run, event_type, data),
+        )
+        verification_status = (
+            "denied" if denied else
+            "unavailable" if not verification_results else
+            "fail" if any(item.status != VerificationStatus.PASS for item in verification_results.values()) else
+            "pass"
+        )
+        self._run_executor.attach_attempt_outcomes(
+            run,
+            attempt_number,
+            verification_status=verification_status,
+            acceptance_status=acceptance.status.value,
         )
         return acceptance, not denied
 

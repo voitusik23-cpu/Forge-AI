@@ -52,6 +52,7 @@ class RunExecutor:
         allowed_tool_ids: Iterable[str] = (),
         workspace: Optional[Workspace] = None,
         _run: Run | None = None,
+        _attempt_number: int = 0,
     ) -> Run:
         """Execute through Orchestrator and retain a safe in-memory event trace."""
         run = _run or Run(task=task)
@@ -78,6 +79,7 @@ class RunExecutor:
                     run_id=run.id,
                     context_fingerprint=execution_context.fingerprint,
                     allowed_tool_ids=frozenset(allowed_tool_ids),
+                    attempt_number=_attempt_number,
                     workspace=workspace,
                 )
                 initial_invocations = list(result.tool_invocations)
@@ -116,6 +118,7 @@ class RunExecutor:
                     context_fingerprint=execution_context.fingerprint,
                     allowed_tool_ids=permission_context.allowed_tool_ids,
                     round_number=1,
+                    attempt_number=_attempt_number,
                     workspace=workspace,
                 )
                 tool_results.extend(
@@ -168,11 +171,30 @@ class RunExecutor:
                 error=run.error.message,
                 duration_seconds=max(0.0, time.perf_counter() - started),
             )
+        finally:
+            self._tool_executor.change_set_collector.finalize(
+                run, _attempt_number
+            )
         return run
 
     @staticmethod
     def _record(run: Run, event_type: EventType, **data: object) -> None:
         run.events.append(Event(run_id=run.id, type=event_type, data=data))
+
+    def attach_attempt_outcomes(
+        self,
+        run: Run,
+        attempt_number: int,
+        *,
+        verification_status: str | None,
+        acceptance_status: str | None,
+    ) -> None:
+        self._tool_executor.change_set_collector.attach_outcomes(
+            run,
+            attempt_number,
+            verification_status=verification_status,
+            acceptance_status=acceptance_status,
+        )
 
     @classmethod
     def _record_context_assembled(
