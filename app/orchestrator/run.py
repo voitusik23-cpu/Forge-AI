@@ -51,12 +51,13 @@ class RunExecutor:
         explicit_inputs: Iterable[str | ContextItem] = (),
         allowed_tool_ids: Iterable[str] = (),
         workspace: Optional[Workspace] = None,
+        _run: Run | None = None,
     ) -> Run:
         """Execute through Orchestrator and retain a safe in-memory event trace."""
-        run = Run(task=task)
+        run = _run or Run(task=task)
         started = time.perf_counter()
         self._record(run, EventType.RUN_STARTED, task_id=getattr(task, "id", None))
-        run.state = RunState.RUNNING
+        run.state = RunState.RUNNING if _run is None else RunState.REVISING
 
         try:
             execution_context = self._context_assembler.assemble(
