@@ -11,3 +11,6 @@ class ReadOnlyTool(Protocol):
 
     def execute(self, invocation: ToolInvocation) -> ToolResult:
         """Execute a validated invocation without mutating project state."""
+
+    def validate_input(self, tool_input: object) -> bool:
+        """Validate input shape without performing the requested operation."""

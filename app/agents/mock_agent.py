@@ -16,13 +16,21 @@ class MockAgent:
         *,
         tool_invocations: Iterable[ToolInvocation] = (),
         output: str | None = None,
+        repeat_tool_invocations_after_results: bool = False,
     ) -> None:
         self.name = name
         self.provider_name = name
         self._tool_invocations = tuple(tool_invocations)
         self._output = output
+        self._repeat_tool_invocations_after_results = repeat_tool_invocations_after_results
+        self.received_tool_results = []
 
     def run(self, task: Task) -> TaskResult:
+        returned_results = task.context.get("forge_tool_results", [])
+        self.received_tool_results = (
+            returned_results if isinstance(returned_results, list) else []
+        )
+        has_tool_results = bool(self.received_tool_results)
         return TaskResult(
             task_id=task.id,
             success=True,
@@ -35,5 +43,9 @@ class MockAgent:
             provider=self.provider_name,
             agent=self.name,
             model_name="mock-agent",
-            tool_invocations=list(self._tool_invocations),
+            tool_invocations=(
+                list(self._tool_invocations)
+                if not has_tool_results or self._repeat_tool_invocations_after_results
+                else []
+            ),
         )

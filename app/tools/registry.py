@@ -30,3 +30,6 @@ class ToolRegistry:
 
     def list_tools(self) -> list[ToolDefinition]:
         return [self._tools[key].definition for key in sorted(self._tools)]
+
+    def contains(self, tool_id: str) -> bool:
+        return tool_id in self._tools

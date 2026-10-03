@@ -1,10 +1,16 @@
-"""Validate and execute one explicitly permitted read-only tool invocation."""
+"""Run policy checks before executing one registered read-only tool."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from hashlib import sha256
 
 from app.orchestrator.models import EventType
 from app.tools.contracts import ToolInvocation, ToolResult, ToolStatus
+from app.tools.permissions import (
+    PermissionCheck,
+    PermissionDecision,
+    PermissionPolicy,
+    ToolExecutionContext,
+)
 from app.tools.registry import ToolNotFoundError, ToolRegistry
 
 
@@ -12,45 +18,96 @@ class ToolExecutor:
     def __init__(
         self,
         registry: ToolRegistry,
-        *,
-        allowed_tool_ids: Iterable[str] = (),
+        permission_policy: PermissionPolicy | None = None,
     ) -> None:
         self._registry = registry
-        self._allowed_tool_ids = frozenset(allowed_tool_ids)
+        self._permission_policy = permission_policy or PermissionPolicy()
 
     def execute(
         self,
         invocation: ToolInvocation,
         *,
+        context: ToolExecutionContext | None = None,
         observer: Callable[[EventType, dict[str, object]], None],
     ) -> ToolResult:
-        self._emit(observer, EventType.TOOL_INVOCATION_REQUESTED, invocation)
-        try:
-            tool = self._registry.get(invocation.tool_id)
-        except ToolNotFoundError:
-            return self._failed(
-                invocation, observer, "tool is not registered", denied=True
+        tool_id = getattr(invocation, "tool_id", "")
+        invocation_id = getattr(invocation, "invocation_id", "")
+        self._emit(
+            observer,
+            EventType.TOOL_INVOCATION_REQUESTED,
+            run_id=getattr(context, "run_id", ""),
+            invocation_id=invocation_id,
+            tool_id=tool_id,
+        )
+        tool = None
+        if isinstance(tool_id, str) and self._registry.contains(tool_id):
+            try:
+                tool = self._registry.get(tool_id)
+            except ToolNotFoundError:
+                tool = None
+        input_valid = isinstance(getattr(invocation, "input", None), dict)
+        if tool is not None:
+            try:
+                input_valid = bool(tool.validate_input(invocation.input))
+            except Exception:
+                input_valid = False
+        permission = self._permission_policy.check(
+            invocation,
+            context=context,
+            tool_registered=tool is not None,
+            input_valid=input_valid,
+        )
+        self._emit_permission_check(observer, permission)
+        if permission.decision == PermissionDecision.DENY:
+            self._emit(
+                observer,
+                EventType.TOOL_INVOCATION_DENIED,
+                run_id=permission.run_id,
+                invocation_id=permission.invocation_id,
+                tool_id=permission.tool_id,
+                reason=permission.reason.value,
             )
-        if invocation.tool_id not in self._allowed_tool_ids:
-            return self._failed(
-                invocation, observer, "tool is not explicitly allowed", denied=True
+            return ToolResult(
+                invocation_id=permission.invocation_id,
+                status=ToolStatus.DENIED,
+                error=permission.reason.value,
             )
 
-        observer(
+        if tool is None:
+            # The registry should not change between check and execution. Keep
+            # this defensive failure distinct from a policy denial.
+            self._emit(
+                observer,
+                EventType.TOOL_EXECUTION_FAILED,
+                run_id=permission.run_id,
+                invocation_id=permission.invocation_id,
+                tool_id=permission.tool_id,
+                status=ToolStatus.FAILED.value,
+            )
+            return ToolResult(
+                permission.invocation_id,
+                ToolStatus.FAILED,
+                error="tool became unavailable after permission check",
+            )
+
+        self._emit(
+            observer,
             EventType.TOOL_EXECUTION_STARTED,
-            {"invocation_id": invocation.invocation_id, "tool_id": invocation.tool_id},
+            run_id=permission.run_id,
+            invocation_id=permission.invocation_id,
+            tool_id=permission.tool_id,
         )
         try:
             result = tool.execute(invocation)
             if (
                 not isinstance(result, ToolResult)
-                or result.invocation_id != invocation.invocation_id
+                or result.invocation_id != permission.invocation_id
                 or not isinstance(result.status, ToolStatus)
             ):
                 raise TypeError("tool returned invalid result")
         except Exception as exc:
             result = ToolResult(
-                invocation.invocation_id,
+                permission.invocation_id,
                 ToolStatus.FAILED,
                 error=f"tool execution failed ({type(exc).__name__})",
             )
@@ -61,45 +118,41 @@ class ToolExecutor:
                 if isinstance(result.output, bytes)
                 else str(result.output or "").encode("utf-8")
             )
-            observer(
+            self._emit(
+                observer,
                 EventType.TOOL_EXECUTION_COMPLETED,
-                {
-                    "invocation_id": invocation.invocation_id,
-                    "tool_id": invocation.tool_id,
-                    "output_sha256": sha256(output_bytes).hexdigest(),
-                },
+                run_id=permission.run_id,
+                invocation_id=permission.invocation_id,
+                tool_id=permission.tool_id,
+                output_sha256=sha256(output_bytes).hexdigest(),
             )
         else:
-            observer(
+            self._emit(
+                observer,
                 EventType.TOOL_EXECUTION_FAILED,
-                {
-                    "invocation_id": invocation.invocation_id,
-                    "tool_id": invocation.tool_id,
-                    "status": result.status.value,
-                },
+                run_id=permission.run_id,
+                invocation_id=permission.invocation_id,
+                tool_id=permission.tool_id,
+                status=result.status.value,
             )
         return result
 
     @staticmethod
-    def _emit(observer, event_type, invocation) -> None:
+    def _emit_permission_check(
+        observer: Callable[[EventType, dict[str, object]], None],
+        permission: PermissionCheck,
+    ) -> None:
         observer(
-            event_type,
-            {"invocation_id": invocation.invocation_id, "tool_id": invocation.tool_id},
-        )
-
-    @classmethod
-    def _failed(cls, invocation, observer, message, *, denied):
-        result = ToolResult(
-            invocation.invocation_id,
-            ToolStatus.DENIED if denied else ToolStatus.FAILED,
-            error=message,
-        )
-        observer(
-            EventType.TOOL_EXECUTION_FAILED,
+            EventType.PERMISSION_CHECKED,
             {
-                "invocation_id": invocation.invocation_id,
-                "tool_id": invocation.tool_id,
-                "status": result.status.value,
+                "run_id": permission.run_id,
+                "invocation_id": permission.invocation_id,
+                "tool_id": permission.tool_id,
+                "decision": permission.decision.value,
+                "reason": permission.reason.value,
             },
         )
-        return result
+
+    @staticmethod
+    def _emit(observer, event_type, **data) -> None:
+        observer(event_type, data)

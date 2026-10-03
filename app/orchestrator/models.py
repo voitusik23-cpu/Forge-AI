@@ -114,6 +114,8 @@ class EventType(str, Enum):
     TOOL_EXECUTION_STARTED = "tool_execution_started"
     TOOL_EXECUTION_COMPLETED = "tool_execution_completed"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
+    PERMISSION_CHECKED = "permission_checked"
+    TOOL_INVOCATION_DENIED = "tool_invocation_denied"
 
 
 @dataclass(frozen=True)

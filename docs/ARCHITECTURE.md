@@ -337,34 +337,53 @@ or a secret scanner. Context metadata does not grant tool permissions.
 Agents can return structured `ToolInvocation` proposals in the existing
 `TaskResult`. `RunExecutor` sends each proposal to the injected `ToolExecutor`;
 it does not create another orchestrator or bypass the existing dispatch path.
-The executor validates that the tool is registered and its ID is explicitly
-allow-listed before calling it. Its default registry and allow-list are empty.
+`ToolRegistry` answers whether a tool is registered. The separate
+`PermissionPolicy` evaluates each invocation against the current Run context
+and its explicit `allowed_tool_ids` (default-deny); invocation input cannot
+grant permission. `ToolExecutor` always obtains this policy decision itself,
+so a direct call without Run context is denied. Only an `ALLOW` decision may
+start tool execution.
 `ReadProjectFile` reads only exact relative paths supplied in its explicit
 allow-list and rejects traversal and resolved paths outside the configured
 project root. It has no secret-store access and cannot write files.
 
-The resulting `ToolResult` is attached to the existing run `TaskResult`. Run
-events record invocation/tool IDs, status, and an output fingerprint on success;
-they never copy tool output or file contents. The deterministic `MockAgent`
-exercises proposals offline. This is a narrow execution boundary, not a general
-permission system, sandbox, or approval workflow.
+After the one bounded tool round, `ToolResult` values are supplied to the agent
+through the existing dispatch path and attached to the final run `TaskResult`.
+Further tool proposals receive `TOOL_LOOP_LIMIT` denial. A `permission_checked`
+event records run/invocation/tool IDs, `ALLOW` or `DENY`, and a structured reason.
+A denied request also records `tool_invocation_denied` and produces no tool
+execution events. Other Run events record
+only IDs, status, and an output fingerprint on success; they never copy tool
+output or file contents. The deterministic `MockAgent` exercises proposals
+offline. This is a narrow boundary, not a general permission system, sandbox,
+or approval workflow. Permission is not human approval.
 
 ## Tool Contract v0.1 — только чтение
 
 Агент может вернуть структурированные предложения `ToolInvocation` в
 существующем `TaskResult`. `RunExecutor` передаёт каждое предложение внедрённому
 `ToolExecutor`; отдельный оркестратор не создаётся и существующий путь dispatch
-не обходится. Исполнитель проверяет регистрацию инструмента и явное включение
-его ID в allow-list до вызова. По умолчанию registry и allow-list пусты.
+не обходится. `ToolRegistry` сообщает, зарегистрирован ли инструмент.
+Отдельная `PermissionPolicy` проверяет invocation по контексту текущего Run и
+его явному `allowed_tool_ids` (по умолчанию отказ); input invocation не может
+выдать разрешение. `ToolExecutor` всегда сам получает решение policy, поэтому
+прямой вызов без контекста Run отклоняется. Запустить инструмент можно только
+после решения `ALLOW`.
 `ReadProjectFile` читает только точные относительные пути из явного allow-list,
 отклоняя traversal и разрешённые пути за пределами настроенного корня проекта.
 У инструмента нет доступа к хранилищу секретов и возможности записи файлов.
 
-Полученный `ToolResult` добавляется в существующий `TaskResult` Run. События Run
-содержат ID invocation/tool, статус и fingerprint результата при успехе; они
-не копируют вывод инструмента или содержимое файлов. Детерминированный
-`MockAgent` проверяет предложения offline. Это узкая граница выполнения, а не
-полноценная система разрешений, sandbox или процесс подтверждения.
+После одного ограниченного tool round значения `ToolResult` передаются агенту
+через существующий dispatch path и добавляются в итоговый `TaskResult` Run.
+Последующие предложения инструментов получают отказ `TOOL_LOOP_LIMIT`.
+Событие `permission_checked` содержит ID run/invocation/tool, `ALLOW` или
+`DENY` и структурированную причину. Для отклонённых invocation дополнительно
+создаётся `tool_invocation_denied`, но события выполнения инструмента не
+создаются. Остальные события Run содержат только ID,
+статус и fingerprint результата при успехе; они не копируют вывод инструмента
+или содержимое файлов. Детерминированный `MockAgent` проверяет предложения
+offline. Это узкая граница, а не полноценная система разрешений, sandbox или
+процесс подтверждения. Permission не означает подтверждение человеком.
 
 For traceability, `context_assembled` also records a deterministic SHA-256
 fingerprint of the canonical assembled items. The fingerprint can be correlated

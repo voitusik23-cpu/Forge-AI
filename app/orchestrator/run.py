@@ -23,6 +23,8 @@ from app.orchestrator.models import (
 )
 from app.orchestrator.orchestrator import Orchestrator
 from app.tools.executor import ToolExecutor
+from app.tools.contracts import ToolResult
+from app.tools.permissions import ToolExecutionContext
 from app.tools.registry import ToolRegistry
 
 
@@ -46,6 +48,7 @@ class RunExecutor:
         provider_name: Optional[str] = None,
         agent_name: Optional[str] = None,
         explicit_inputs: Iterable[str | ContextItem] = (),
+        allowed_tool_ids: Iterable[str] = (),
     ) -> Run:
         """Execute through Orchestrator and retain a safe in-memory event trace."""
         run = Run(task=task)
@@ -67,15 +70,53 @@ class RunExecutor:
                     run, event_type, **data
                 ),
             )
-            result.tool_results.extend(
-                self._tool_executor.execute(
-                    invocation,
+            if result.success and result.tool_invocations:
+                permission_context = ToolExecutionContext(
+                    run_id=run.id,
+                    context_fingerprint=execution_context.fingerprint,
+                    allowed_tool_ids=frozenset(allowed_tool_ids),
+                )
+                initial_invocations = list(result.tool_invocations)
+                tool_results = [
+                    self._tool_executor.execute(
+                        invocation,
+                        context=permission_context,
+                        observer=lambda event_type, data: self._record(
+                            run, event_type, **data
+                        ),
+                    )
+                    for invocation in initial_invocations
+                ]
+                followup_task = self._task_with_tool_results(
+                    dispatch_task, tool_results
+                )
+                result = self._orchestrator.dispatch(
+                    followup_task,
+                    agent_name=agent_name,
+                    provider_name=provider_name,
                     observer=lambda event_type, data: self._record(
                         run, event_type, **data
                     ),
                 )
-                for invocation in result.tool_invocations
-            )
+                followup_invocations = list(result.tool_invocations)
+                followup_context = ToolExecutionContext(
+                    run_id=run.id,
+                    context_fingerprint=execution_context.fingerprint,
+                    allowed_tool_ids=permission_context.allowed_tool_ids,
+                    round_number=1,
+                )
+                tool_results.extend(
+                    self._tool_executor.execute(
+                        invocation,
+                        context=followup_context,
+                        observer=lambda event_type, data: self._record(
+                            run, event_type, **data
+                        ),
+                    )
+                    for invocation in followup_invocations
+                )
+                result.tool_invocations = initial_invocations + followup_invocations
+                result.tool_results = tool_results
             run.result = result
             if result.success:
                 run.state = RunState.COMPLETED
@@ -147,6 +188,20 @@ class RunExecutor:
         task: Task, execution_context: ExecutionContext
     ) -> Task:
         return replace(task, context={"forge_execution_context": execution_context.to_dict()})
+
+    @staticmethod
+    def _task_with_tool_results(task: Task, tool_results: list[ToolResult]) -> Task:
+        context = dict(task.context)
+        context["forge_tool_results"] = [
+            {
+                "invocation_id": result.invocation_id,
+                "status": result.status.value,
+                "output": result.output,
+                "error": result.error,
+            }
+            for result in tool_results
+        ]
+        return replace(task, context=context)
 
     @staticmethod
     def _usage_data(result: TaskResult) -> Optional[dict[str, object]]:
