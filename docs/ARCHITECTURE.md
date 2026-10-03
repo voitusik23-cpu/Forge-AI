@@ -332,6 +332,40 @@ count and kind/source/trust/freshness summaries, never item content. This is a
 small explicit-input boundary, not RAG, project memory, repository discovery,
 or a secret scanner. Context metadata does not grant tool permissions.
 
+## Tool Contract v0.1 — Read-only execution
+
+Agents can return structured `ToolInvocation` proposals in the existing
+`TaskResult`. `RunExecutor` sends each proposal to the injected `ToolExecutor`;
+it does not create another orchestrator or bypass the existing dispatch path.
+The executor validates that the tool is registered and its ID is explicitly
+allow-listed before calling it. Its default registry and allow-list are empty.
+`ReadProjectFile` reads only exact relative paths supplied in its explicit
+allow-list and rejects traversal and resolved paths outside the configured
+project root. It has no secret-store access and cannot write files.
+
+The resulting `ToolResult` is attached to the existing run `TaskResult`. Run
+events record invocation/tool IDs, status, and an output fingerprint on success;
+they never copy tool output or file contents. The deterministic `MockAgent`
+exercises proposals offline. This is a narrow execution boundary, not a general
+permission system, sandbox, or approval workflow.
+
+## Tool Contract v0.1 — только чтение
+
+Агент может вернуть структурированные предложения `ToolInvocation` в
+существующем `TaskResult`. `RunExecutor` передаёт каждое предложение внедрённому
+`ToolExecutor`; отдельный оркестратор не создаётся и существующий путь dispatch
+не обходится. Исполнитель проверяет регистрацию инструмента и явное включение
+его ID в allow-list до вызова. По умолчанию registry и allow-list пусты.
+`ReadProjectFile` читает только точные относительные пути из явного allow-list,
+отклоняя traversal и разрешённые пути за пределами настроенного корня проекта.
+У инструмента нет доступа к хранилищу секретов и возможности записи файлов.
+
+Полученный `ToolResult` добавляется в существующий `TaskResult` Run. События Run
+содержат ID invocation/tool, статус и fingerprint результата при успехе; они
+не копируют вывод инструмента или содержимое файлов. Детерминированный
+`MockAgent` проверяет предложения offline. Это узкая граница выполнения, а не
+полноценная система разрешений, sandbox или процесс подтверждения.
+
 For traceability, `context_assembled` also records a deterministic SHA-256
 fingerprint of the canonical assembled items. The fingerprint can be correlated
 with the event's `run_id` without copying context contents into the event

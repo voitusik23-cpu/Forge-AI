@@ -22,6 +22,8 @@ from app.orchestrator.models import (
     TaskResult,
 )
 from app.orchestrator.orchestrator import Orchestrator
+from app.tools.executor import ToolExecutor
+from app.tools.registry import ToolRegistry
 
 
 class RunExecutor:
@@ -31,9 +33,11 @@ class RunExecutor:
         self,
         orchestrator: Orchestrator,
         context_assembler: Optional[ContextAssembler] = None,
+        tool_executor: Optional[ToolExecutor] = None,
     ) -> None:
         self._orchestrator = orchestrator
         self._context_assembler = context_assembler or ContextAssembler()
+        self._tool_executor = tool_executor or ToolExecutor(ToolRegistry())
 
     def execute(
         self,
@@ -62,6 +66,15 @@ class RunExecutor:
                 observer=lambda event_type, data: self._record(
                     run, event_type, **data
                 ),
+            )
+            result.tool_results.extend(
+                self._tool_executor.execute(
+                    invocation,
+                    observer=lambda event_type, data: self._record(
+                        run, event_type, **data
+                    ),
+                )
+                for invocation in result.tool_invocations
             )
             run.result = result
             if result.success:

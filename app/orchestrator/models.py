@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from app.usage import Usage
+from app.tools.contracts import ToolInvocation, ToolResult
 
 
 class TaskPriority(Enum):
@@ -85,6 +86,8 @@ class TaskResult:
     provider: Optional[str] = None
     agent: Optional[str] = None
     model_name: Optional[str] = None
+    tool_invocations: list[ToolInvocation] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
 
 
 class RunState(str, Enum):
@@ -107,6 +110,10 @@ class EventType(str, Enum):
     FALLBACK = "fallback"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
+    TOOL_INVOCATION_REQUESTED = "tool_invocation_requested"
+    TOOL_EXECUTION_STARTED = "tool_execution_started"
+    TOOL_EXECUTION_COMPLETED = "tool_execution_completed"
+    TOOL_EXECUTION_FAILED = "tool_execution_failed"
 
 
 @dataclass(frozen=True)

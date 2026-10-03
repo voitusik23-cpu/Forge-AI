@@ -1,1 +1,1 @@
-"""Future controlled tools and integrations."""
+"""Provider-neutral, explicitly bounded read-only tools."""
