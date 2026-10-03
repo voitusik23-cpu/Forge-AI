@@ -701,3 +701,44 @@ SHA-256 fingerprint; неизменённые цели исключаются. �
 проверяет результат; Acceptance решает, выполнены ли обязательные критерии
 задачи. Это трассируемость в памяти процесса, а не Git или сервис хранения
 артефактов.
+
+## Project Snapshot Boundary v0.1
+
+`ProjectSnapshotter` observes only the explicit relative paths passed by the
+caller and reuses `Workspace.resolve_target` / `verify_target` for containment
+and link rejection. It records existence and SHA-256 fingerprints without
+storing file contents or scanning directories. Missing requested files are
+recorded with `exists=false` and no fingerprint; unsafe paths and unreadable
+targets fail the snapshot. Each non-empty snapshot is linked to an in-memory
+`PROJECT_SNAPSHOT` Artifact and a safe `snapshot_created` event. Workspace has
+no separate stable ID, so the snapshot carries `run_id` and `attempt_number`.
+
+When `RevisionLoopExecutor.execute(..., snapshot_paths=...)` is used, the
+explicit file set is observed before and after each attempt. Snapshots for
+initial execution use attempt 0; each revision uses its own attempt number.
+The event order records the initial state, mutation and ChangeSet, then the
+after-state before Verification and Acceptance. A snapshot describes observed
+state; a ChangeSet describes the mutation; Verification checks expectations;
+Acceptance decides whether required task criteria passed. Snapshots are
+read-only in-memory artifacts, not backups or version history.
+
+## Граница Project Snapshot v0.1
+
+`ProjectSnapshotter` наблюдает только явно переданные относительные пути и
+использует `Workspace.resolve_target` / `verify_target` для проверки границы
+и отклонения ссылок. Он записывает наличие файла и SHA-256 fingerprints, не
+сохраняя содержимое и не сканируя каталоги. Отсутствующий запрошенный файл
+записывается с `exists=false` и без fingerprint; небезопасные пути и цели,
+которые нельзя безопасно прочитать, завершают Snapshot ошибкой. Каждый
+непустой Snapshot связан с in-memory Artifact типа `PROJECT_SNAPSHOT` и
+безопасным событием `snapshot_created`. У Workspace нет отдельного стабильного
+ID, поэтому Snapshot содержит `run_id` и `attempt_number`.
+
+При вызове `RevisionLoopExecutor.execute(..., snapshot_paths=...)` указанный
+список файлов наблюдается до и после каждой попытки. Для первоначального
+выполнения используется attempt 0; каждая revision получает собственный номер
+попытки. Порядок событий фиксирует исходное состояние, изменение и ChangeSet,
+затем состояние после изменения до Verification и Acceptance. Snapshot
+описывает наблюдаемое состояние; ChangeSet — изменение; Verification проверяет
+ожидания; Acceptance решает, выполнены ли обязательные критерии задачи.
+Snapshot — read-only артефакт в памяти, а не резервная копия или история версий.

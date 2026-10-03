@@ -17,6 +17,7 @@ class ChangeSetStatus(str, Enum):
 
 class ArtifactType(str, Enum):
     CHANGESET = "CHANGESET"
+    PROJECT_SNAPSHOT = "PROJECT_SNAPSHOT"
 
 
 class ArtifactStatus(str, Enum):
@@ -47,5 +48,6 @@ class Artifact:
     artifact_id: str = field(default_factory=lambda: str(uuid4()))
     run_id: str = ""
     artifact_type: ArtifactType = ArtifactType.CHANGESET
-    changeset_id: str = ""
+    changeset_id: str | None = None
+    project_snapshot_id: str | None = None
     status: ArtifactStatus = ArtifactStatus.AVAILABLE

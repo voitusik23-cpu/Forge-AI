@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.artifacts import FileChangeType
+from app.artifacts import ArtifactType, FileChangeType
 from app.agents.registry import AgentRegistry
 from app.orchestrator.models import EventType, RunState, Task, TaskResult
 from app.orchestrator.orchestrator import Orchestrator
@@ -109,12 +109,13 @@ class RevisionLoopTests(unittest.TestCase):
         loop = RevisionLoopExecutor(run_executor, max_revision_attempts=max_attempts)
         return loop, agent, resolver
 
-    def execute(self, loop, *, allowed=(WriteProjectFile.TOOL_ID,), explicit_inputs=()):
+    def execute(self, loop, *, allowed=(WriteProjectFile.TOOL_ID,), explicit_inputs=(), snapshot_paths=None):
         return loop.execute(
             Task(id="revision-test", description="write expected file"),
             criteria=(self.criterion,),
             verification_expectations=self.expectations,
             explicit_inputs=explicit_inputs,
+            snapshot_paths=snapshot_paths,
             allowed_tool_ids=allowed,
             workspace=self.workspace,
         )
@@ -125,9 +126,21 @@ class RevisionLoopTests(unittest.TestCase):
             loop,
             allowed=(item for item in (WriteProjectFile.TOOL_ID,)),
             explicit_inputs=(item for item in ("caller input",)),
+            snapshot_paths=("result.txt",),
         )
         run = result.run
         types = [event.type for event in run.events]
+        before_index = types.index(EventType.SNAPSHOT_CREATED)
+        write_index = types.index(EventType.TOOL_EXECUTION_COMPLETED)
+        changeset_index = types.index(EventType.CHANGESET_CREATED)
+        after_index = types.index(EventType.SNAPSHOT_CREATED, before_index + 1)
+        verification_index = types.index(EventType.VERIFICATION_COMPLETED)
+        acceptance_index = types.index(EventType.ACCEPTANCE_COMPLETED)
+        self.assertLess(before_index, write_index)
+        self.assertLess(write_index, changeset_index)
+        self.assertLess(changeset_index, after_index)
+        self.assertLess(after_index, verification_index)
+        self.assertLess(verification_index, acceptance_index)
         self.assertEqual(result.status, RevisionStatus.COMPLETED)
         self.assertEqual(result.attempt_number, 1)
         self.assertEqual(result.acceptance_result.status, AcceptanceStatus.PASS)
@@ -140,9 +153,36 @@ class RevisionLoopTests(unittest.TestCase):
         self.assertEqual(run.change_sets[0].acceptance_status, "fail")
         self.assertEqual(run.change_sets[1].verification_status, "pass")
         self.assertEqual(run.change_sets[1].acceptance_status, "pass")
+        changeset_artifacts = [
+            artifact for artifact in run.artifacts
+            if artifact.artifact_type == ArtifactType.CHANGESET
+        ]
+        snapshot_artifacts = [
+            artifact for artifact in run.artifacts
+            if artifact.artifact_type == ArtifactType.PROJECT_SNAPSHOT
+        ]
+        self.assertEqual([artifact.changeset_id for artifact in changeset_artifacts], [
+            item.changeset_id for item in run.change_sets
+        ])
+        self.assertEqual(len(run.project_snapshots), 4)
+        self.assertEqual([item.attempt_number for item in run.project_snapshots], [0, 0, 1, 1])
+        self.assertEqual(len(snapshot_artifacts), 4)
         self.assertEqual(
-            [artifact.changeset_id for artifact in run.artifacts],
-            [item.changeset_id for item in run.change_sets],
+            [artifact.project_snapshot_id for artifact in snapshot_artifacts],
+            [item.snapshot_id for item in run.project_snapshots],
+        )
+        self.assertFalse(run.project_snapshots[0].files[0].exists)
+        self.assertEqual(
+            run.project_snapshots[1].files[0].fingerprint,
+            hashlib.sha256(self.bad.encode()).hexdigest(),
+        )
+        self.assertEqual(
+            run.project_snapshots[2].files[0].fingerprint,
+            hashlib.sha256(self.bad.encode()).hexdigest(),
+        )
+        self.assertEqual(
+            run.project_snapshots[3].files[0].fingerprint,
+            hashlib.sha256(self.good.encode()).hexdigest(),
         )
         self.assertEqual(types.count(EventType.ACCEPTANCE_COMPLETED), 2)
         self.assertEqual(types.count(EventType.REVISION_STARTED), 1)

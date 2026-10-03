@@ -22,6 +22,7 @@ from app.tools.verification import (
     WorkspaceVerifier,
 )
 from app.tools.workspace import Workspace
+from app.tools.project_snapshots import ProjectSnapshotter
 
 
 class RevisionStatus(str, Enum):
@@ -63,6 +64,7 @@ class RevisionLoopExecutor:
         max_revision_attempts: int = 1,
         verifier: WorkspaceVerifier | None = None,
         acceptance_gate: AcceptanceGate | None = None,
+        snapshotter: ProjectSnapshotter | None = None,
     ) -> None:
         if (
             isinstance(max_revision_attempts, bool)
@@ -74,6 +76,7 @@ class RevisionLoopExecutor:
         self.max_revision_attempts = max_revision_attempts
         self._verifier = verifier or WorkspaceVerifier()
         self._acceptance_gate = acceptance_gate or AcceptanceGate()
+        self._snapshotter = snapshotter or ProjectSnapshotter()
 
     def execute(
         self,
@@ -86,12 +89,24 @@ class RevisionLoopExecutor:
         explicit_inputs=(),
         allowed_tool_ids=(),
         workspace: Workspace | None = None,
+        snapshot_paths: Iterable[str] | None = None,
     ) -> RevisionResult:
         """Execute once, then revise only after a safe, observed Acceptance FAIL."""
         criteria = tuple(criteria)
         expectations = dict(verification_expectations)
         explicit_inputs = tuple(explicit_inputs)
         allowed_tool_ids = tuple(allowed_tool_ids)
+        requested_snapshot_paths = (
+            None if snapshot_paths is None else tuple(snapshot_paths)
+        )
+        run = Run(task=task)
+        if requested_snapshot_paths is not None:
+            self._snapshotter.create(
+                requested_snapshot_paths,
+                run=run,
+                attempt_number=0,
+                workspace=workspace,
+            )
         run = self._run_executor.execute(
             task,
             provider_name=provider_name,
@@ -99,7 +114,16 @@ class RevisionLoopExecutor:
             explicit_inputs=explicit_inputs,
             allowed_tool_ids=allowed_tool_ids,
             workspace=workspace,
+            _run=run,
+            _attempt_number=0,
         )
+        if requested_snapshot_paths is not None:
+            self._snapshotter.create(
+                requested_snapshot_paths,
+                run=run,
+                attempt_number=0,
+                workspace=workspace,
+            )
         acceptance, can_revise = self._verify_and_accept(
             run, criteria, expectations, workspace, attempt_number=0
         )
@@ -127,6 +151,13 @@ class RevisionLoopExecutor:
                 "reason": request.reason,
             })
             run.state = RunState.REVISING
+            if requested_snapshot_paths is not None:
+                self._snapshotter.create(
+                    requested_snapshot_paths,
+                    run=run,
+                    attempt_number=attempt,
+                    workspace=workspace,
+                )
             revision_task = self._revision_task(task, request)
             self._run_executor.execute(
                 revision_task,
@@ -138,6 +169,13 @@ class RevisionLoopExecutor:
                 _run=run,
                 _attempt_number=attempt,
             )
+            if requested_snapshot_paths is not None:
+                self._snapshotter.create(
+                    requested_snapshot_paths,
+                    run=run,
+                    attempt_number=attempt,
+                    workspace=workspace,
+                )
             next_acceptance, can_revise = self._verify_and_accept(
                 run, criteria, expectations, workspace, attempt_number=attempt
             )

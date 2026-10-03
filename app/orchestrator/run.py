@@ -58,7 +58,7 @@ class RunExecutor:
         run = _run or Run(task=task)
         started = time.perf_counter()
         self._record(run, EventType.RUN_STARTED, task_id=getattr(task, "id", None))
-        run.state = RunState.RUNNING if _run is None else RunState.REVISING
+        run.state = RunState.RUNNING if _attempt_number == 0 else RunState.REVISING
 
         try:
             execution_context = self._context_assembler.assemble(

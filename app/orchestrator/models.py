@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from app.artifacts import Artifact, ChangeSet
+from app.snapshots import ProjectSnapshot
 from app.usage import Usage
 from app.tools.contracts import ToolInvocation, ToolResult
 
@@ -126,6 +127,7 @@ class EventType(str, Enum):
     REVISION_STARTED = "revision_started"
     REVISION_COMPLETED = "revision_completed"
     CHANGESET_CREATED = "changeset_created"
+    SNAPSHOT_CREATED = "snapshot_created"
 
 
 @dataclass(frozen=True)
@@ -159,3 +161,4 @@ class Run:
     error: Optional[RunError] = None
     change_sets: list[ChangeSet] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
+    project_snapshots: list[ProjectSnapshot] = field(default_factory=list)
