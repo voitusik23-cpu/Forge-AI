@@ -355,8 +355,60 @@ A denied request also records `tool_invocation_denied` and produces no tool
 execution events. Other Run events record
 only IDs, status, and an output fingerprint on success; they never copy tool
 output or file contents. The deterministic `MockAgent` exercises proposals
-offline. This is a narrow boundary, not a general permission system, sandbox,
-or approval workflow. Permission is not human approval.
+offline. This is a narrow permission boundary, not a general permission
+system or sandbox. Human approval is a separate boundary described below.
+
+## Approval Boundary v0.1
+
+Tool permission and human approval are separate checks. `ToolExecutor` first
+asks `PermissionPolicy`; a `DENY` ends the path without requesting approval.
+Only after `ALLOW`, `ApprovalPolicy` checks its explicit
+`approval_required_tools` allow-list. Tools outside the list proceed without
+approval. A required approval creates an `ApprovalRequest` containing only the
+Run, invocation, and tool IDs plus a fixed reason. The request does not contain
+tool input or file contents.
+
+An independent `ApprovalResolver` may return `APPROVED` or `REJECTED`. Its
+in-memory implementation matches the exact `run_id` and `invocation_id` and
+consumes each decision once. With no resolution, the Run enters
+`WAITING_FOR_APPROVAL`, records `approval_requested`, and does not execute the
+tool or continue agent dispatch. An approval rejection returns a denied
+`ToolResult`. Only permission `ALLOW` together with approval
+`NOT_REQUIRED` or `APPROVED` can reach tool execution. Agent input cannot set
+approval state or supply a decision.
+
+`approval_requested` and `approval_resolved` events contain safe IDs, state or
+resolution, and a fixed reason; they do not contain invocation input, secrets,
+credentials, or file contents. This v0.1 boundary is in-process and does not
+provide a user interface, durable decisions, or checkpoint/resume after a Run
+waits for approval. It is not a full human approval workflow.
+
+## Граница подтверждения v0.1
+
+Разрешение инструмента и подтверждение человеком — отдельные проверки.
+`ToolExecutor` сначала обращается к `PermissionPolicy`; при `DENY` выполнение
+завершается без запроса подтверждения. Только после `ALLOW` политика
+`ApprovalPolicy` проверяет явный список `approval_required_tools`. Инструменты,
+не включённые в список, выполняются без подтверждения. Обязательное
+подтверждение создаёт `ApprovalRequest`, содержащий только ID Run, вызова и
+инструмента, а также фиксированную причину. В запрос не входят входные данные
+инструмента или содержимое файлов.
+
+Независимый `ApprovalResolver` может вернуть `APPROVED` или `REJECTED`. Его
+внутрипроцессная реализация сопоставляет точные `run_id` и `invocation_id` и
+использует каждое решение только один раз. Если решения нет, Run переходит в
+`WAITING_FOR_APPROVAL`, записывает событие `approval_requested` и не запускает
+инструмент или последующую отправку агенту. При отказе возвращается запрещённый
+`ToolResult`. Запустить инструмент можно только при сочетании разрешения
+`ALLOW` с подтверждением `NOT_REQUIRED` или `APPROVED`. Входные данные агента не
+могут устанавливать состояние подтверждения или передавать решение.
+
+События `approval_requested` и `approval_resolved` содержат безопасные ID,
+состояние или решение и фиксированную причину; входные данные вызова, секреты,
+учётные данные и содержимое файлов в них не записываются. Граница v0.1 работает
+в памяти процесса и не предоставляет пользовательский интерфейс, постоянное
+хранение решений или checkpoint/resume после ожидания подтверждения. Это не
+полноценный процесс подтверждения человеком.
 
 ## Tool Contract v0.1 — только чтение
 

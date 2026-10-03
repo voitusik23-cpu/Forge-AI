@@ -24,6 +24,7 @@ class ToolStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     DENIED = "denied"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
 
 
 @dataclass(frozen=True)

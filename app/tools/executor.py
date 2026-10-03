@@ -4,6 +4,12 @@ from collections.abc import Callable
 from hashlib import sha256
 
 from app.orchestrator.models import EventType
+from app.tools.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalResolver,
+    ApprovalState,
+)
 from app.tools.contracts import ToolInvocation, ToolResult, ToolStatus
 from app.tools.permissions import (
     PermissionCheck,
@@ -19,9 +25,13 @@ class ToolExecutor:
         self,
         registry: ToolRegistry,
         permission_policy: PermissionPolicy | None = None,
+        approval_policy: ApprovalPolicy | None = None,
+        approval_resolver: ApprovalResolver | None = None,
     ) -> None:
         self._registry = registry
         self._permission_policy = permission_policy or PermissionPolicy()
+        self._approval_policy = approval_policy or ApprovalPolicy()
+        self._approval_resolver = approval_resolver
 
     def execute(
         self,
@@ -72,6 +82,52 @@ class ToolExecutor:
                 status=ToolStatus.DENIED,
                 error=permission.reason.value,
             )
+
+        approval_state = self._approval_policy.evaluate(permission.tool_id)
+        if approval_state == ApprovalState.REQUIRED:
+            request = ApprovalRequest(
+                run_id=permission.run_id,
+                invocation_id=permission.invocation_id,
+                tool_id=permission.tool_id,
+                reason="tool requires explicit approval",
+            )
+            self._emit(
+                observer,
+                EventType.APPROVAL_REQUESTED,
+                run_id=request.run_id,
+                invocation_id=request.invocation_id,
+                tool_id=request.tool_id,
+                state=ApprovalState.REQUIRED.value,
+                reason=request.reason,
+            )
+            resolution = (
+                self._approval_resolver.resolve(request)
+                if self._approval_resolver is not None
+                else None
+            )
+            if not isinstance(resolution, ApprovalState) or resolution not in (
+                ApprovalState.APPROVED,
+                ApprovalState.REJECTED,
+            ):
+                return ToolResult(
+                    permission.invocation_id,
+                    ToolStatus.WAITING_FOR_APPROVAL,
+                    error="approval required",
+                )
+            self._emit(
+                observer,
+                EventType.APPROVAL_RESOLVED,
+                run_id=request.run_id,
+                invocation_id=request.invocation_id,
+                tool_id=request.tool_id,
+                resolution=resolution.value,
+            )
+            if resolution == ApprovalState.REJECTED:
+                return ToolResult(
+                    permission.invocation_id,
+                    ToolStatus.DENIED,
+                    error="approval rejected",
+                )
 
         if tool is None:
             # The registry should not change between check and execution. Keep

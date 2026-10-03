@@ -23,7 +23,7 @@ from app.orchestrator.models import (
 )
 from app.orchestrator.orchestrator import Orchestrator
 from app.tools.executor import ToolExecutor
-from app.tools.contracts import ToolResult
+from app.tools.contracts import ToolResult, ToolStatus
 from app.tools.permissions import ToolExecutionContext
 from app.tools.registry import ToolRegistry
 
@@ -87,6 +87,14 @@ class RunExecutor:
                     )
                     for invocation in initial_invocations
                 ]
+                result.tool_results = tool_results
+                if any(
+                    item.status == ToolStatus.WAITING_FOR_APPROVAL
+                    for item in tool_results
+                ):
+                    run.result = result
+                    run.state = RunState.WAITING_FOR_APPROVAL
+                    return run
                 followup_task = self._task_with_tool_results(
                     dispatch_task, tool_results
                 )

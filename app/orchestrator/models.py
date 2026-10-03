@@ -95,6 +95,7 @@ class RunState(str, Enum):
 
     CREATED = "CREATED"
     RUNNING = "RUNNING"
+    WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
@@ -116,6 +117,8 @@ class EventType(str, Enum):
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     PERMISSION_CHECKED = "permission_checked"
     TOOL_INVOCATION_DENIED = "tool_invocation_denied"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_RESOLVED = "approval_resolved"
 
 
 @dataclass(frozen=True)
