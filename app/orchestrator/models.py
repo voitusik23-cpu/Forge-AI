@@ -141,6 +141,13 @@ class EventType(str, Enum):
     DECISION_MADE = "decision_made"
     DECISION_REJECTED = "decision_rejected"
     CONTEXT_DECISION_READY = "context_decision_ready"
+    HARNESS_STARTED = "harness_started"
+    HARNESS_ITERATION_STARTED = "harness_iteration_started"
+    HARNESS_PHASE_CHANGED = "harness_phase_changed"
+    HARNESS_OBSERVATION_RECORDED = "harness_observation_recorded"
+    HARNESS_COMPLETED = "harness_completed"
+    HARNESS_FAILED = "harness_failed"
+    HARNESS_LIMIT_REACHED = "harness_limit_reached"
 
     @classmethod
     def _missing_(cls, value: object):

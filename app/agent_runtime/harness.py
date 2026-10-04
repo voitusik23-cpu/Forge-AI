@@ -1,0 +1,644 @@
+"""Deterministic Agent Harness and controlled Run Loop for Forge AI."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import replace
+from typing import Any
+from uuid import uuid4
+
+from app.agent_runtime.models import (
+    HarnessPhase,
+    HarnessRequest,
+    HarnessResult,
+    HarnessState,
+    HarnessStatus,
+    StructuredObservation,
+)
+from app.agent_runtime.policy import AgentHarnessPolicy
+from app.context.assembler import DecisionContextAssembler
+from app.decision.models import Decision, DecisionAction, DecisionRequest, DecisionType
+from app.decision.provider import DecisionProvider, DeterministicDecisionProvider
+from app.decision.validator import DecisionValidationReport, validate_decision
+from app.execution.adapter import LocalExecutionAdapter
+from app.execution.authorizer import ExecutionCoordinator
+from app.execution.request import ExecutionOutcomeStatus, ExecutionResult
+from app.orchestrator.models import EventType
+from app.orchestrator.trace import RunEvent, RunEventCollector, RunTrace
+from app.projects.state import ProjectState, ProjectStateStatus, derive_project_state
+from app.tools.acceptance import AcceptanceGate, AcceptanceResult, AcceptanceStatus
+from app.tools.approval import ApprovalPolicy, ApprovalRequest, ApprovalState
+from app.tools.verification import VerificationExpectation, VerificationResult, WorkspaceVerifier
+
+
+class AgentHarness:
+    """Bounded, deterministic runtime harness coordinating the Run Loop.
+
+    Explicit Lifecycle:
+        OBSERVE
+        -> ASSEMBLE_CONTEXT
+        -> DECIDE
+        -> VALIDATE_DECISION
+        -> AUTHORIZE
+        -> ACT (at most one authoritative action)
+        -> OBSERVE_RESULT
+        -> UPDATE_STATE
+        -> REPEAT or COMPLETE
+    """
+
+    def __init__(
+        self,
+        *,
+        context_assembler: DecisionContextAssembler | None = None,
+        decision_provider: DecisionProvider | None = None,
+        decision_validator: (
+            Callable[[Decision, DecisionRequest, ProjectState | None], DecisionValidationReport]
+            | None
+        ) = None,
+        execution_coordinator: ExecutionCoordinator | None = None,
+        verifier: WorkspaceVerifier | None = None,
+        acceptance_gate: AcceptanceGate | None = None,
+        state_derivator: Callable[..., ProjectState] | None = None,
+        policy: AgentHarnessPolicy | None = None,
+    ) -> None:
+        self._context_assembler = context_assembler or DecisionContextAssembler()
+        self._decision_provider = decision_provider or DeterministicDecisionProvider()
+        self._decision_validator = decision_validator or validate_decision
+        self._execution_coordinator = execution_coordinator
+        self._verifier = verifier or WorkspaceVerifier()
+        self._acceptance_gate = acceptance_gate or AcceptanceGate()
+        self._state_derivator = state_derivator or derive_project_state
+        self.policy = policy or AgentHarnessPolicy()
+
+    def run(self, request: HarnessRequest) -> HarnessResult:
+        """Execute the controlled, bounded Run Loop according to configured policy."""
+        collector = RunEventCollector(request.run_id)
+
+        current_state = HarnessState(
+            run_id=request.run_id,
+            attempt_number=request.attempt_number,
+            iteration=0,
+            phase=HarnessPhase.OBSERVE,
+            status=HarnessStatus.RUNNING,
+        )
+
+        def emit(event_type: EventType, data: Mapping[str, object] | None = None) -> None:
+            collector.emit(
+                event_type,
+                attempt_number=current_state.attempt_number,
+                task_id=request.task_specification.task_id if request.task_specification else None,
+                metadata=data or {},
+            )
+
+        emit(EventType.HARNESS_STARTED, {"policy": repr(self.policy)})
+
+        iterations_history: list[HarnessState] = []
+        observations: list[StructuredObservation] = []
+        decisions: list[Decision] = []
+        execution_results: list[ExecutionResult] = []
+        verification_results: list[VerificationResult] = []
+        acceptance_result: AcceptanceResult | None = None
+
+        action_count = 0
+        execution_count = 0
+        revision_count = 0
+        exec_index = 0
+
+        current_project_state = request.initial_project_state or self._state_derivator(
+            run_id=request.run_id,
+            attempt_number=request.attempt_number,
+            task_id=request.task_specification.task_id if request.task_specification else "",
+        )
+
+        while not current_state.terminal:
+            # 0. Check bounds
+            if current_state.iteration >= self.policy.max_iterations:
+                current_state = replace(
+                    current_state,
+                    phase=HarnessPhase.FAILED,
+                    status=HarnessStatus.LIMIT_REACHED,
+                    terminal=True,
+                    metadata={"limit": "max_iterations", "value": self.policy.max_iterations},
+                )
+                emit(
+                    EventType.HARNESS_LIMIT_REACHED,
+                    {"reason": "max_iterations_reached", "iteration": current_state.iteration},
+                )
+                iterations_history.append(current_state)
+                break
+
+            if action_count >= self.policy.max_actions:
+                current_state = replace(
+                    current_state,
+                    phase=HarnessPhase.FAILED,
+                    status=HarnessStatus.LIMIT_REACHED,
+                    terminal=True,
+                    metadata={"limit": "max_actions", "value": self.policy.max_actions},
+                )
+                emit(
+                    EventType.HARNESS_LIMIT_REACHED,
+                    {"reason": "max_actions_reached", "action_count": action_count},
+                )
+                iterations_history.append(current_state)
+                break
+
+            emit(EventType.HARNESS_ITERATION_STARTED, {"iteration": current_state.iteration})
+
+            # PHASE 1: OBSERVE
+            current_state = replace(current_state, phase=HarnessPhase.OBSERVE)
+            emit(
+                EventType.HARNESS_PHASE_CHANGED,
+                {"phase": HarnessPhase.OBSERVE.value, "iteration": current_state.iteration},
+            )
+
+            # PHASE 2: CONTEXT
+            current_state = replace(current_state, phase=HarnessPhase.CONTEXT)
+            emit(
+                EventType.HARNESS_PHASE_CHANGED,
+                {"phase": HarnessPhase.CONTEXT.value, "iteration": current_state.iteration},
+            )
+
+            conditions: list[str] = []
+            if current_state.status == HarnessStatus.WAITING_FOR_APPROVAL:
+                conditions.append("approval_pending")
+            if revision_count >= self.policy.max_revision_attempts:
+                conditions.append("revision_limit_reached")
+            for res in execution_results:
+                if res.outcome_status == ExecutionOutcomeStatus.PERMISSION_DENIED:
+                    conditions.append("permission_denied")
+                elif res.outcome_status in (
+                    ExecutionOutcomeStatus.POLICY_DENIED,
+                    ExecutionOutcomeStatus.APPROVAL_REJECTED,
+                ):
+                    conditions.append("policy_denied")
+                elif res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
+                    conditions.append("approval_pending")
+
+            try:
+                context_envelope = self._context_assembler.assemble(
+                    run_id=request.run_id,
+                    attempt_number=current_state.attempt_number,
+                    task_id=request.task_specification.task_id if request.task_specification else "",
+                    task_specification=request.task_specification,
+                    project_state=current_project_state,
+                    verification_results=tuple(verification_results),
+                    acceptance_result=acceptance_result,
+                    blocking_conditions=tuple(conditions),
+                    requirements=request.requirements,
+                    acceptance_criteria=request.acceptance_criteria,
+                )
+            except Exception as exc:
+                current_state = replace(
+                    current_state,
+                    phase=HarnessPhase.FAILED,
+                    status=HarnessStatus.FAILED,
+                    terminal=True,
+                    metadata={"error": str(exc)},
+                )
+                emit(EventType.HARNESS_FAILED, {"error": str(exc)})
+                iterations_history.append(current_state)
+                break
+
+            # PHASE 3: DECIDE
+            current_state = replace(
+                current_state,
+                phase=HarnessPhase.DECIDE,
+                latest_context_id=context_envelope.context_id,
+                latest_context_fingerprint=context_envelope.context_fingerprint,
+            )
+            emit(
+                EventType.HARNESS_PHASE_CHANGED,
+                {"phase": HarnessPhase.DECIDE.value, "iteration": current_state.iteration},
+            )
+
+            dec_req = DecisionRequest(
+                decision_id=str(uuid4()),
+                run_id=request.run_id,
+                attempt_number=current_state.attempt_number,
+                current_project_state=current_project_state,
+                blocking_conditions=tuple(conditions),
+                context_id=context_envelope.context_id,
+                context_fingerprint=context_envelope.context_fingerprint,
+                context_envelope=context_envelope,
+            )
+            emit(
+                EventType.DECISION_REQUESTED,
+                {"decision_id": dec_req.decision_id, "iteration": current_state.iteration},
+            )
+            decision = self._decision_provider.decide(dec_req)
+            emit(
+                EventType.DECISION_MADE,
+                {
+                    "decision_id": decision.decision_id,
+                    "action": decision.action.value,
+                    "decision_type": decision.decision_type.value,
+                },
+            )
+            decisions.append(decision)
+            current_state = replace(current_state, latest_decision_id=decision.decision_id)
+
+            # PHASE 4: VALIDATE
+            current_state = replace(current_state, phase=HarnessPhase.VALIDATE)
+            emit(
+                EventType.HARNESS_PHASE_CHANGED,
+                {"phase": HarnessPhase.VALIDATE.value, "iteration": current_state.iteration},
+            )
+
+            val = self._decision_validator(decision, dec_req, current_project_state)
+            if not val.valid:
+                emit(
+                    EventType.DECISION_REJECTED,
+                    {"decision_id": decision.decision_id, "errors": list(val.errors)},
+                )
+                if self.policy.fail_on_unknown_decision or any(
+                    "premature" in e or "invalid" in e for e in val.errors
+                ):
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.FAILED,
+                        status=HarnessStatus.FAILED,
+                        terminal=True,
+                        metadata={"validation_errors": list(val.errors)},
+                    )
+                    emit(
+                        EventType.HARNESS_FAILED,
+                        {"reason": "decision_validation_failed", "errors": list(val.errors)},
+                    )
+                    iterations_history.append(current_state)
+                    break
+
+            # PHASE 5: AUTHORIZE
+            current_state = replace(current_state, phase=HarnessPhase.AUTHORIZE)
+            emit(
+                EventType.HARNESS_PHASE_CHANGED,
+                {"phase": HarnessPhase.AUTHORIZE.value, "iteration": current_state.iteration},
+            )
+
+            authorized = False
+            auth_denial_reason = ""
+            auth_waiting = False
+
+            action = decision.action
+            if action == DecisionAction.COMPLETE_RUN:
+                if (
+                    acceptance_result is not None
+                    and acceptance_result.status == AcceptanceStatus.PASS
+                ):
+                    authorized = True
+                else:
+                    authorized = False
+                    auth_denial_reason = "acceptance_not_passed"
+
+            elif action == DecisionAction.FAIL_RUN:
+                authorized = True
+
+            elif action in (
+                DecisionAction.WAIT_FOR_APPROVAL,
+                DecisionAction.REQUEST_USER_APPROVAL,
+            ):
+                authorized = True
+                auth_waiting = True
+
+            elif action == DecisionAction.RUN_VERIFICATION:
+                authorized = True
+
+            elif action == DecisionAction.REQUEST_REVISION:
+                if revision_count < self.policy.max_revision_attempts:
+                    authorized = True
+                else:
+                    authorized = False
+                    auth_denial_reason = "revision_limit_reached"
+
+            elif action == DecisionAction.EXECUTE:
+                if execution_count >= self.policy.max_execution_attempts:
+                    authorized = False
+                    auth_denial_reason = "execution_limit_reached"
+                else:
+                    if exec_index < len(request.execution_requests):
+                        current_exec_req = request.execution_requests[exec_index]
+                        cmd = current_exec_req.command[0] if current_exec_req.command else ""
+                        allowed_cmds = request.allowed_execution_commands
+                        if allowed_cmds is not None and cmd not in allowed_cmds:
+                            authorized = False
+                            auth_denial_reason = "permission_denied"
+                        else:
+                            if request.approval_policy is not None:
+                                appr_state = request.approval_policy.evaluate(cmd)
+                            else:
+                                appr_state = ApprovalState.NOT_REQUIRED
+                            if appr_state == ApprovalState.REQUIRED:
+                                # Needs human approval — check resolver
+                                if request.approval_resolver is not None:
+                                    appr_request = ApprovalRequest(
+                                        run_id=request.run_id,
+                                        invocation_id=current_exec_req.request_id,
+                                        tool_id=cmd,
+                                        reason="execution_requires_approval",
+                                    )
+                                    resolved = request.approval_resolver.resolve(appr_request)
+                                    if resolved == ApprovalState.APPROVED:
+                                        authorized = True
+                                    elif resolved == ApprovalState.REJECTED:
+                                        authorized = False
+                                        auth_denial_reason = "approval_rejected"
+                                    else:
+                                        # None → still pending
+                                        authorized = False
+                                        auth_waiting = True
+                                        auth_denial_reason = "approval_waiting"
+                                else:
+                                    authorized = False
+                                    auth_waiting = True
+                                    auth_denial_reason = "approval_waiting"
+                            else:
+                                authorized = True
+                    else:
+                        authorized = False
+                        auth_denial_reason = "no_execution_request"
+            else:
+                authorized = False
+                auth_denial_reason = "unknown_action"
+
+            # PHASE 6: ACT (at most one authoritative action)
+            current_state = replace(current_state, phase=HarnessPhase.ACT)
+            emit(
+                EventType.HARNESS_PHASE_CHANGED,
+                {"phase": HarnessPhase.ACT.value, "iteration": current_state.iteration},
+            )
+            action_count += 1
+
+            action_outcome = ""
+            latest_exec_id = None
+            latest_verif_id = None
+
+            if not authorized:
+                if auth_waiting or auth_denial_reason == "approval_waiting":
+                    action_outcome = "approval_waiting"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.WAITING,
+                        status=HarnessStatus.WAITING_FOR_APPROVAL,
+                        terminal=True,
+                        metadata={"reason": "approval_waiting"},
+                    )
+                    emit(EventType.EXECUTION_DENIED, {"reason": "approval_waiting"})
+                    emit(EventType.HARNESS_PHASE_CHANGED, {"phase": HarnessPhase.WAITING.value})
+                elif auth_denial_reason == "permission_denied":
+                    action_outcome = "permission_denied"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.FAILED,
+                        status=HarnessStatus.FAILED,
+                        terminal=True,
+                        metadata={"reason": "permission_denied"},
+                    )
+                    emit(EventType.EXECUTION_DENIED, {"reason": "permission_denied"})
+                    emit(EventType.HARNESS_FAILED, {"reason": "permission_denied"})
+                elif auth_denial_reason == "approval_rejected":
+                    action_outcome = "approval_rejected"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.FAILED,
+                        status=HarnessStatus.FAILED,
+                        terminal=True,
+                        metadata={"reason": "approval_rejected"},
+                    )
+                    emit(EventType.EXECUTION_DENIED, {"reason": "approval_rejected"})
+                    emit(EventType.HARNESS_FAILED, {"reason": "approval_rejected"})
+                else:
+                    action_outcome = f"denied:{auth_denial_reason}"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.FAILED,
+                        status=HarnessStatus.FAILED,
+                        terminal=True,
+                        metadata={"reason": auth_denial_reason},
+                    )
+                    emit(EventType.HARNESS_FAILED, {"reason": auth_denial_reason})
+            else:
+                if action == DecisionAction.COMPLETE_RUN:
+                    action_outcome = "completed"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.COMPLETE,
+                        status=HarnessStatus.COMPLETED,
+                        terminal=True,
+                    )
+                    emit(EventType.HARNESS_COMPLETED, {"status": "completed"})
+
+                elif action == DecisionAction.FAIL_RUN:
+                    action_outcome = "failed"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.FAILED,
+                        status=HarnessStatus.FAILED,
+                        terminal=True,
+                    )
+                    emit(EventType.HARNESS_FAILED, {"status": "failed"})
+
+                elif action in (
+                    DecisionAction.WAIT_FOR_APPROVAL,
+                    DecisionAction.REQUEST_USER_APPROVAL,
+                ):
+                    action_outcome = "approval_waiting"
+                    current_state = replace(
+                        current_state,
+                        phase=HarnessPhase.WAITING,
+                        status=HarnessStatus.WAITING_FOR_APPROVAL,
+                        terminal=True,
+                    )
+                    emit(EventType.HARNESS_PHASE_CHANGED, {"phase": HarnessPhase.WAITING.value})
+
+                elif action == DecisionAction.REQUEST_REVISION:
+                    revision_count += 1
+                    action_outcome = "revision_requested"
+                    current_state = replace(
+                        current_state,
+                        attempt_number=current_state.attempt_number + 1,
+                    )
+                    emit(
+                        EventType.REVISION_STARTED,
+                        {"attempt_number": current_state.attempt_number},
+                    )
+
+                elif action == DecisionAction.EXECUTE:
+                    execution_count += 1
+                    current_exec_req = request.execution_requests[exec_index]
+                    exec_index += 1
+                    coordinator = self._execution_coordinator or ExecutionCoordinator(
+                        LocalExecutionAdapter(
+                            workspace_root=request.workspace.root if request.workspace else None
+                        )
+                    )
+                    allowed_cmds = (
+                        frozenset(request.allowed_execution_commands)
+                        if request.allowed_execution_commands is not None
+                        else None
+                    )
+                    exec_res = coordinator.execute(
+                        current_exec_req,
+                        run_id=request.run_id,
+                        allowed_commands=allowed_cmds,
+                        approval_policy=request.approval_policy,
+                        approval_resolver=request.approval_resolver,
+                        observer=lambda event_type, data: emit(event_type, data),
+                    )
+                    execution_results.append(exec_res)
+                    action_outcome = exec_res.outcome_status.value
+                    latest_exec_id = exec_res.request_id
+
+                    if exec_res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.WAITING,
+                            status=HarnessStatus.WAITING_FOR_APPROVAL,
+                            terminal=True,
+                            metadata={"reason": "approval_waiting"},
+                        )
+                        emit(EventType.HARNESS_PHASE_CHANGED, {"phase": HarnessPhase.WAITING.value})
+                    elif exec_res.outcome_status in (
+                        ExecutionOutcomeStatus.PERMISSION_DENIED,
+                        ExecutionOutcomeStatus.POLICY_DENIED,
+                        ExecutionOutcomeStatus.APPROVAL_REJECTED,
+                    ):
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.FAILED,
+                            status=HarnessStatus.FAILED,
+                            terminal=True,
+                            metadata={"reason": exec_res.outcome_status.value},
+                        )
+                        emit(EventType.HARNESS_FAILED, {"reason": exec_res.outcome_status.value})
+                    elif exec_res.outcome_status != ExecutionOutcomeStatus.EXECUTION_SUCCESS:
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.FAILED,
+                            status=HarnessStatus.FAILED,
+                            terminal=True,
+                            metadata={"reason": exec_res.outcome_status.value},
+                        )
+                        emit(EventType.HARNESS_FAILED, {"reason": exec_res.outcome_status.value})
+
+                elif action == DecisionAction.RUN_VERIFICATION:
+                    current_state = replace(current_state, phase=HarnessPhase.VERIFY)
+                    emit(
+                        EventType.HARNESS_PHASE_CHANGED,
+                        {"phase": HarnessPhase.VERIFY.value, "iteration": current_state.iteration},
+                    )
+
+                    verifs_for_this_round: list[VerificationResult] = []
+                    for crit_id, exp in request.verification_expectations.items():
+                        v_res = self._verifier.verify(
+                            exp,
+                            workspace=request.workspace,
+                            run_id=request.run_id,
+                            observer=lambda event_type, data: emit(event_type, data),
+                            criterion_id=crit_id,
+                        )
+                        verifs_for_this_round.append(v_res)
+                        verification_results.append(v_res)
+                        latest_verif_id = v_res.verification_id
+
+                    v_dict = {
+                        (v.criterion_id or f"crit-{idx}"): v
+                        for idx, v in enumerate(verifs_for_this_round)
+                    }
+                    acceptance_result = self._acceptance_gate.evaluate(
+                        criteria=request.acceptance_criteria,
+                        verifications=v_dict,
+                        run_id=request.run_id,
+                        observer=lambda event_type, data: emit(event_type, data),
+                        requirements=request.requirements if request.requirements else None,
+                    )
+                    action_outcome = acceptance_result.status.value
+
+            # PHASE 7: OBSERVE_RESULT
+            obs = StructuredObservation(
+                action=action.value if hasattr(action, "value") else str(action),
+                result_status=action_outcome,
+                execution_result_id=latest_exec_id,
+                verification_id=latest_verif_id,
+                acceptance_status=acceptance_result.status.value if acceptance_result else None,
+                project_state=current_project_state.status.value if current_project_state else None,
+                metadata={"action_count": action_count, "iteration": current_state.iteration},
+            )
+            observations.append(obs)
+            emit(
+                EventType.HARNESS_OBSERVATION_RECORDED,
+                {
+                    "action": obs.action,
+                    "result_status": obs.result_status,
+                    "iteration": current_state.iteration,
+                },
+            )
+
+            # PHASE 8: UPDATE_STATE
+            # Preserve the terminal phase (e.g. COMPLETE, WAITING, FAILED) so that
+            # the state derivation bookkeeping does not overwrite it.
+            terminal_phase = current_state.phase if current_state.terminal else None
+            terminal_status = current_state.status if current_state.terminal else None
+
+            if not current_state.terminal:
+                current_state = replace(current_state, phase=HarnessPhase.UPDATE)
+                emit(
+                    EventType.HARNESS_PHASE_CHANGED,
+                    {"phase": HarnessPhase.UPDATE.value, "iteration": current_state.iteration},
+                )
+
+            current_project_state = self._state_derivator(
+                run_id=request.run_id,
+                attempt_number=current_state.attempt_number,
+                task_id=request.task_specification.task_id if request.task_specification else "",
+                execution_results=execution_results,
+                verification_results=verification_results,
+                acceptance_result=acceptance_result,
+            )
+            emit(
+                EventType.PROJECT_STATE_UPDATED,
+                {
+                    "run_id": request.run_id,
+                    "attempt_number": current_project_state.attempt_number,
+                    "status": current_project_state.status.value,
+                },
+            )
+
+            current_state = replace(
+                current_state,
+                project_state_status=current_project_state.status.value,
+                latest_execution_result_id=latest_exec_id or current_state.latest_execution_result_id,
+                latest_verification_id=latest_verif_id or current_state.latest_verification_id,
+            )
+
+            # Restore terminal phase / status so result.final_state has the
+            # correct phase (COMPLETE, WAITING, FAILED) rather than UPDATE.
+            if terminal_phase is not None and terminal_status is not None:
+                current_state = replace(
+                    current_state,
+                    phase=terminal_phase,
+                    status=terminal_status,
+                )
+
+            iterations_history.append(current_state)
+
+            if current_state.terminal:
+                break
+
+
+            current_state = replace(
+                current_state,
+                iteration=current_state.iteration + 1,
+                phase=HarnessPhase.OBSERVE,
+            )
+
+        return HarnessResult(
+            run_id=request.run_id,
+            final_state=current_state,
+            iterations=tuple(iterations_history),
+            observations=tuple(observations),
+            decisions=tuple(decisions),
+            execution_results=tuple(execution_results),
+            verification_results=tuple(verification_results),
+            final_acceptance=acceptance_result,
+            final_project_state=current_project_state,
+            events=tuple(collector.events),
+        )
