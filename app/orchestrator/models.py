@@ -136,6 +136,16 @@ class EventType(str, Enum):
     EXECUTION_STARTED = "execution_started"
     EXECUTION_COMPLETED = "execution_completed"
     EXECUTION_DENIED = "execution_denied"
+    PROJECT_STATE_UPDATED = "project_state_updated"
+
+    @classmethod
+    def _missing_(cls, value: object):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            for member in cls:
+                if member.value == normalized or member.name.lower() == normalized:
+                    return member
+        return None
 
 
 @dataclass(frozen=True)

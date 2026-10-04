@@ -35,6 +35,7 @@ from app.execution.request import (
     ExecutionResult,
 )
 from app.projects.state import ProjectState, derive_project_state
+from app.orchestrator.trace import RunEvent, RunTrace, build_trace_from_run
 
 
 class EngineeringRunStatus(str, Enum):
@@ -89,10 +90,15 @@ class EngineeringRunResult:
     execution_profile: ProjectExecutionProfile | None = None
     execution_results: tuple[ExecutionResult, ...] = ()
     project_states: tuple[ProjectState, ...] = ()
+    trace: RunTrace | None = None
 
     @property
     def final_project_state(self) -> ProjectState | None:
         return self.project_states[-1] if self.project_states else None
+
+    @property
+    def events(self) -> tuple[RunEvent, ...]:
+        return self.trace.events if self.trace is not None else ()
 
     @property
     def detailed_acceptance_report(self) -> DetailedAcceptanceReport | None:
@@ -229,6 +235,37 @@ class EngineeringRunExecutor:
             )
             project_states.append(st)
 
+        for st in project_states:
+            run.events.append(
+                Event(
+                    run_id=run.id,
+                    type=EventType.PROJECT_STATE_UPDATED,
+                    data={
+                        "run_id": run.id,
+                        "attempt_number": st.attempt_number,
+                        "status": st.status.value,
+                        "project_state_status": st.status.value,
+                        "snapshot_id": st.snapshot_id,
+                        "changeset_id": st.changeset_id,
+                        "acceptance_status": st.acceptance_status,
+                    },
+                )
+            )
+
+        run.events.append(
+            Event(
+                run_id=run.id,
+                type=EventType.RUN_COMPLETED,
+                data={
+                    "run_id": run.id,
+                    "status": final_status.value,
+                    "task_id": task_id,
+                },
+            )
+        )
+
+        trace = build_trace_from_run(run, project_states=tuple(project_states))
+
         return EngineeringRunResult(
             run_id=run.id,
             task_id=task_id,
@@ -250,6 +287,7 @@ class EngineeringRunExecutor:
             execution_profile=execution_profile,
             execution_results=tuple(execution_results),
             project_states=tuple(project_states),
+            trace=trace,
         )
 
     @staticmethod

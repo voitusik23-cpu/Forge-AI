@@ -1202,3 +1202,65 @@ ProjectState (Запись состояния и трассируемости)
   - Он НЕ заменяет границы `Permission`, `Approval` или `ExecutionPolicy`.
   - Он НЕ принимает решений о приёмке (это исключительная ответственность `AcceptanceGate`).
   - Он НЕ выполняет операций Git, отката/восстановления файлов или сохранения в базу данных.
+
+## Run Trace / Event Contract v0.1
+
+Run Trace / Event Contract v0.1 introduces a deterministic, provider-neutral in-memory event and trace model (`RunEvent`, `RunTrace`, `RunEventCollector`) providing chronological observability across an Engineering Run:
+
+```text
+Run Lifecycle Facts
+        ↓
+RunEvent (Ordered, Immutable Observation)
+        ↓
+RunEventCollector / RunTrace (Monotonic Sequence & Run Binding)
+        ↓
+EngineeringRunResult.trace / EngineeringRunResult.events
+```
+
+- **Purpose:** Provide a safe, audit-grade chronological trace of execution milestones connecting Forge artifacts without introducing distributed tracing, event sourcing, databases, or streaming infrastructure.
+- **RunEvent Model:** An immutable, frozen dataclass capturing safe lifecycle facts:
+  - Identity & Ordering: `run_id`, `sequence_number` (monotonic integer starting at 0), `event_type` (`RunEventType`), `event_id`, `timestamp`.
+  - Context & Revision: `attempt_number`, `task_id`.
+  - Artifact references: `requirement_id`, `criterion_id`, `execution_request_id`, `execution_result_id`, `verification_id`, `changeset_id`, `snapshot_id`, `project_state_status`, `acceptance_status`.
+  - Sanitized metadata: `metadata: Mapping[str, object]`.
+- **Event Semantics (`RunEventType`):** Minimal canonical lifecycle enum including `RUN_STARTED`, `CONTEXT_ASSEMBLED`, `EXECUTION_REQUESTED`, `EXECUTION_POLICY_CHECKED`, `EXECUTION_STARTED`, `EXECUTION_COMPLETED`, `EXECUTION_DENIED`, `APPROVAL_REQUESTED`, `APPROVAL_RESOLVED`, `VERIFICATION_COMPLETED`, `ACCEPTANCE_COMPLETED`, `REVISION_STARTED`, `REVISION_COMPLETED`, `PROJECT_STATE_UPDATED`, `RUN_COMPLETED`.
+- **Deterministic Sequence Ordering:** Authoritative ordering within a Run is established strictly by `run_id + sequence_number`. Wall-clock timestamps provide informational context but sequence monotonicity (0, 1, 2, ...) governs trace validity. Out-of-order, duplicate, or negative sequence numbers are strictly rejected.
+- **Metadata Sanitization & Security:** Automatic deterministic filtering purges `stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, and `file_content` from event metadata. Events store references only, never raw streams or source code.
+- **Trace Collection (`RunTrace`, `RunEventCollector`):** In-memory append-only collector binding events to `run_id`, enforcing sequential continuity, and exposing an immutable tuple of events (`trace.events`). Cross-run events and sequence violations raise `ValueError`.
+- **Relationship to EngineeringRun & ProjectState:** `EngineeringRunResult.trace` aggregates the full run trace. When each attempt's `ProjectState` is derived, `PROJECT_STATE_UPDATED` events record state transitions referencing `snapshot_id`, `changeset_id`, and `acceptance_status`. The final event in the trace is `RUN_COMPLETED`.
+- **What RunTrace is NOT:**
+  - NOT a persistence layer or database event store.
+  - NOT an event sourcing, message queue, Kafka, or Redis system.
+  - NOT an execution mechanism, permission boundary, or approval authority.
+  - NOT an acceptance authority (`AcceptanceGate` remains the sole decider).
+
+## Run Trace / Event Contract v0.1 — русская версия
+
+Контракт трассировки и событий запуска v0.1 (Run Trace / Event Contract v0.1) определяет детерминированную, нейтральную к провайдерам in-memory модель событий и трассировки (`RunEvent`, `RunTrace`, `RunEventCollector`), обеспечивающую хронологическую наблюдаемость инженерного запуска (Engineering Run):
+
+```text
+Факты жизненного цикла запуска
+        ↓
+RunEvent (Упорядоченное неизменяемое наблюдение)
+        ↓
+RunEventCollector / RunTrace (Монотонная последовательность и привязка к run_id)
+        ↓
+EngineeringRunResult.trace / EngineeringRunResult.events
+```
+
+- **Назначение:** Обеспечить безопасную хронологическую трассировку контрольных точек выполнения для аудита, связывающую существующие артефакты Forge без внедрения распределённой трассировки, event sourcing, баз данных или брокеров сообщений.
+- **Модель `RunEvent`:** Неизменяемый (frozen) dataclass, фиксирующий факты жизненного цикла:
+  - Идентификация и порядок: `run_id`, `sequence_number` (монотонное целое число, начиная с 0), `event_type` (`RunEventType`), `event_id`, `timestamp`.
+  - Контекст и попытки: `attempt_number`, `task_id`.
+  - Ссылки на артефакты: `requirement_id`, `criterion_id`, `execution_request_id`, `execution_result_id`, `verification_id`, `changeset_id`, `snapshot_id`, `project_state_status`, `acceptance_status`.
+  - Очищенные метаданные: `metadata: Mapping[str, object]`.
+- **Семантика событий (`RunEventType`):** Минимальный канонический enum жизненного цикла, включающий `RUN_STARTED`, `CONTEXT_ASSEMBLED`, `EXECUTION_REQUESTED`, `EXECUTION_POLICY_CHECKED`, `EXECUTION_STARTED`, `EXECUTION_COMPLETED`, `EXECUTION_DENIED`, `APPROVAL_REQUESTED`, `APPROVAL_RESOLVED`, `VERIFICATION_COMPLETED`, `ACCEPTANCE_COMPLETED`, `REVISION_STARTED`, `REVISION_COMPLETED`, `PROJECT_STATE_UPDATED`, `RUN_COMPLETED`.
+- **Детерминированный порядок последовательности:** Авторитетный порядок внутри запуска определяется строго парой `run_id + sequence_number`. Метки времени носят информационный характер, тогда как монотонность последовательности (0, 1, 2, ...) определяет валидность трассы. Непоследовательные, дублирующиеся или отрицательные номера последовательности отклоняются с ошибкой `ValueError`.
+- **Санитизация метаданных и безопасность:** Автоматическая детерминированная фильтрация удаляет `stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code` и `file_content` из метаданных событий. События содержат только идентификаторы ссылок, но никогда сырые потоки или исходный код.
+- **Сбор трассы (`RunTrace`, `RunEventCollector`):** In-memory коллектор, выполняющий только добавление событий с проверкой привязки к `run_id`, соблюдения строгой последовательности и предоставляющий неизменяемый кортеж событий (`trace.events`). События с чужим `run_id` или нарушением порядка отклоняются.
+- **Связь с EngineeringRun и ProjectState:** `EngineeringRunResult.trace` содержит полную трассу запуска. При формировании `ProjectState` каждой попытки события `PROJECT_STATE_UPDATED` фиксируют переходы состояний со ссылками на `snapshot_id`, `changeset_id` и `acceptance_status`. Финальным событием трассы является `RUN_COMPLETED`.
+- **Чем RunTrace НЕ является:**
+  - НЕ является слоем персистентности или хранилищем событий в базе данных.
+  - НЕ является event sourcing, очередью сообщений, Kafka или Redis.
+  - НЕ является механизмом выполнения, границей прав или инстанцией согласования.
+  - НЕ является инстанцией приёмки (`AcceptanceGate` остаётся единственным органом приёмки).
