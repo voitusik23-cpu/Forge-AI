@@ -184,6 +184,7 @@ class DecisionContextAssembler:
         requirements: Iterable[Any] = (),
         acceptance_criteria: Iterable[Any] = (),
         skills: Iterable[SkillDefinition] = (),
+        project_memory: Iterable[Any] = (),
     ) -> DecisionContextEnvelope:
         if not run_id or not isinstance(run_id, str):
             raise ContextAssemblyError("run_id must be a non-empty string")
@@ -412,6 +413,36 @@ class DecisionContextAssembler:
                     value=json.dumps(skill_payload, ensure_ascii=False),
                     trust_level=ctx_trust,
                     source_id=f"skill:{skill_id}",
+                    sensitivity=ContextSensitivity.INTERNAL,
+                )
+            )
+
+        # 11. Project Memory (bounded informational context)
+        for mem in project_memory:
+            mem_id = getattr(mem, "memory_id", str(uuid4()))
+            cat = getattr(mem, "category", "")
+            cat_val = cat.value if hasattr(cat, "value") else str(cat)
+            title = str(getattr(mem, "title", ""))[:120]
+            content = str(getattr(mem, "content", ""))[:1000]
+            prov = getattr(mem, "provenance", None)
+            prov_dict = prov.to_dict() if hasattr(prov, "to_dict") else {}
+            trust = getattr(mem, "trust_level", ContextTrustLevel.CONFIRMED)
+
+            mem_payload = {
+                "memory_id": mem_id,
+                "category": cat_val,
+                "title": title,
+                "content": content,
+                "provenance": prov_dict,
+            }
+            items.append(
+                ContextItem(
+                    item_id=f"memory:{mem_id}",
+                    item_type="project_memory",
+                    source_type=ContextSourceType.PROJECT_MEMORY,
+                    value=json.dumps(mem_payload, ensure_ascii=False),
+                    trust_level=trust if isinstance(trust, ContextTrustLevel) else ContextTrustLevel.CONFIRMED,
+                    source_id=f"memory:{mem_id}",
                     sensitivity=ContextSensitivity.INTERNAL,
                 )
             )

@@ -63,6 +63,7 @@ class AgentHarness:
         state_derivator: Callable[..., ProjectState] | None = None,
         policy: AgentHarnessPolicy | None = None,
         skill_evaluator: SkillEvaluator | None = None,
+        memory_store: Any | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -73,6 +74,7 @@ class AgentHarness:
         self._state_derivator = state_derivator or derive_project_state
         self.policy = policy or AgentHarnessPolicy()
         self._skill_evaluator = skill_evaluator or SkillEvaluator()
+        self._memory_store = memory_store
 
     def run(self, request: HarnessRequest) -> HarnessResult:
         """Execute the controlled, bounded Run Loop according to configured policy."""
@@ -202,6 +204,23 @@ class AgentHarness:
                     available_tool_ids=frozenset(avail_tools),
                 )
 
+            project_memory: tuple[Any, ...] = ()
+            if self._memory_store is not None:
+                proj_id = getattr(request, "project_id", None)
+                if not proj_id and hasattr(request, "metadata") and isinstance(request.metadata, dict):
+                    proj_id = request.metadata.get("project_id")
+                if not proj_id and request.task_specification:
+                    proj_id = getattr(request.task_specification, "project_id", None)
+                if not proj_id:
+                    proj_id = request.run_id
+
+                if hasattr(self._memory_store, "get_active_memory"):
+                    project_memory = tuple(self._memory_store.get_active_memory(str(proj_id)))
+                elif hasattr(self._memory_store, "query"):
+                    from app.memory.models import MemoryQuery
+
+                    project_memory = tuple(self._memory_store.query(MemoryQuery(project_id=str(proj_id))))
+
             try:
                 context_envelope = self._context_assembler.assemble(
                     run_id=request.run_id,
@@ -215,6 +234,7 @@ class AgentHarness:
                     requirements=request.requirements,
                     acceptance_criteria=request.acceptance_criteria,
                     skills=applicable_skills,
+                    project_memory=project_memory,
                 )
             except Exception as exc:
                 current_state = replace(
