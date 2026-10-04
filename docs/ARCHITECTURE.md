@@ -1048,3 +1048,79 @@ AcceptanceGate
   - `orphan_verification`: потерянные или непривязанные верификации.
   - `verification_referencing_wrong_criterion`: противоречивые ссылки на критерии.
 - **Интеграция с Acceptance Gate:** `AcceptanceGate` остаётся единственной инстанцией, принимающей решение по приёмке задачи и требований на основе экземпляров `VerificationResult`.
+
+## Test Verification Adapter v0.1
+
+The Test Verification Adapter introduces a framework-neutral adapter that transforms declarative test verification intent into execution and verification requests without launching subprocesses:
+
+```text
+AcceptanceCriterion
+        ↓
+VerificationRequest
+        ↓
+TestVerificationAdapter
+        ↓
+ExecutionRequest
+        ↓
+ExecutionCoordinator
+        ↓
+Permission / Approval / ExecutionPolicy
+        ↓
+LocalExecutionAdapter
+        ↓
+ExecutionResult
+        ↓
+VerificationEvaluator
+        ↓
+VerificationResult
+        ↓
+AcceptanceGate
+```
+
+- **Declarative Test Intent (`TestVerificationIntent`):** Specifies test execution intent strictly through an argument sequence tuple (`command: tuple[str, ...]`), target criterion (`criterion_id`), framework category (`TestFramework`: `GENERIC`, `PYTEST`, `UNITTEST`, `CUSTOM`), expected exit code (`expected_exit_code`), safe relative working directory, timeout, and profile constraints. Unparsed shell command strings are strictly forbidden.
+- **Execution Delegation:** `TestVerificationAdapter` does not execute subprocesses and does not make authorization decisions. It builds an `ExecutionRequest` which must be dispatched through `ExecutionCoordinator`. All security boundaries (`Permission`, `Approval`, `ExecutionPolicy`) remain mandatory and cannot be bypassed.
+- **Verification Evaluation:** Rather than duplicating verification evaluation logic, the adapter delegates execution evaluation to the existing `VerificationEvaluator`, maintaining uniform objective semantics:
+  - Exit code matches expected code → `VerificationStatus.PASS`.
+  - Exit code mismatch or failure status → `VerificationStatus.FAIL`.
+  - Process timeout → `VerificationStatus.ERROR`.
+  - Execution error → `VerificationStatus.ERROR`.
+  - Authorization denial → `VerificationStatus.DENIED`.
+- **Traceability Preservation:** Maintains full traceability from `requirement_id` to `criterion_id`, `verification_id`, `execution_request_id`, `execution_result_id`, `evidence`, and final `AcceptanceGate` assessment.
+
+## Test Verification Adapter v0.1 — русская версия
+
+Адаптер верификации тестов (Test Verification Adapter) вводит нейтральный к тестовым фреймворкам уровень, преобразующий декларативное намерение тестирования в запросы выполнения и верификации без самостоятельного запуска подпроцессов:
+
+```text
+AcceptanceCriterion
+        ↓
+VerificationRequest
+        ↓
+TestVerificationAdapter
+        ↓
+ExecutionRequest
+        ↓
+ExecutionCoordinator
+        ↓
+Permission / Approval / ExecutionPolicy
+        ↓
+LocalExecutionAdapter
+        ↓
+ExecutionResult
+        ↓
+VerificationEvaluator
+        ↓
+VerificationResult
+        ↓
+AcceptanceGate
+```
+
+- **Декларативное намерение тестирования (`TestVerificationIntent`):** Специфицирует намерение запуска тестов исключительно через кортеж аргументов (`command: tuple[str, ...]`), целевой критерий (`criterion_id`), категорию фреймворка (`TestFramework`: `GENERIC`, `PYTEST`, `UNITTEST`, `CUSTOM`), ожидаемый код возврата (`expected_exit_code`), безопасную относительную рабочую директорию, таймаут и профиль выполнения. Передача сырых shell-строк категорически запрещена.
+- **Делегирование выполнения:** `TestVerificationAdapter` не запускает подпроцессы и не принимает решений об авторизации. Он формирует `ExecutionRequest`, который обязан пройти через существующий `ExecutionCoordinator`. Все границы безопасности (`Permission`, `Approval`, `ExecutionPolicy`) обязательны и не могут быть обойдены.
+- **Оценка результатов верификации:** Адаптер не дублирует логику оценки, а делегирует её существующему `VerificationEvaluator`, обеспечивая единую объективную семантику:
+  - Код возврата совпадает с ожидаемым → `VerificationStatus.PASS`.
+  - Код возврата не совпадает или статус `FAILURE` → `VerificationStatus.FAIL`.
+  - Таймаут подпроцесса → `VerificationStatus.ERROR`.
+  - Ошибка запуска процесса → `VerificationStatus.ERROR`.
+  - Отказ авторизации выполнения → `VerificationStatus.DENIED`.
+- **Сохранение трассируемости:** Обеспечивает сквозную трассируемость от `requirement_id` к `criterion_id`, `verification_id`, `execution_request_id`, `execution_result_id`, `evidence` и итоговому вердикту `AcceptanceGate`.
