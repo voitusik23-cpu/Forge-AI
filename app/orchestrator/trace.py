@@ -83,6 +83,8 @@ class RunEvent:
     project_state_status: str | None = None
     acceptance_status: str | None = None
     decision_id: str | None = None
+    context_id: str | None = None
+    context_fingerprint: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -120,6 +122,8 @@ class RunEvent:
             "project_state_status": self.project_state_status,
             "acceptance_status": self.acceptance_status,
             "decision_id": self.decision_id,
+            "context_id": self.context_id,
+            "context_fingerprint": self.context_fingerprint,
             "metadata": dict(self.metadata),
         }
 
@@ -213,6 +217,8 @@ class RunEventCollector:
         project_state_status: str | None = None,
         acceptance_status: str | None = None,
         decision_id: str | None = None,
+        context_id: str | None = None,
+        context_fingerprint: str | None = None,
         metadata: Mapping[str, object] | None = None,
         timestamp: datetime | None = None,
     ) -> RunEvent:
@@ -235,6 +241,8 @@ class RunEventCollector:
             project_state_status=project_state_status,
             acceptance_status=acceptance_status,
             decision_id=decision_id,
+            context_id=context_id,
+            context_fingerprint=context_fingerprint,
             metadata=metadata or {},
         )
         self._trace.append(ev)
@@ -295,6 +303,12 @@ def build_trace_from_run(
         dec_id = data.get("decision_id")
         decision_id = str(dec_id) if dec_id else None
 
+        ctx_id = data.get("context_id")
+        context_id = str(ctx_id) if ctx_id else None
+
+        ctx_fp = data.get("context_fingerprint")
+        context_fingerprint = str(ctx_fp) if ctx_fp else None
+
         # Build clean metadata without duplication of top-level reference keys
         meta = {
             k: v
@@ -314,6 +328,8 @@ def build_trace_from_run(
                 "project_state_status",
                 "acceptance_status",
                 "decision_id",
+                "context_id",
+                "context_fingerprint",
             )
         }
 
@@ -332,6 +348,8 @@ def build_trace_from_run(
             project_state_status=project_state_status,
             acceptance_status=acceptance_status,
             decision_id=decision_id,
+            context_id=context_id,
+            context_fingerprint=context_fingerprint,
             metadata=meta,
         )
 

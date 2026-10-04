@@ -1,21 +1,37 @@
-"""Deterministic, read-only assembly of task and explicitly supplied context."""
+"""Deterministic, read-only assembly of task and Decision Context Envelopes."""
 
-import json
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from typing import Iterable
+import json
+from typing import Any
+from uuid import uuid4
 
 from app.context.models import (
     ContextFreshness,
     ContextItem,
+    ContextSensitivity,
     ContextSource,
+    ContextSourceType,
     ContextTrust,
+    ContextTrustLevel,
+    DecisionContextEnvelope,
     ExecutionContext,
+    TraceSummary,
+)
+from app.context.validation import (
+    MAX_CONTEXT_ITEMS,
+    MAX_METADATA_ITEMS,
+    MAX_STRING_LENGTH,
+    sanitize_context_metadata,
+    validate_decision_context,
 )
 from app.orchestrator.models import Task
 
 
 class ContextAssemblyError(ValueError):
-    """Raised when explicit context cannot be assembled safely."""
+    """Raised when explicit context or a decision context envelope cannot be assembled safely."""
 
 
 class ContextBudgetExceededError(ContextAssemblyError):
@@ -41,7 +57,7 @@ class ContextBudgetExceededError(ContextAssemblyError):
 
 
 class ContextAssembler:
-    """Assemble only caller-provided content; never reads files or networks."""
+    """Assemble only caller-provided content; never reads files or networks (legacy)."""
 
     def __init__(self, *, max_items: int = 16, max_characters: int = 20_000) -> None:
         if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items < 1:
@@ -111,9 +127,7 @@ class ContextAssembler:
                     freshness=ContextFreshness.UNKNOWN,
                 )
             elif isinstance(value, ContextItem):
-                # The caller supplied this value for this run; don't allow it to
-                # claim SYSTEM provenance through the explicit-input channel.
-                item = replace(value, source=ContextSource.EXPLICIT_INPUT)
+                item = replace(value, source_type=ContextSourceType.EXPLICIT_INPUT)
             else:
                 raise ContextAssemblyError(
                     "explicit inputs must be text or ContextItem values"
@@ -134,3 +148,264 @@ class ContextAssembler:
                 max_items=self.max_items,
                 max_characters=self.max_characters,
             )
+
+
+class DecisionContextAssembler:
+    """Assembles a bounded, deterministic DecisionContextEnvelope from explicit structured state."""
+
+    def __init__(
+        self,
+        max_context_items: int = MAX_CONTEXT_ITEMS,
+        max_metadata_items: int = MAX_METADATA_ITEMS,
+        max_string_length: int = MAX_STRING_LENGTH,
+    ) -> None:
+        self.max_context_items = max_context_items
+        self.max_metadata_items = max_metadata_items
+        self.max_string_length = max_string_length
+
+    def assemble(
+        self,
+        *,
+        run_id: str,
+        attempt_number: int,
+        task_id: str | None = None,
+        task_specification: Any | None = None,
+        project_state: Any | None = None,
+        verification_results: Iterable[Any] = (),
+        acceptance_result: Any | None = None,
+        revision_result: Any | None = None,
+        run_trace: Any | None = None,
+        blocking_conditions: Iterable[str] = (),
+        available_actions: Iterable[Any] = (),
+        metadata: Mapping[str, object] | None = None,
+        context_items: Iterable[ContextItem] = (),
+        context_id: str | None = None,
+        requirements: Iterable[Any] = (),
+        acceptance_criteria: Iterable[Any] = (),
+    ) -> DecisionContextEnvelope:
+        if not run_id or not isinstance(run_id, str):
+            raise ContextAssemblyError("run_id must be a non-empty string")
+        if attempt_number < 0:
+            raise ContextAssemblyError(f"attempt_number cannot be negative: {attempt_number}")
+
+        sanitized_meta = sanitize_context_metadata(metadata)
+        cid = context_id or str(uuid4())
+        items: list[ContextItem] = []
+
+        # 1. Task specification / identity / requirements
+        eff_task_id = task_id
+        reqs_summary: dict[str, object] = {}
+        reqs: Iterable[Any] = ()
+        if task_specification is not None:
+            eff_task_id = eff_task_id or getattr(task_specification, "task_id", None)
+            reqs = getattr(task_specification, "requirements", ()) or ()
+        if not reqs and requirements:
+            reqs = tuple(requirements)
+        if reqs:
+            req_ids = tuple(
+                getattr(r, "requirement_id", None) or getattr(r, "id", None) or str(r)
+                for r in reqs
+            )
+            reqs_summary = {"count": len(reqs), "requirement_ids": list(req_ids)}
+            for r in reqs:
+                rid = getattr(r, "requirement_id", None) or getattr(r, "id", None) or str(r)
+                rdesc = getattr(r, "description", str(r))
+                items.append(
+                    ContextItem(
+                        item_id=f"requirement:{rid}",
+                        item_type="requirement",
+                        source_type=ContextSourceType.REQUIREMENT,
+                        value=f"{rid}:{rdesc}",
+                        trust_level=ContextTrustLevel.VERIFIED,
+                        source_id=rid,
+                    )
+                )
+
+        # 2. ProjectState
+        ps_status = None
+        if project_state is not None:
+            ps_status = project_state.status.value if hasattr(project_state.status, "value") else str(project_state.status)
+            items.append(
+                ContextItem(
+                    item_id=f"project_state:{run_id}:{attempt_number}",
+                    item_type="project_state",
+                    source_type=ContextSourceType.PROJECT_STATE,
+                    value=f"status={ps_status},snapshot={getattr(project_state, 'snapshot_id', None)},changeset={getattr(project_state, 'changeset_id', None)}",
+                    trust_level=ContextTrustLevel.VERIFIED,
+                    source_id=f"run:{run_id}",
+                )
+            )
+
+        # 3. Acceptance summary
+        acc_summary: dict[str, object] = {}
+        if acceptance_result is not None:
+            a_status = acceptance_result.status.value if hasattr(acceptance_result.status, "value") else str(acceptance_result.status)
+            acc_summary = {
+                "status": a_status,
+                "code": getattr(acceptance_result, "code", ""),
+            }
+            items.append(
+                ContextItem(
+                    item_id=f"acceptance:{run_id}:{attempt_number}",
+                    item_type="acceptance_result",
+                    source_type=ContextSourceType.ACCEPTANCE,
+                    value=f"status={a_status},code={getattr(acceptance_result, 'code', '')}",
+                    trust_level=ContextTrustLevel.VERIFIED,
+                    source_id=f"run:{run_id}",
+                )
+            )
+        elif acceptance_criteria:
+            crit_list = list(acceptance_criteria)
+            crit_ids = [
+                getattr(c, "criterion_id", None) or getattr(c, "id", None) or str(c)
+                for c in crit_list
+            ]
+            acc_summary = {"criteria_count": len(crit_ids), "criteria_ids": crit_ids}
+            for c in crit_list:
+                cid_val = getattr(c, "criterion_id", None) or getattr(c, "id", None) or str(c)
+                cdesc = getattr(c, "description", str(c))
+                items.append(
+                    ContextItem(
+                        item_id=f"acceptance_criterion:{cid_val}",
+                        item_type="acceptance_criterion",
+                        source_type=ContextSourceType.ACCEPTANCE,
+                        value=f"{cid_val}:{cdesc}",
+                        trust_level=ContextTrustLevel.VERIFIED,
+                        source_id=cid_val,
+                    )
+                )
+
+        # 4. Verification summary
+        ver_summary: dict[str, object] = {}
+        ver_list = list(verification_results)
+        if ver_list:
+            passed = sum(
+                1
+                for v in ver_list
+                if hasattr(v, "status")
+                and str(getattr(v.status, "value", v.status)).lower() == "pass"
+            )
+            failed = sum(
+                1
+                for v in ver_list
+                if hasattr(v, "status")
+                and str(getattr(v.status, "value", v.status)).lower() == "fail"
+            )
+            summary_status = "pass" if failed == 0 and passed > 0 else ("fail" if failed > 0 else "unknown")
+            ver_summary = {
+                "total": len(ver_list),
+                "passed": passed,
+                "failed": failed,
+                "status": summary_status,
+            }
+            items.append(
+                ContextItem(
+                    item_id=f"verification:{run_id}:{attempt_number}",
+                    item_type="verification_summary",
+                    source_type=ContextSourceType.VERIFICATION,
+                    value=f"passed={passed},failed={failed},total={len(ver_list)}",
+                    trust_level=ContextTrustLevel.VERIFIED,
+                    source_id=f"run:{run_id}",
+                )
+            )
+
+        # 5. Revision summary
+        rev_summary: dict[str, object] = {}
+        if revision_result is not None:
+            rev_status = revision_result.status.value if hasattr(revision_result.status, "value") else str(revision_result.status)
+            rev_summary = {
+                "status": rev_status,
+                "attempt_number": getattr(revision_result, "attempt_number", attempt_number),
+            }
+            items.append(
+                ContextItem(
+                    item_id=f"revision:{run_id}:{attempt_number}",
+                    item_type="revision_state",
+                    source_type=ContextSourceType.REVISION,
+                    value=f"status={rev_status},attempt={rev_summary['attempt_number']}",
+                    trust_level=ContextTrustLevel.VERIFIED,
+                    source_id=f"run:{run_id}",
+                )
+            )
+
+        # 6. Trace summary (bounded)
+        trace_summary_obj: TraceSummary | None = None
+        if run_trace is not None and hasattr(run_trace, "events"):
+            evs = run_trace.events
+            latest_types = tuple(e.event_type.value for e in evs[-5:])
+            latest_seq = evs[-1].sequence_number if evs else None
+            latest_dec = next((e.decision_id for e in reversed(evs) if getattr(e, "decision_id", None)), None)
+            latest_ver = next((e.verification_id for e in reversed(evs) if getattr(e, "verification_id", None)), None)
+            latest_acc = next((e.criterion_id for e in reversed(evs) if getattr(e, "criterion_id", None)), None)
+            trace_summary_obj = TraceSummary(
+                event_count=len(evs),
+                latest_event_types=latest_types,
+                latest_sequence_number=latest_seq,
+                latest_decision_reference=latest_dec,
+                latest_verification_reference=latest_ver,
+                latest_acceptance_reference=latest_acc,
+            )
+            items.append(
+                ContextItem(
+                    item_id=f"trace_summary:{run_id}:{attempt_number}",
+                    item_type="trace_summary",
+                    source_type=ContextSourceType.RUN_TRACE,
+                    value=f"events={len(evs)},latest_seq={latest_seq}",
+                    trust_level=ContextTrustLevel.VERIFIED,
+                    source_id=f"run:{run_id}",
+                )
+            )
+
+        # 7. Blocking conditions
+        cond_tuple = tuple(sorted(str(c) for c in blocking_conditions))
+        if cond_tuple:
+            items.append(
+                ContextItem(
+                    item_id=f"blocking_conditions:{run_id}:{attempt_number}",
+                    item_type="blocking_conditions",
+                    source_type=ContextSourceType.SYSTEM_POLICY,
+                    value=",".join(cond_tuple),
+                    trust_level=ContextTrustLevel.CONFIRMED,
+                    source_id=f"run:{run_id}",
+                )
+            )
+
+        # 8. Available actions
+        acts_tuple = tuple(str(a.value if hasattr(a, "value") else a) for a in available_actions)
+
+        # 9. Additional user-supplied context items
+        for ci in context_items:
+            items.append(ci)
+
+        # Budget verification
+        if len(items) > self.max_context_items:
+            raise ContextBudgetExceededError(
+                item_count=len(items),
+                character_count=sum(len(it.value) for it in items),
+                max_items=self.max_context_items,
+                max_characters=self.max_context_items * self.max_string_length,
+            )
+
+        envelope = DecisionContextEnvelope(
+            context_id=cid,
+            run_id=run_id,
+            attempt_number=attempt_number,
+            task_id=eff_task_id,
+            project_state_status=ps_status,
+            requirements_summary=reqs_summary,
+            acceptance_summary=acc_summary,
+            verification_summary=ver_summary,
+            revision_summary=rev_summary,
+            blocking_conditions=cond_tuple,
+            available_actions=acts_tuple,
+            trace_summary=trace_summary_obj,
+            context_items=tuple(items),
+            metadata=sanitized_meta,
+            project_state=project_state,
+        )
+
+        report = validate_decision_context(envelope)
+        if not report.valid:
+            raise ContextAssemblyError(f"Envelope validation failed: {', '.join(report.errors)}")
+
+        return envelope

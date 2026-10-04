@@ -140,6 +140,7 @@ class EventType(str, Enum):
     DECISION_REQUESTED = "decision_requested"
     DECISION_MADE = "decision_made"
     DECISION_REJECTED = "decision_rejected"
+    CONTEXT_DECISION_READY = "context_decision_ready"
 
     @classmethod
     def _missing_(cls, value: object):

@@ -98,6 +98,9 @@ class DecisionRequest:
     available_actions: tuple[DecisionAction, ...] = ()
     blocking_conditions: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+    context_id: str | None = None
+    context_fingerprint: str | None = None
+    context_envelope: Any | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id or not isinstance(self.run_id, str):
@@ -125,6 +128,8 @@ class DecisionRequest:
             "available_actions": [a.value for a in self.available_actions],
             "blocking_conditions": list(self.blocking_conditions),
             "metadata": dict(self.metadata),
+            "context_id": self.context_id,
+            "context_fingerprint": self.context_fingerprint,
         }
 
 

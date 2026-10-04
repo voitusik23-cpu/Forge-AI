@@ -1372,3 +1372,99 @@ EngineeringRun Executor / Event Trace (Наблюдаемость и контр�
   - НЕ является провайдер-специфичным маршрутизатором.
   - НЕ является заменой границ прав доступа (Permission), подтверждений (Approval) или политик выполнения.
   - НЕ является механизмом выполнения команд или изменения файлов.
+
+## Decision Context Envelope v0.1
+
+Decision Context Envelope v0.1 introduces a bounded, immutable, provenance-aware context container (`DecisionContextEnvelope`, `ContextItem`, `TraceSummary`, `validate_decision_context`, `DecisionContextAssembler`) that assembles the minimal structured context required for the Decision Layer to decide the next action in an Engineering Run:
+
+```text
+Structured Run State (ProjectState, TaskSpecification, AcceptanceResult, VerificationResult, RevisionResult, TraceSummary, Blocking Conditions)
+                                              ↓
+                                   DecisionContextAssembler
+                                              ↓
+                                   DecisionContextEnvelope
+                                              ↓
+                                  validate_decision_context
+                                              ↓
+                                  CONTEXT_DECISION_READY (Event)
+                                              ↓
+                                   DecisionRequest (Context References)
+                                              ↓
+                                   DeterministicDecisionProvider
+```
+
+- **Purpose and Key Invariant:** Context assembly is strictly an aggregation and bounding mechanism. It does NOT authorize actions, does NOT execute processes, does NOT access external networks, does NOT read the filesystem, and does NOT bypass existing permission, approval, or execution boundaries.
+- **Contract Models (`app/context/models.py`):**
+  - `ContextSourceType`: Categorizes item provenance (`USER_TASK`, `EXPLICIT_INPUT`, `TASK_CONTEXT`, `PROJECT_STATE`, `REQUIREMENT`, `ACCEPTANCE`, `VERIFICATION`, `REVISION`, `RUN_TRACE`, `SYSTEM_POLICY`).
+  - `ContextTrustLevel`: Classifies evidence trustworthiness (`UNTRUSTED`, `CONFIRMED`, `VERIFIED`, `TRUSTED`).
+  - `ContextFreshness`: Tracks temporal relevance (`CURRENT`, `HISTORICAL`, `STALE`, `UNKNOWN`).
+  - `ContextSensitivity`: Categorizes data sensitivity (`PUBLIC`, `INTERNAL`, `CONFIDENTIAL`, `RESTRICTED`).
+  - `ContextItem`: Immutable, provenance-aware context unit with `item_id`, `item_type`, `source_type`, `value`, `trust_level`, `freshness`, `sensitivity`, `source_id`, and `metadata`. Provides backwards-compatible property aliases (`id`, `kind`, `content`, `source`, `trust`) for legacy callers.
+  - `TraceSummary`: Safe, bounded summary of `RunTrace` events (event count, latest event types, latest sequence number, latest decision/verification/acceptance references) without duplicating raw event payloads.
+  - `DecisionContextEnvelope`: Bounded, immutable envelope comprising `context_id`, `run_id`, `attempt_number`, `task_id`, `project_state_status`, structured summaries of requirements, acceptance, verification, and revision, sorted `blocking_conditions`, `available_actions`, `trace_summary`, `context_items`, and sanitized `metadata`. Computes a deterministic SHA-256 `context_fingerprint` over structured fields.
+- **Budget and Validation (`app/context/validation.py`):**
+  - Enforces strict upper bounds: `MAX_CONTEXT_ITEMS = 64`, `MAX_METADATA_ITEMS = 32`, `MAX_STRING_LENGTH = 4096`.
+  - Validates run binding, rejects negative attempt numbers, empty `run_id`, duplicate item IDs, oversized strings, and cross-run references.
+  - Strictly rejects or sanitizes forbidden sensitive keys (`stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, `file_content`).
+- **Deterministic Assembly (`app/context/assembler.py`):**
+  - `DecisionContextAssembler`: Pure in-memory assembler that projects structured run artifacts into bounded context items and summaries without any network or filesystem I/O.
+  - Enforces budgets and runs validation before returning the envelope; raises `ContextBudgetExceededError` or `ContextAssemblyError` on boundary violations.
+- **Engineering Run & Trace Integration:**
+  - `EngineeringRunExecutor` coordinates `DecisionContextAssembler` at each `ProjectState` transition.
+  - Emits the safe `CONTEXT_DECISION_READY` trace event containing `context_id`, `context_fingerprint`, `run_id`, `attempt_number`, and `item_count`.
+  - Populates `context_id`, `context_fingerprint`, and `context_envelope` in `DecisionRequest`.
+  - `DeterministicDecisionProvider` propagates `context_id` and `context_fingerprint` into `Decision.references`.
+  - `EngineeringRunResult.context_envelopes` and `.final_context_envelope` expose assembled envelopes.
+- **What Decision Context Envelope is NOT:**
+  - NOT an LLM prompt builder or generative agent memory.
+  - NOT a vector database, embedding store, or retrieval engine.
+  - NOT an event bus, message broker, or distributed storage system.
+  - NOT an execution authority or policy bypass.
+
+## Decision Context Envelope v0.1 — русская версия
+
+Контекстный конверт решений v0.1 (Decision Context Envelope v0.1) вводит ограниченный, неизменяемый и учитывающий происхождение данных контейнер контекста (`DecisionContextEnvelope`, `ContextItem`, `TraceSummary`, `validate_decision_context`, `DecisionContextAssembler`), собирающий минимальный структурированный контекст, необходимый Слою принятия решений (Decision Layer) для определения следующего действия в инженерном запуске (Engineering Run):
+
+```text
+Структурированное состояние запуска (ProjectState, TaskSpecification, AcceptanceResult, VerificationResult, RevisionResult, TraceSummary, Блокирующие условия)
+                                              ↓
+                                   DecisionContextAssembler
+                                              ↓
+                                   DecisionContextEnvelope
+                                              ↓
+                                  validate_decision_context
+                                              ↓
+                                  CONTEXT_DECISION_READY (Событие трассы)
+                                              ↓
+                                   DecisionRequest (Ссылки на контекст)
+                                              ↓
+                                   DeterministicDecisionProvider
+```
+
+- **Назначение и ключевой инвариант:** Сборка контекста — это строго механизм агрегации и ограничения данных. Она НЕ авторизует действия, НЕ запускает процессы, НЕ обращается к внешним сетям, НЕ читает файловую систему и НЕ обходит существующие границы разрешений (Permission), подтверждений (Approval) или выполнения (Execution).
+- **Модели контракта (`app/context/models.py`):**
+  - `ContextSourceType`: Источник происхождения элемента (`USER_TASK`, `EXPLICIT_INPUT`, `TASK_CONTEXT`, `PROJECT_STATE`, `REQUIREMENT`, `ACCEPTANCE`, `VERIFICATION`, `REVISION`, `RUN_TRACE`, `SYSTEM_POLICY`).
+  - `ContextTrustLevel`: Уровень доверия к источнику (`UNTRUSTED`, `CONFIRMED`, `VERIFIED`, `TRUSTED`).
+  - `ContextFreshness`: Актуальность данных во времени (`CURRENT`, `HISTORICAL`, `STALE`, `UNKNOWN`).
+  - `ContextSensitivity`: Категория конфиденциальности (`PUBLIC`, `INTERNAL`, `CONFIDENTIAL`, `RESTRICTED`).
+  - `ContextItem`: Неизменяемая единица контекста с отслеживаемым происхождением, включающая `item_id`, `item_type`, `source_type`, `value`, `trust_level`, `freshness`, `sensitivity`, `source_id` и `metadata`. Предоставляет свойства обратной совместимости (`id`, `kind`, `content`, `source`, `trust`) для прежних потребителей.
+  - `TraceSummary`: Безопасная, ограниченная сводка событий `RunTrace` (количество событий, типы последних событий, последний порядковый номер, последние ссылки на решения, верификацию и приёмку) без копирования сырых данных событий.
+  - `DecisionContextEnvelope`: Ограниченный неизменяемый конверт, содержащий `context_id`, `run_id`, `attempt_number`, `task_id`, `project_state_status`, структурированные сводки требований, приёмки, верификации и ревизий, отсортированные `blocking_conditions`, `available_actions`, `trace_summary`, `context_items` и очищенный `metadata`. Вычисляет детерминированный SHA-256 хеш `context_fingerprint` по структурированным полям.
+- **Бюджеты и валидация (`app/context/validation.py`):**
+  - Задаёт строгие лимиты объема: `MAX_CONTEXT_ITEMS = 64`, `MAX_METADATA_ITEMS = 32`, `MAX_STRING_LENGTH = 4096`.
+  - Проверяет привязку к запуску, отклоняет отрицательные номера попыток, пустой `run_id`, дублирующиеся ID элементов, превышение длины строк и перекрёстные ссылки между запусками.
+  - Категорически отклоняет или очищает запрещённые конфиденциальные ключи (`stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, `file_content`).
+- **Детерминированная сборка (`app/context/assembler.py`):**
+  - `DecisionContextAssembler`: Чистый сборщик в памяти, проецирующий структурированные артефакты запуска в ограниченные элементы контекста и сводки без сетевого ввода-вывода или обращений к файловой системе.
+  - Контролирует бюджеты и проводит валидацию перед возвратом конверта; при нарушении границ генерирует `ContextBudgetExceededError` или `ContextAssemblyError`.
+- **Интеграция с Engineering Run и трассировкой:**
+  - `EngineeringRunExecutor` вызывает `DecisionContextAssembler` при каждом переходе `ProjectState`.
+  - Генерирует безопасное событие трассы `CONTEXT_DECISION_READY`, содержащее `context_id`, `context_fingerprint`, `run_id`, `attempt_number` и `item_count`.
+  - Передаёт `context_id`, `context_fingerprint` и `context_envelope` в `DecisionRequest`.
+  - `DeterministicDecisionProvider` включает `context_id` и `context_fingerprint` в `Decision.references`.
+  - `EngineeringRunResult.context_envelopes` и `.final_context_envelope` открывают доступ к собранным контекстным конвертам.
+- **Чем Контекстный конверт решений НЕ является:**
+  - НЕ является сборщиком промптов для LLM или памятью генеративного агента.
+  - НЕ является векторной базой данных, хранилищем эмбеддингов или поисковой системой.
+  - НЕ является шиной событий, брокером сообщений или распределённым хранилищем.
+  - НЕ является органом авторизации или обходом политик безопасности.

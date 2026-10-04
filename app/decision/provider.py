@@ -32,8 +32,21 @@ class DeterministicDecisionProvider:
     def decide(self, request: DecisionRequest) -> Decision:
         dec_id = str(uuid4())
         conditions = set(request.blocking_conditions)
-        ps = request.current_project_state
-        state_status = ps.status if ps else None
+        if not conditions and request.context_envelope and request.context_envelope.blocking_conditions:
+            conditions = set(request.context_envelope.blocking_conditions)
+
+        ps = request.current_project_state or (request.context_envelope.project_state if request.context_envelope else None)
+        state_status = ps.status if ps else (
+            request.context_envelope.project_state_status if request.context_envelope else None
+        )
+
+        refs: dict[str, Any] = {}
+        ctx_id = request.context_id or (request.context_envelope.context_id if request.context_envelope else None)
+        ctx_fp = request.context_fingerprint or (request.context_envelope.context_fingerprint if request.context_envelope else None)
+        if ctx_id:
+            refs["context_id"] = ctx_id
+        if ctx_fp:
+            refs["context_fingerprint"] = ctx_fp
 
         # Rule A: Unrecoverable security, permission, or policy failure
         if "security_denied" in conditions or "permission_denied" in conditions:
@@ -44,7 +57,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.FAIL_RUN,
                 reason_code="security_denied",
                 attempt_number=request.attempt_number,
-                references={"blocking_condition": "security_denied"},
+                references={**refs, "blocking_condition": "security_denied"},
             )
         if "policy_denied" in conditions:
             return Decision(
@@ -54,7 +67,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.FAIL_RUN,
                 reason_code="policy_denied",
                 attempt_number=request.attempt_number,
-                references={"blocking_condition": "policy_denied"},
+                references={**refs, "blocking_condition": "policy_denied"},
             )
 
         # Rule B: Revision limit reached
@@ -66,7 +79,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.FAIL_RUN,
                 reason_code="revision_limit_reached",
                 attempt_number=request.attempt_number,
-                references={"blocking_condition": "revision_limit_reached"},
+                references={**refs, "blocking_condition": "revision_limit_reached"},
             )
 
         # Rule C: Approval pending or required
@@ -83,7 +96,7 @@ class DeterministicDecisionProvider:
                 action=action,
                 reason_code="approval_pending",
                 attempt_number=request.attempt_number,
-                references={"blocking_condition": "approval_pending"},
+                references={**refs, "blocking_condition": "approval_pending"},
             )
 
         # Rule D: Acceptance is PASS
@@ -98,7 +111,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.COMPLETE_RUN,
                 reason_code="acceptance_passed",
                 attempt_number=request.attempt_number,
-                references={"acceptance_status": "pass"},
+                references={**refs, "acceptance_status": "pass"},
             )
 
         # Rule E: Required verification failed
@@ -114,7 +127,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.REQUEST_REVISION,
                 reason_code="verification_failed",
                 attempt_number=request.attempt_number,
-                references={"verification_status": "fail"},
+                references={**refs, "verification_status": "fail"},
             )
 
         # Rule F: Verification is required but has not run
@@ -129,7 +142,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.RUN_VERIFICATION,
                 reason_code="verification_required",
                 attempt_number=request.attempt_number,
-                references={"project_state": "CHANGED"},
+                references={**refs, "project_state": "CHANGED"},
             )
 
         # Rule G: Execution is required and has not happened
@@ -145,7 +158,7 @@ class DeterministicDecisionProvider:
                 action=DecisionAction.EXECUTE,
                 reason_code="execution_required",
                 attempt_number=request.attempt_number,
-                references={"project_state": "INITIAL"},
+                references={**refs, "project_state": "INITIAL"},
             )
 
         # Rule H: Otherwise wait
@@ -156,4 +169,5 @@ class DeterministicDecisionProvider:
             action=DecisionAction.WAIT_FOR_APPROVAL,
             reason_code="idle",
             attempt_number=request.attempt_number,
+            references=refs if refs else None,
         )

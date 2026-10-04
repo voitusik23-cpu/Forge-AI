@@ -7,7 +7,11 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 
-from app.context import ContextItem
+from app.context import (
+    ContextItem,
+    DecisionContextAssembler,
+    DecisionContextEnvelope,
+)
 from app.orchestrator.models import Event, EventType, Run, RunState, Task
 from app.orchestrator.revision import (
     RevisionAttemptResult,
@@ -77,6 +81,7 @@ class EngineeringRunRequest:
     approval_policy: ApprovalPolicy | None = None
     approval_resolver: ApprovalResolver | None = None
     decision_provider: DecisionProvider | None = None
+    context_assembler: DecisionContextAssembler | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.execution_requests, list):
@@ -105,6 +110,7 @@ class EngineeringRunResult:
     project_states: tuple[ProjectState, ...] = ()
     trace: RunTrace | None = None
     decisions: tuple[Decision, ...] = ()
+    context_envelopes: tuple[DecisionContextEnvelope, ...] = ()
 
     @property
     def final_project_state(self) -> ProjectState | None:
@@ -113,6 +119,10 @@ class EngineeringRunResult:
     @property
     def final_decision(self) -> Decision | None:
         return self.decisions[-1] if self.decisions else None
+
+    @property
+    def final_context_envelope(self) -> DecisionContextEnvelope | None:
+        return self.context_envelopes[-1] if self.context_envelopes else None
 
     @property
     def events(self) -> tuple[RunEvent, ...]:
@@ -131,10 +141,12 @@ class EngineeringRunExecutor:
         revision_executor: RevisionLoopExecutor,
         execution_coordinator: ExecutionCoordinator | None = None,
         decision_provider: DecisionProvider | None = None,
+        context_assembler: DecisionContextAssembler | None = None,
     ) -> None:
         self._revision_executor = revision_executor
         self._execution_coordinator = execution_coordinator
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
+        self._context_assembler = context_assembler or DecisionContextAssembler()
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
         task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
@@ -274,7 +286,9 @@ class EngineeringRunExecutor:
             )
 
         provider = request.decision_provider or self._decision_provider
+        context_assembler = request.context_assembler or self._context_assembler
         decisions: list[Decision] = []
+        context_envelopes: list[DecisionContextEnvelope] = []
         for idx, st in enumerate(project_states):
             conditions: list[str] = []
             if idx == len(project_states) - 1:
@@ -296,12 +310,49 @@ class EngineeringRunExecutor:
                     elif res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
                         conditions.append("approval_pending")
 
+            attempt_obj = attempts[idx] if idx < len(attempts) else None
+            attempt_verifs = attempt_obj.verification_results if attempt_obj else ()
+            attempt_acc = attempt_obj.acceptance_result if attempt_obj else final_acceptance
+
+            # Assemble Decision Context Envelope
+            envelope = context_assembler.assemble(
+                run_id=run.id,
+                attempt_number=st.attempt_number,
+                task_id=task_id,
+                task_specification=request.task_specification,
+                project_state=st,
+                verification_results=attempt_verifs,
+                acceptance_result=attempt_acc,
+                revision_result=revision_result if idx == len(project_states) - 1 else None,
+                blocking_conditions=tuple(conditions),
+                requirements=requirements or (),
+                acceptance_criteria=criteria or (),
+            )
+            context_envelopes.append(envelope)
+
+            run.events.append(
+                Event(
+                    run_id=run.id,
+                    type=EventType.CONTEXT_DECISION_READY,
+                    data={
+                        "context_id": envelope.context_id,
+                        "context_fingerprint": envelope.context_fingerprint,
+                        "run_id": run.id,
+                        "attempt_number": envelope.attempt_number,
+                        "item_count": envelope.item_count,
+                    },
+                )
+            )
+
             dec_req = DecisionRequest(
                 decision_id=str(uuid4()),
                 run_id=run.id,
                 attempt_number=st.attempt_number,
                 current_project_state=st,
                 blocking_conditions=tuple(conditions),
+                context_id=envelope.context_id,
+                context_fingerprint=envelope.context_fingerprint,
+                context_envelope=envelope,
             )
             run.events.append(
                 Event(
@@ -312,6 +363,8 @@ class EngineeringRunExecutor:
                         "run_id": run.id,
                         "attempt_number": dec_req.attempt_number,
                         "project_state_status": st.status.value,
+                        "context_id": dec_req.context_id,
+                        "context_fingerprint": dec_req.context_fingerprint,
                     },
                 )
             )
@@ -330,6 +383,8 @@ class EngineeringRunExecutor:
                             "action": decision.action.value,
                             "rationale": decision.rationale,
                             "metadata": dict(decision.metadata),
+                            "context_id": decision.references.get("context_id") if decision.references else None,
+                            "context_fingerprint": decision.references.get("context_fingerprint") if decision.references else None,
                         },
                     )
                 )
@@ -385,6 +440,7 @@ class EngineeringRunExecutor:
             project_states=tuple(project_states),
             trace=trace,
             decisions=tuple(decisions),
+            context_envelopes=tuple(context_envelopes),
         )
 
     @staticmethod
