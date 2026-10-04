@@ -1,5 +1,6 @@
 """Decision Layer / Run Control contracts and providers."""
 
+from app.decision.ai_provider import AIDecisionProvider
 from app.decision.models import (
     Decision,
     DecisionAction,
@@ -18,6 +19,7 @@ from app.decision.validator import (
 )
 
 __all__ = [
+    "AIDecisionProvider",
     "DECISION_TO_ACTION_COMPATIBILITY",
     "Decision",
     "DecisionAction",
@@ -29,3 +31,4 @@ __all__ = [
     "sanitize_decision_metadata",
     "validate_decision",
 ]
+
