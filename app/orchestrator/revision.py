@@ -14,6 +14,9 @@ from app.tools.acceptance import (
     AcceptanceGate,
     AcceptanceResult,
     AcceptanceStatus,
+    DetailedAcceptanceReport,
+    RequirementEvaluation,
+    RequirementStatus,
 )
 from app.tools.contracts import ToolStatus
 from app.tools.verification import (
@@ -37,6 +40,16 @@ class RevisionStatus(str, Enum):
 class FailedCriterion:
     criterion_id: str
     code: str
+    requirement_id: str = ""
+    verification_code: str = ""
+
+
+@dataclass(frozen=True)
+class FailedRequirement:
+    requirement_id: str
+    status: str
+    failed_criteria: tuple[FailedCriterion, ...]
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -46,6 +59,8 @@ class RevisionRequest:
     reason: str
     failed_criteria: tuple[FailedCriterion, ...]
     attempt_number: int
+    failed_requirements: tuple[FailedRequirement, ...] = ()
+    detailed_report: DetailedAcceptanceReport | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,7 @@ class RevisionLoopExecutor:
         *,
         criteria: Iterable[AcceptanceCriterion],
         verification_expectations: Mapping[str, VerificationExpectation],
+        requirements: Iterable[Any] | None = None,
         provider_name: str | None = None,
         agent_name: str | None = None,
         explicit_inputs=(),
@@ -143,7 +159,7 @@ class RevisionLoopExecutor:
                 workspace=workspace,
             )
         acceptance, can_revise, verification_results = self._verify_and_accept(
-            run, criteria, expectations, workspace, attempt_number=0
+            run, criteria, expectations, workspace, requirements=requirements, attempt_number=0
         )
         attempts = [self._attempt_result(
             run, 0, (initial_before, initial_after), verification_results, acceptance
@@ -164,6 +180,8 @@ class RevisionLoopExecutor:
                 reason=acceptance.code,
                 failed_criteria=failed,
                 attempt_number=attempt,
+                failed_requirements=self._failed_requirements(acceptance),
+                detailed_report=acceptance.report,
             )
             self._emit(run, EventType.REVISION_STARTED, {
                 "run_id": run.id,
@@ -200,7 +218,7 @@ class RevisionLoopExecutor:
                     workspace=workspace,
                 )
             next_acceptance, can_revise, verification_results = self._verify_and_accept(
-                run, criteria, expectations, workspace, attempt_number=attempt
+                run, criteria, expectations, workspace, requirements=requirements, attempt_number=attempt
             )
             attempts.append(self._attempt_result(
                 run, attempt, (revision_before, revision_after),
@@ -221,7 +239,7 @@ class RevisionLoopExecutor:
         return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run, tuple(attempts))
 
     def _verify_and_accept(
-        self, run, criteria, expectations, workspace, *, attempt_number
+        self, run, criteria, expectations, workspace, *, requirements=None, attempt_number
     ):
         # Hard execution/policy failures and unresolved approvals stop before acceptance.
         if run.state != RunState.COMPLETED or run.result is None:
@@ -247,6 +265,7 @@ class RevisionLoopExecutor:
         acceptance = self._acceptance_gate.evaluate(
             criteria,
             verification_results,
+            requirements=requirements,
             run_id=run.id,
             observer=lambda event_type, data: self._emit(run, event_type, data),
         )
@@ -280,21 +299,83 @@ class RevisionLoopExecutor:
     @staticmethod
     def _failed_criteria(result: AcceptanceResult) -> tuple[FailedCriterion, ...]:
         return tuple(
-            FailedCriterion(item.criterion_id, item.code)
+            FailedCriterion(
+                criterion_id=item.criterion_id,
+                code=item.code,
+                requirement_id=item.requirement_id,
+                verification_code=(
+                    item.verification_result.code
+                    if item.verification_result is not None
+                    else ""
+                ),
+            )
             for item in result.results
             if item.status == AcceptanceStatus.FAIL
         )
 
     @staticmethod
+    def _failed_requirements(result: AcceptanceResult) -> tuple[FailedRequirement, ...]:
+        if result.report is None:
+            return ()
+        failed_reqs = []
+        for req_eval in result.report.requirement_evaluations:
+            if req_eval.status == RequirementStatus.FAIL:
+                failed_c = tuple(
+                    FailedCriterion(
+                        criterion_id=c.criterion_id,
+                        code=c.code,
+                        requirement_id=c.requirement_id,
+                        verification_code=(
+                            c.verification_result.code
+                            if c.verification_result is not None
+                            else ""
+                        ),
+                    )
+                    for c in req_eval.criterion_results
+                    if c.status == AcceptanceStatus.FAIL
+                )
+                failed_reqs.append(
+                    FailedRequirement(
+                        requirement_id=req_eval.requirement_id,
+                        status=req_eval.status.value,
+                        failed_criteria=failed_c,
+                        reasons=req_eval.failure_reasons,
+                    )
+                )
+        return tuple(failed_reqs)
+
+    @staticmethod
     def _revision_task(task: Task, request: RevisionRequest) -> Task:
         context = dict(task.context)
+        failed_criteria_payload = []
+        for item in request.failed_criteria:
+            entry: dict[str, object] = {"criterion_id": item.criterion_id, "code": item.code}
+            if item.requirement_id:
+                entry["requirement_id"] = item.requirement_id
+                entry["verification_code"] = item.verification_code
+            failed_criteria_payload.append(entry)
+
         context["forge_revision"] = {
             "revision_id": request.revision_id,
             "reason": request.reason,
             "attempt_number": request.attempt_number,
-            "failed_criteria": [
-                {"criterion_id": item.criterion_id, "code": item.code}
-                for item in request.failed_criteria
+            "failed_criteria": failed_criteria_payload,
+            "failed_requirements": [
+                {
+                    "requirement_id": item.requirement_id,
+                    "status": item.status,
+                    "reasons": list(item.reasons),
+                    "failed_criteria": [
+                        {
+                            "criterion_id": c.criterion_id,
+                            "code": c.code,
+                            "requirement_id": c.requirement_id,
+                            "verification_code": c.verification_code,
+                        }
+                        for c in item.failed_criteria
+                    ],
+                }
+                for item in request.failed_requirements
             ],
         }
         return replace(task, context=context)

@@ -85,7 +85,9 @@ class EngineeringRunTests(unittest.TestCase):
         self.workspace = Workspace(self.root)
         self.good = "accepted fixture"
         self.bad = "rejected fixture"
-        self.criterion = AcceptanceCriterion("file-content", "File has expected digest")
+        self.criterion = AcceptanceCriterion(
+            "file-content", "File has expected digest", requirement_id="file-created"
+        )
         self.expectations = {
             "file-content": VerificationExpectation(
                 "result.txt", True, hashlib.sha256(self.good.encode()).hexdigest()
@@ -228,7 +230,10 @@ class EngineeringRunTests(unittest.TestCase):
             Requirement("same", "First"), Requirement("same", "Second")
         )
         duplicate_criteria = (
-            self.criterion, AcceptanceCriterion(self.criterion.criterion_id, "Again")
+            self.criterion,
+            AcceptanceCriterion(
+                self.criterion.criterion_id, "Again", requirement_id="file-created"
+            ),
         )
         self.assertIn(
             "duplicate_requirement_id",

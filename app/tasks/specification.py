@@ -88,6 +88,8 @@ class TaskSpecification:
         if len(requirement_ids) != len(set(requirement_ids)):
             errors.append("duplicate_requirement_id")
 
+        valid_requirement_ids = set(requirement_ids)
+
         if not isinstance(self.acceptance_criteria, tuple):
             errors.append("acceptance_criteria_required")
             criteria = ()
@@ -98,6 +100,7 @@ class TaskSpecification:
             if any(not isinstance(item, AcceptanceCriterion) for item in criteria):
                 errors.append("invalid_acceptance_criterion")
         criterion_ids: list[str] = []
+        criterion_req_ids: dict[str, list[str]] = {r_id: [] for r_id in valid_requirement_ids}
         for item in criteria:
             if not isinstance(item, AcceptanceCriterion):
                 continue
@@ -109,8 +112,21 @@ class TaskSpecification:
                 errors.append("acceptance_criterion_description_required")
             if not isinstance(item.required, bool):
                 errors.append("acceptance_criterion_required_must_be_bool")
+
+            if not isinstance(item.requirement_id, str) or not item.requirement_id.strip():
+                errors.append("acceptance_criterion_requirement_id_required")
+            elif item.requirement_id not in valid_requirement_ids:
+                errors.append("orphan_acceptance_criterion")
+            else:
+                criterion_req_ids[item.requirement_id].append(item.criterion_id)
+
         if len(criterion_ids) != len(set(criterion_ids)):
             errors.append("duplicate_acceptance_criterion_id")
+
+        for item in requirements:
+            if isinstance(item, Requirement) and item.required:
+                if item.requirement_id in valid_requirement_ids and not criterion_req_ids.get(item.requirement_id):
+                    errors.append("required_requirement_missing_criteria")
 
         return SpecificationValidationResult(
             SpecificationValidationStatus.FAIL if errors else SpecificationValidationStatus.PASS,
@@ -136,6 +152,7 @@ class TaskSpecification:
                     "criterion_id": item.criterion_id,
                     "description": item.description,
                     "required": item.required,
+                    "requirement_id": item.requirement_id,
                 }
                 for item in self.acceptance_criteria
             ],

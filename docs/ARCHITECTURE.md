@@ -1,5 +1,9 @@
 # Planned architecture
 
+The long-term boundaries and principles are specified in
+[`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md); this document
+describes the current architecture and implemented behavior.
+
 ```text
 User
   ↓
@@ -826,3 +830,37 @@ Verification. `AcceptanceGate` остаётся единственным ком�
 `task_id`, не копируя спецификацию целиком в события. Контракт выполняет только
 структурную детерминированную проверку: он не выводит требования и не выполняет
 семантическую или LLM-валидацию.
+
+## Requirement Acceptance Traceability v0.1
+
+`AcceptanceCriterion` explicitly references its owning `Requirement` via `requirement_id`.
+`TaskSpecification.validate()` deterministically enforces that every criterion references a valid
+requirement in the specification, disallows orphan criteria, requires non-empty identifiers, and
+guarantees that every required `Requirement` has at least one associated `AcceptanceCriterion`.
+Optional requirements are permitted without criteria and are recorded as `SKIPPED`.
+
+`AcceptanceGate` evaluates verification outcomes and aggregates them into a structured, typed
+`DetailedAcceptanceReport` alongside the aggregate `AcceptanceResult`. A required `Requirement`
+fails if any of its required criteria fail, causing overall acceptance to fail. Failures of optional
+requirements are visible in `DetailedAcceptanceReport` but do not fail overall acceptance. When
+acceptance fails, `RevisionLoopExecutor` extracts structured requirement-level failure data
+(`FailedRequirement` and `FailedCriterion` with `requirement_id` and verification outcome codes)
+and attaches it to the revision task context, ensuring deterministic defect localization without
+relying on unparsed LLM text.
+
+## Requirement Acceptance Traceability v0.1 — русская версия
+
+`AcceptanceCriterion` явно ссылается на породившее его требование `Requirement` через поле `requirement_id`.
+Валидатор `TaskSpecification.validate()` детерминированно гарантирует, что каждый критерий ссылается на
+валидное требование спецификации, запрещает критерии-сироты (orphan criteria), требует непустые
+идентификаторы и обеспечивает наличие хотя бы одного `AcceptanceCriterion` для каждого обязательного
+`Requirement`. Необязательные требования допускаются без критериев и отмечаются статусом `SKIPPED`.
+
+`AcceptanceGate` оценивает результаты верификации и формирует структурированный типизированный отчёт
+`DetailedAcceptanceReport` вместе с итоговым вердиктом `AcceptanceResult`. Обязательное требование
+проваливается, если хотя бы один из его обязательных критериев не пройден, что приводит к итоговому
+FAIL приёмки. Провалы необязательных требований фиксируются в `DetailedAcceptanceReport`, но не
+приводят к общему провалу приёмки. При отказе приёмки `RevisionLoopExecutor` извлекает структурированные
+данные о сбое уровня требований (`FailedRequirement` и `FailedCriterion` с указанием `requirement_id` и
+кодов верификации) и передаёт их в контекст задачи ревизии, гарантируя детерминированную локализацию
+дефектов без использования неструктурированного текста LLM.

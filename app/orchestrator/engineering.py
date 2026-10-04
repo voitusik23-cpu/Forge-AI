@@ -14,7 +14,12 @@ from app.orchestrator.revision import (
     RevisionResult,
     RevisionStatus,
 )
-from app.tools.acceptance import AcceptanceCriterion, AcceptanceResult, AcceptanceStatus
+from app.tools.acceptance import (
+    AcceptanceCriterion,
+    AcceptanceResult,
+    AcceptanceStatus,
+    DetailedAcceptanceReport,
+)
 from app.tools.changesets import ChangeSet
 from app.tools.verification import VerificationExpectation, VerificationResult
 from app.tools.workspace import Workspace
@@ -59,6 +64,10 @@ class EngineeringRunResult:
     revision_result: RevisionResult
     run: Run = field(compare=False, repr=False)
 
+    @property
+    def detailed_acceptance_report(self) -> DetailedAcceptanceReport | None:
+        return self.final_acceptance.report if self.final_acceptance else None
+
 
 class EngineeringRunExecutor:
     """Coordinate existing revision, workspace, snapshot, and acceptance contracts."""
@@ -67,7 +76,7 @@ class EngineeringRunExecutor:
         self._revision_executor = revision_executor
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
-        task, criteria, task_id = self._resolve_input(request)
+        task, criteria, requirements, task_id = self._resolve_input(request)
         revision_result = self._revision_executor.execute(
             task,
             provider_name=request.provider_name,
@@ -78,6 +87,7 @@ class EngineeringRunExecutor:
             snapshot_paths=request.snapshot_paths,
             verification_expectations=request.verification_expectations,
             criteria=criteria,
+            requirements=requirements,
             max_revision_attempts=request.max_revision_attempts,
         )
         run = revision_result.run
@@ -155,13 +165,13 @@ class EngineeringRunExecutor:
                 description="Execute the supplied TaskSpecification.",
                 context={"task_specification": specification.to_context_data()},
             )
-            return task, specification.acceptance_criteria, specification.task_id
+            return task, specification.acceptance_criteria, specification.requirements, specification.task_id
 
         if not isinstance(request.task, Task):
             raise ValueError("task or task_specification is required")
         if request.acceptance_criteria is None:
             raise ValueError("acceptance_criteria is required for legacy task input")
-        return request.task, request.acceptance_criteria, request.task.id
+        return request.task, request.acceptance_criteria, None, request.task.id
 
     @staticmethod
     def _final_status(run: Run, result: RevisionResult) -> EngineeringRunStatus:
