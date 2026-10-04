@@ -531,6 +531,95 @@ class TestExecutionPlane(unittest.TestCase):
         )
         self.assertEqual(report.status, AcceptanceStatus.PASS)
 
+    # V. Host PYTHONPATH is not inherited by default
+    def test_pythonpath_not_inherited_from_host(self) -> None:
+        old_val = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = "/polluted/host/pythonpath"
+        try:
+            req = ExecutionRequest(
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import os; print('PYTHONPATH=' + os.environ.get('PYTHONPATH', 'unset'))",
+                ),
+                profile=self.profile,
+            )
+            result = self.adapter.execute(req)
+            self.assertEqual(result.status, ExecutionStatus.SUCCESS)
+            self.assertIn("PYTHONPATH=unset", result.stdout)
+        finally:
+            if old_val is not None:
+                os.environ["PYTHONPATH"] = old_val
+            else:
+                os.environ.pop("PYTHONPATH", None)
+
+    # W. Explicitly supplied PYTHONPATH is preserved
+    def test_pythonpath_explicitly_injected_is_preserved(self) -> None:
+        req = ExecutionRequest(
+            command=(
+                sys.executable,
+                "-c",
+                "import os; print('PYTHONPATH=' + os.environ.get('PYTHONPATH', 'unset'))",
+            ),
+            environment_variables={"PYTHONPATH": "explicit_project_path"},
+            profile=self.profile,
+        )
+        result = self.adapter.execute(req)
+        self.assertEqual(result.status, ExecutionStatus.SUCCESS)
+        self.assertIn("PYTHONPATH=explicit_project_path", result.stdout)
+
+    # X. Git forbidden flag --git-dir is rejected
+    def test_git_forbidden_flag_git_dir(self) -> None:
+        git_profile = ProjectExecutionProfile(
+            profile_id="git-profile",
+            allowed_commands=("git",),
+        )
+        for cmd in (
+            ("git", "--git-dir=/primary/repo/.git", "status"),
+            ("git", "--git-dir", "/primary/repo/.git", "status"),
+        ):
+            req = ExecutionRequest(command=cmd, profile=git_profile)
+            decision = self.policy.evaluate(req)
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "forbidden_flag:--git-dir")
+
+            res = self.adapter.execute(req)
+            self.assertEqual(res.status, ExecutionStatus.DENIED)
+            self.assertIn("forbidden_flag:--git-dir", res.stderr)
+
+    # Y. Git forbidden flag --work-tree is rejected
+    def test_git_forbidden_flag_work_tree(self) -> None:
+        git_profile = ProjectExecutionProfile(
+            profile_id="git-profile",
+            allowed_commands=("git",),
+        )
+        for cmd in (
+            ("git", "--work-tree=/primary/repo", "status"),
+            ("git", "--work-tree", "/primary/repo", "status"),
+        ):
+            req = ExecutionRequest(command=cmd, profile=git_profile)
+            decision = self.policy.evaluate(req)
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "forbidden_flag:--work-tree")
+
+            res = self.adapter.execute(req)
+            self.assertEqual(res.status, ExecutionStatus.DENIED)
+            self.assertIn("forbidden_flag:--work-tree", res.stderr)
+
+    # Z. Ordinary allowed git commands remain governed by existing policy
+    def test_git_allowed_command_without_forbidden_flags(self) -> None:
+        git_profile = ProjectExecutionProfile(
+            profile_id="git-profile",
+            allowed_commands=("git",),
+        )
+        req = ExecutionRequest(
+            command=("git", "status"),
+            profile=git_profile,
+        )
+        decision = self.policy.evaluate(req)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "authorized")
+
 
 if __name__ == "__main__":
     unittest.main()

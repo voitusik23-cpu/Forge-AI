@@ -71,7 +71,6 @@ SAFE_ENV_WHITELIST_KEYS: frozenset[str] = frozenset({
     # Python & runtime environment
     "PYTHONHOME",
     "PYTHONIOENCODING",
-    "PYTHONPATH",
     "PYTHONUNBUFFERED",
     "PYTHONUTF8",
     "VIRTUAL_ENV",
@@ -218,7 +217,7 @@ class LocalExecutionAdapter:
         secrets_to_register: list[str] = []
         for k, v in request.environment_variables.items():
             val_str = str(v).strip()
-            if val_str and (len(val_str) >= 4 or _SENSITIVE_KEY_PATTERN.search(str(k))):
+            if val_str and _SENSITIVE_KEY_PATTERN.search(str(k)):
                 secrets_to_register.append(val_str)
 
         if secrets_to_register and isinstance(self._redactor, DefaultSecretRedactor):

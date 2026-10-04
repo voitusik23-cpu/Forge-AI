@@ -63,6 +63,23 @@ class ExecutionPolicy:
                 reason=f"command_not_allowed:{executable}",
             )
 
+        # Check command-specific forbidden flags
+        exec_name = Path(executable.strip()).name.lower()
+        exec_stem = Path(executable.strip()).stem.lower()
+        if exec_name == "git" or exec_stem == "git":
+            for part in request.command[1:]:
+                clean_part = part.strip().lower()
+                if clean_part == "--git-dir" or clean_part.startswith("--git-dir="):
+                    return ExecutionPolicyDecision(
+                        allowed=False,
+                        reason="forbidden_flag:--git-dir",
+                    )
+                if clean_part == "--work-tree" or clean_part.startswith("--work-tree="):
+                    return ExecutionPolicyDecision(
+                        allowed=False,
+                        reason="forbidden_flag:--work-tree",
+                    )
+
         # Check working directory safety
         if not isinstance(request.working_directory, str) or not request.working_directory.strip():
             return ExecutionPolicyDecision(allowed=False, reason="working_directory_required")
