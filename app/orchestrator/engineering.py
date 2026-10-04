@@ -25,6 +25,7 @@ from app.tools.verification import VerificationExpectation, VerificationResult
 from app.tools.workspace import Workspace
 from app.snapshots import ProjectSnapshot
 from app.tasks.specification import InvalidTaskSpecificationError, TaskSpecification
+from app.execution.profile import ProjectExecutionProfile
 
 
 class EngineeringRunStatus(str, Enum):
@@ -48,6 +49,7 @@ class EngineeringRunRequest:
     allowed_tool_ids: tuple[str, ...] = ()
     explicit_inputs: tuple[str | ContextItem, ...] = ()
     task_specification: TaskSpecification | None = None
+    execution_profile: ProjectExecutionProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class EngineeringRunResult:
     acceptance_results: tuple[AcceptanceResult, ...]
     revision_result: RevisionResult
     run: Run = field(compare=False, repr=False)
+    execution_profile: ProjectExecutionProfile | None = None
 
     @property
     def detailed_acceptance_report(self) -> DetailedAcceptanceReport | None:
@@ -76,7 +79,7 @@ class EngineeringRunExecutor:
         self._revision_executor = revision_executor
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
-        task, criteria, requirements, task_id = self._resolve_input(request)
+        task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
         revision_result = self._revision_executor.execute(
             task,
             provider_name=request.provider_name,
@@ -100,10 +103,13 @@ class EngineeringRunExecutor:
             ),
             None,
         )
+        start_data: dict[str, object] = {"run_id": run.id, "task_id": task_id, "status": "started"}
+        if execution_profile is not None:
+            start_data["profile_id"] = execution_profile.profile_id
         run.events.insert(0, Event(
             run_id=run.id,
             type=EventType.ENGINEERING_RUN_STARTED,
-            data={"run_id": run.id, "task_id": task_id, "status": "started"},
+            data=start_data,
             timestamp=run.events[0].timestamp,
         ))
         run.events.append(Event(
@@ -145,6 +151,7 @@ class EngineeringRunExecutor:
             ),
             revision_result=revision_result,
             run=run,
+            execution_profile=execution_profile,
         )
 
     @staticmethod
@@ -157,21 +164,55 @@ class EngineeringRunExecutor:
                 )
             if not isinstance(specification, TaskSpecification):
                 raise ValueError("task_specification must be a TaskSpecification")
+            if request.execution_profile is not None and specification.execution_profile is not None:
+                if request.execution_profile != specification.execution_profile:
+                    raise ValueError(
+                        "Conflicting execution_profile specified in request and task_specification"
+                    )
+            execution_profile = specification.execution_profile or request.execution_profile
+            if execution_profile is not None and specification.execution_profile is None:
+                if not isinstance(execution_profile, ProjectExecutionProfile):
+                    raise ValueError("execution_profile must be a ProjectExecutionProfile")
+                profile_val = execution_profile.validate()
+                if not profile_val.valid:
+                    raise ValueError(f"Invalid execution_profile: {', '.join(profile_val.errors)}")
             validation = specification.validate()
             if not validation.valid:
                 raise InvalidTaskSpecificationError(validation)
+            task_context: dict[str, object] = {
+                "task_specification": specification.to_context_data()
+            }
+            if execution_profile is not None and "execution_profile" not in task_context["task_specification"]:
+                task_context["execution_profile"] = execution_profile.to_dict()
             task = Task(
                 id=specification.task_id,
                 description="Execute the supplied TaskSpecification.",
-                context={"task_specification": specification.to_context_data()},
+                context=task_context,
             )
-            return task, specification.acceptance_criteria, specification.requirements, specification.task_id
+            return (
+                task,
+                specification.acceptance_criteria,
+                specification.requirements,
+                specification.task_id,
+                execution_profile,
+            )
 
         if not isinstance(request.task, Task):
             raise ValueError("task or task_specification is required")
         if request.acceptance_criteria is None:
             raise ValueError("acceptance_criteria is required for legacy task input")
-        return request.task, request.acceptance_criteria, None, request.task.id
+
+        execution_profile = request.execution_profile
+        if execution_profile is not None:
+            if not isinstance(execution_profile, ProjectExecutionProfile):
+                raise ValueError("execution_profile must be a ProjectExecutionProfile")
+            profile_val = execution_profile.validate()
+            if not profile_val.valid:
+                raise ValueError(f"Invalid execution_profile: {', '.join(profile_val.errors)}")
+            if "execution_profile" not in request.task.context:
+                request.task.context["execution_profile"] = execution_profile.to_dict()
+
+        return request.task, request.acceptance_criteria, None, request.task.id, execution_profile
 
     @staticmethod
     def _final_status(run: Run, result: RevisionResult) -> EngineeringRunStatus:

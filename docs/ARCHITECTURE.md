@@ -864,3 +864,23 @@ FAIL приёмки. Провалы необязательных требова�
 данные о сбое уровня требований (`FailedRequirement` и `FailedCriterion` с указанием `requirement_id` и
 кодов верификации) и передаёт их в контекст задачи ревизии, гарантируя детерминированную локализацию
 дефектов без использования неструктурированного текста LLM.
+
+## Execution Plane Contracts and Project Execution Profile v0.1
+
+The Execution Plane contract introduces typed domain models defining where, what, and how tasks execute without executing actual shell processes, containers, or network operations:
+
+- `ProjectExecutionProfile`: declares the target execution environment (`ExecutionEnvironmentType`: `HOST`, `VIRTUALENV`, `CONTAINER`, `CUSTOM`), runtime name and optional version, target operating system (`TargetOS`), workspace-relative working directory, timeout, output byte limits, network access flag, and an optional whitelist of `allowed_commands`. Deterministic validation enforces safe relative paths, positive limits, and valid environment variable identifiers.
+- `ExecutionRequest`: specifies a declared execution action via a typed command tuple (`command` argv sequence), working directory, request-level environment variables, and optional profile constraints. When evaluated against a profile, requests for unallowed executables are rejected before execution.
+- `ExecutionResult`: captures the outcome of an execution request, including typed `ExecutionStatus` (`SUCCESS`, `FAILURE`, `TIMEOUT`, `DENIED`, `ERROR`), integer exit code, captured standard output and error streams, duration, and output truncation flag.
+- `SecretRedactor` / `DefaultSecretRedactor`: ensures execution metadata, command arguments, environment variables, and output streams are safely redacted before storage or event emission. Known secret tokens, high-entropy API key patterns (`sk-...`, `ghp_...`, Bearer tokens), and sensitive key patterns (`token`, `secret`, `password`, `key`, `auth`, `credential`) are replaced with `[REDACTED]`.
+- Integration: `TaskSpecification` and `EngineeringRunRequest` support attaching a `ProjectExecutionProfile`. The profile is validated, serialized into task context, exposed on `EngineeringRunResult`, and emitted in safe run start event metadata without leaking secret or environment payloads.
+
+## Execution Plane Contracts and Project Execution Profile v0.1 — русская версия
+
+Контракт Execution Plane вводит типизированные доменные модели, определяющие где, что и как должно выполняться, без запуска реальных процессов shell, контейнеров или сетевых вызовов:
+
+- `ProjectExecutionProfile`: декларирует целевое окружение выполнения (`ExecutionEnvironmentType`: `HOST`, `VIRTUALENV`, `CONTAINER`, `CUSTOM`), имя и версию рантайма, целевую ОС (`TargetOS`), относительную рабочую директорию, таймаут, лимит вывода в байтах, флаг доступа к сети и опциональный список разрешённых команд `allowed_commands`. Детерминированная валидация проверяет безопасность путей, положительные лимиты и корректность имён переменных окружения.
+- `ExecutionRequest`: специфицирует конкретное действие выполнения через типизированный кортеж аргументов команды (`command` argv), рабочую директорию, переменные окружения уровня запроса и ограничения профиля. При проверке относительно профиля запросы с неразрешёнными командами отклоняются до запуска.
+- `ExecutionResult`: фиксирует результат выполнения, включая типизированный `ExecutionStatus` (`SUCCESS`, `FAILURE`, `TIMEOUT`, `DENIED`, `ERROR`), целочисленный код возврата, стандартный вывод и поток ошибок, длительность и признак усечения вывода.
+- `SecretRedactor` / `DefaultSecretRedactor`: обеспечивает безопасную маскировку секретов в метаданных выполнения, аргументах команд, переменных окружения и потоках вывода перед сохранением или отправкой событий. Зарегистрированные секреты, шаблоны API-ключей (`sk-...`, `ghp_...`, Bearer) и чувствительные имена ключей (`token`, `secret`, `password`, `key`, `auth`, `credential`) заменяются на `[REDACTED]`.
+- Интеграция: `TaskSpecification` и `EngineeringRunRequest` поддерживают привязку `ProjectExecutionProfile`. Профиль валидируется, сериализуется в контекст задачи, предоставляется в `EngineeringRunResult` и передаётся в безопасных метаданных события запуска без утечки секретов и переменных окружения.

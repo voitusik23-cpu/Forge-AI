@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from app.execution.profile import ProjectExecutionProfile
 from app.tools.acceptance import AcceptanceCriterion
 
 
@@ -49,6 +50,7 @@ class TaskSpecification:
     description: str
     requirements: tuple[Requirement, ...]
     acceptance_criteria: tuple[AcceptanceCriterion, ...]
+    execution_profile: ProjectExecutionProfile | None = None
 
     def __post_init__(self) -> None:
         # Lists are convenient at API boundaries; store immutable collections.
@@ -128,6 +130,14 @@ class TaskSpecification:
                 if item.requirement_id in valid_requirement_ids and not criterion_req_ids.get(item.requirement_id):
                     errors.append("required_requirement_missing_criteria")
 
+        if self.execution_profile is not None:
+            if not isinstance(self.execution_profile, ProjectExecutionProfile):
+                errors.append("invalid_execution_profile")
+            else:
+                profile_result = self.execution_profile.validate()
+                if not profile_result.valid:
+                    errors.extend(f"execution_profile_{err}" for err in profile_result.errors)
+
         return SpecificationValidationResult(
             SpecificationValidationStatus.FAIL if errors else SpecificationValidationStatus.PASS,
             tuple(errors),
@@ -135,7 +145,7 @@ class TaskSpecification:
 
     def to_context_data(self) -> dict[str, object]:
         """Return only specification data for the existing ContextAssembler."""
-        return {
+        data: dict[str, object] = {
             "task_id": self.task_id,
             "title": self.title,
             "description": self.description,
@@ -157,3 +167,6 @@ class TaskSpecification:
                 for item in self.acceptance_criteria
             ],
         }
+        if self.execution_profile is not None:
+            data["execution_profile"] = self.execution_profile.to_dict()
+        return data
