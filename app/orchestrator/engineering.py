@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from enum import Enum
 
 from app.context import ContextItem
@@ -33,6 +34,17 @@ from app.execution.request import (
     ExecutionOutcomeStatus,
     ExecutionRequest,
     ExecutionResult,
+)
+from uuid import uuid4
+
+from app.decision import (
+    Decision,
+    DecisionAction,
+    DecisionProvider,
+    DecisionRequest,
+    DecisionType,
+    DeterministicDecisionProvider,
+    validate_decision,
 )
 from app.projects.state import ProjectState, derive_project_state
 from app.orchestrator.trace import RunEvent, RunTrace, build_trace_from_run
@@ -64,6 +76,7 @@ class EngineeringRunRequest:
     allowed_execution_commands: tuple[str, ...] | None = None
     approval_policy: ApprovalPolicy | None = None
     approval_resolver: ApprovalResolver | None = None
+    decision_provider: DecisionProvider | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.execution_requests, list):
@@ -91,10 +104,15 @@ class EngineeringRunResult:
     execution_results: tuple[ExecutionResult, ...] = ()
     project_states: tuple[ProjectState, ...] = ()
     trace: RunTrace | None = None
+    decisions: tuple[Decision, ...] = ()
 
     @property
     def final_project_state(self) -> ProjectState | None:
         return self.project_states[-1] if self.project_states else None
+
+    @property
+    def final_decision(self) -> Decision | None:
+        return self.decisions[-1] if self.decisions else None
 
     @property
     def events(self) -> tuple[RunEvent, ...]:
@@ -112,9 +130,11 @@ class EngineeringRunExecutor:
         self,
         revision_executor: RevisionLoopExecutor,
         execution_coordinator: ExecutionCoordinator | None = None,
+        decision_provider: DecisionProvider | None = None,
     ) -> None:
         self._revision_executor = revision_executor
         self._execution_coordinator = execution_coordinator
+        self._decision_provider = decision_provider or DeterministicDecisionProvider()
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
         task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
@@ -177,11 +197,12 @@ class EngineeringRunExecutor:
         start_data: dict[str, object] = {"run_id": run.id, "task_id": task_id, "status": "started"}
         if execution_profile is not None:
             start_data["profile_id"] = execution_profile.profile_id
+        start_ts = run.events[0].timestamp if run.events else datetime.now(timezone.utc)
         run.events.insert(0, Event(
             run_id=run.id,
             type=EventType.ENGINEERING_RUN_STARTED,
             data=start_data,
-            timestamp=run.events[0].timestamp,
+            timestamp=start_ts,
         ))
         run.events.append(Event(
             run_id=run.id,
@@ -252,6 +273,81 @@ class EngineeringRunExecutor:
                 )
             )
 
+        provider = request.decision_provider or self._decision_provider
+        decisions: list[Decision] = []
+        for idx, st in enumerate(project_states):
+            conditions: list[str] = []
+            if idx == len(project_states) - 1:
+                if (
+                    final_status == EngineeringRunStatus.LIMIT_REACHED
+                    or revision_result.status == RevisionStatus.LIMIT_REACHED
+                ):
+                    conditions.append("revision_limit_reached")
+                if run.state == RunState.WAITING_FOR_APPROVAL:
+                    conditions.append("approval_pending")
+                for res in execution_results:
+                    if res.outcome_status == ExecutionOutcomeStatus.PERMISSION_DENIED:
+                        conditions.append("permission_denied")
+                    elif res.outcome_status in (
+                        ExecutionOutcomeStatus.POLICY_DENIED,
+                        ExecutionOutcomeStatus.APPROVAL_REJECTED,
+                    ):
+                        conditions.append("policy_denied")
+                    elif res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
+                        conditions.append("approval_pending")
+
+            dec_req = DecisionRequest(
+                decision_id=str(uuid4()),
+                run_id=run.id,
+                attempt_number=st.attempt_number,
+                current_project_state=st,
+                blocking_conditions=tuple(conditions),
+            )
+            run.events.append(
+                Event(
+                    run_id=run.id,
+                    type=EventType.DECISION_REQUESTED,
+                    data={
+                        "decision_id": dec_req.decision_id,
+                        "run_id": run.id,
+                        "attempt_number": dec_req.attempt_number,
+                        "project_state_status": st.status.value,
+                    },
+                )
+            )
+            decision = provider.decide(dec_req)
+            val = validate_decision(decision, dec_req, st)
+            if val.valid:
+                run.events.append(
+                    Event(
+                        run_id=run.id,
+                        type=EventType.DECISION_MADE,
+                        data={
+                            "decision_id": decision.decision_id,
+                            "run_id": run.id,
+                            "attempt_number": decision.attempt_number,
+                            "decision_type": decision.decision_type.value,
+                            "action": decision.action.value,
+                            "rationale": decision.rationale,
+                            "metadata": dict(decision.metadata),
+                        },
+                    )
+                )
+                decisions.append(decision)
+            else:
+                run.events.append(
+                    Event(
+                        run_id=run.id,
+                        type=EventType.DECISION_REJECTED,
+                        data={
+                            "decision_id": decision.decision_id,
+                            "run_id": run.id,
+                            "attempt_number": decision.attempt_number,
+                            "errors": list(val.errors),
+                        },
+                    )
+                )
+
         run.events.append(
             Event(
                 run_id=run.id,
@@ -288,6 +384,7 @@ class EngineeringRunExecutor:
             execution_results=tuple(execution_results),
             project_states=tuple(project_states),
             trace=trace,
+            decisions=tuple(decisions),
         )
 
     @staticmethod

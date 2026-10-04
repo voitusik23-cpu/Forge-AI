@@ -5,11 +5,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 from uuid import uuid4
 
 from app.orchestrator.models import Event, EventType, Run
-from app.projects.state import ProjectState
+
+if TYPE_CHECKING:
+    from app.projects.state import ProjectState
 
 RunEventType = EventType
 
@@ -80,6 +82,7 @@ class RunEvent:
     snapshot_id: str | None = None
     project_state_status: str | None = None
     acceptance_status: str | None = None
+    decision_id: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -116,6 +119,7 @@ class RunEvent:
             "snapshot_id": self.snapshot_id,
             "project_state_status": self.project_state_status,
             "acceptance_status": self.acceptance_status,
+            "decision_id": self.decision_id,
             "metadata": dict(self.metadata),
         }
 
@@ -208,6 +212,7 @@ class RunEventCollector:
         snapshot_id: str | None = None,
         project_state_status: str | None = None,
         acceptance_status: str | None = None,
+        decision_id: str | None = None,
         metadata: Mapping[str, object] | None = None,
         timestamp: datetime | None = None,
     ) -> RunEvent:
@@ -229,6 +234,7 @@ class RunEventCollector:
             snapshot_id=snapshot_id,
             project_state_status=project_state_status,
             acceptance_status=acceptance_status,
+            decision_id=decision_id,
             metadata=metadata or {},
         )
         self._trace.append(ev)
@@ -286,6 +292,9 @@ def build_trace_from_run(
         acc_status = data.get("acceptance_status")
         acceptance_status = str(acc_status) if acc_status else None
 
+        dec_id = data.get("decision_id")
+        decision_id = str(dec_id) if dec_id else None
+
         # Build clean metadata without duplication of top-level reference keys
         meta = {
             k: v
@@ -304,6 +313,7 @@ def build_trace_from_run(
                 "snapshot_id",
                 "project_state_status",
                 "acceptance_status",
+                "decision_id",
             )
         }
 
@@ -321,6 +331,7 @@ def build_trace_from_run(
             snapshot_id=snapshot_id,
             project_state_status=project_state_status,
             acceptance_status=acceptance_status,
+            decision_id=decision_id,
             metadata=meta,
         )
 

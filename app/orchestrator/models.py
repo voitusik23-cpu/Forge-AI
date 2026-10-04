@@ -137,6 +137,9 @@ class EventType(str, Enum):
     EXECUTION_COMPLETED = "execution_completed"
     EXECUTION_DENIED = "execution_denied"
     PROJECT_STATE_UPDATED = "project_state_updated"
+    DECISION_REQUESTED = "decision_requested"
+    DECISION_MADE = "decision_made"
+    DECISION_REJECTED = "decision_rejected"
 
     @classmethod
     def _missing_(cls, value: object):

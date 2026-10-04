@@ -1264,3 +1264,111 @@ EngineeringRunResult.trace / EngineeringRunResult.events
   - НЕ является event sourcing, очередью сообщений, Kafka или Redis.
   - НЕ является механизмом выполнения, границей прав или инстанцией согласования.
   - НЕ является инстанцией приёмки (`AcceptanceGate` остаётся единственным органом приёмки).
+
+## Decision Layer / Run Control v0.1
+
+Decision Layer / Run Control v0.1 introduces a deterministic, provider-neutral decision contract (`Decision`, `DecisionRequest`, `DecisionType`, `DecisionAction`, `DecisionProvider`, `DeterministicDecisionProvider`, `validate_decision`) that governs WHAT SHOULD HAPPEN NEXT in an Engineering Run without executing actions directly:
+
+```text
+ProjectState / Run Context / Blocking Conditions
+                    ↓
+DecisionRequest (Safe Input Context)
+                    ↓
+DecisionProvider (Deterministic Precedence Engine)
+                    ↓
+Decision (Immutable Recommendation)
+                    ↓
+validate_decision (Run Binding, Compatibility, Capabilities)
+                    ↓
+EngineeringRun Executor / Event Trace (Observability & Control)
+                    ↓
+[Existing Authoritative Boundaries: Permission, Approval, ExecutionPolicy, AcceptanceGate]
+```
+
+- **Purpose & Core Invariant:** The Decision Layer produces typed recommendations/decisions on run control flow. It does NOT execute actions, make LLM calls, or bypass existing boundaries (`Permission`, `Approval`, `ExecutionPolicy`, `AcceptanceGate`). A decision is NEVER an authorization.
+- **Contract Models (`app/decision/models.py`):**
+  - `DecisionType`: Coarse decision intent (`CONTINUE`, `REVISE`, `VERIFY`, `REQUEST_APPROVAL`, `WAIT`, `FAIL`, `COMPLETE`).
+  - `DecisionAction`: Concrete actionable operation (`EXECUTE`, `RUN_VERIFICATION`, `REQUEST_REVISION`, `REQUEST_USER_APPROVAL`, `WAIT_FOR_APPROVAL`, `COMPLETE_RUN`, `FAIL_RUN`).
+  - `DecisionRequest`: Structured input context presenting `run_id`, optional `attempt_number`, `current_project_state`, `acceptance_status`, `verification_status_summary`, `available_actions`, `blocking_conditions`, and sanitized `metadata`.
+  - `Decision`: Immutable recommendation containing `decision_id`, `run_id`, `decision_type`, `action`, `reason_code`/`rationale`, optional `confidence`, `attempt_number`, `references`, and sanitized `metadata`.
+  - `sanitize_decision_metadata`: Filters out sensitive and raw keys (`stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, `file_content`) and limits value length to 4096 characters.
+- **Decision Validation (`validate_decision`, `DecisionValidationReport`):**
+  - Validates `decision.run_id == request.run_id`.
+  - Validates `decision_type` and `action` compatibility against `DECISION_TO_ACTION_COMPATIBILITY`.
+  - Enforces that `action` is present in `request.available_actions` when capabilities are constrained.
+  - Verifies non-negative attempt numbers and attempt consistency.
+  - Rejects cross-run references (`references["run_id"] != request.run_id`).
+  - Decisions with validation errors are strictly rejected by the run controller.
+- **Deterministic Decision Engine (`DeterministicDecisionProvider`):** Implements a strict, deterministic rule precedence order based solely on structured state and blocking conditions:
+  - **Rule A (Security/Policy Denial):** Unrecoverable permission, security, or policy failure in `blocking_conditions` (`"security_denied"`, `"permission_denied"`, `"policy_denied"`) -> `FAIL` / `FAIL_RUN`.
+  - **Rule B (Revision Limit):** Revision limit reached (`"revision_limit_reached"`) -> `FAIL` / `FAIL_RUN`.
+  - **Rule C (Approval Pending):** Human approval required or pending (`"approval_required"`, `"approval_pending"`) -> `REQUEST_APPROVAL` / `REQUEST_USER_APPROVAL` or `WAIT_FOR_APPROVAL`.
+  - **Rule D (Acceptance Passed):** Acceptance status is `PASS` or state is `ACCEPTED` -> `COMPLETE` / `COMPLETE_RUN`.
+  - **Rule E (Verification Failed):** Verification failed or state is `FAILED` -> `REVISE` / `REQUEST_REVISION`.
+  - **Rule F (Verification Required):** State is `CHANGED` or verification required -> `VERIFY` / `RUN_VERIFICATION`.
+  - **Rule G (Execution Required):** State is `INITIAL` or execution required -> `CONTINUE` / `EXECUTE`.
+  - **Rule H (Default / Idle):** Otherwise -> `WAIT` / `WAIT_FOR_APPROVAL`.
+- **Engineering Run & Trace Integration:**
+  - `EngineeringRunExecutor` accepts an optional `DecisionProvider` (defaulting to `DeterministicDecisionProvider`).
+  - At each project state transition, a `DecisionRequest` is formed and evaluated.
+  - Safe trace events are emitted: `DECISION_REQUESTED` and `DECISION_MADE` (or `DECISION_REJECTED` if invalid), populated with `decision_id` in `RunTrace`.
+  - `EngineeringRunResult.decisions` exposes all valid accepted decisions, and `EngineeringRunResult.final_decision` provides access to the final decision.
+- **What Decision Layer is NOT:**
+  - NOT an autonomous agent reasoning system or LLM prompt loop.
+  - NOT a provider-specific routing mechanism.
+  - NOT a substitute for Permission, Approval, or Execution boundaries.
+  - NOT an executor or state mutator.
+
+## Decision Layer / Run Control v0.1 — русская версия
+
+Слой принятия решений и управления запуском v0.1 (Decision Layer / Run Control v0.1) вводит детерминированный, нейтральный к провайдерам контракт решений (`Decision`, `DecisionRequest`, `DecisionType`, `DecisionAction`, `DecisionProvider`, `DeterministicDecisionProvider`, `validate_decision`), определяющий, ЧТО ДОЛЖНО ПРОИЗОЙТИ ДАЛЬШЕ в инженерном запуске (Engineering Run), без непосредственного выполнения действий:
+
+```text
+ProjectState / Контекст запуска / Блокирующие условия
+                    ↓
+DecisionRequest (Безопасный входной контекст)
+                    ↓
+DecisionProvider (Детерминированный движок приоритетов)
+                    ↓
+Decision (Неизменяемая рекомендация)
+                    ↓
+validate_decision (Привязка к запуску, совместимость, возможности)
+                    ↓
+EngineeringRun Executor / Event Trace (Наблюдаемость и контроль)
+                    ↓
+[Существующие авторитетные границы: Permission, Approval, ExecutionPolicy, AcceptanceGate]
+```
+
+- **Назначение и ключевой инвариант:** Слой решений формирует типизированные рекомендации и решения по управлению потоком запуска. Он НЕ выполняет действия, НЕ обращается к LLM и НЕ обходит существующие границы (`Permission`, `Approval`, `ExecutionPolicy`, `AcceptanceGate`). Решение НИКОГДА не является авторизацией или разрешением.
+- **Модели контракта (`app/decision/models.py`):**
+  - `DecisionType`: Верхнеуровневый тип намерения (`CONTINUE`, `REVISE`, `VERIFY`, `REQUEST_APPROVAL`, `WAIT`, `FAIL`, `COMPLETE`).
+  - `DecisionAction`: Конкретная типизированная операция (`EXECUTE`, `RUN_VERIFICATION`, `REQUEST_REVISION`, `REQUEST_USER_APPROVAL`, `WAIT_FOR_APPROVAL`, `COMPLETE_RUN`, `FAIL_RUN`).
+  - `DecisionRequest`: Структурированный входной контекст с полями `run_id`, опциональным `attempt_number`, `current_project_state`, `acceptance_status`, `verification_status_summary`, `available_actions`, `blocking_conditions` и очищенным `metadata`.
+  - `Decision`: Неизменяемая рекомендация, содержащая `decision_id`, `run_id`, `decision_type`, `action`, `reason_code`/`rationale`, опциональный `confidence`, `attempt_number`, `references` и очищенный `metadata`.
+  - `sanitize_decision_metadata`: Исключает конфиденциальные и сырые ключи (`stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, `file_content`) и ограничивает размер строковых значений до 4096 символов.
+- **Валидация решений (`validate_decision`, `DecisionValidationReport`):**
+  - Проверяет равенство `decision.run_id == request.run_id`.
+  - Проверяет совместимость `decision_type` и `action` по таблице `DECISION_TO_ACTION_COMPATIBILITY`.
+  - Проверяет наличие `action` в `request.available_actions`, если список допустимых действий ограничен.
+  - Проверяет неотрицательность номера попытки и соответствие попытке запроса.
+  - Отклоняет ссылки на чужие запуски (`references["run_id"] != request.run_id`).
+  - Решения с ошибками валидации категорически отклоняются контроллером запуска.
+- **Детерминированный движок решений (`DeterministicDecisionProvider`):** Реализует строгую детерминированную иерархию правил на основе структурированного состояния и условий:
+  - **Правило A (Отказ безопасности/политики):** Неисправимая ошибка прав, безопасности или политики в `blocking_conditions` (`"security_denied"`, `"permission_denied"`, `"policy_denied"`) -> `FAIL` / `FAIL_RUN`.
+  - **Правило B (Превышение лимита):** Достигнут лимит попыток (`"revision_limit_reached"`) -> `FAIL` / `FAIL_RUN`.
+  - **Правило C (Ожидание подтверждения):** Требуется или ожидает подтверждение пользователя (`"approval_required"`, `"approval_pending"`) -> `REQUEST_APPROVAL` / `REQUEST_USER_APPROVAL` или `WAIT_FOR_APPROVAL`.
+  - **Правило D (Приёмка пройдена):** Статус приёмки `PASS` или состояние `ACCEPTED` -> `COMPLETE` / `COMPLETE_RUN`.
+  - **Правило E (Ошибка верификации):** Верификация не пройдена или состояние `FAILED` -> `REVISE` / `REQUEST_REVISION`.
+  - **Правило F (Требуется верификация):** Состояние `CHANGED` или выставлен флаг верификации -> `VERIFY` / `RUN_VERIFICATION`.
+  - **Правило G (Требуется выполнение):** Состояние `INITIAL` или требуется выполнение -> `CONTINUE` / `EXECUTE`.
+  - **Правило H (Ожидание по умолчанию):** Во всех остальных случаях -> `WAIT` / `WAIT_FOR_APPROVAL`.
+- **Интеграция с Engineering Run и трассировкой:**
+  - `EngineeringRunExecutor` принимает опциональный `DecisionProvider` (по умолчанию `DeterministicDecisionProvider`).
+  - При каждом переходе состояния проекта формируется и оценивается `DecisionRequest`.
+  - В трассу записываются безопасные события: `DECISION_REQUESTED` и `DECISION_MADE` (или `DECISION_REJECTED` при ошибке валидации), обогащённые `decision_id` в `RunTrace`.
+  - `EngineeringRunResult.decisions` предоставляет все принятые валидные решения, а `EngineeringRunResult.final_decision` возвращает финальное решение.
+- **Чем Слой решений НЕ является:**
+  - НЕ является системой рассуждений автономных агентов или LLM-циклом.
+  - НЕ является провайдер-специфичным маршрутизатором.
+  - НЕ является заменой границ прав доступа (Permission), подтверждений (Approval) или политик выполнения.
+  - НЕ является механизмом выполнения команд или изменения файлов.
