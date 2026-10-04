@@ -8,6 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from app.orchestrator.trace import FORBIDDEN_METADATA_SUBSTRINGS, sanitize_event_metadata
+from app.skills.models import SkillDefinition
 
 if TYPE_CHECKING:
     from app.decision.models import Decision, DecisionAction
@@ -122,6 +123,8 @@ class HarnessRequest:
     approval_policy: ApprovalPolicy | None = None
     approval_resolver: ApprovalResolver | None = None
     initial_project_state: ProjectState | None = None
+    available_skills: tuple[SkillDefinition, ...] = ()
+    available_capabilities: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -137,6 +140,13 @@ class HarnessRequest:
             object.__setattr__(self, "acceptance_criteria", tuple(self.acceptance_criteria))
         if isinstance(self.requirements, list):
             object.__setattr__(self, "requirements", tuple(self.requirements))
+        if isinstance(self.available_skills, (list, tuple)):
+            for s in self.available_skills:
+                if not isinstance(s, SkillDefinition):
+                    raise ValueError(f"available_skills elements must be SkillDefinition, got {type(s)}")
+            object.__setattr__(self, "available_skills", tuple(self.available_skills))
+        if isinstance(self.available_capabilities, list):
+            object.__setattr__(self, "available_capabilities", tuple(self.available_capabilities))
 
 
 @dataclass(frozen=True)

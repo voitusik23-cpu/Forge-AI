@@ -27,6 +27,7 @@ class ContextSourceType(str, Enum):
     DECISION = "DECISION"
     USER_DECISION = "USER_DECISION"
     SYSTEM_POLICY = "SYSTEM_POLICY"
+    SKILL = "SKILL"
     # Legacy backward-compatible types
     USER_TASK = "USER_TASK"
     EXPLICIT_INPUT = "EXPLICIT_INPUT"

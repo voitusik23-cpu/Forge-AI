@@ -29,6 +29,8 @@ from app.projects.state import ProjectState, ProjectStateStatus, derive_project_
 from app.tools.acceptance import AcceptanceGate, AcceptanceResult, AcceptanceStatus
 from app.tools.approval import ApprovalPolicy, ApprovalRequest, ApprovalState
 from app.tools.verification import VerificationExpectation, VerificationResult, WorkspaceVerifier
+from app.skills.evaluator import SkillEvaluator
+from app.skills.models import SkillDefinition
 
 
 class AgentHarness:
@@ -60,6 +62,7 @@ class AgentHarness:
         acceptance_gate: AcceptanceGate | None = None,
         state_derivator: Callable[..., ProjectState] | None = None,
         policy: AgentHarnessPolicy | None = None,
+        skill_evaluator: SkillEvaluator | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -69,6 +72,7 @@ class AgentHarness:
         self._acceptance_gate = acceptance_gate or AcceptanceGate()
         self._state_derivator = state_derivator or derive_project_state
         self.policy = policy or AgentHarnessPolicy()
+        self._skill_evaluator = skill_evaluator or SkillEvaluator()
 
     def run(self, request: HarnessRequest) -> HarnessResult:
         """Execute the controlled, bounded Run Loop according to configured policy."""
@@ -174,6 +178,30 @@ class AgentHarness:
                 elif res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
                     conditions.append("approval_pending")
 
+            # Evaluate available skills
+            applicable_skills: tuple[SkillDefinition, ...] = ()
+            if getattr(request, "available_skills", None):
+                avail_tools: set[str] = set()
+                if getattr(request, "allowed_execution_commands", None):
+                    avail_tools.update(request.allowed_execution_commands)
+                    for cmd in request.allowed_execution_commands:
+                        if "python" in str(cmd).lower():
+                            avail_tools.add("python_test_runner")
+                for ex in getattr(request, "execution_requests", ()) or ():
+                    tool_id = getattr(ex, "tool_id", None)
+                    if tool_id:
+                        avail_tools.add(str(tool_id))
+                    if hasattr(ex, "metadata") and isinstance(ex.metadata, dict):
+                        m_tid = ex.metadata.get("tool_id")
+                        if m_tid:
+                            avail_tools.add(str(m_tid))
+                applicable_skills = self._skill_evaluator.find_applicable_skills(
+                    request.available_skills,
+                    task=request.task_specification,
+                    available_capabilities=frozenset(getattr(request, "available_capabilities", ()) or ()),
+                    available_tool_ids=frozenset(avail_tools),
+                )
+
             try:
                 context_envelope = self._context_assembler.assemble(
                     run_id=request.run_id,
@@ -186,6 +214,7 @@ class AgentHarness:
                     blocking_conditions=tuple(conditions),
                     requirements=request.requirements,
                     acceptance_criteria=request.acceptance_criteria,
+                    skills=applicable_skills,
                 )
             except Exception as exc:
                 current_state = replace(

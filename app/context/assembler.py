@@ -28,6 +28,7 @@ from app.context.validation import (
     validate_decision_context,
 )
 from app.orchestrator.models import Task
+from app.skills.models import SkillDefinition
 
 
 class ContextAssemblyError(ValueError):
@@ -182,6 +183,7 @@ class DecisionContextAssembler:
         context_id: str | None = None,
         requirements: Iterable[Any] = (),
         acceptance_criteria: Iterable[Any] = (),
+        skills: Iterable[SkillDefinition] = (),
     ) -> DecisionContextEnvelope:
         if not run_id or not isinstance(run_id, str):
             raise ContextAssemblyError("run_id must be a non-empty string")
@@ -376,6 +378,43 @@ class DecisionContextAssembler:
         # 9. Additional user-supplied context items
         for ci in context_items:
             items.append(ci)
+
+        # 10. Active Skills (advisory procedural guidance)
+        for skill in skills:
+            if not isinstance(skill, SkillDefinition):
+                continue
+            manifest = skill.manifest
+            skill_id = str(manifest.skill_id)
+            name = str(manifest.name or skill_id)
+            trust_level = manifest.trust_level
+            trust_val = trust_level.value if hasattr(trust_level, "value") else str(trust_level or "UNTRUSTED")
+
+            if trust_val == "BUILTIN":
+                ctx_trust = ContextTrustLevel.VERIFIED
+            elif trust_val == "LOCAL":
+                ctx_trust = ContextTrustLevel.CONFIRMED
+            else:
+                ctx_trust = ContextTrustLevel.UNVERIFIED
+
+            instructions = str(skill.instructions or "").strip()
+            # Bounded procedural guidance (max 1000 characters)
+            bounded_instructions = instructions[:1000]
+            skill_payload = {
+                "name": name,
+                "skill_id": skill_id,
+                "guidance": bounded_instructions,
+            }
+            items.append(
+                ContextItem(
+                    item_id=f"skill:{skill_id}",
+                    item_type="skill",
+                    source_type=ContextSourceType.SKILL,
+                    value=json.dumps(skill_payload, ensure_ascii=False),
+                    trust_level=ctx_trust,
+                    source_id=f"skill:{skill_id}",
+                    sensitivity=ContextSensitivity.INTERNAL,
+                )
+            )
 
         # Budget verification
         if len(items) > self.max_context_items:
