@@ -964,3 +964,87 @@ AcceptanceGate
 - События жизненного цикла и аудита: безопасные события (`execution_requested`, `execution_policy_checked`, `execution_started`, `execution_completed`, `execution_denied`) содержат только идентификаторы, статусы, коды возврата и длительность. Потоки stdout/stderr, переменные окружения и сырые секреты не попадают в метаданные событий.
 - Связывание с верификацией и приёмкой: `VerificationResult` содержит опциональное поле `execution_result_id`, а функция `create_execution_verification_evidence` формирует структурированное свидетельство с данными о выполнении и коде возврата. Сбой выполнения не приводит к автоматическому провалу приёмки, если критерии приёмки не завязаны на этот результат выполнения.
 - Обратная совместимость: классические Engineering Run без запросов выполнения продолжают работать со 100% функциональной совместимостью.
+
+## Verification Contract and Objective Evidence v0.2
+
+Verification Contract v0.2 establishes objective evidence boundaries separating process execution from criterion verification:
+
+```text
+Requirement
+    ↓
+AcceptanceCriterion
+    ↓
+VerificationRequest
+    ↓
+ExecutionRequest
+    ↓
+ExecutionResult
+    ↓
+VerificationEvidence
+    ↓
+VerificationResult
+    ↓
+AcceptanceGate
+```
+
+- **Fundamental Principle (`ExecutionResult != VerificationResult`):** A zero exit code (`exit_code == 0`) or successful subprocess execution does not by itself prove requirement satisfaction. Verification requires an explicit verification intent, objective comparison against declared expectations, and structured evidence.
+- **`VerificationRequest`:** Minimal typed contract capturing verification intent: `verification_id`, `criterion_id`, `verification_type` (`PROCESS_EXIT`, `COMMAND_EXECUTION`, `WORKSPACE_FILE`, `CUSTOM`), `execution_request_id`, `expected_exit_code`, `expected_check`, and `metadata`. Validates non-empty identifiers and integer codes.
+- **`VerificationEvidence`:** Typed, structured, audit-grade evidence artifact: `evidence_id`, `verification_id`, `source`, `execution_result_id`, `outcome`, and sanitized `metadata`. LLM opinions or unparsed conversational claims are strictly disallowed as evidence. Lifecycle events and evidence never store raw stdout/stderr, environment variables, or secrets.
+- **`VerificationEvaluator`:** Deterministic evaluator converting `VerificationRequest` and `ExecutionResult` into a `VerificationResult` without executing subprocesses or calling LLMs:
+  - Exit code matches `expected_exit_code` and status `SUCCESS` → `VerificationStatus.PASS` (`code="execution_matched"`).
+  - Exit code mismatch or status `FAILURE` → `VerificationStatus.FAIL` (`code="exit_code_mismatch"` or `"execution_failure"`).
+  - Subprocess timeout → `VerificationStatus.ERROR` (`code="execution_timeout"`).
+  - Subprocess execution error → `VerificationStatus.ERROR` (`code="execution_error"`).
+  - Subprocess authorization denial → `VerificationStatus.DENIED`.
+  - Missing execution result → `VerificationStatus.NOT_RUN` (`code="execution_missing"`).
+  - Emits safe `verification_requested` and `verification_completed` events carrying metadata only.
+- **Deterministic Traceability (`validate_verification_traceability`):** Validates the complete chain `requirement_id → criterion_id → verification_id → execution_result_id → evidence` against:
+  - `unknown_requirement`: criteria referencing non-existent requirements.
+  - `unknown_criterion`: verifications referencing non-existent criteria.
+  - `duplicate_verification_id`: collisions in verification identifiers.
+  - `missing_evidence`: verifications without structured evidence.
+  - `orphan_verification`: unmapped or orphaned verifications.
+  - `verification_referencing_wrong_criterion`: conflicting criterion references.
+- **Acceptance Gate Integration:** `AcceptanceGate` remains the sole authority for evaluating task and requirement acceptance from `VerificationResult` instances.
+
+## Verification Contract and Objective Evidence v0.2 — русская версия
+
+Контракт верификации v0.2 задаёт границы объективных доказательств, строго отделяя выполнение процесса от верификации критериев:
+
+```text
+Requirement
+    ↓
+AcceptanceCriterion
+    ↓
+VerificationRequest
+    ↓
+ExecutionRequest
+    ↓
+ExecutionResult
+    ↓
+VerificationEvidence
+    ↓
+VerificationResult
+    ↓
+AcceptanceGate
+```
+
+- **Базовый принцип (`ExecutionResult != VerificationResult`):** Успешное выполнение подпроцесса или нулевой код возврата (`exit_code == 0`) сами по себе не доказывают выполнение требования. Верификация требует явного намерения проверки, объективного сравнения с заявленными ожиданиями и структурированного свидетельства (evidence).
+- **`VerificationRequest`:** Минимальный типизированный контракт намерения верификации: `verification_id`, `criterion_id`, `verification_type` (`PROCESS_EXIT`, `COMMAND_EXECUTION`, `WORKSPACE_FILE`, `CUSTOM`), `execution_request_id`, `expected_exit_code`, `expected_check` и `metadata`. Валидирует непустые идентификаторы и целочисленные коды возврата.
+- **`VerificationEvidence`:** Типизированное структурированное доказательство пригодное для аудита: `evidence_id`, `verification_id`, `source`, `execution_result_id`, `outcome` и очищенные `metadata`. Мнение LLM или текстовые заявления модели категорически запрещены в качестве evidence. События жизненного цикла и evidence никогда не содержат сырые stdout/stderr, переменные окружения или секреты.
+- **`VerificationEvaluator`:** Детерминированный оценщик, преобразующий `VerificationRequest` и `ExecutionResult` в `VerificationResult` без запуска процессов и без обращения к LLM:
+  - Код возврата совпадает с `expected_exit_code` и статус `SUCCESS` → `VerificationStatus.PASS` (`code="execution_matched"`).
+  - Несовпадение кода возврата или статус `FAILURE` → `VerificationStatus.FAIL` (`code="exit_code_mismatch"` или `"execution_failure"`).
+  - Таймаут подпроцесса → `VerificationStatus.ERROR` (`code="execution_timeout"`).
+  - Ошибка запуска/исполнения подпроцесса → `VerificationStatus.ERROR` (`code="execution_error"`).
+  - Отказ авторизации выполнения → `VerificationStatus.DENIED`.
+  - Отсутствие результата выполнения → `VerificationStatus.NOT_RUN` (`code="execution_missing"`).
+  - Отправляет безопасные события `verification_requested` и `verification_completed`, содержащие только метаданные.
+- **Детерминированная трассируемость (`validate_verification_traceability`):** Проверяет полную цепочку `requirement_id → criterion_id → verification_id → execution_result_id → evidence` на:
+  - `unknown_requirement`: критерии, ссылающиеся на несуществующие требования.
+  - `unknown_criterion`: верификации, ссылающиеся на несуществующие критерии.
+  - `duplicate_verification_id`: коллизии идентификаторов верификаций.
+  - `missing_evidence`: верификации без прикреплённого доказательства.
+  - `orphan_verification`: потерянные или непривязанные верификации.
+  - `verification_referencing_wrong_criterion`: противоречивые ссылки на критерии.
+- **Интеграция с Acceptance Gate:** `AcceptanceGate` остаётся единственной инстанцией, принимающей решение по приёмке задачи и требований на основе экземпляров `VerificationResult`.

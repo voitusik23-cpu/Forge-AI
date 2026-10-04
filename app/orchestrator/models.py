@@ -122,6 +122,7 @@ class EventType(str, Enum):
     TOOL_INVOCATION_DENIED = "tool_invocation_denied"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_RESOLVED = "approval_resolved"
+    VERIFICATION_REQUESTED = "verification_requested"
     VERIFICATION_COMPLETED = "verification_completed"
     ACCEPTANCE_COMPLETED = "acceptance_completed"
     REVISION_STARTED = "revision_started"
