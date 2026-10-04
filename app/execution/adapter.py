@@ -1,36 +1,113 @@
-"""Deterministic local execution adapter using safe subprocess execution."""
+"""Deterministic local execution backend using safe subprocess execution in ephemeral workspaces."""
 
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from app.execution.policy import ExecutionPolicy
-from app.execution.redaction import DefaultSecretRedactor, SecretRedactor
+from app.execution.redaction import (
+    _SENSITIVE_KEY_PATTERN,
+    DefaultSecretRedactor,
+    SecretRedactor,
+)
 from app.execution.request import (
     ExecutionRequest,
     ExecutionResult,
     ExecutionStatus,
 )
+from app.execution.workspace_manager import EphemeralWorkspaceManager
+
+
+SAFE_ENV_WHITELIST_KEYS: frozenset[str] = frozenset({
+    # Windows system environment
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PUBLIC",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+    # POSIX system environment
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "PWD",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    # Python & runtime environment
+    "PYTHONHOME",
+    "PYTHONIOENCODING",
+    "PYTHONPATH",
+    "PYTHONUNBUFFERED",
+    "PYTHONUTF8",
+    "VIRTUAL_ENV",
+})
+
+
+@runtime_checkable
+class ExecutionBackend(Protocol):
+    """Contract for Forge execution backends."""
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        """Execute an authorized, approved execution request in an isolated environment."""
+        ...
 
 
 class LocalExecutionAdapter:
-    """Executes authorized ExecutionRequests as isolated local processes without shell."""
+    """Executes authorized ExecutionRequests as isolated local processes in ephemeral workspaces."""
 
     def __init__(
         self,
         workspace_root: Path | None = None,
         policy: ExecutionPolicy | None = None,
         redactor: SecretRedactor | None = None,
+        workspace_manager: EphemeralWorkspaceManager | None = None,
+        *,
+        isolate_workspace: bool = True,
     ) -> None:
         self._workspace_root = workspace_root.resolve() if workspace_root is not None else None
         self._policy = policy or ExecutionPolicy()
         self._redactor = redactor or DefaultSecretRedactor()
+        self._workspace_manager = workspace_manager
+        self._isolate_workspace = isolate_workspace
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        """Evaluate policy and execute the command locally if authorized."""
+        """Evaluate policy, stage ephemeral workspace, execute safely, harvest artifacts, and clean up."""
+        # 1. Policy evaluation (Default Deny before touching any resources)
         decision = self._policy.evaluate(request)
         if not decision.allowed:
             return self._redactor.redact_result(
@@ -47,123 +124,229 @@ class LocalExecutionAdapter:
 
         assert request.profile is not None  # Guaranteed by policy evaluation
 
-        # Resolve working directory safely
-        if self._workspace_root is not None:
-            resolved_cwd = (self._workspace_root / request.working_directory).resolve()
-            try:
-                resolved_cwd.relative_to(self._workspace_root)
-            except ValueError:
-                return self._redactor.redact_result(
-                    ExecutionResult(
-                        request_id=request.request_id,
-                        status=ExecutionStatus.DENIED,
-                        exit_code=None,
-                        stdout="",
-                        stderr="Execution denied: working directory escapes workspace root",
-                        duration_seconds=0.0,
-                        metadata={"denial_reason": "working_directory_escapes_workspace"},
-                    )
-                )
-            if not resolved_cwd.exists() or not resolved_cwd.is_dir():
-                return self._redactor.redact_result(
-                    ExecutionResult(
-                        request_id=request.request_id,
-                        status=ExecutionStatus.ERROR,
-                        exit_code=None,
-                        stdout="",
-                        stderr=f"Working directory does not exist: {resolved_cwd}",
-                        duration_seconds=0.0,
-                        metadata={"error": "working_directory_missing"},
-                    )
-                )
-            cwd_path = resolved_cwd
-        else:
-            cwd_path = Path(request.working_directory).resolve()
-            if not cwd_path.exists() or not cwd_path.is_dir():
-                return self._redactor.redact_result(
-                    ExecutionResult(
-                        request_id=request.request_id,
-                        status=ExecutionStatus.ERROR,
-                        exit_code=None,
-                        stdout="",
-                        stderr=f"Working directory does not exist: {cwd_path}",
-                        duration_seconds=0.0,
-                        metadata={"error": "working_directory_missing"},
-                    )
-                )
+        # 2. Secret registration & environment preparation
+        active_redactor = self._prepare_redactor(request)
+        env = self._build_scoped_environment(request)
 
-        # Assemble process environment safely
-        env = os.environ.copy()
+        # 3. Ephemeral workspace isolation & execution
+        if self._isolate_workspace:
+            ws_mgr = self._workspace_manager or EphemeralWorkspaceManager(
+                source_workspace_root=self._workspace_root
+            )
+            with ws_mgr:
+                scratch_root = ws_mgr.scratch_root
+                resolved_cwd, err_res = self._resolve_working_directory(request, scratch_root)
+                if err_res is not None:
+                    return active_redactor.redact_result(err_res)
+
+                raw_result = self._run_process(request, resolved_cwd, env)
+
+                # Harvest artifacts before workspace cleanup
+                if request.artifact_targets:
+                    run_id = str(request.metadata.get("run_id") or request.request_id)
+                    provenance = request.command[0] if request.command else "execution"
+                    try:
+                        artifacts = ws_mgr.harvest_artifacts(
+                            request.artifact_targets,
+                            run_id=run_id,
+                            provenance_source=provenance,
+                        )
+                        raw_result = ExecutionResult(
+                            request_id=raw_result.request_id,
+                            status=raw_result.status,
+                            exit_code=raw_result.exit_code,
+                            stdout=raw_result.stdout,
+                            stderr=raw_result.stderr,
+                            duration_seconds=raw_result.duration_seconds,
+                            truncated=raw_result.truncated,
+                            metadata=raw_result.metadata,
+                            outcome_status=raw_result.outcome_status,
+                            artifacts=artifacts,
+                        )
+                    except Exception as exc:
+                        raw_result = ExecutionResult(
+                            request_id=raw_result.request_id,
+                            status=ExecutionStatus.ERROR,
+                            exit_code=raw_result.exit_code,
+                            stdout=raw_result.stdout,
+                            stderr=f"{raw_result.stderr}\nArtifact harvesting error: {exc}".strip(),
+                            duration_seconds=raw_result.duration_seconds,
+                            truncated=raw_result.truncated,
+                            metadata={**raw_result.metadata, "artifact_error": str(exc)},
+                            outcome_status=raw_result.outcome_status,
+                        )
+        else:
+            root = self._workspace_root or Path(".")
+            resolved_cwd, err_res = self._resolve_working_directory(request, root)
+            if err_res is not None:
+                return active_redactor.redact_result(err_res)
+            raw_result = self._run_process(request, resolved_cwd, env)
+
+        return active_redactor.redact_result(raw_result)
+
+    def _resolve_working_directory(
+        self, request: ExecutionRequest, root: Path
+    ) -> tuple[Path, ExecutionResult | None]:
+        resolved_cwd = (root / request.working_directory).resolve()
+        try:
+            resolved_cwd.relative_to(root)
+        except ValueError:
+            return resolved_cwd, ExecutionResult(
+                request_id=request.request_id,
+                status=ExecutionStatus.DENIED,
+                exit_code=None,
+                stdout="",
+                stderr="Execution denied: working directory escapes workspace root",
+                duration_seconds=0.0,
+                metadata={"denial_reason": "working_directory_escapes_workspace"},
+            )
+
+        if not resolved_cwd.exists() or not resolved_cwd.is_dir():
+            return resolved_cwd, ExecutionResult(
+                request_id=request.request_id,
+                status=ExecutionStatus.ERROR,
+                exit_code=None,
+                stdout="",
+                stderr=f"Working directory does not exist: {resolved_cwd}",
+                duration_seconds=0.0,
+                metadata={"error": "working_directory_missing"},
+            )
+
+        return resolved_cwd, None
+
+    def _prepare_redactor(self, request: ExecutionRequest) -> SecretRedactor:
+        secrets_to_register: list[str] = []
+        for k, v in request.environment_variables.items():
+            val_str = str(v).strip()
+            if val_str and (len(val_str) >= 4 or _SENSITIVE_KEY_PATTERN.search(str(k))):
+                secrets_to_register.append(val_str)
+
+        if secrets_to_register and isinstance(self._redactor, DefaultSecretRedactor):
+            return self._redactor.with_registered_secrets(secrets_to_register)
+        return self._redactor
+
+    def _build_scoped_environment(self, request: ExecutionRequest) -> dict[str, str]:
+        env: dict[str, str] = {}
+        for k in SAFE_ENV_WHITELIST_KEYS:
+            if k in os.environ:
+                env[k] = os.environ[k]
+            elif os.name == "nt":
+                for ek, ev in os.environ.items():
+                    if ek.upper() == k:
+                        env[ek] = ev
+                        break
+
+        assert request.profile is not None
         for k, v in request.profile.environment_variables.items():
             env[str(k)] = str(v)
+
         for k, v in request.environment_variables.items():
             env[str(k)] = str(v)
 
-        # Determine timeout
+        # Best-effort network restrictions
+        if not request.profile.network_access:
+            env["http_proxy"] = "http://127.0.0.1:0"
+            env["https_proxy"] = "http://127.0.0.1:0"
+            env["all_proxy"] = "http://127.0.0.1:0"
+            env["HTTP_PROXY"] = "http://127.0.0.1:0"
+            env["HTTPS_PROXY"] = "http://127.0.0.1:0"
+            env["ALL_PROXY"] = "http://127.0.0.1:0"
+            env["NO_PROXY"] = ""
+
+        return env
+
+    def _run_process(
+        self, request: ExecutionRequest, cwd_path: Path, env: dict[str, str]
+    ) -> ExecutionResult:
+        assert request.profile is not None
         timeout = (
             request.timeout_seconds
             if request.timeout_seconds is not None
             else request.profile.timeout_seconds
         )
-
         max_output_bytes = request.profile.max_output_bytes
 
-        # Execute process strictly without shell
         start_time = time.monotonic()
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        start_new_session = (os.name != "nt")
+
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 list(request.command),
                 cwd=str(cwd_path),
                 env=env,
-                timeout=timeout,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 shell=False,
+                creationflags=creationflags,
+                start_new_session=start_new_session,
             )
+        except FileNotFoundError:
             duration = time.monotonic() - start_time
-            raw_stdout = proc.stdout.decode("utf-8", errors="replace")
-            raw_stderr = proc.stderr.decode("utf-8", errors="replace")
+            return ExecutionResult(
+                request_id=request.request_id,
+                status=ExecutionStatus.ERROR,
+                exit_code=None,
+                stdout="",
+                stderr=f"Executable not found: {request.command[0]}",
+                duration_seconds=duration,
+                metadata=dict(request.metadata),
+            )
+        except Exception as exc:
+            duration = time.monotonic() - start_time
+            return ExecutionResult(
+                request_id=request.request_id,
+                status=ExecutionStatus.ERROR,
+                exit_code=None,
+                stdout="",
+                stderr=f"Adapter execution exception: {type(exc).__name__}: {str(exc)}",
+                duration_seconds=duration,
+                metadata=dict(request.metadata),
+            )
+
+        try:
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+            duration = time.monotonic() - start_time
             exit_code = proc.returncode
-            status = (
-                ExecutionStatus.SUCCESS
-                if exit_code == 0
-                else ExecutionStatus.FAILURE
-            )
-        except subprocess.TimeoutExpired as exc:
+            status = ExecutionStatus.SUCCESS if exit_code == 0 else ExecutionStatus.FAILURE
+            raw_stdout = stdout_bytes.decode("utf-8", errors="replace")
+            raw_stderr = stderr_bytes.decode("utf-8", errors="replace")
+        except subprocess.TimeoutExpired:
+            self._terminate_process_tree(proc)
             duration = time.monotonic() - start_time
-            raw_stdout = exc.stdout.decode("utf-8", errors="replace") if exc.stdout else ""
+            try:
+                out_b, err_b = proc.communicate(timeout=2)
+                raw_stdout = out_b.decode("utf-8", errors="replace") if out_b else ""
+                raw_stderr = err_b.decode("utf-8", errors="replace") if err_b else ""
+            except Exception:
+                raw_stdout = ""
+                raw_stderr = ""
             raw_stderr = (
-                exc.stderr.decode("utf-8", errors="replace")
-                if exc.stderr
+                f"{raw_stderr}\nProcess timed out after {timeout} seconds".strip()
+                if raw_stderr
                 else f"Process timed out after {timeout} seconds"
             )
             exit_code = None
             status = ExecutionStatus.TIMEOUT
-        except FileNotFoundError:
-            duration = time.monotonic() - start_time
-            raw_stdout = ""
-            raw_stderr = f"Executable not found: {request.command[0]}"
-            exit_code = None
-            status = ExecutionStatus.ERROR
-        except Exception as exc:
-            duration = time.monotonic() - start_time
-            raw_stdout = ""
-            raw_stderr = f"Adapter execution exception: {type(exc).__name__}: {str(exc)}"
-            exit_code = None
-            status = ExecutionStatus.ERROR
+        finally:
+            if proc.stdout and not proc.stdout.closed:
+                proc.stdout.close()
+            if proc.stderr and not proc.stderr.closed:
+                proc.stderr.close()
 
         # Enforce output truncation limit
         truncated = False
-        stdout_bytes = raw_stdout.encode("utf-8")
-        if len(stdout_bytes) > max_output_bytes:
-            raw_stdout = stdout_bytes[:max_output_bytes].decode("utf-8", errors="ignore")
+        out_enc = raw_stdout.encode("utf-8")
+        if len(out_enc) > max_output_bytes:
+            raw_stdout = out_enc[:max_output_bytes].decode("utf-8", errors="ignore")
             truncated = True
 
-        stderr_bytes = raw_stderr.encode("utf-8")
-        if len(stderr_bytes) > max_output_bytes:
-            raw_stderr = stderr_bytes[:max_output_bytes].decode("utf-8", errors="ignore")
+        err_enc = raw_stderr.encode("utf-8")
+        if len(err_enc) > max_output_bytes:
+            raw_stderr = err_enc[:max_output_bytes].decode("utf-8", errors="ignore")
             truncated = True
 
-        raw_result = ExecutionResult(
+        return ExecutionResult(
             request_id=request.request_id,
             status=status,
             exit_code=exit_code,
@@ -174,4 +357,44 @@ class LocalExecutionAdapter:
             metadata=dict(request.metadata),
         )
 
-        return self._redactor.redact_result(raw_result)
+    def _terminate_process_tree(self, proc: subprocess.Popen[bytes]) -> None:
+        """Terminate process tree with first-class Windows and POSIX support."""
+        if proc.poll() is not None:
+            return
+
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        else:
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.2)
+                if proc.poll() is None:
+                    os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+class LocalProcessExecutionBackend(LocalExecutionAdapter):
+    """Default v0.1 implementation of ExecutionBackend protocol executing isolated local processes."""

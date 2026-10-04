@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from uuid import uuid4
 
+from app.execution.artifacts import Artifact
 from app.execution.profile import ProjectExecutionProfile
 
 
@@ -30,11 +31,14 @@ class ExecutionRequest:
     environment_variables: Mapping[str, str] = field(default_factory=dict)
     timeout_seconds: float | None = None
     profile: ProjectExecutionProfile | None = None
+    artifact_targets: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if isinstance(self.command, list):
             object.__setattr__(self, "command", tuple(self.command))
+        if isinstance(self.artifact_targets, (list, tuple)):
+            object.__setattr__(self, "artifact_targets", tuple(self.artifact_targets))
         if isinstance(self.environment_variables, dict):
             object.__setattr__(
                 self, "environment_variables", dict(self.environment_variables)
@@ -67,6 +71,15 @@ class ExecutionRequest:
         if self.timeout_seconds is not None:
             if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0:
                 errors.append("invalid_timeout_seconds")
+
+        for target in self.artifact_targets:
+            if not isinstance(target, str) or not target.strip():
+                errors.append("invalid_artifact_target")
+                break
+            norm_target = target.replace("\\", "/")
+            if norm_target.startswith("/") or norm_target.startswith("..") or "/../" in norm_target:
+                errors.append("unsafe_artifact_target")
+                break
 
         if self.profile is not None:
             profile_validation = self.profile.validate()
@@ -106,10 +119,13 @@ class ExecutionResult:
     truncated: bool = False
     metadata: Mapping[str, object] = field(default_factory=dict)
     outcome_status: ExecutionOutcomeStatus | None = None
+    artifacts: tuple[Artifact, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.metadata, dict):
             object.__setattr__(self, "metadata", dict(self.metadata))
+        if isinstance(self.artifacts, (list, tuple)):
+            object.__setattr__(self, "artifacts", tuple(self.artifacts))
         if self.outcome_status is None:
             mapping = {
                 ExecutionStatus.SUCCESS: ExecutionOutcomeStatus.EXECUTION_SUCCESS,

@@ -68,6 +68,15 @@ class DefaultSecretRedactor:
             _COMMON_SECRET_PATTERNS + tuple(custom_patterns)
         )
 
+    def with_registered_secrets(self, secrets: Sequence[str]) -> DefaultSecretRedactor:
+        """Return a new redactor with additional registered secrets."""
+        merged = list(self._registered_secrets)
+        for s in secrets:
+            if isinstance(s, str) and s.strip() and s not in merged:
+                merged.append(s)
+        custom = self._patterns[len(_COMMON_SECRET_PATTERNS):]
+        return DefaultSecretRedactor(registered_secrets=merged, custom_patterns=custom)
+
     def redact_text(self, text: str) -> str:
         if not text:
             return text
@@ -133,6 +142,7 @@ class DefaultSecretRedactor:
             environment_variables=sanitized_env,
             timeout_seconds=request.timeout_seconds,
             profile=request.profile,
+            artifact_targets=getattr(request, "artifact_targets", ()),
             metadata=sanitized_metadata,
         )
 
@@ -147,6 +157,7 @@ class DefaultSecretRedactor:
             truncated=result.truncated,
             metadata=self.redact_mapping(result.metadata),
             outcome_status=result.outcome_status,
+            artifacts=getattr(result, "artifacts", ()),
         )
 
     def safe_event_data(self, result: ExecutionResult) -> dict[str, object]:

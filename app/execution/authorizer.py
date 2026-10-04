@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from app.execution.adapter import LocalExecutionAdapter
+from app.execution.adapter import ExecutionBackend, LocalExecutionAdapter
 from app.execution.policy import ExecutionPolicy
 from app.execution.redaction import DefaultSecretRedactor, SecretRedactor
 from app.execution.request import (
@@ -28,12 +28,12 @@ class ExecutionCoordinator:
     2. Permission check
     3. Approval check (if required)
     4. ExecutionPolicy
-    5. LocalExecutionAdapter
+    5. LocalExecutionAdapter / ExecutionBackend
     """
 
     def __init__(
         self,
-        adapter: Optional[LocalExecutionAdapter] = None,
+        adapter: Optional[ExecutionBackend] = None,
         policy: Optional[ExecutionPolicy] = None,
         redactor: Optional[SecretRedactor] = None,
     ) -> None:
@@ -171,6 +171,8 @@ class ExecutionCoordinator:
                 policy=self._policy,
                 redactor=self._redactor,
             )
+        if run_id and "run_id" not in request.metadata:
+            request = replace(request, metadata={**request.metadata, "run_id": run_id})
         raw_result = adapter.execute(request)
         outcome_status = self._map_outcome_status(raw_result.status)
         result = replace(
@@ -191,6 +193,7 @@ class ExecutionCoordinator:
                 "exit_code": result.exit_code,
                 "duration": result.duration_seconds,
                 "truncated": result.truncated,
+                "artifact_count": len(result.artifacts),
             },
         )
 
