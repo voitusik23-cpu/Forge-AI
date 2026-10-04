@@ -898,3 +898,69 @@ The Execution Boundary defines the deterministic enforcement layer that bridges 
 
 - `ExecutionPolicy`: оценивает `ExecutionRequest` относительно связанного профиля `ProjectExecutionProfile` по строгой модели default-deny. Политика проверяет наличие запроса, непустую команду, валидность профиля, явное присутствие команды в `profile.allowed_commands` (с поддержкой совпадения по basename и регистру), безопасность и относительность рабочей директории, непревышение таймаута профиля `timeout_seconds` и корректность имён переменных окружения. При непрохождении проверки возвращается статус `ExecutionStatus.DENIED` и процесс не запускается.
 - `LocalExecutionAdapter`: выполняет авторизованные политикой запросы как локальные процессы операционной системы строго без использования shell (`shell=False`). Адаптер контролирует нахождение рабочей директории в границах workspace, формирует окружение на основе профиля и запроса, обеспечивает таймаут (`ExecutionStatus.TIMEOUT`), перехватывает потоки вывода и ошибок, преобразует коды возврата (0 в `SUCCESS`, ненулевой в `FAILURE`, исключения в `ERROR`), ограничивает размер вывода согласно `profile.max_output_bytes` (с установкой флага `truncated=True`) и маскирует секреты и чувствительные метаданные через `SecretRedactor`.
+
+## Engineering Run Execution and Verification Integration v0.1
+
+The Engineering Run execution integration orchestrates the safe, deterministic transition from proposed execution requests to verified acceptance criteria without bypassing security boundaries:
+
+```text
+Engineering Run
+    ↓
+ExecutionRequest
+    ↓
+Permission / Approval boundary (ExecutionCoordinator)
+    ↓
+ExecutionPolicy
+    ↓
+LocalExecutionAdapter
+    ↓
+ExecutionResult
+    ↓
+VerificationResult
+    ↓
+AcceptanceGate
+```
+
+- `ExecutionCoordinator`: acts as the single authorization and coordination point enforcing a strict, ordered evaluation sequence:
+  1. `ExecutionRequest` reception: records the request and emits the `execution_requested` event.
+  2. Permission boundary: checks executable against `allowed_execution_commands` (default-deny, case-insensitive, basename-aware). If not allowed, returns `ExecutionStatus.DENIED` with `outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED` and emits `execution_denied`. No process is launched.
+  3. Approval boundary: checks whether `ApprovalPolicy` requires human approval for the executable. If required and unresolved/waiting, yields `outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING` and moves the run to `RunState.WAITING_FOR_APPROVAL`. If rejected, returns `outcome_status=ExecutionOutcomeStatus.APPROVAL_REJECTED` and emits `execution_denied`. No process is launched.
+  4. ExecutionPolicy boundary: evaluates the request against `ExecutionPolicy` and profile constraints. Emits `execution_policy_checked`. If denied, returns `outcome_status=ExecutionOutcomeStatus.POLICY_DENIED` and emits `execution_denied`. No process is launched.
+  5. LocalExecutionAdapter execution: invoked only after permission, approval, and policy checks all succeed. Emits `execution_started`, executes subprocess strictly without shell (`shell=False`), bounds output bytes, redacts secrets, and emits `execution_completed`.
+- Outcome status vocabulary: exact, fine-grained differentiation via `ExecutionOutcomeStatus`: `PERMISSION_DENIED`, `APPROVAL_WAITING`, `APPROVAL_REJECTED`, `POLICY_DENIED`, `EXECUTION_ERROR`, `EXECUTION_TIMEOUT`, `EXECUTION_FAILURE`, and `EXECUTION_SUCCESS`.
+- Audit and lifecycle events: safe events (`execution_requested`, `execution_policy_checked`, `execution_started`, `execution_completed`, `execution_denied`) carry only identifiers, statuses, exit codes, and durations. Standard output, standard error, environment variables, and raw secrets are never leaked into event metadata.
+- Verification and Acceptance linkage: `VerificationResult` provides an optional `execution_result_id`, and `create_execution_verification_evidence` generates structured criterion evidence containing execution status and exit codes. Execution failure does not automatically fail acceptance unless an acceptance criterion explicitly maps to the execution outcome.
+- Backward compatibility: legacy Engineering Runs without execution requests continue to run with 100% functional compatibility.
+
+## Engineering Run Execution and Verification Integration v0.1 — русская версия
+
+Интеграция выполнения в Engineering Run обеспечивает безопасный, детерминированный переход от предложенных запросов выполнения к проверяемым критериям приёмки без обхода границ безопасности:
+
+```text
+Engineering Run
+    ↓
+ExecutionRequest
+    ↓
+Граница Permission / Approval (ExecutionCoordinator)
+    ↓
+ExecutionPolicy
+    ↓
+LocalExecutionAdapter
+    ↓
+ExecutionResult
+    ↓
+VerificationResult
+    ↓
+AcceptanceGate
+```
+
+- `ExecutionCoordinator`: выступает единой точкой авторизации и координации, обеспечивающей строгую последовательность проверок:
+  1. Получение `ExecutionRequest`: фиксирует запрос и отправляет событие `execution_requested`.
+  2. Граница Permission: проверяет исполняемый файл по списку `allowed_execution_commands` (default-deny, с учётом регистра и имени файла). При отсутствии разрешения возвращает `ExecutionStatus.DENIED` с `outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED` и отправляет событие `execution_denied`. Процесс не запускается.
+  3. Граница Approval: проверяет, требует ли `ApprovalPolicy` одобрения человека. Если одобрение требуется и находится в ожидании, возвращает `outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING`, а ран переходит в состояние `RunState.WAITING_FOR_APPROVAL`. При отказе возвращает `outcome_status=ExecutionOutcomeStatus.APPROVAL_REJECTED` и отправляет `execution_denied`. Процесс не запускается.
+  4. Граница ExecutionPolicy: проверяет запрос через `ExecutionPolicy` и ограничения профиля. Отправляет событие `execution_policy_checked`. При отклонении возвращает `outcome_status=ExecutionOutcomeStatus.POLICY_DENIED` и отправляет `execution_denied`. Процесс не запускается.
+  5. Запуск через LocalExecutionAdapter: вызывается только после успешного прохождения всех трёх предварительных проверок (Permission, Approval, Policy). Отправляет событие `execution_started`, запускает процесс строго без shell (`shell=False`), ограничивает размер вывода, маскирует секреты и отправляет событие `execution_completed`.
+- Спектр статусов исхода: точная дифференциация через `ExecutionOutcomeStatus`: `PERMISSION_DENIED`, `APPROVAL_WAITING`, `APPROVAL_REJECTED`, `POLICY_DENIED`, `EXECUTION_ERROR`, `EXECUTION_TIMEOUT`, `EXECUTION_FAILURE` и `EXECUTION_SUCCESS`.
+- События жизненного цикла и аудита: безопасные события (`execution_requested`, `execution_policy_checked`, `execution_started`, `execution_completed`, `execution_denied`) содержат только идентификаторы, статусы, коды возврата и длительность. Потоки stdout/stderr, переменные окружения и сырые секреты не попадают в метаданные событий.
+- Связывание с верификацией и приёмкой: `VerificationResult` содержит опциональное поле `execution_result_id`, а функция `create_execution_verification_evidence` формирует структурированное свидетельство с данными о выполнении и коде возврата. Сбой выполнения не приводит к автоматическому провалу приёмки, если критерии приёмки не завязаны на этот результат выполнения.
+- Обратная совместимость: классические Engineering Run без запросов выполнения продолжают работать со 100% функциональной совместимостью.

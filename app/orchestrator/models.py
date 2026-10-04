@@ -130,6 +130,11 @@ class EventType(str, Enum):
     SNAPSHOT_CREATED = "snapshot_created"
     ENGINEERING_RUN_STARTED = "engineering_run_started"
     ENGINEERING_RUN_COMPLETED = "engineering_run_completed"
+    EXECUTION_REQUESTED = "execution_requested"
+    EXECUTION_POLICY_CHECKED = "execution_policy_checked"
+    EXECUTION_STARTED = "execution_started"
+    EXECUTION_COMPLETED = "execution_completed"
+    EXECUTION_DENIED = "execution_denied"
 
 
 @dataclass(frozen=True)

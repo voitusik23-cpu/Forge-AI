@@ -1,6 +1,7 @@
 """Contracts and domain models for execution profile and execution plane."""
 
 from app.execution.adapter import LocalExecutionAdapter
+from app.execution.authorizer import ExecutionCoordinator
 from app.execution.policy import (
     ExecutionPolicy,
     ExecutionPolicyDecision,
@@ -18,6 +19,7 @@ from app.execution.redaction import (
     SecretRedactor,
 )
 from app.execution.request import (
+    ExecutionOutcomeStatus,
     ExecutionRequest,
     ExecutionResult,
     ExecutionStatus,
@@ -25,7 +27,9 @@ from app.execution.request import (
 
 __all__ = [
     "DefaultSecretRedactor",
+    "ExecutionCoordinator",
     "ExecutionEnvironmentType",
+    "ExecutionOutcomeStatus",
     "ExecutionPolicy",
     "ExecutionPolicyDecision",
     "ExecutionRequest",

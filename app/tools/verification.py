@@ -8,11 +8,14 @@ import stat
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 
 from app.orchestrator.models import EventType
 from app.tools.workspace import Workspace, WorkspacePathError
+
+if TYPE_CHECKING:
+    from app.execution.request import ExecutionResult
 
 
 class VerificationStatus(str, Enum):
@@ -36,6 +39,26 @@ class VerificationResult:
     relative_path: str | None = None
     fingerprint: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+    execution_result_id: str | None = None
+
+
+def create_execution_verification_evidence(
+    criterion_id: str,
+    execution_result: ExecutionResult,
+) -> dict[str, object]:
+    """Minimal integration point associating execution outcome with criterion verification."""
+    return {
+        "criterion_id": criterion_id,
+        "execution_request_id": execution_result.request_id,
+        "execution_result_id": execution_result.request_id,
+        "execution_status": execution_result.status.value,
+        "outcome_status": execution_result.outcome_status.value
+        if execution_result.outcome_status
+        else execution_result.status.value,
+        "exit_code": execution_result.exit_code,
+        "duration_seconds": execution_result.duration_seconds,
+        "truncated": execution_result.truncated,
+    }
 
 
 class WorkspaceVerifier:

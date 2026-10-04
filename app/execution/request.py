@@ -80,6 +80,19 @@ class ExecutionRequest:
         return tuple(errors)
 
 
+class ExecutionOutcomeStatus(str, Enum):
+    """Fine-grained execution outcome differentiating authorization and process states."""
+
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    APPROVAL_WAITING = "APPROVAL_WAITING"
+    APPROVAL_REJECTED = "APPROVAL_REJECTED"
+    POLICY_DENIED = "POLICY_DENIED"
+    EXECUTION_ERROR = "EXECUTION_ERROR"
+    EXECUTION_TIMEOUT = "EXECUTION_TIMEOUT"
+    EXECUTION_FAILURE = "EXECUTION_FAILURE"
+    EXECUTION_SUCCESS = "EXECUTION_SUCCESS"
+
+
 @dataclass(frozen=True)
 class ExecutionResult:
     """Outcome of an execution request."""
@@ -92,10 +105,22 @@ class ExecutionResult:
     duration_seconds: float = 0.0
     truncated: bool = False
     metadata: Mapping[str, object] = field(default_factory=dict)
+    outcome_status: ExecutionOutcomeStatus | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.metadata, dict):
             object.__setattr__(self, "metadata", dict(self.metadata))
+        if self.outcome_status is None:
+            mapping = {
+                ExecutionStatus.SUCCESS: ExecutionOutcomeStatus.EXECUTION_SUCCESS,
+                ExecutionStatus.FAILURE: ExecutionOutcomeStatus.EXECUTION_FAILURE,
+                ExecutionStatus.TIMEOUT: ExecutionOutcomeStatus.EXECUTION_TIMEOUT,
+                ExecutionStatus.DENIED: ExecutionOutcomeStatus.POLICY_DENIED,
+                ExecutionStatus.ERROR: ExecutionOutcomeStatus.EXECUTION_ERROR,
+            }
+            mapped = mapping.get(self.status)
+            if mapped is not None:
+                object.__setattr__(self, "outcome_status", mapped)
 
     @property
     def success(self) -> bool:

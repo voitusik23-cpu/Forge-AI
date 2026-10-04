@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from app.context import ContextItem
@@ -20,12 +20,20 @@ from app.tools.acceptance import (
     AcceptanceStatus,
     DetailedAcceptanceReport,
 )
+from app.tools.approval import ApprovalPolicy, ApprovalResolver
 from app.tools.changesets import ChangeSet
 from app.tools.verification import VerificationExpectation, VerificationResult
 from app.tools.workspace import Workspace
 from app.snapshots import ProjectSnapshot
 from app.tasks.specification import InvalidTaskSpecificationError, TaskSpecification
 from app.execution.profile import ProjectExecutionProfile
+from app.execution.authorizer import ExecutionCoordinator
+from app.execution.adapter import LocalExecutionAdapter
+from app.execution.request import (
+    ExecutionOutcomeStatus,
+    ExecutionRequest,
+    ExecutionResult,
+)
 
 
 class EngineeringRunStatus(str, Enum):
@@ -50,6 +58,18 @@ class EngineeringRunRequest:
     explicit_inputs: tuple[str | ContextItem, ...] = ()
     task_specification: TaskSpecification | None = None
     execution_profile: ProjectExecutionProfile | None = None
+    execution_requests: tuple[ExecutionRequest, ...] = ()
+    allowed_execution_commands: tuple[str, ...] | None = None
+    approval_policy: ApprovalPolicy | None = None
+    approval_resolver: ApprovalResolver | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.execution_requests, list):
+            object.__setattr__(self, "execution_requests", tuple(self.execution_requests))
+        if isinstance(self.allowed_execution_commands, list):
+            object.__setattr__(
+                self, "allowed_execution_commands", tuple(self.allowed_execution_commands)
+            )
 
 
 @dataclass(frozen=True)
@@ -66,6 +86,7 @@ class EngineeringRunResult:
     revision_result: RevisionResult
     run: Run = field(compare=False, repr=False)
     execution_profile: ProjectExecutionProfile | None = None
+    execution_results: tuple[ExecutionResult, ...] = ()
 
     @property
     def detailed_acceptance_report(self) -> DetailedAcceptanceReport | None:
@@ -75,8 +96,13 @@ class EngineeringRunResult:
 class EngineeringRunExecutor:
     """Coordinate existing revision, workspace, snapshot, and acceptance contracts."""
 
-    def __init__(self, revision_executor: RevisionLoopExecutor) -> None:
+    def __init__(
+        self,
+        revision_executor: RevisionLoopExecutor,
+        execution_coordinator: ExecutionCoordinator | None = None,
+    ) -> None:
         self._revision_executor = revision_executor
+        self._execution_coordinator = execution_coordinator
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
         task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
@@ -94,6 +120,39 @@ class EngineeringRunExecutor:
             max_revision_attempts=request.max_revision_attempts,
         )
         run = revision_result.run
+
+        execution_results: list[ExecutionResult] = []
+        if request.execution_requests:
+            coordinator = self._execution_coordinator or ExecutionCoordinator(
+                LocalExecutionAdapter(
+                    workspace_root=request.workspace.root if request.workspace else None
+                )
+            )
+            allowed_cmds = (
+                frozenset(request.allowed_execution_commands)
+                if request.allowed_execution_commands is not None
+                else None
+            )
+            for exec_req in request.execution_requests:
+                effective_req = (
+                    replace(exec_req, profile=execution_profile)
+                    if exec_req.profile is None and execution_profile is not None
+                    else exec_req
+                )
+                res = coordinator.execute(
+                    effective_req,
+                    run_id=run.id,
+                    allowed_commands=allowed_cmds,
+                    approval_policy=request.approval_policy,
+                    approval_resolver=request.approval_resolver,
+                    observer=lambda event_type, data: run.events.append(
+                        Event(run_id=run.id, type=event_type, data=data)
+                    ),
+                )
+                execution_results.append(res)
+                if res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
+                    run.state = RunState.WAITING_FOR_APPROVAL
+
         final_status = self._final_status(run, revision_result)
         final_acceptance = next(
             (
@@ -128,6 +187,7 @@ class EngineeringRunExecutor:
                     item.acceptance_result is not None
                     for item in revision_result.attempts
                 ),
+                "execution_count": len(execution_results),
                 "reason": self._reason_code(final_status, final_acceptance, run),
             },
         ))
@@ -152,6 +212,7 @@ class EngineeringRunExecutor:
             revision_result=revision_result,
             run=run,
             execution_profile=execution_profile,
+            execution_results=tuple(execution_results),
         )
 
     @staticmethod

@@ -146,6 +146,7 @@ class DefaultSecretRedactor:
             duration_seconds=result.duration_seconds,
             truncated=result.truncated,
             metadata=self.redact_mapping(result.metadata),
+            outcome_status=result.outcome_status,
         )
 
     def safe_event_data(self, result: ExecutionResult) -> dict[str, object]:
@@ -153,6 +154,7 @@ class DefaultSecretRedactor:
         return {
             "request_id": sanitized.request_id,
             "status": sanitized.status.value,
+            "outcome_status": sanitized.outcome_status.value if sanitized.outcome_status else sanitized.status.value,
             "exit_code": sanitized.exit_code,
             "duration_seconds": sanitized.duration_seconds,
             "truncated": sanitized.truncated,
