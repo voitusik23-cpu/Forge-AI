@@ -1124,3 +1124,81 @@ AcceptanceGate
   - Ошибка запуска процесса → `VerificationStatus.ERROR`.
   - Отказ авторизации выполнения → `VerificationStatus.DENIED`.
 - **Сохранение трассируемости:** Обеспечивает сквозную трассируемость от `requirement_id` к `criterion_id`, `verification_id`, `execution_request_id`, `execution_result_id`, `evidence` и итоговому вердикту `AcceptanceGate`.
+
+## Project State Contract v0.1
+
+Project State Contract v0.1 introduces a deterministic, provider-neutral model (`ProjectState`) that represents the state of a project across an Engineering Run and its revision attempts:
+
+```text
+Workspace + ProjectSnapshot (Observed State)
+        ↓
+ChangeSet (Mutations)
+        ↓
+ExecutionResult (Process Evidence)
+        ↓
+VerificationResult (Objective Verification)
+        ↓
+AcceptanceResult (Acceptance Evaluation)
+        ↓
+ProjectState (State & Traceability Record)
+```
+
+- **ProjectState Model:** An immutable, structured dataclass capturing the lifecycle state of a run attempt:
+  - Identity: `run_id`, `attempt_number`, `project_id`, `task_id`.
+  - Artifact references: `snapshot_ids`, `changeset_ids`, `execution_result_ids`, `verification_result_ids`.
+  - Outcomes: `acceptance_status`, `status` (`ProjectStateStatus`).
+  - Convenient accessors: `snapshot_id`, `changeset_id`.
+  - Audit serialization: `to_dict()`.
+- **State Semantics (`ProjectStateStatus`):** Minimal deterministic lifecycle enum:
+  - `INITIAL`: Run initialized, no changesets, execution results, or verifications.
+  - `IN_PROGRESS`: Execution or attempt is actively underway without finished artifacts.
+  - `CHANGED`: Changesets or execution results are present, but verification has not run.
+  - `VERIFIED`: Verification checks executed and all passed, prior to acceptance evaluation.
+  - `ACCEPTED`: Acceptance gate evaluated criteria and marked them as passed.
+  - `FAILED`: Any verification failed or acceptance gate rejected criteria.
+- **Deterministic Derivation (`derive_project_state`):** Pure function mapping attempt artifacts to `ProjectState`. Purges `stdout`, `stderr`, and `raw_output` from `metadata` to prevent secret leaks and stream bloat.
+- **Engineering Run Integration:** `EngineeringRunResult.project_states` maintains the chronological sequence of attempt states (e.g. Attempt 1: `FAILED` -> Attempt 2: `ACCEPTED`), with `EngineeringRunResult.final_project_state` pointing to the state of the final attempt.
+- **Boundaries & Exclusions:**
+  - `ProjectState` is a state and traceability contract, NOT an execution mechanism.
+  - It does NOT replace `Permission`, `Approval`, or `ExecutionPolicy` boundaries.
+  - It does NOT make acceptance decisions (which remain the sole responsibility of `AcceptanceGate`).
+  - It does NOT perform Git operations, rollback/restore, filesystem changes, or database persistence.
+
+## Project State Contract v0.1 — русская версия
+
+Контракт состояния проекта v0.1 (Project State Contract v0.1) определяет детерминированную, нейтральную к провайдерам модель (`ProjectState`), фиксирующую состояние проекта на протяжении инженерного запуска (Engineering Run) и его попыток доработки:
+
+```text
+Workspace + ProjectSnapshot (Наблюдаемое состояние)
+        ↓
+ChangeSet (Изменения)
+        ↓
+ExecutionResult (Свидетельства выполнения)
+        ↓
+VerificationResult (Объективная верификация)
+        ↓
+AcceptanceResult (Оценка приёмки)
+        ↓
+ProjectState (Запись состояния и трассируемости)
+```
+
+- **Модель `ProjectState`:** Неизменяемый структурированный dataclass, фиксирующий состояние попытки запуска:
+  - Идентификация: `run_id`, `attempt_number`, `project_id`, `task_id`.
+  - Ссылки на артефакты: `snapshot_ids`, `changeset_ids`, `execution_result_ids`, `verification_result_ids`.
+  - Итоги: `acceptance_status`, `status` (`ProjectStateStatus`).
+  - Удобные свойства: `snapshot_id`, `changeset_id`.
+  - Сериализация для аудита: `to_dict()`.
+- **Семантика состояний (`ProjectStateStatus`):** Минимальный детерминированный enum жизненного цикла:
+  - `INITIAL`: Запуск инициализирован, артефактов изменений, выполнения или верификации ещё нет.
+  - `IN_PROGRESS`: Запуск или попытка выполняется в текущий момент.
+  - `CHANGED`: Сформированы изменения (ChangeSet) или результаты выполнения, но они ещё не верифицированы.
+  - `VERIFIED`: Проверки верификации завершены и все прошли успешно (до оценки приёмки).
+  - `ACCEPTED`: Критерии проверены `AcceptanceGate` и успешно приняты.
+  - `FAILED`: Ошибка верификации или отклонение критериев приёмкой.
+- **Детерминированный вывод (`derive_project_state`):** Чистая функция, формирующая `ProjectState` на основе артефактов попытки. Очищает `metadata` от `stdout`, `stderr` и `raw_output` для предотвращения утечки секретов и засорения контекста.
+- **Интеграция с Engineering Run:** `EngineeringRunResult.project_states` сохраняет хронологическую последовательность состояний попыток (например, Attempt 1: `FAILED` -> Attempt 2: `ACCEPTED`), а свойство `EngineeringRunResult.final_project_state` возвращает состояние последней попытки.
+- **Границы и исключения:**
+  - `ProjectState` является контрактом состояния и трассируемости, а НЕ механизмом выполнения.
+  - Он НЕ заменяет границы `Permission`, `Approval` или `ExecutionPolicy`.
+  - Он НЕ принимает решений о приёмке (это исключительная ответственность `AcceptanceGate`).
+  - Он НЕ выполняет операций Git, отката/восстановления файлов или сохранения в базу данных.

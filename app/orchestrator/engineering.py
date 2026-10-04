@@ -34,6 +34,7 @@ from app.execution.request import (
     ExecutionRequest,
     ExecutionResult,
 )
+from app.projects.state import ProjectState, derive_project_state
 
 
 class EngineeringRunStatus(str, Enum):
@@ -87,6 +88,11 @@ class EngineeringRunResult:
     run: Run = field(compare=False, repr=False)
     execution_profile: ProjectExecutionProfile | None = None
     execution_results: tuple[ExecutionResult, ...] = ()
+    project_states: tuple[ProjectState, ...] = ()
+
+    @property
+    def final_project_state(self) -> ProjectState | None:
+        return self.project_states[-1] if self.project_states else None
 
     @property
     def detailed_acceptance_report(self) -> DetailedAcceptanceReport | None:
@@ -193,6 +199,36 @@ class EngineeringRunExecutor:
         ))
 
         attempts = revision_result.attempts
+        project_states: list[ProjectState] = []
+        if attempts:
+            for idx, attempt in enumerate(attempts):
+                attempt_exec_results = (
+                    execution_results if idx == len(attempts) - 1 else ()
+                )
+                st = derive_project_state(
+                    run_id=run.id,
+                    attempt_number=attempt.attempt_number,
+                    task_id=task_id,
+                    snapshots=attempt.snapshots,
+                    changesets=attempt.changesets,
+                    execution_results=attempt_exec_results,
+                    verification_results=attempt.verification_results,
+                    acceptance_result=attempt.acceptance_result,
+                )
+                project_states.append(st)
+        else:
+            st = derive_project_state(
+                run_id=run.id,
+                attempt_number=0,
+                task_id=task_id,
+                snapshots=run.project_snapshots,
+                changesets=run.change_sets,
+                execution_results=execution_results,
+                verification_results=(),
+                acceptance_result=final_acceptance,
+            )
+            project_states.append(st)
+
         return EngineeringRunResult(
             run_id=run.id,
             task_id=task_id,
@@ -213,6 +249,7 @@ class EngineeringRunExecutor:
             run=run,
             execution_profile=execution_profile,
             execution_results=tuple(execution_results),
+            project_states=tuple(project_states),
         )
 
     @staticmethod
