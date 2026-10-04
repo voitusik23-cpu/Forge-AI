@@ -84,8 +84,15 @@ class AIDecisionProvider:
             if ps and hasattr(ps, "status") and hasattr(ps.status, "value")
             else (str(ps.status) if ps and hasattr(ps, "status") else "INITIAL")
         )
-        acceptance_status = request.acceptance_status or "none"
-        verification_status = request.verification_status_summary or "none"
+        acceptance_status = request.acceptance_status
+        if not acceptance_status and ps and getattr(ps, "acceptance_status", None):
+            acceptance_status = str(ps.acceptance_status)
+        if not acceptance_status:
+            acceptance_status = "none"
+
+        verification_status = request.verification_status_summary
+        if not verification_status:
+            verification_status = "none"
 
         conditions = sorted(str(c) for c in request.blocking_conditions)
         actions = (

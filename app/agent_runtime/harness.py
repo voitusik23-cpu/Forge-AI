@@ -211,11 +211,24 @@ class AgentHarness:
                 {"phase": HarnessPhase.DECIDE.value, "iteration": current_state.iteration},
             )
 
+            acc_status = (
+                current_project_state.acceptance_status
+                if current_project_state and current_project_state.acceptance_status
+                else (acceptance_result.status.value if acceptance_result else None)
+            )
+            verif_summary = (
+                f"passed={sum(1 for v in verification_results if getattr(v.status, 'value', str(v.status)) == 'passed')},"
+                f"failed={sum(1 for v in verification_results if getattr(v.status, 'value', str(v.status)) != 'passed')}"
+            ) if verification_results else None
+
             dec_req = DecisionRequest(
                 decision_id=str(uuid4()),
                 run_id=request.run_id,
                 attempt_number=current_state.attempt_number,
+                task_id=request.task_specification.task_id if request.task_specification else "",
                 current_project_state=current_project_state,
+                acceptance_status=acc_status,
+                verification_status_summary=verif_summary,
                 blocking_conditions=tuple(conditions),
                 context_id=context_envelope.context_id,
                 context_fingerprint=context_envelope.context_fingerprint,
