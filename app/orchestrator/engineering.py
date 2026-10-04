@@ -19,6 +19,7 @@ from app.tools.changesets import ChangeSet
 from app.tools.verification import VerificationExpectation, VerificationResult
 from app.tools.workspace import Workspace
 from app.snapshots import ProjectSnapshot
+from app.tasks.specification import InvalidTaskSpecificationError, TaskSpecification
 
 
 class EngineeringRunStatus(str, Enum):
@@ -30,21 +31,24 @@ class EngineeringRunStatus(str, Enum):
 
 @dataclass(frozen=True)
 class EngineeringRunRequest:
-    task: Task
-    workspace: Workspace
-    snapshot_paths: tuple[str, ...]
-    verification_expectations: Mapping[str, VerificationExpectation]
-    acceptance_criteria: tuple[AcceptanceCriterion, ...]
+    # The original positional field order remains available for legacy callers.
+    task: Task | None = None
+    workspace: Workspace | None = None
+    snapshot_paths: tuple[str, ...] = ()
+    verification_expectations: Mapping[str, VerificationExpectation] = field(default_factory=dict)
+    acceptance_criteria: tuple[AcceptanceCriterion, ...] | None = None
     max_revision_attempts: int = 1
     provider_name: str | None = None
     agent_name: str | None = None
     allowed_tool_ids: tuple[str, ...] = ()
     explicit_inputs: tuple[str | ContextItem, ...] = ()
+    task_specification: TaskSpecification | None = None
 
 
 @dataclass(frozen=True)
 class EngineeringRunResult:
     run_id: str
+    task_id: str
     final_status: EngineeringRunStatus
     final_acceptance: AcceptanceResult | None
     attempts: tuple[RevisionAttemptResult, ...]
@@ -63,8 +67,9 @@ class EngineeringRunExecutor:
         self._revision_executor = revision_executor
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
+        task, criteria, task_id = self._resolve_input(request)
         revision_result = self._revision_executor.execute(
-            request.task,
+            task,
             provider_name=request.provider_name,
             agent_name=request.agent_name,
             allowed_tool_ids=request.allowed_tool_ids,
@@ -72,7 +77,7 @@ class EngineeringRunExecutor:
             workspace=request.workspace,
             snapshot_paths=request.snapshot_paths,
             verification_expectations=request.verification_expectations,
-            criteria=request.acceptance_criteria,
+            criteria=criteria,
             max_revision_attempts=request.max_revision_attempts,
         )
         run = revision_result.run
@@ -88,7 +93,7 @@ class EngineeringRunExecutor:
         run.events.insert(0, Event(
             run_id=run.id,
             type=EventType.ENGINEERING_RUN_STARTED,
-            data={"run_id": run.id, "status": "started"},
+            data={"run_id": run.id, "task_id": task_id, "status": "started"},
             timestamp=run.events[0].timestamp,
         ))
         run.events.append(Event(
@@ -114,6 +119,7 @@ class EngineeringRunExecutor:
         attempts = revision_result.attempts
         return EngineeringRunResult(
             run_id=run.id,
+            task_id=task_id,
             final_status=final_status,
             final_acceptance=final_acceptance,
             attempts=attempts,
@@ -130,6 +136,32 @@ class EngineeringRunExecutor:
             revision_result=revision_result,
             run=run,
         )
+
+    @staticmethod
+    def _resolve_input(request: EngineeringRunRequest):
+        specification = request.task_specification
+        if specification is not None:
+            if request.task is not None or request.acceptance_criteria is not None:
+                raise ValueError(
+                    "task_specification cannot be combined with legacy task or acceptance_criteria"
+                )
+            if not isinstance(specification, TaskSpecification):
+                raise ValueError("task_specification must be a TaskSpecification")
+            validation = specification.validate()
+            if not validation.valid:
+                raise InvalidTaskSpecificationError(validation)
+            task = Task(
+                id=specification.task_id,
+                description="Execute the supplied TaskSpecification.",
+                context={"task_specification": specification.to_context_data()},
+            )
+            return task, specification.acceptance_criteria, specification.task_id
+
+        if not isinstance(request.task, Task):
+            raise ValueError("task or task_specification is required")
+        if request.acceptance_criteria is None:
+            raise ValueError("acceptance_criteria is required for legacy task input")
+        return request.task, request.acceptance_criteria, request.task.id
 
     @staticmethod
     def _final_status(run: Run, result: RevisionResult) -> EngineeringRunStatus:

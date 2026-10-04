@@ -781,3 +781,48 @@ ChangeSet, результатами Verification и Acceptance. Также до�
 цикл; событие завершения содержит только статус, количества и стабильный код
 причины. Все записи остаются в памяти. Хранение, откат, операции Git, политика
 выбора провайдера и автономный деплой не входят в эту границу.
+
+## Task Specification / Acceptance Input Boundary v0.1
+
+`TaskSpecification` is the provider-neutral input contract for what the user
+wants completed: `task_id`, title, description, `Requirement` values, and the
+existing `AcceptanceCriterion` values. A Requirement states what must be done;
+Verification observes whether an expected result exists; AcceptanceCriterion
+states how completion is judged. Requirements do not become Verification
+results. `AcceptanceGate` remains the only component that aggregates the
+criteria into PASS or FAIL.
+
+`EngineeringRunRequest` accepts either the legacy `Task` plus explicit
+acceptance criteria or a `TaskSpecification`. The specification path adapts to
+the existing `Task` and `ContextAssembler`; its data is marked as untrusted task
+context and is reused for revisions. It cannot set tool permissions, approval,
+Workspace boundaries, or the revision limit. A valid specification supplies
+the criteria passed to the existing `AcceptanceGate`; the request rejects a
+second independent criteria field. Invalid or structurally incomplete
+specifications fail validation before a Run starts. `EngineeringRunResult` and
+the safe `engineering_run_started` event carry `task_id` without copying the
+full specification into events. The contract is structural and deterministic;
+it does not infer requirements or perform semantic or LLM validation.
+
+## Task Specification / Acceptance Input Boundary v0.1 — русская версия
+
+`TaskSpecification` — provider-neutral входной контракт того, что нужно
+выполнить: `task_id`, заголовок, описание, значения `Requirement` и существующие
+значения `AcceptanceCriterion`. Requirement описывает, что необходимо сделать;
+Verification наблюдает, существует ли ожидаемый результат; AcceptanceCriterion
+задаёт способ оценки выполнения. Requirements не превращаются в результаты
+Verification. `AcceptanceGate` остаётся единственным компонентом, который
+агрегирует критерии в PASS или FAIL.
+
+`EngineeringRunRequest` принимает либо прежнюю пару `Task` с явно заданными
+критериями Acceptance, либо `TaskSpecification`. Ветка со спецификацией
+адаптирует её к существующему `Task` и `ContextAssembler`; данные спецификации
+помечаются как недоверенный task context и повторно используются в revision.
+Спецификация не задаёт разрешения инструментов, approval, границы Workspace или
+лимит revision. Валидная спецификация предоставляет критерии для существующего
+`AcceptanceGate`; второй независимый набор критериев в запросе запрещён.
+Невалидная или структурно неполная спецификация отклоняется до запуска Run.
+`EngineeringRunResult` и безопасное событие `engineering_run_started` содержат
+`task_id`, не копируя спецификацию целиком в события. Контракт выполняет только
+структурную детерминированную проверку: он не выводит требования и не выполняет
+семантическую или LLM-валидацию.
