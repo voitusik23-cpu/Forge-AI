@@ -150,6 +150,10 @@ class EventType(str, Enum):
     HARNESS_LIMIT_REACHED = "harness_limit_reached"
     MEMORY_RECORDED = "memory_recorded"
     MEMORY_REVISED = "memory_revised"
+    KNOWLEDGE_PROPOSED = "knowledge_proposed"
+    KNOWLEDGE_APPROVED = "knowledge_approved"
+    KNOWLEDGE_REJECTED = "knowledge_rejected"
+    KNOWLEDGE_REVISED = "knowledge_revised"
 
     @classmethod
     def _missing_(cls, value: object):

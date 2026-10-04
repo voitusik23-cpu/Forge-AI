@@ -29,6 +29,7 @@ class ContextSourceType(str, Enum):
     SYSTEM_POLICY = "SYSTEM_POLICY"
     SKILL = "SKILL"
     PROJECT_MEMORY = "PROJECT_MEMORY"
+    FORGE_KNOWLEDGE = "FORGE_KNOWLEDGE"
     # Legacy backward-compatible types
     USER_TASK = "USER_TASK"
     EXPLICIT_INPUT = "EXPLICIT_INPUT"

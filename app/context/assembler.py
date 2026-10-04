@@ -185,6 +185,7 @@ class DecisionContextAssembler:
         acceptance_criteria: Iterable[Any] = (),
         skills: Iterable[SkillDefinition] = (),
         project_memory: Iterable[Any] = (),
+        knowledge: Iterable[Any] = (),
     ) -> DecisionContextEnvelope:
         if not run_id or not isinstance(run_id, str):
             raise ContextAssemblyError("run_id must be a non-empty string")
@@ -443,6 +444,41 @@ class DecisionContextAssembler:
                     value=json.dumps(mem_payload, ensure_ascii=False),
                     trust_level=trust if isinstance(trust, ContextTrustLevel) else ContextTrustLevel.CONFIRMED,
                     source_id=f"memory:{mem_id}",
+                    sensitivity=ContextSensitivity.INTERNAL,
+                )
+            )
+
+        # 12. Governed Forge Knowledge (advisory context)
+        for k_item in knowledge:
+            k_id = getattr(k_item, "knowledge_id", str(uuid4()))
+            cat = getattr(k_item, "category", "")
+            cat_val = cat.value if hasattr(cat, "value") else str(cat)
+            statement = str(getattr(k_item, "statement", ""))[:240]
+            rationale = str(getattr(k_item, "rationale", ""))[:1000]
+            scope = getattr(k_item, "scope", "")
+            scope_val = scope.value if hasattr(scope, "value") else str(scope)
+            app_obj = getattr(k_item, "applicability", None)
+            app_dict = app_obj.to_dict() if hasattr(app_obj, "to_dict") else {}
+            non_app_obj = getattr(k_item, "non_applicability", None)
+            non_app_dict = non_app_obj.to_dict() if hasattr(non_app_obj, "to_dict") else {}
+
+            k_payload = {
+                "knowledge_id": k_id,
+                "scope": scope_val,
+                "category": cat_val,
+                "statement": statement,
+                "rationale": rationale,
+                "applicability": app_dict,
+                "non_applicability": non_app_dict,
+            }
+            items.append(
+                ContextItem(
+                    item_id=f"knowledge:{k_id}",
+                    item_type="forge_knowledge",
+                    source_type=ContextSourceType.FORGE_KNOWLEDGE,
+                    value=json.dumps(k_payload, ensure_ascii=False),
+                    trust_level=ContextTrustLevel.CONFIRMED,
+                    source_id=f"knowledge:{k_id}",
                     sensitivity=ContextSensitivity.INTERNAL,
                 )
             )
