@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
 from app.decision.models import Decision, DecisionAction, DecisionRequest, DecisionType
+from app.projects.state import ProjectStateStatus
 
 if TYPE_CHECKING:
     from app.projects.state import ProjectState
@@ -81,6 +82,21 @@ def validate_decision(
         ref_run_id = decision.references.get("run_id")
         if ref_run_id is not None and ref_run_id != request.run_id:
             errors.append("cross_run_reference")
+
+    # 7. Premature completion check (COMPLETE requires PASS acceptance)
+    if decision.decision_type == DecisionType.COMPLETE or decision.action == DecisionAction.COMPLETE_RUN:
+        acc_pass = (
+            request.acceptance_status == "pass"
+            or (state is not None and getattr(state, "acceptance_status", None) == "pass")
+            or (state is not None and getattr(state, "status", None) == ProjectStateStatus.ACCEPTED)
+        )
+        if not acc_pass:
+            errors.append("premature_completion:acceptance_not_passed")
+
+    # 8. Revision limit check (REVISE disallowed if revision_limit_reached)
+    if decision.decision_type == DecisionType.REVISE or decision.action == DecisionAction.REQUEST_REVISION:
+        if "revision_limit_reached" in request.blocking_conditions:
+            errors.append("invalid_revision:revision_limit_reached")
 
     return DecisionValidationReport(valid=len(errors) == 0, errors=tuple(errors))
 

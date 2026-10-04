@@ -292,10 +292,7 @@ class EngineeringRunExecutor:
         for idx, st in enumerate(project_states):
             conditions: list[str] = []
             if idx == len(project_states) - 1:
-                if (
-                    final_status == EngineeringRunStatus.LIMIT_REACHED
-                    or revision_result.status == RevisionStatus.LIMIT_REACHED
-                ):
+                if final_status == EngineeringRunStatus.LIMIT_REACHED:
                     conditions.append("revision_limit_reached")
                 if run.state == RunState.WAITING_FOR_APPROVAL:
                     conditions.append("approval_pending")
