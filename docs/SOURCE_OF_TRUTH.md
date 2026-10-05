@@ -12,9 +12,9 @@
 > is authoritative. For **current** architecture in detail, see
 > [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Verified baseline.** Commit `ad6b82b` (`feat: reset execution authorization
-> contract v0.2`), working tree at the time of writing. Verification command:
-> `python -m unittest discover tests` → **668 tests, OK (skipped=2)**.
+> **Verified baseline.** Commit `fe8fc72` (`security: harden credential redaction
+> for GitHub tokens`), working tree at the time of writing. Verification command:
+> `python -m unittest discover tests` → **716 tests, OK (skipped=2)**.
 
 ## Status legend
 
@@ -92,7 +92,7 @@ covers it. Test file names are the verification; they run in the default
 | Area | Status | Evidence |
 | --- | --- | --- |
 | Orchestrator / agent registry / provider-neutral task dispatch | **CURRENT / VERIFIED** | `app/orchestrator/orchestrator.py`, `app/agents/` — `tests/test_orchestrator.py`, `tests/test_routing_smoke.py` |
-| Provider layer (OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Mock, xAI placeholder) | **CURRENT / VERIFIED** (xAI unconfigured placeholder) | `app/agents/providers/` — `tests/test_providers.py`, `tests/test_openai_provider.py`, `tests/test_anthropic_provider.py`, `tests/test_gemini_provider.py`, `tests/test_openai_compatible_providers.py` |
+| Provider layer (OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Together, Mock, xAI placeholder) | **CURRENT / VERIFIED** (xAI unconfigured placeholder) | `app/agents/providers/` — `tests/test_providers.py`, `tests/test_openai_provider.py`, `tests/test_anthropic_provider.py`, `tests/test_gemini_provider.py`, `tests/test_openai_compatible_providers.py`, `tests/test_together_provider.py` |
 | Provider capabilities metadata | **CURRENT / VERIFIED** | `app/agents/providers/capabilities.py` — `tests/test_provider_capabilities.py` |
 | Dispatcher, deterministic classification, cost-aware routing | **CURRENT / VERIFIED** | `app/orchestrator/dispatcher.py`, `app/orchestrator/classification.py` — `tests/test_dispatcher.py`, `tests/test_task_classification.py` |
 | Provider fallback (finite, sequential) | **CURRENT / VERIFIED** | `app/orchestrator/` — `tests/test_dispatcher.py` |
@@ -306,9 +306,9 @@ they become reachable when a production run loop is wired to the execution plane
 > [`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md). Подробное описание
 > **текущей** архитектуры — в [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Проверенная база.** Коммит `ad6b82b` (`feat: reset execution authorization
-> contract v0.2`), рабочее дерево на момент написания. Команда проверки:
-> `python -m unittest discover tests` → **668 tests, OK (skipped=2)**.
+> **Проверенная база.** Коммит `fe8fc72` (`security: harden credential redaction
+> for GitHub tokens`), рабочее дерево на момент написания. Команда проверки:
+> `python -m unittest discover tests` → **716 tests, OK (skipped=2)**.
 
 ## Легенда статусов
 
@@ -386,7 +386,7 @@ Ready-to-run Project и workflow продвижения знаний Candidate -
 | Область | Статус | Evidence |
 | --- | --- | --- |
 | Orchestrator / реестр агентов / провайдер-нейтральная диспетчеризация задач | **CURRENT / VERIFIED** | `app/orchestrator/orchestrator.py`, `app/agents/` — `tests/test_orchestrator.py`, `tests/test_routing_smoke.py` |
-| Слой провайдеров (OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Mock, заглушка xAI) | **CURRENT / VERIFIED** (xAI — ненастроенная заглушка) | `app/agents/providers/` — `tests/test_providers.py`, `tests/test_openai_provider.py`, `tests/test_anthropic_provider.py`, `tests/test_gemini_provider.py`, `tests/test_openai_compatible_providers.py` |
+| Слой провайдеров (OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Together, Mock, заглушка xAI) | **CURRENT / VERIFIED** (xAI — ненастроенная заглушка) | `app/agents/providers/` — `tests/test_providers.py`, `tests/test_openai_provider.py`, `tests/test_anthropic_provider.py`, `tests/test_gemini_provider.py`, `tests/test_openai_compatible_providers.py`, `tests/test_together_provider.py` |
 | Метаданные capabilities провайдеров | **CURRENT / VERIFIED** | `app/agents/providers/capabilities.py` — `tests/test_provider_capabilities.py` |
 | Dispatcher, детерминированная классификация, cost-aware маршрутизация | **CURRENT / VERIFIED** | `app/orchestrator/dispatcher.py`, `app/orchestrator/classification.py` — `tests/test_dispatcher.py`, `tests/test_task_classification.py` |
 | Fallback провайдеров (конечный, последовательный) | **CURRENT / VERIFIED** | `app/orchestrator/` — `tests/test_dispatcher.py` |

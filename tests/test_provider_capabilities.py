@@ -21,7 +21,7 @@ class ProviderCapabilitiesTests(unittest.TestCase):
         values = {item.provider_name: item for item in registry.list_capabilities()}
         self.assertEqual(
             set(values),
-            {"openai", "anthropic", "google", "xai", "deepseek", "openrouter", "groq", "mock"},
+            {"openai", "anthropic", "google", "xai", "deepseek", "openrouter", "groq", "together", "mock"},
         )
         expected_keys = {
             "openai": "OPENAI_API_KEY",
@@ -31,6 +31,7 @@ class ProviderCapabilitiesTests(unittest.TestCase):
             "deepseek": "DEEPSEEK_API_KEY",
             "openrouter": "OPENROUTER_API_KEY",
             "groq": "GROQ_API_KEY",
+            "together": "TOGETHER_API_KEY",
             "mock": None,
         }
         for name, key_env in expected_keys.items():

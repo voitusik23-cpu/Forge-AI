@@ -216,9 +216,9 @@ backend already exists.
 
 The provider layer is provider-neutral and extensible. The current factory
 registers OpenAI, Anthropic, Google/Gemini, xAI, DeepSeek, OpenRouter, Groq,
-and Mock. OpenAI, Anthropic, Google/Gemini, DeepSeek, OpenRouter, and Groq have
-provider integrations; xAI remains an unconfigured placeholder, and Mock is
-offline/test support.
+Together, and Mock. OpenAI, Anthropic, Google/Gemini, DeepSeek, OpenRouter,
+Groq, and Together have provider integrations; xAI remains an unconfigured
+placeholder, and Mock is offline/test support.
 
 Provider selection may consider task category, declared capabilities,
 availability, cost tier, configuration, fallback policy, and explicit
@@ -336,7 +336,7 @@ leak into shared workflow models.
 
 | Area | Current | Future |
 | --- | --- | --- |
-| Provider Layer | Common interface; OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Mock; xAI placeholder | Broader provider/model metadata and replaceable integrations |
+| Provider Layer | Common interface; OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Together, Mock; xAI placeholder | Broader provider/model metadata and replaceable integrations |
 | Dispatcher | Deterministic classification, capability/config checks, cost tiers, explicit selection, finite fallback | Policy growth for budget, quality, and latency with explainable decisions |
 | Task Classification | Rule-based CODE, ANALYSIS, REVIEW, OTHER plus legacy routing categories | User-visible classification controls and broader project/task taxonomies |
 | Planner | Deterministic templates; static plans with ordered dependencies | Goal decomposition, editable plans, and execution-aware planning |
@@ -1131,9 +1131,10 @@ production-backend секретов уже существует.
 ## 8. Система провайдеров
 
 Слой провайдеров провайдер-нейтрален и расширяем. Текущая фабрика регистрирует
-OpenAI, Anthropic, Google/Gemini, xAI, DeepSeek, OpenRouter, Groq и Mock. OpenAI,
-Anthropic, Google/Gemini, DeepSeek, OpenRouter и Groq имеют интеграции провайдеров;
-xAI остаётся ненастроенной заглушкой, а Mock — offline/test-поддержкой.
+OpenAI, Anthropic, Google/Gemini, xAI, DeepSeek, OpenRouter, Groq, Together и Mock.
+OpenAI, Anthropic, Google/Gemini, DeepSeek, OpenRouter, Groq и Together имеют
+интеграции провайдеров; xAI остаётся ненастроенной заглушкой, а Mock —
+offline/test-поддержкой.
 
 Выбор провайдера может учитывать категорию задачи, объявленные capabilities,
 доступность, cost-tier, конфигурацию, политику fallback и явный выбор
@@ -1255,7 +1256,7 @@ capabilities/конфигурацию. Типы SDK провайдеров и д
 
 | Область | Сейчас | Будущее |
 | --- | --- | --- |
-| Provider Layer | Общий интерфейс; OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Mock; заглушка xAI | Более широкие метаданные провайдеров/моделей и заменяемые интеграции |
+| Provider Layer | Общий интерфейс; OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Groq, Together, Mock; заглушка xAI | Более широкие метаданные провайдеров/моделей и заменяемые интеграции |
 | Dispatcher | Детерминированная классификация, проверки capabilities/конфигурации, cost-tiers, явный выбор, конечный fallback | Рост политики по бюджету, качеству и задержке с объяснимыми решениями |
 | Task Classification | Основанные на правилах CODE, ANALYSIS, REVIEW, OTHER плюс legacy-категории маршрутизации | Видимые пользователю средства управления классификацией и более широкие таксономии проектов/задач |
 | Planner | Детерминированные шаблоны; статические планы с упорядоченными зависимостями | Декомпозиция целей, редактируемые планы и планирование с учётом выполнения |

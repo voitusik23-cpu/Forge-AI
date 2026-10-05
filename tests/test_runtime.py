@@ -23,7 +23,7 @@ class RuntimeBootstrapTests(unittest.TestCase):
         self.assertIs(runtime.settings, settings)
         self.assertIsInstance(runtime.orchestrator, Orchestrator)
         self.assertIsInstance(runtime.run_executor, RunExecutor)
-        expected = ["openai", "anthropic", "deepseek", "google", "xai", "openrouter", "groq", "mock"]
+        expected = ["openai", "anthropic", "deepseek", "google", "xai", "openrouter", "groq", "together", "mock"]
         self.assertEqual(runtime.provider_registry.list_providers(), expected)
         self.assertEqual(runtime.agent_registry.list_agents(), expected)
         capability_names = {

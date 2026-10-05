@@ -27,7 +27,7 @@ Human Goal / Existing Software / Website / Data
 Forge AI is at an **orchestration, execution and governance foundation** stage.
 Implemented and verified today:
 
-- provider-neutral task dispatch with six real provider integrations plus an
+- provider-neutral task dispatch with seven real provider integrations plus an
   offline Mock provider, deterministic classification and cost-aware routing,
   and a finite fallback chain;
 - primary + independent reviewer execution with one bounded revision;
@@ -58,7 +58,7 @@ planned. Read it before trusting any other description of "current state".
 ```text
 User / Goal
    -> Dispatcher -> Provider adapters (OpenAI, Anthropic, Gemini, DeepSeek,
-                    OpenRouter, Groq, Mock) -- provider-neutral Core
+                    OpenRouter, Groq, Together, Mock) -- provider-neutral Core
    -> Orchestrator / Agents / Skills
    -> Decision layer (advisory only) -> Agent Harness (bounded run loop)
    -> Execution Plane: Permission -> ExecutionIntent -> Approval -> Policy
@@ -321,7 +321,7 @@ production-точки входа.
 ```text
 Пользователь / Цель
    -> Dispatcher -> адаптеры провайдеров (OpenAI, Anthropic, Gemini, DeepSeek,
-                    OpenRouter, Groq, Mock) -- провайдер-нейтральное ядро
+                    OpenRouter, Groq, Together, Mock) -- провайдер-нейтральное ядро
    -> Orchestrator / агенты / Skills
    -> Decision-слой (только рекомендации) -> Agent Harness (ограниченный цикл)
    -> Execution Plane: Permission -> ExecutionIntent -> Approval -> Policy

@@ -61,6 +61,10 @@ _DECLARATIONS = {
     "deepseek": (True, True, CostTier.CHEAP, False),
     "openrouter": (True, True, CostTier.CHEAP, False),
     "groq": (True, True, CostTier.CHEAP, False),
+    # Together is fully prepaid with a minimum credit purchase and no free
+    # trial, so it is a paid provider and is excluded from automatic routing
+    # unless FORGE_ALLOW_PAID_PROVIDERS is enabled.
+    "together": (True, True, CostTier.PAID, False),
     "mock": (False, False, CostTier.FREE, False),
 }
 
@@ -73,6 +77,9 @@ _TASK_CATEGORIES = {
     # The configured Cohere free model supports the three text task intents.
     "openrouter": ("code", "analysis", "review"),
     "groq": ("code", "analysis"),
+    # Together serves text chat models across the three text task intents; the
+    # concrete model is selected through the existing model_name mechanism.
+    "together": ("code", "analysis", "review"),
     "mock": (),
 }
 
