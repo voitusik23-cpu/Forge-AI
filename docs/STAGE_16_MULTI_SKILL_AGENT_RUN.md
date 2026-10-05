@@ -225,7 +225,7 @@ Stage 16 explicitly does **NOT** implement:
 
 ---
 
-# Многонавыковый запуск агента Forge AI — Этап 16B (Русская версия)
+# Многонавыковый запуск агента Forge AI — Этап 16B — русская версия
 
 **Статус:** РЕАЛИЗОВАНО И ПРОВЕРЕНО
 
@@ -336,3 +336,72 @@ $$\begin{aligned}
   `python -m compileall app tests` — Чисто (0 ошибок, 0 предупреждений).
 - **Проверка `git diff --check`:**
   Успешно (0 ошибок).
+
+---
+
+## 10. Граница Skill и Plan
+
+$$\begin{aligned}
+\text{Skill} &= \text{Advisory procedural domain knowledge (\"how to do a class of work\")} \\
+\text{Plan} &= \text{Explicit execution intent and step dependency graph (\"what concrete steps to do\")} \\
+\text{Harness} &= \text{Controlled runtime execution loop and phase bounds} \\
+\text{Policy} &= \text{Authoritative permission, approval, and acceptance gate}
+\end{aligned}$$
+
+Skills никогда не должны становиться скрытыми планами выполнения. Упорядочивание
+workflow принадлежит исключительно слою Planning (`app/planning/`) и циклу
+управления Agent Harness.
+
+---
+
+## 11. Тестовая матрица MS-1 ... MS-8
+
+Выделенный набор тестов в `tests/test_multi_skill_harness.py` проверяет все
+инварианты множественных skills:
+
+| Test ID | Метод теста | Описание и проверяемый инвариант | Результат |
+| :--- | :--- | :--- | :---: |
+| **MS-1** | `test_all_applicable_skills_included_without_truncation` | Все 5 подходящих skills возвращаются без усечения; детерминированно отсортированы по `skill_id`; все доходят до контекста. | **PASS** |
+| **MS-2** | `test_multi_skill_context_assembly_and_bounds` | Несколько skills форматируются в отдельные ограниченные элементы `ContextItem` ($\le 1000$ символов) с проверенным отображением trust и безопасностью секретов. | **PASS** |
+| **MS-3** | `test_complementary_multi_skill_end_to_end_run` | Многоходовый запуск с 2 дополняющими skills: ход 1 выполняет тесты по Skill A; ход 2 верифицирует по Skill B; ход 3 завершается при прохождении приёмки. | **PASS** |
+| **MS-4** | `test_conflicting_multi_skill_advisory_resolution` | 2 конфликтующих skills в контексте: ИИ выбирает один; авторитетные политики ограничивают его; выполнение проходит чисто, без движка конфликтов и без дедлока. | **PASS** |
+| **MS-5** | `test_multi_skill_cannot_bypass_permission_policy` | Несколько skills, советующих неразрешённую команду, авторитетно блокируются с `permission_denied` со стороны `PermissionPolicy`. | **PASS** |
+| **MS-6** | `test_multi_skill_cannot_bypass_approval_policy` | Несколько skills, советующих неодобренное действие, авторитетно останавливаются в `WAITING_FOR_APPROVAL` со стороны `ApprovalPolicy`. | **PASS** |
+| **MS-7** | `test_skill_text_chaining_is_inert` | Текст в Skill A, упоминающий Skill B, не запускает никакой динамической активации, инъекции или рекурсии. | **PASS** |
+| **MS-8** | `test_multi_skill_deterministic_cross_run_isolation` | Последовательные запуски с несколькими skills дают побитово идентичные элементы контекста и нулевое загрязнение состояния между запусками. | **PASS** |
+
+---
+
+## 12. Результаты тестов
+
+- **Набор тестов Stage 16B (`tests/test_multi_skill_harness.py`):**
+  `Ran 8 tests in 0.148s — OK`
+- **Полный набор тестов репозитория (`tests/test_*.py`):**
+  `Ran 530 tests in 3.999s — OK (skipped=2)`
+  **Точная разбивка: 530 тестов: 528 прошли, 2 пропущены, 0 неуспешных.**
+- **Компиляция байткода (`compileall`):**
+  `python -m compileall app tests` — чисто (0 ошибок, 0 предупреждений).
+- **Проверка git diff (`git diff --check`):**
+  Пройдена с 0 ошибок.
+
+---
+
+## 13. Не-цели
+
+Stage 16 явно **НЕ** реализует:
+- Динамический маркетплейс skills или их скачивание из сети.
+- Движки приоритета, весов или ранжирования skills.
+- Семантическое сходство, эмбеддинги или векторный поиск для skills.
+- LLM-маршрутизацию или выбор skills.
+- Графы зависимостей skills или предварительные условия между skills.
+- Сцепление skills, конечные автоматы или выполнение workflow.
+- Повышение разрешений на основе skills или динамические белые списки.
+- Изменения схемы `Decision`.
+
+---
+
+## 14. Известные ограничения
+
+- Все skills должны быть объявлены в `HarnessRequest.available_skills` в момент вызова запуска.
+- Элементы контекста ограничены `MAX_CONTEXT_ITEMS = 64`. Если задача предоставляет десятки skills, лимиты общего числа элементов контекста предотвратят неограниченный рост.
+- Skills не взаимодействуют друг с другом. Любая процедурная координация между ходами синтезируется исключительно рекомендательным AI Decision Provider.

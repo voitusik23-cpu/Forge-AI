@@ -48,6 +48,25 @@ Task
 Automatic routing is introduced separately in Dispatcher v0.2. Real
 integrations for providers other than OpenAI and Anthropic remain future work.
 
+
+## Orchestrator v0.1 — русская версия
+
+`Orchestrator` — ядро начальной оркестрации, использующее провайдер-нейтральные модели
+задач и результатов, интерфейс агента, реестр в памяти и локального mock-агента.
+Диспетчеризация явная: вызывающий передаёт `agent_name`; оркестратор не выбирает
+агента и не маршрутизирует автоматически между провайдерами.
+
+```text
+Task
+  -> Orchestrator
+  -> Registry
+  -> Agent
+  -> TaskResult
+```
+
+Автоматическая маршрутизация вводится отдельно в Dispatcher v0.2. Реальные
+интеграции для провайдеров, отличных от OpenAI и Anthropic, остаются будущей
+работой.
 ## Dispatcher v0.2
 
 `Task` carries a coarse `TaskCategory` and a provider-neutral `parameters`
@@ -79,6 +98,39 @@ Explicit `provider_name` bypasses automatic choice and fallback; the caller's
 selection is never replaced. Dispatcher uses only common registries, metadata,
 and SecretStore presence checks, not provider SDKs.
 
+
+## Dispatcher v0.2 — русская версия
+
+`Task` несёт грубую `TaskCategory` и провайдер-нейтральное отображение `parameters`
+(включая необязательное переопределение модели и требуемые capabilities).
+`Dispatcher` применяет детерминированный порядок предпочтений, проверяет
+доступность/конфигурацию/capabilities кандидата и пытается использовать каждого
+подходящего кандидата не более одного раза через существующие `AgentRegistry` и
+адаптер `Provider`:
+
+```text
+Task(category, parameters)
+  -> Orchestrator
+  -> Dispatcher / DispatchPolicy
+  -> AgentRegistry
+  -> ProviderAgent
+  -> Provider interface
+  -> TaskResult
+```
+
+Категория coding предпочитает OpenAI, затем Anthropic; reasoning — Anthropic, затем
+OpenAI; large-context использует Google/Gemini; cheap/free — OpenRouter; fast/cheap —
+DeepSeek; остальные категории используют `FORGE_DEFAULT_PROVIDER` и cost-tiers.
+Кандидат должен быть включён в `FORGE_ENABLED_PROVIDERS`, зарегистрирован, иметь
+требуемый API-ключ и поддерживать запрошенные capabilities задачи. Идентификатор
+модели OpenRouter определяет, является ли её capability-tier бесплатным (`:free` или
+`openrouter/free`) или cheap. Платные кандидаты требуют
+`FORGE_ALLOW_PAID_PROVIDERS=true`. После отказа или недоступности кандидатов
+категории последовательно перебирается конечная
+`FORGE_PROVIDER_FALLBACK_CHAIN`. Явный `provider_name` обходит автоматический выбор
+и fallback; выбор вызывающего никогда не подменяется. Dispatcher использует только
+общие реестры, метаданные и проверку наличия через SecretStore, но не SDK
+провайдеров.
 ## Task Classification + Specialized Routing v0.1
 
 `TaskCategory` is shared by task models and routing. A caller-supplied category
@@ -98,6 +150,26 @@ the configured finite fallback chain remains in effect after automatic
 candidates. The `python -m app.smoke_classified_routing` command exercises one
 real request for each new category.
 
+
+## Task Classification + Specialized Routing v0.1 — русская версия
+
+`TaskCategory` используется совместно моделями задач и маршрутизацией. Категория,
+заданная вызывающим, соблюдается без изменений. Когда она не указана, небольшой
+детерминированный классификатор исследует описание задачи, контекст и параметры и
+назначает `code`, `analysis`, `review` или `other`. Паттерны review имеют приоритет
+над паттернами code, затем над analysis; задачи без совпадений остаются `other`.
+Ни модель, ни внешний сервис для классификации не используются.
+
+Для `code`, `analysis` и `review` dispatcher фильтрует провайдеров по декларативным
+метаданным capability `task_categories`, а затем упорядочивает подходящих
+провайдеров по существующим уровням free, cheap и разрешённым paid. Остальные задачи
+сохраняют существующий cost-aware маршрут, а legacy-значения `TaskCategory`
+продолжают поддерживаться. Одна и та же конфигурация даёт одну и ту же
+классификацию и один и тот же порядок провайдеров. Явный `provider_name` продолжает
+переопределять автоматическую маршрутизацию, а настроенная конечная цепочка fallback
+остаётся в силе после автоматических кандидатов. Команда
+`python -m app.smoke_classified_routing` выполняет по одному реальному запросу для
+каждой новой категории.
 ## Multi-Agent Execution v0.1
 
 `MultiAgentExecutor` sends the task through the existing Orchestrator/Dispatcher
@@ -114,6 +186,21 @@ Statuses distinguish `approved`, `changes_requested`, `review_failed`, and
 revision, while each review is routed independently. No correction loop runs
 after the final review.
 
+
+## Multi-Agent Execution v0.1 — русская версия
+
+`MultiAgentExecutor` отправляет задачу через существующие Orchestrator/Dispatcher для
+одного выполнения primary. При успехе провайдер-нейтральный `ProviderReviewer`
+подаёт задачу категории `review` через тот же путь маршрутизации, с исходными
+деталями задачи и ответом primary в структурированном контексте. Если review
+запрашивает изменения, primary вызывается ещё один раз с предыдущим ответом и
+обратной связью ревью, после чего следует одно финальное ревью. Workflow никогда не
+выполняет более одной ревизии. Reviewer только оценивает текст и не может изменять
+файлы. Сбой primary пропускает ревью; сбой ревизии сохраняет исходный результат
+primary; сбой reviewer сохраняет доступные результаты primary/ревизии. Статусы
+различают `approved`, `changes_requested`, `review_failed` и `revision_failed`.
+Явный `provider_name` primary сохраняется для ревизии, тогда как каждое ревью
+маршрутизируется независимо. После финального ревью цикл коррекции не запускается.
 ## Planner v0.1
 
 `Planner` maps a plain-text goal to a provider-neutral `ProjectPlan` using
@@ -125,6 +212,18 @@ previous task in the selected template. Plan IDs are stable for the same
 normalized goal. This component only creates plans: it does not call a model,
 dispatch tasks, track execution, or manage dependencies at runtime.
 
+
+## Planner v0.1 — русская версия
+
+`Planner` отображает цель в виде обычного текста в провайдер-нейтральный
+`ProjectPlan`, используя детерминированные шаблоны для Telegram-ботов,
+веб-приложений, данных/анализа и общего ПО. Планы содержат упорядоченные элементы
+`PlannedTask` со стабильными ID, существующими значениями `TaskCategory`, явными
+зависимостями и начальным статусом `READY` или `PENDING`. Первая задача готова;
+последующие задачи зависят от предыдущей задачи в выбранном шаблоне. ID плана
+стабильны для одной и той же нормализованной цели. Этот компонент только создаёт
+планы: он не вызывает модель, не диспетчеризует задачи, не отслеживает выполнение и
+не управляет зависимостями во время выполнения.
 ## Provider Layer v0.1
 
 The provider layer sits behind the existing Agent interface. The orchestrator
@@ -154,6 +253,33 @@ Provider settings store only an environment variable name as a credential
 reference; they never read or store the referenced secret. `MockProvider` is
 the deterministic, offline implementation for tests.
 
+
+## Provider Layer v0.1 — русская версия
+
+Слой провайдеров находится за существующим интерфейсом Agent. Оркестратор продолжает
+диспетчеризацию явно выбранному агенту; обобщённый `ProviderAgent` адаптирует задачу
+в провайдер-нейтральный запрос и адаптирует ответ обратно в `TaskResult`.
+
+```text
+User
+  -> Orchestrator
+  -> Agent
+  -> Provider
+  -> AI API (future integration only)
+```
+
+- **Orchestrator** диспетчеризует задачу выбранному вызывающим агенту и не содержит
+  поведения, специфичного для провайдера.
+- **Agent** принимает задачу и владеет обобщённым контрактом «задача -> результат».
+- **Provider** принимает провайдер-нейтральный запрос и возвращает провайдер-нейтральный
+  ответ; детали протокола и SDK конкретного провайдера остаются за его реализацией.
+- **AI API** — интеграции остаются изолированными внутри реализаций провайдеров.
+
+`ProviderFactory` создаёт провайдера только когда его имя передано явно.
+`ProviderRegistry` управляет экземплярами провайдеров отдельно от `AgentRegistry`.
+Настройки провайдера хранят только имя переменной окружения как ссылку на учётные
+данные; они никогда не читают и не хранят сам секрет. `MockProvider` —
+детерминированная offline-реализация для тестов.
 ## Runtime & Configuration Layer v0.1
 
 The runtime is assembled explicitly and has no global singleton:
@@ -185,6 +311,37 @@ for providers. It reads only `PROVIDER_*_EMAIL` values and does not put account
 emails in provider responses, task results, or logs. API keys continue to be
 resolved only through `SecretStore`.
 
+
+## Runtime & Configuration Layer v0.1 — русская версия
+
+Runtime собирается явно и не имеет глобального singleton:
+
+```text
+Runtime
+  -> Settings
+  -> Registries
+  -> Orchestrator
+  -> Agent
+  -> Provider
+```
+
+`RuntimeSettings` содержит значения уровня приложения: окружение, режим отладки,
+провайдера/модель по умолчанию, включённых провайдеров, переопределения моделей,
+таймаут, число повторов и уровень логирования. Он загружается из переменных
+окружения `FORGE_*` и валидируется до сборки runtime. Настроенный провайдер по
+умолчанию используется для задач категории `other`; dispatcher v0.2 применяет
+политику категорий для остальных категорий задач.
+
+`ProviderConfig` остаётся отдельным и содержит метаданные, специфичные для
+провайдера, включая только имя переменной окружения, которая может хранить учётные
+данные. Настройки runtime не загружают API-ключи, а конфигурация провайдера не
+разрешает указанную переменную. Секреты не логируются и не хранятся в Git. Запуск
+выполняет только локальную сборку зависимостей и не делает внешних API-вызовов.
+
+`ProviderAccountConfig` отдельно хранит необязательные локальные метаданные
+email-адресов аккаунтов провайдеров. Он читает только значения `PROVIDER_*_EMAIL` и
+не помещает email-адреса аккаунтов в ответы провайдеров, результаты задач или логи.
+API-ключи по-прежнему разрешаются только через `SecretStore`.
 ## Execution Pipeline v0.1
 
 ```text
@@ -212,6 +369,33 @@ clear domain exceptions; unexpected exceptions are not swallowed.
 and zero token/cost usage. Provider-specific implementations remain behind the
 Provider interface and outside the execution service.
 
+
+## Execution Pipeline v0.1 — русская версия
+
+```text
+User
+  -> Task
+  -> Orchestrator
+  -> ExecutionService (TaskExecutor)
+  -> Agent
+  -> Provider
+  -> ProviderResponse
+  -> TaskResult
+  -> User
+```
+
+Пользователь передаёт `Task` и явно указывает `agent_name`. Оркестратор делегирует
+`TaskExecutor`, который валидирует задачу, находит этого одного агента и
+нормализует ожидаемые доменные/провайдерские отказы и пустые результаты. Он не
+выбирает и не маршрутизирует агентов автоматически. `ProviderAgent` адаптирует
+задачу в провайдер-нейтральный запрос; провайдер возвращает `ProviderResponse` с
+выводом и `Usage`. Агент переносит метаданные провайдера, агента и использования в
+`TaskResult`, возвращаемый вызывающему. Неизвестные агенты и невалидные задачи
+вызывают понятные доменные исключения; неожиданные исключения не подавляются.
+
+`MockProvider` работает синхронно и offline, возвращая детерминированный вывод и
+нулевое использование токенов/стоимости. Реализации, специфичные для провайдеров,
+остаются за интерфейсом Provider и вне сервиса выполнения.
 ## Provider Fallback v0.1
 
 `RuntimeSettings.provider_fallback_chain`, loaded from the optional
@@ -226,6 +410,21 @@ failed `TaskResult` containing the reasons. Explicit `provider_name` and legacy
 `agent_name` dispatch bypass fallback. No scoring, retry loop, parallel calls,
 or fallback based on cost/quality is involved.
 
+
+## Provider Fallback v0.1 — русская версия
+
+`RuntimeSettings.provider_fallback_chain`, загружаемый из необязательной настройки
+`FORGE_PROVIDER_FALLBACK_CHAIN` (список через запятую), задаёт упорядоченный
+конечный список, перебираемый после основного провайдера политики категории.
+Dispatcher проверяет каждого кандидата через `ProviderRegistry` и его существующие
+метаданные capabilities, затем вызывает его адаптер через зарегистрированного
+агента. Dispatcher пытается использовать primary один раз, затем каждый отдельный
+настроенный fallback не более одного раза, последовательно. Отсутствующие
+провайдеры/агенты и нормализованные отказы выполнения провайдера переводят к
+следующей записи; успех останавливает цепочку. Исчерпание возвращает неуспешный
+`TaskResult`, содержащий причины. Явный `provider_name` и legacy-диспетчеризация по
+`agent_name` обходят fallback. Никакого оценивания, цикла повторов, параллельных
+вызовов или fallback по стоимости/качеству здесь нет.
 ## OpenAI Provider v0.1
 
 `OpenAIProvider` uses the official OpenAI Python SDK and its Responses API. It
@@ -239,6 +438,20 @@ rate-limit, timeout, connection/API, and malformed-response failures become
 safe provider errors; unexpected exceptions continue to propagate. Google and
 xAI provider adapters remain unconfigured, and task routing stays explicit.
 
+
+## OpenAI Provider v0.1 — русская версия
+
+`OpenAIProvider` использует официальный Python SDK OpenAI и его Responses API. Он
+вызывается только когда явно диспетчеризованная задача доходит до провайдера; запуск
+runtime, обычные проверки работоспособности и offline-тесты не делают API-запросов.
+Провайдер читает API-ключ из `OPENAI_API_KEY` во время генерации и никогда не
+копирует его в `ProviderConfig`. Ключ SDK и данные запроса не логируются.
+`output_text` становится провайдер-нейтральным выводом, использование Responses даёт
+количество входных/выходных токенов, а оценка стоимости остаётся неустановленной.
+Отказы аутентификации, лимитов, таймаута, соединения/API и некорректного ответа
+превращаются в безопасные ошибки провайдера; неожиданные исключения продолжают
+распространяться. Адаптеры провайдеров Google и xAI остаются ненастроенными, а
+маршрутизация задач остаётся явной.
 ## Local secrets
 
 `SecretStore` lazily resolves a provider's environment-variable reference from
@@ -250,6 +463,16 @@ and request their own key only when generating. `.env` is ignored by Git;
 The same lookup flow supports OpenAI, Anthropic, Gemini, xAI, DeepSeek, and
 OpenRouter adapters.
 
+
+## Local secrets — русская версия
+
+`SecretStore` лениво разрешает ссылку на переменную окружения провайдера: сначала из
+окружения процесса, затем из корневого файла `.env` репозитория. Он не загружает
+секреты в `RuntimeSettings`, `ProviderConfig` или состояние окружения процесса.
+Провайдеры получают общий store через `ProviderFactory` и запрашивают собственный
+ключ только при генерации. `.env` игнорируется Git; `.env.example` содержит пустые
+поля ключей и остаётся отслеживаемым как документация. Тот же порядок поиска
+поддерживает адаптеры OpenAI, Anthropic, Gemini, xAI, DeepSeek и OpenRouter.
 ## Anthropic Provider v0.1
 
 `AnthropicProvider` uses the official Python SDK Messages API when a task is
@@ -258,6 +481,14 @@ explicitly dispatched to it. It resolves `ANTHROPIC_API_KEY` through the shared
 user message, and maps text blocks and token usage into `ProviderResponse`.
 Startup and offline tests do not make requests.
 
+
+## Anthropic Provider v0.1 — русская версия
+
+`AnthropicProvider` использует официальный Python SDK и Messages API, когда задача
+явно направлена ему. Он разрешает `ANTHROPIC_API_KEY` через общий `SecretStore` во
+время генерации, отправляет промпт и сериализованный контекст как сообщение
+пользователя и отображает текстовые блоки и использование токенов в
+`ProviderResponse`. Запуск и offline-тесты запросов не делают.
 ## OpenAI-Compatible Providers v0.1
 
 `DeepSeekProvider`, `OpenRouterProvider`, and `GroqProvider` share the local
@@ -275,6 +506,23 @@ use fake clients; ordinary startup makes no request.
 These adapters are invoked only by task dispatch, and tests use fake clients
 only.
 
+
+## OpenAI-Compatible Providers v0.1 — русская версия
+
+`DeepSeekProvider`, `OpenRouterProvider` и `GroqProvider` используют общий локальный
+адаптер `OpenAICompatibleProvider` и существующий Python SDK OpenAI, применяя
+интерфейс Chat Completions с настроенным базовым URL каждого сервиса и ссылкой на
+ключ в SecretStore. Groq использует `GROQ_API_KEY` и
+`https://api.groq.com/openai/v1`. `ProviderConfig.model_name` принимает
+идентификаторы моделей провайдера напрямую; маршрут `openrouter/free` доступен как
+`OpenRouterProvider.FREE_MODEL_ID` и может быть выбран как настроенная модель.
+Runtime отдельно загружает `FORGE_OPENROUTER_MODEL`, по умолчанию
+`cohere/north-mini-code:free`, не меняя настройки моделей других провайдеров. Явная
+команда `python -m app.smoke_openrouter` отправляет один реальный запрос через
+runtime, dispatcher, `ProviderAgent` и адаптер OpenRouter. Тесты используют
+fake-клиенты; обычный запуск запросов не делает.
+Эти адаптеры вызываются только при диспетчеризации задач, а тесты используют только
+fake-клиенты.
 ## Gemini provider
 
 `GoogleProvider` implements Gemini through Google's official `google-genai`
@@ -284,6 +532,15 @@ to the shared `ProviderResponse`. Startup and automated tests do not make API
 requests. The explicit `python -m app.smoke_gemini` command performs one real
 request.
 
+
+## Gemini provider — русская версия
+
+`GoogleProvider` реализует Gemini через официальный SDK Google `google-genai`. Он
+разрешает `GEMINI_API_KEY` лениво через `SecretStore`, использует модель из
+`FORGE_GEMINI_MODEL` (по умолчанию `gemini-3.8-flash`) и отображает текст и
+использование в общий `ProviderResponse`. Запуск и автоматические тесты не делают
+API-запросов. Явная команда `python -m app.smoke_gemini` выполняет один реальный
+запрос.
 ## Provider Capabilities v0.1
 
 `ProviderCapabilitiesRegistry` exposes immutable metadata for each built-in
@@ -299,6 +556,21 @@ and these declarations do not claim those features are implemented by Forge
 AI's current text-only adapter. Cost tiers are labels, not price data or
 calculated estimates.
 
+
+## Provider Capabilities v0.1 — русская версия
+
+`ProviderCapabilitiesRegistry` предоставляет неизменяемые метаданные для каждого
+встроенного провайдера: каноническое имя, имя переменной окружения для API-ключа,
+поддержку streaming и инструментов, поддержку large-context, грубый cost-tier
+`free`/`cheap`/`paid` и `enabled_by_config`. Поле ключа содержит только имя
+переменной, никогда сам ключ. `enabled_by_config` повторяет существующий флаг
+`ProviderConfig.enabled`. Метаданные capabilities отделены от типов
+запроса/ответа провайдера. Dispatcher использует cost-tiers для политики обычных
+задач, описанной ниже, тогда как объявления streaming/инструментов описывают
+возможности API провайдера в целом. Поддержка инструментов может зависеть от
+модели, и эти объявления не утверждают, что данные возможности реализованы текущим
+текстовым адаптером Forge AI. Cost-tiers — это метки, а не данные о ценах или
+рассчитанные оценки.
 ## Cost-aware Provider Routing v0.1
 
 For ordinary `TaskCategory.OTHER` tasks, `DispatchPolicy` orders registered
@@ -314,6 +586,22 @@ is retained after cost-ordered candidates. Explicit `provider_name` bypasses
 cost selection and retains absolute priority. No actual costs are calculated,
 and Dispatcher does not score by quality, latency, or budget.
 
+
+## Cost-aware Provider Routing v0.1 — русская версия
+
+Для обычных задач `TaskCategory.OTHER` `DispatchPolicy` упорядочивает
+зарегистрированных провайдеров по существующему `ProviderCapabilitiesRegistry`:
+`free`, затем `cheap`, затем `paid`. Кандидаты должны присутствовать в реестрах
+провайдеров и агентов, быть включёнными конфигурацией, иметь требуемый ключ и
+удовлетворять требованиям capabilities задачи. Платные кандидаты исключаются, если
+политика `RuntimeSettings.allow_paid_providers` не включена через
+`FORGE_ALLOW_PAID_PROVIDERS=true`; её значение по умолчанию — false. Каждый
+кандидат проверяется через существующий ограниченный поток выполнения/fallback,
+поэтому отсутствующий ключ/модель переводит к следующему разрешённому кандидату.
+Настроенная цепочка fallback сохраняется после упорядоченных по стоимости
+кандидатов. Явный `provider_name` обходит выбор по стоимости и сохраняет абсолютный
+приоритет. Фактические стоимости не рассчитываются, и Dispatcher не оценивает по
+качеству, задержке или бюджету.
 ## Context Assembly v0.1
 
 `ContextAssembler` builds an `ExecutionContext` from the user task, its existing
@@ -336,6 +624,29 @@ count and kind/source/trust/freshness summaries, never item content. This is a
 small explicit-input boundary, not RAG, project memory, repository discovery,
 or a secret scanner. Context metadata does not grant tool permissions.
 
+
+## Context Assembly v0.1 — русская версия
+
+`ContextAssembler` строит `ExecutionContext` из пользовательской задачи, её
+существующего `Task.context` и необязательных переданных вызывающим текстовых
+значений или значений `ContextItem`. Каждый элемент имеет ID, вид, содержимое,
+источник, доверие и свежесть. Данные задачи помечаются `USER_TASK`; переданные
+вызывающим материалы помечаются `EXPLICIT_INPUT`. Простые текстовые входы по
+умолчанию получают `UNTRUSTED` и `UNKNOWN`; trust/freshness, переданные вместе с
+`ContextItem`, сохраняются, тогда как его source нормализуется в
+`EXPLICIT_INPUT`.
+
+Сборщик не выполняет доступа к файловой системе, сети, провайдерам, агентам или
+памяти. Он применяет настраиваемые лимиты по количеству элементов и символам и
+завершает Run с ошибкой до диспетчеризации агенту, а не усекает содержимое.
+Значения по умолчанию — 16 элементов и 20 000 символов содержимого; вызывающие
+могут настроить их, внедрив `ContextAssembler(max_items=..., max_characters=...)` в
+`RunExecutor`. Собранное значение передаётся в диспетчеризованной задаче под ключом
+`forge_execution_context`; исходный `Run.task` остаётся неизменным. Событие
+`context_assembled` содержит только количество элементов и сводки
+kind/source/trust/freshness, никогда содержимое элементов. Это небольшая граница
+явного ввода, а не RAG, память проектов, discovery репозитория или сканер секретов.
+Метаданные контекста не выдают разрешения на инструменты.
 ## Tool Contract v0.1 — Read-only execution
 
 Agents can return structured `ToolInvocation` proposals in the existing
@@ -362,6 +673,33 @@ output or file contents. The deterministic `MockAgent` exercises proposals
 offline. This is a narrow permission boundary, not a general permission
 system or sandbox. Human approval is a separate boundary described below.
 
+
+## Tool Contract v0.1 — Read-only execution — русская версия
+
+Агенты могут возвращать структурированные предложения `ToolInvocation` в
+существующем `TaskResult`. `RunExecutor` отправляет каждое предложение внедрённому
+`ToolExecutor`; он не создаёт другой оркестратор и не обходит существующий путь
+диспетчеризации. `ToolRegistry` отвечает, зарегистрирован ли инструмент. Отдельная
+`PermissionPolicy` оценивает каждую инвокацию относительно текущего контекста Run и
+его явного `allowed_tool_ids` (default-deny); входные данные инвокации не могут
+выдать разрешение. `ToolExecutor` всегда получает это решение политики сам, поэтому
+прямой вызов без контекста Run отклоняется. Только решение `ALLOW` может начать
+выполнение инструмента.
+`ReadProjectFile` читает только точные относительные пути, переданные в его явном
+белом списке, и отклоняет обход и разрешённые пути вне настроенного корня проекта. У
+него нет доступа к secret-store, и он не может записывать файлы.
+
+После одного ограниченного раунда инструментов значения `ToolResult` передаются
+агенту через существующий путь диспетчеризации и прикрепляются к итоговому
+`TaskResult` запуска. Дальнейшие предложения инструментов получают отказ
+`TOOL_LOOP_LIMIT`. Событие `permission_checked` фиксирует ID запуска/инвокации/
+инструмента, `ALLOW` или `DENY` и структурированную причину. Отклонённый запрос
+также фиксирует `tool_invocation_denied` и не порождает событий выполнения
+инструмента. Остальные события Run фиксируют только ID, статус и fingerprint вывода
+при успехе; они никогда не копируют вывод инструмента или содержимое файлов.
+Детерминированный `MockAgent` проверяет предложения offline. Это узкая граница
+разрешений, а не общая система разрешений или песочница. Одобрение человеком —
+отдельная граница, описанная ниже.
 ## Approval Boundary v0.1
 
 Tool permission and human approval are separate checks. `ToolExecutor` first
@@ -387,7 +725,7 @@ credentials, or file contents. This v0.1 boundary is in-process and does not
 provide a user interface, durable decisions, or checkpoint/resume after a Run
 waits for approval. It is not a full human approval workflow.
 
-## Граница подтверждения v0.1
+## Граница подтверждения v0.1 — русская версия
 
 Разрешение инструмента и подтверждение человеком — отдельные проверки.
 `ToolExecutor` сначала обращается к `PermissionPolicy`; при `DENY` выполнение
@@ -414,7 +752,7 @@ waits for approval. It is not a full human approval workflow.
 хранение решений или checkpoint/resume после ожидания подтверждения. Это не
 полноценный процесс подтверждения человеком.
 
-## Tool Contract v0.1 — только чтение
+## Tool Contract v0.1 — только чтение — русская версия
 
 Агент может вернуть структурированные предложения `ToolInvocation` в
 существующем `TaskResult`. `RunExecutor` передаёт каждое предложение внедрённому
@@ -538,7 +876,7 @@ byte count, and SHA-256 fingerprint. They never copy the written content into
 the event journal. The offline integration tests use isolated temporary
 workspaces and make no network/API calls.
 
-## Граница Workspace v0.1 — контролируемая запись
+## Граница Workspace v0.1 — контролируемая запись — русская версия
 
 Workspace — существующий абсолютный каталог, явно переданный в
 RunExecutor.execute(..., workspace=...). Корень передаётся в Run-scoped
@@ -587,6 +925,25 @@ target when valid, outcome code, and content fingerprint when computed. It does 
 contents. This boundary is read-only and is not an OS sandbox; a hostile concurrent filesystem
 change between checks and open remains a limitation of the existing Workspace boundary.
 
+
+## Verification Boundary v0.1 — русская версия
+
+`WorkspaceVerifier` проверяет одно переданное вызывающим `VerificationExpectation`
+относительно явно предоставленного `Workspace`. Он повторно использует нормализатор
+Workspace, проверки нахождения в границах и отклонение ссылок/reparse points.
+Ожидания охватывают наличие или отсутствие файла и, необязательно, SHA-256
+содержимого. Он читает только обычный файл внутри workspace, когда запрошена
+проверка содержимого; он никогда не создаёт каталоги, не изменяет файлы, не
+вызывает инструмент записи и не исправляет неуспешный результат.
+
+Mutation != Verification. `WriteProjectFile` выполняет одобренное изменение;
+verifier независимо наблюдает получившееся состояние workspace. Предполагаемая
+последовательность — **Write -> Observe -> Verify**. Безопасное событие
+`verification_completed` фиксирует ID запуска и верификации, нормализованную цель
+(когда она валидна), код результата и fingerprint содержимого (когда он вычислен).
+Оно не фиксирует содержимое файлов. Эта граница только для чтения и не является
+OS-песочницей; враждебное параллельное изменение файловой системы между проверкой и
+открытием остаётся ограничением существующей границы Workspace.
 ## Execution Authorization Hardening v0.1
 
 Block 1 makes execution authorization fail closed. `app.execution.identity` is the single
@@ -612,7 +969,7 @@ same coordinator and identity mechanism.
 This block does not provide an OS sandbox, network isolation, environment hardening, dotfile
 filtering, host filesystem isolation, hardlink protection, or durable approval persistence.
 
-## Усиление авторизации выполнения v0.1
+## Усиление авторизации выполнения v0.1 — русская версия
 
 Block 1 переводит авторизацию выполнения в fail-closed режим. `app.execution.identity` является
 единым authoritative-механизмом идентичности команды для валидации запроса, Agent Harness,
@@ -734,7 +1091,7 @@ to that result; Verification checks the result; Acceptance decides whether the
 required task criteria are met. This is in-memory traceability, not Git or an
 artifact storage service.
 
-## Граница ChangeSet / Artifact v0.1
+## Граница ChangeSet / Artifact v0.1 — русская версия
 
 `ChangeSetCollector` наблюдает только явно указанные вызовы инструмента
 изменения файлов после прохождения Permission и Approval. Он вычисляет
@@ -776,7 +1133,7 @@ state; a ChangeSet describes the mutation; Verification checks expectations;
 Acceptance decides whether required task criteria passed. Snapshots are
 read-only in-memory artifacts, not backups or version history.
 
-## Граница Project Snapshot v0.1
+## Граница Project Snapshot v0.1 — русская версия
 
 `ProjectSnapshotter` наблюдает только явно переданные относительные пути и
 использует `Workspace.resolve_target` / `verify_target` для проверки границы
@@ -937,16 +1294,22 @@ The Execution Plane contract introduces typed domain models defining where, what
 
 ## Execution Boundary and Local Execution Adapter v0.1
 
+> **Historical section.** The behavior below describes the v0.1 execution
+> boundary as first introduced. Matching was never basename- or
+> case-insensitive in the shipped code, and the current (v0.2) enforcement model
+> is defined in "Execution Authorization Contract v0.2" below and in
+> [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md).
+
 The Execution Boundary defines the deterministic enforcement layer that bridges authorized `ExecutionRequest`s and local process execution:
 
-- `ExecutionPolicy`: evaluates an `ExecutionRequest` against its associated `ProjectExecutionProfile` under a strict default-deny model. It ensures the request exists, the command is non-empty, the profile is valid, the command is explicitly listed in `profile.allowed_commands` (supporting path basenames and case-insensitivity), the working directory is safe and relative, timeout does not exceed the profile's `timeout_seconds`, and environment variable names are valid. If policy evaluation fails, `ExecutionStatus.DENIED` is returned and no subprocess is created.
+- `ExecutionPolicy`: evaluates an execution request against its associated `ProjectExecutionProfile` under a strict default-deny model. It ensures the request exists, the command is non-empty, the profile is valid, the command matches `profile.allowed_commands` by **exact canonical executable identity** (and by exact argv when the entry is a `CommandIdentity`), the working directory is a safe canonical workspace-relative path, timeout does not exceed the profile's `timeout_seconds`, and environment variable names are valid. If policy evaluation fails, `ExecutionStatus.DENIED` is returned and no subprocess is created.
 - `LocalExecutionAdapter`: executes policy-authorized requests as local operating system processes strictly without shell (`shell=False`). It resolves working directories within workspace boundaries, overlays profile and request environment variables, enforces timeouts (`ExecutionStatus.TIMEOUT`), captures standard output and error streams, maps exit codes (0 to `SUCCESS`, non-zero to `FAILURE`, unhandled exceptions to `ERROR`), bounds output byte sizes using `profile.max_output_bytes` (setting `truncated=True`), and redacts secrets and sensitive metadata via `SecretRedactor`.
 
 ## Execution Boundary and Local Execution Adapter v0.1 — русская версия
 
 Граница выполнения (Execution Boundary) задаёт детерминированный уровень контроля, связывающий авторизованные запросы `ExecutionRequest` с локальным запуском процессов:
 
-- `ExecutionPolicy`: оценивает `ExecutionRequest` относительно связанного профиля `ProjectExecutionProfile` по строгой модели default-deny. Политика проверяет наличие запроса, непустую команду, валидность профиля, явное присутствие команды в `profile.allowed_commands` (с поддержкой совпадения по basename и регистру), безопасность и относительность рабочей директории, непревышение таймаута профиля `timeout_seconds` и корректность имён переменных окружения. При непрохождении проверки возвращается статус `ExecutionStatus.DENIED` и процесс не запускается.
+- `ExecutionPolicy`: оценивает запрос на выполнение относительно связанного профиля `ProjectExecutionProfile` по строгой модели default-deny. Политика проверяет наличие запроса, непустую команду, валидность профиля, совпадение команды с `profile.allowed_commands` по **точному каноническому идентификатору исполняемого файла** (и по точному argv, если запись — `CommandIdentity`), безопасность канонического относительного пути рабочей директории, непревышение таймаута профиля `timeout_seconds` и корректность имён переменных окружения. При непрохождении проверки возвращается статус `ExecutionStatus.DENIED` и процесс не запускается.
 - `LocalExecutionAdapter`: выполняет авторизованные политикой запросы как локальные процессы операционной системы строго без использования shell (`shell=False`). Адаптер контролирует нахождение рабочей директории в границах workspace, формирует окружение на основе профиля и запроса, обеспечивает таймаут (`ExecutionStatus.TIMEOUT`), перехватывает потоки вывода и ошибок, преобразует коды возврата (0 в `SUCCESS`, ненулевой в `FAILURE`, исключения в `ERROR`), ограничивает размер вывода согласно `profile.max_output_bytes` (с установкой флага `truncated=True`) и маскирует секреты и чувствительные метаданные через `SecretRedactor`.
 
 ## Engineering Run Execution and Verification Integration v0.1
@@ -973,7 +1336,7 @@ AcceptanceGate
 
 - `ExecutionCoordinator`: acts as the single authorization and coordination point enforcing a strict, ordered evaluation sequence:
   1. `ExecutionRequest` reception: records the request and emits the `execution_requested` event.
-  2. Permission boundary: checks executable against `allowed_execution_commands` (default-deny, case-insensitive, basename-aware). If not allowed, returns `ExecutionStatus.DENIED` with `outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED` and emits `execution_denied`. No process is launched.
+  2. Permission boundary: checks the requested command against `allowed_execution_commands` (default-deny, **exact canonical executable identity**; no basename or partial matching). If not allowed, returns `ExecutionStatus.DENIED` with `outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED` and emits `execution_denied`. No process is launched.
   3. Approval boundary: checks whether `ApprovalPolicy` requires human approval for the executable. If required and unresolved/waiting, yields `outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING` and moves the run to `RunState.WAITING_FOR_APPROVAL`. If rejected, returns `outcome_status=ExecutionOutcomeStatus.APPROVAL_REJECTED` and emits `execution_denied`. No process is launched.
   4. ExecutionPolicy boundary: evaluates the request against `ExecutionPolicy` and profile constraints. Emits `execution_policy_checked`. If denied, returns `outcome_status=ExecutionOutcomeStatus.POLICY_DENIED` and emits `execution_denied`. No process is launched.
   5. LocalExecutionAdapter execution: invoked only after permission, approval, and policy checks all succeed. Emits `execution_started`, executes subprocess strictly without shell (`shell=False`), bounds output bytes, redacts secrets, and emits `execution_completed`.
@@ -1006,7 +1369,7 @@ AcceptanceGate
 
 - `ExecutionCoordinator`: выступает единой точкой авторизации и координации, обеспечивающей строгую последовательность проверок:
   1. Получение `ExecutionRequest`: фиксирует запрос и отправляет событие `execution_requested`.
-  2. Граница Permission: проверяет исполняемый файл по списку `allowed_execution_commands` (default-deny, с учётом регистра и имени файла). При отсутствии разрешения возвращает `ExecutionStatus.DENIED` с `outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED` и отправляет событие `execution_denied`. Процесс не запускается.
+  2. Граница Permission: проверяет запрошенную команду по списку `allowed_execution_commands` (default-deny, **точный канонический идентификатор исполняемого файла**; совпадение по basename или частичное совпадение не поддерживается). При отсутствии разрешения возвращает `ExecutionStatus.DENIED` с `outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED` и отправляет событие `execution_denied`. Процесс не запускается.
   3. Граница Approval: проверяет, требует ли `ApprovalPolicy` одобрения человека. Если одобрение требуется и находится в ожидании, возвращает `outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING`, а ран переходит в состояние `RunState.WAITING_FOR_APPROVAL`. При отказе возвращает `outcome_status=ExecutionOutcomeStatus.APPROVAL_REJECTED` и отправляет `execution_denied`. Процесс не запускается.
   4. Граница ExecutionPolicy: проверяет запрос через `ExecutionPolicy` и ограничения профиля. Отправляет событие `execution_policy_checked`. При отклонении возвращает `outcome_status=ExecutionOutcomeStatus.POLICY_DENIED` и отправляет `execution_denied`. Процесс не запускается.
   5. Запуск через LocalExecutionAdapter: вызывается только после успешного прохождения всех трёх предварительных проверок (Permission, Approval, Policy). Отправляет событие `execution_started`, запускает процесс строго без shell (`shell=False`), ограничивает размер вывода, маскирует секреты и отправляет событие `execution_completed`.
@@ -1512,9 +1875,344 @@ Structured Run State (ProjectState, TaskSpecification, AcceptanceResult, Verific
   - Генерирует безопасное событие трассы `CONTEXT_DECISION_READY`, содержащее `context_id`, `context_fingerprint`, `run_id`, `attempt_number` и `item_count`.
   - Передаёт `context_id`, `context_fingerprint` и `context_envelope` в `DecisionRequest`.
   - `DeterministicDecisionProvider` включает `context_id` и `context_fingerprint` в `Decision.references`.
-  - `EngineeringRunResult.context_envelopes` и `.final_context_envelope` открывают доступ к собранным контекстным конвертам.
 - **Чем Контекстный конверт решений НЕ является:**
   - НЕ является сборщиком промптов для LLM или памятью генеративного агента.
   - НЕ является векторной базой данных, хранилищем эмбеддингов или поисковой системой.
   - НЕ является шиной событий, брокером сообщений или распределённым хранилищем.
   - НЕ является органом авторизации или обходом политик безопасности.
+
+## Execution Authorization Contract v0.2
+
+> **Status: CURRENT / VERIFIED** at commit `ad6b82b` (`feat: reset execution
+> authorization contract v0.2`). Implemented in `app/execution/intent.py`,
+> `app/execution/capabilities.py`, `app/execution/paths.py`,
+> `app/execution/authorizer.py`, `app/execution/policy.py`,
+> `app/execution/adapter.py`, `app/tools/approval.py`. Covered by
+> `tests/test_execution_authorization_hardening_v02.py`,
+> `tests/test_execution_authorization_hardening.py`,
+> `tests/test_execution_plane.py`, `tests/test_approval_boundary.py`.
+> Verified limitations are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §4.
+
+### Pipeline
+
+```text
+ExecutionRequest (control-plane proposal: command, cwd, env, timeout, artifacts, profile)
+        |
+        v
+1. Permission boundary          allowed_commands, default-deny, exact canonical identity
+        |
+        v
+2. ExecutionIntent construction IntentBuilder.from_request(request, profile).build()
+        |                       canonical normalization, immutable value object
+        v
+3. Approval boundary            ApprovalPolicy -> ApprovalResolver (untrusted proposer)
+        |                       coordinator re-checks the returned intent fingerprint
+        v
+4. ExecutionPolicy              pure evaluation of the intent against the profile
+        |
+        v
+5. workspace_root validation    mandatory, absolute, existing directory, fail-closed
+        |
+        v
+6. AuthorizedExecution          internal authority marker, created only by the coordinator
+        |
+        v
+7. LocalExecutionAdapter        validates the marker, then subprocess.Popen(shell=False)
+```
+
+Every denial path returns `ExecutionStatus.DENIED` with a typed
+`ExecutionOutcomeStatus` and emits `execution_denied`. No process is created on
+any denial path.
+
+### ExecutionIntent (the authorization subject)
+
+`ExecutionIntent` is a frozen value object and is the subject that Permission,
+Approval, Policy and the adapter all evaluate. `IntentBody` is an alias of it.
+
+Fields: `executable`, `argv`, `working_directory`, `environment_variables`
+(canonical sorted tuple of pairs), `timeout_seconds`, `max_output_bytes`,
+`artifact_targets` (canonical sorted tuple), `profile_id`, `network_access`,
+`capabilities` (`frozenset[ExecutionCapability]`).
+
+- `IntentBuilder` is the only constructor path. `with_command` canonicalizes the
+  executable through `canonical_executable`; `with_working_directory` and
+  `with_artifact_targets` normalize through `normalize_workspace_relative_path`;
+  `build()` sorts and freezes the collections and classifies capabilities.
+- `ExecutionIntent.fingerprint` is a deterministic SHA-256 over a canonical JSON
+  projection of **all** listed fields, serialized with sorted keys and stable
+  separators. The fingerprint is the authorization identity used by Approval.
+- There is no deserialization path from untrusted input into `ExecutionIntent`,
+  and no `dataclasses.replace` is applied on the authorize -> execute path.
+
+### Canonical path security
+
+`app/execution/paths.py` provides two domains:
+
+- `canonical_executable` (program identity): bare name preserved
+  (case-normalized), absolute path preserved in normalized form, and any
+  relative or dot-prefixed form rejected with `PathSecurityError`.
+- `normalize_workspace_relative_path` (workspace-relative path): rejects NUL,
+  trailing separators, UNC and Windows device paths (`\\?\`, `\\.\`), Windows
+  drive-absolute and drive-relative forms (`C:\...`, `C:/...`, `C:foo`), POSIX
+  absolute paths, rooted Windows paths, traversal components (`..`), ADS/colon
+  syntax, trailing dot/space components, and reserved device names; returns a
+  canonical forward-slash relative path.
+
+This module is the single canonical implementation for the execution plane.
+`ExecutionPolicy`, `ExecutionRequest.validate`, `ProjectExecutionProfile.validate`
+and `IntentBuilder` all delegate to it. `app/tools/workspace.py` keeps its own
+independent validator for the **tool** boundary; the two implementations are not
+yet unified, and the physical containment check
+(`Path.relative_to` after `resolve()`) remains a second, non-redundant layer in
+the adapter and in `EphemeralWorkspaceManager`.
+
+### Permission, approval and policy boundaries
+
+- **Permission**: `allowed_commands is None` or an empty command denies with
+  `PERMISSION_DENIED` / `permission_missing`. Otherwise the command must match the
+  allowed set by exact canonical executable identity.
+- **Approval**: required when `ExecutionRequest.approval_required` is true, or when
+  `ApprovalPolicy` requires it for `"execute"`, for the `CommandIdentity`, or for
+  the canonical executable. The coordinator builds
+  `ApprovalRequest(intent_fingerprint=intent.fingerprint)`, calls the resolver, and
+  accepts `ApprovalState` or `ApprovalResolution`. `None` or any non-approved
+  decision yields `APPROVAL_WAITING`; `REJECTED` yields `APPROVAL_REJECTED`. If the
+  resolver returns a non-empty `approved_fingerprint` that differs from the current
+  intent fingerprint, execution is denied with `intent_fingerprint_mismatch`.
+  `InMemoryApprovalResolver` is single-use and fingerprint-bound; the coordinator's
+  verification only runs when the resolver supplies a fingerprint (see limitations).
+- **Policy**: `ExecutionPolicy.evaluate(intent, profile)` first matches
+  `CommandIdentity` entries (exact executable + exact argv, no capability check),
+  then bare-string entries (exact executable; every capability required by the
+  intent must be declared in `profile.capabilities`, otherwise
+  `argv_not_authorized`). It then re-validates paths defensively, rejects the
+  forbidden git flags `--git-dir` / `--work-tree`, and bounds timeout, output size
+  and environment variable syntax against the profile.
+
+### Capability model (current implementation)
+
+`ExecutionCapability` has four members: `EXEC_CHILD`, `INTERPRET_TEXT`,
+`INTERPRET_MODULE`, `NETWORK`. `classify_invocation(executable, argv)` derives the
+required set from hard-coded wrapper/network name lists, a `find -exec` rule, git
+network subcommands, and interpreter flag regexes for the python, shell,
+PowerShell, cmd, node, ruby, perl and php families.
+
+**This is a recognition list, not a closed capability model.** Programs outside
+the lists classify to an empty capability set, and a bare-string `allowed_commands`
+entry then admits free-form argv. The intended direction (declared invocations
+with a fail-closed default for unrecognized behavior) is recorded as a candidate
+in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §4.2 and in
+[`DECISIONS.md`](DECISIONS.md).
+
+### Backend authority boundary
+
+`AuthorizedExecution` is the internal authority marker. It carries the intent, the
+resolved `workspace_root`, `run_id`, metadata, a private coordinator sentinel, and
+the intent fingerprint captured at creation time. `is_valid()` verifies the
+sentinel, the types, the absolute workspace root, and that the stored fingerprint
+still equals the current intent fingerprint — so swapping the intent after creation
+is detected.
+
+`LocalExecutionAdapter.execute()` requires an `AuthorizedExecution` and raises
+`ExecutionAuthorizationError` for anything else, before touching the filesystem or
+spawning a process. The adapter no longer evaluates policy itself; policy is the
+coordinator's boundary. The marker type is a fail-closed integrity check, not a
+cryptographic capability: any same-process code can construct data structures, so
+the design target is prevention of accidental and refactoring-introduced bypass,
+not resistance to an in-process adversary.
+
+### Workspace boundary
+
+`ExecutionCoordinator` requires an explicit `workspace_root` for local process
+spawning: a missing root is denied with `workspace_root_required`, and a relative,
+non-existent or non-directory root is denied with `workspace_root_invalid`. If an
+adapter instance was constructed with its own `_workspace_root`, that value is
+used when the caller passes none; a non-local backend without an explicit root
+falls back to the system temporary directory.
+
+`LocalExecutionAdapter` stages a COPY of the workspace root into an ephemeral
+scratch directory per execution (`EphemeralWorkspaceManager`), rejects symlinks as
+staging mechanisms, skips `.git` and `__pycache__`, resolves the working directory
+and re-checks containment with `relative_to`, harvests declared artifacts before
+cleanup, and deletes the scratch directory afterwards.
+
+**Not implemented (Block 2):** declared-input allow-lists, deny-by-default
+staging, workspace identity/content binding, secret-file exclusion policy, and any
+OS-level sandbox (namespaces, cgroups, Job Objects, kernel filesystem or network
+confinement). `network_access=False` is enforced only by proxy environment
+variables and is best-effort. Forge is **not** an OS-level sandbox.
+
+### Events
+
+`execution_requested`, `execution_policy_checked`, `execution_started`,
+`execution_completed` and `execution_denied` carry only identifiers, statuses,
+outcome status, denial reason, exit code, duration, truncation flag and artifact
+count. Standard output, standard error, environment values and secrets are never
+placed in event metadata.
+
+## Execution Authorization Contract v0.2 — русская версия
+
+> **Статус: ТЕКУЩАЯ РЕАЛИЗАЦИЯ / ПРОВЕРЕНО** на коммите `ad6b82b`
+> (`feat: reset execution authorization contract v0.2`).
+
+### Конвейер авторизации
+
+```text
+ExecutionRequest (предложение control plane: команда, cwd, env, timeout, артефакты, профиль)
+        |
+        v
+1. Граница Permission           allowed_commands, default-deny, точный канонический идентификатор
+        |
+        v
+2. Построение ExecutionIntent   IntentBuilder.from_request(request, profile).build()
+        |                       каноническая нормализация, неизменяемый объект-значение
+        v
+3. Граница Approval             ApprovalPolicy -> ApprovalResolver (недоверенный источник решения)
+        |                       координатор повторно сверяет fingerprint интента
+        v
+4. ExecutionPolicy              чистая проверка интента относительно профиля
+        |
+        v
+5. Проверка workspace_root      обязательный, абсолютный, существующий каталог, fail-closed
+        |
+        v
+6. AuthorizedExecution          внутренний маркер полномочия, создаётся только координатором
+        |
+        v
+7. LocalExecutionAdapter        проверяет маркер, затем subprocess.Popen(shell=False)
+```
+
+Любой отказ возвращает `ExecutionStatus.DENIED` с типизированным
+`ExecutionOutcomeStatus` и событием `execution_denied`. Ни на одном пути отказа
+процесс не создаётся.
+
+### ExecutionIntent — субъект авторизации
+
+`ExecutionIntent` — неизменяемый объект-значение и единственный субъект, который
+оценивают Permission, Approval, Policy и адаптер. `IntentBody` — псевдоним этого
+типа.
+
+Поля: `executable`, `argv`, `working_directory`, `environment_variables`
+(канонический отсортированный кортеж пар), `timeout_seconds`,
+`max_output_bytes`, `artifact_targets` (канонический отсортированный кортеж),
+`profile_id`, `network_access`, `capabilities`
+(`frozenset[ExecutionCapability]`).
+
+- `IntentBuilder` — единственный путь конструирования. `with_command`
+  канонизирует исполняемый файл через `canonical_executable`;
+  `with_working_directory` и `with_artifact_targets` нормализуют через
+  `normalize_workspace_relative_path`; `build()` сортирует и замораживает
+  коллекции и классифицирует capabilities.
+- `ExecutionIntent.fingerprint` — детерминированный SHA-256 по канонической
+  JSON-проекции **всех** перечисленных полей, с сортировкой ключей и стабильными
+  разделителями. Fingerprint является идентификатором авторизации для Approval.
+- Пути десериализации недоверенного ввода в `ExecutionIntent` не существует, и
+  `dataclasses.replace` на пути authorize -> execute не применяется.
+
+### Каноническая безопасность путей
+
+`app/execution/paths.py` реализует два домена:
+
+- `canonical_executable` (идентичность программы): одиночное имя сохраняется
+  (с нормализацией регистра), абсолютный путь сохраняется в нормализованном виде,
+  относительные и начинающиеся с точки формы отклоняются с `PathSecurityError`.
+- `normalize_workspace_relative_path` (путь относительно workspace): отклоняет
+  NUL, завершающие разделители, UNC и device-пути Windows (`\\?\`, `\\.\`),
+  Windows drive-absolute и drive-relative формы (`C:\...`, `C:/...`, `C:foo`),
+  POSIX-абсолютные пути, rooted-пути Windows, компоненты обхода (`..`), синтаксис
+  ADS/двоеточия, компоненты с точкой или пробелом в конце и зарезервированные
+  имена устройств; возвращает канонический относительный путь с прямыми слэшами.
+
+Этот модуль — единственная каноническая реализация для execution plane.
+`ExecutionPolicy`, `ExecutionRequest.validate`, `ProjectExecutionProfile.validate`
+и `IntentBuilder` делегируют в него. `app/tools/workspace.py` сохраняет
+собственный независимый валидатор для **tool**-границы; две реализации пока не
+объединены, а проверка физического нахождения в границах (`Path.relative_to`
+после `resolve()`) остаётся вторым, не избыточным слоем в адаптере и в
+`EphemeralWorkspaceManager`.
+
+### Границы Permission, Approval и Policy
+
+- **Permission**: `allowed_commands is None` или пустая команда отклоняются с
+  `PERMISSION_DENIED` / `permission_missing`. Иначе команда должна совпасть с
+  разрешённым набором по точному каноническому идентификатору исполняемого файла.
+- **Approval**: требуется, если `ExecutionRequest.approval_required` истинно либо
+  `ApprovalPolicy` требует одобрения для `"execute"`, для `CommandIdentity` или для
+  канонического исполняемого файла. Координатор формирует
+  `ApprovalRequest(intent_fingerprint=intent.fingerprint)`, вызывает resolver и
+  принимает `ApprovalState` либо `ApprovalResolution`. `None` или любое
+  неодобренное решение даёт `APPROVAL_WAITING`; `REJECTED` даёт
+  `APPROVAL_REJECTED`. Если resolver вернул непустой `approved_fingerprint`,
+  отличный от текущего fingerprint интента, выполнение отклоняется с
+  `intent_fingerprint_mismatch`. `InMemoryApprovalResolver` одноразовый и привязан
+  к fingerprint; проверка координатора выполняется только тогда, когда resolver
+  передал fingerprint (см. ограничения).
+- **Policy**: `ExecutionPolicy.evaluate(intent, profile)` сначала сопоставляет
+  записи `CommandIdentity` (точный исполняемый файл + точный argv, без проверки
+  capabilities), затем строковые записи (точный исполняемый файл; каждая
+  требуемая интентом capability должна быть объявлена в `profile.capabilities`,
+  иначе `argv_not_authorized`). Далее политика защитно перепроверяет пути,
+  отклоняет запрещённые флаги git `--git-dir` / `--work-tree` и ограничивает
+  таймаут, размер вывода и синтаксис имён переменных окружения по профилю.
+
+### Модель capabilities (текущая реализация)
+
+`ExecutionCapability` содержит четыре члена: `EXEC_CHILD`, `INTERPRET_TEXT`,
+`INTERPRET_MODULE`, `NETWORK`. `classify_invocation(executable, argv)` выводит
+требуемый набор из жёстко заданных списков имён wrapper/network-программ, правила
+`find -exec`, сетевых подкоманд git и регулярных выражений флагов интерпретаторов
+для семейств python, shell, PowerShell, cmd, node, ruby, perl и php.
+
+**Это список распознавания, а не замкнутая модель capability.** Программы вне
+списков классифицируются в пустой набор capabilities, и строковая запись
+`allowed_commands` после этого допускает произвольный argv. Намеренное
+направление (объявленные инвокации с fail-closed поведением по умолчанию для
+нераспознанного) зафиксировано как кандидат в
+[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §4.2 и в [`DECISIONS.md`](DECISIONS.md).
+
+### Граница полномочий backend
+
+`AuthorizedExecution` — внутренний маркер полномочия. Он несёт интент,
+разрешённый `workspace_root`, `run_id`, метаданные, приватный sentinel
+координатора и fingerprint интента, зафиксированный при создании. `is_valid()`
+проверяет sentinel, типы, абсолютность workspace root и то, что сохранённый
+fingerprint всё ещё равен текущему fingerprint интента, — поэтому подмена интента
+после создания обнаруживается.
+
+`LocalExecutionAdapter.execute()` требует `AuthorizedExecution` и выбрасывает
+`ExecutionAuthorizationError` для всего остального, до обращения к файловой
+системе и до запуска процесса. Адаптер больше не оценивает политику сам; политика
+— граница координатора. Маркер является fail-closed проверкой целостности, а не
+криптографическим полномочием: любой код в том же процессе может создавать
+структуры данных, поэтому цель дизайна — предотвращение случайного и внесённого
+рефакторингом обхода, а не сопротивление злонамеренному коду внутри процесса.
+
+### Граница workspace
+
+`ExecutionCoordinator` требует явный `workspace_root` для локального запуска
+процессов: отсутствующий root отклоняется с `workspace_root_required`, а
+относительный, несуществующий или не являющийся каталогом — с
+`workspace_root_invalid`. Если экземпляр адаптера создан со своим
+`_workspace_root`, это значение используется, когда вызывающий не передал ничего;
+нелокальный backend без явного root использует системный временный каталог.
+
+`LocalExecutionAdapter` копирует workspace root в временный scratch-каталог на
+каждое выполнение (`EphemeralWorkspaceManager`), отклоняет симлинки как механизм
+подготовки, пропускает `.git` и `__pycache__`, разрешает рабочую директорию и
+повторно проверяет нахождение в границах через `relative_to`, собирает
+объявленные артефакты до очистки и удаляет scratch-каталог после.
+
+**Не реализовано (Block 2):** списки объявленных входов, deny-by-default
+подготовка, привязка идентичности/содержимого workspace, политика исключения
+файлов с секретами и любая OS-песочница (namespaces, cgroups, Job Objects,
+файловое или сетевое ограничение на уровне ядра). `network_access=False`
+обеспечивается только переменными окружения прокси и является best-effort.
+Forge **не** является OS-песочницей.
+
+### События
+
+`execution_requested`, `execution_policy_checked`, `execution_started`,
+`execution_completed` и `execution_denied` несут только идентификаторы, статусы,
+outcome status, причину отказа, код возврата, длительность, признак усечения и
+количество артефактов. Стандартный вывод, поток ошибок, значения переменных
+окружения и секреты никогда не попадают в метаданные событий.

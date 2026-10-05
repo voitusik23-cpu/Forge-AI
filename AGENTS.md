@@ -90,6 +90,60 @@ No agent should assume that another agent's output is automatically correct.
 - Keep architecture documentation current.
 - Record important architectural decisions in `docs/DECISIONS.md`.
 - Maintain a clear project `README.md`.
+- Provide a Russian translation after canonical English technical/product documentation intended for both AI agents and the human project owner. Preserve the English text and its structure and meaning; do not translate code, paths, commands, identifiers, commit hashes, or technical literals unnecessarily.
+- When documented architecture, product, safety, workflow, or other rules change, identify and update only the affected Forge documents, update their Russian translations where present, and check for contradictions. Do not mechanically edit every document after every change.
+- Keep the document hierarchy clear: `AGENTS.md` defines agent rules; `FORGE_VISION.md` defines product direction; `TECHNICAL_SPECIFICATION.md` defines target architecture and constraints; `ARCHITECTURE.md` describes current implementation; `ROADMAP.md` defines implementation order and progress; `DECISIONS.md` records architectural decisions and rationale.
+- Apply these translation and synchronization rules to future permanent documentation. Keep current implementation distinct from target/future architecture; update current-state, roadmap, architecture, specification, vision, or decision records only when the source change warrants it.
+
+## 12. Operating contract for coding agents
+
+These four rules are mandatory for every agent task. They are ordered: each one
+assumes the previous one was followed.
+
+### UNDERSTAND BEFORE ACT
+
+- Inspect the relevant architecture and the existing implementation before
+  editing anything. Read `docs/SOURCE_OF_TRUTH.md` for verified current state and
+  `docs/ARCHITECTURE.md` for the subsystem you are touching.
+- Never assume a planned or specified capability already exists. Verify it in
+  `app/` before relying on it, and never describe planned work in the present
+  tense.
+- Never rely on a previous chat, a review document, or a stage document as
+  evidence of current behavior. The code and the passing test suite are the
+  evidence.
+
+### SMALLEST SUFFICIENT CHANGE
+
+- Make the smallest change that fully solves the stated problem. Prefer
+  removing duplicated implementations over adding another one.
+- Do not rewrite working code without a clear reason, and do not restructure
+  unrelated subsystems.
+- Do not resolve a backward-compatibility question in the permissive direction
+  when the change is security-relevant.
+
+### SURGICAL SCOPE
+
+- Do not silently expand scope. If the task grows beyond what was asked, stop and
+  report the discovered scope instead of implementing it.
+- Never modify unrelated uncommitted work in the working tree. Inspect
+  `git status` first and leave other people's or other agents' pending changes
+  untouched.
+- Never modify a real `.env` file, and never touch secret values.
+
+### DONE MUST BE PROVEN
+
+- Tests are required for important functionality. A security fix requires a
+  regression test that fails before the fix and passes after it.
+- Run the full test suite before declaring completion, not only the touched
+  test files.
+- Run `python -m compileall -q app tests` and `git diff --check` before
+  completion and report their results.
+- Inspect `git diff` before any commit, keep commits scoped to the task, and
+  never commit secrets.
+- Do not claim success without the verification evidence. If a check could not
+  be run, say so explicitly.
+- Do not push, and do not commit, unless the task explicitly requests it.
+
 
 ---
 
@@ -185,3 +239,39 @@ No agent should assume that another agent's output is automatically correct.
 - Поддерживайте архитектурную документацию в актуальном состоянии.
 - Фиксируйте важные архитектурные решения в `docs/DECISIONS.md`.
 - Поддерживайте понятный `README.md` проекта.
+- Добавляйте перевод на русский язык после канонического английского текста технической и продуктовой документации, предназначенной как для AI-агентов, так и для владельца проекта. Сохраняйте английский текст, его структуру и смысл; не переводите без необходимости код, пути, команды, идентификаторы, хеши коммитов и технические literals.
+- При изменении задокументированных архитектурных, продуктовых, безопасностных, рабочих или иных правил определяйте и обновляйте только затронутые документы Forge, обновляйте имеющиеся русские переводы и проверяйте документы на противоречия. Не изменяйте механически все документы после каждого изменения.
+- Соблюдайте иерархию документов: `AGENTS.md` задаёт правила для агентов; `FORGE_VISION.md` описывает направление продукта; `TECHNICAL_SPECIFICATION.md` определяет целевую архитектуру и ограничения; `ARCHITECTURE.md` описывает текущую реализацию; `ROADMAP.md` задаёт порядок реализации и прогресс; `DECISIONS.md` фиксирует архитектурные решения и их обоснование.
+- Применяйте эти правила перевода и синхронизации ко всей будущей постоянной документации. Отделяйте текущую реализацию от целевой и будущей архитектуры; обновляйте описание текущего состояния, roadmap, архитектуру, спецификацию, vision или записи решений только если этого требует исходное изменение.
+
+## 12. Рабочий контракт для coding-агентов
+
+Эти четыре правила обязательны для каждой задачи агента. Они упорядочены: каждое
+предполагает выполнение предыдущего.
+
+### UNDERSTAND BEFORE ACT (сначала понять, потом действовать)
+
+- Перед любым редактированием изучите относящуюся к задаче архитектуру и существующую реализацию. Проверенное текущее состояние — в `docs/SOURCE_OF_TRUTH.md`, описание подсистемы — в `docs/ARCHITECTURE.md`.
+- Никогда не предполагайте, что запланированная или описанная в спецификации возможность уже реализована. Проверьте её в `app/`, прежде чем на неё опираться, и никогда не описывайте запланированную работу в настоящем времени.
+- Никогда не считайте предыдущий чат, документ ревью или stage-документ доказательством текущего поведения. Доказательство — код и проходящий набор тестов.
+
+### SMALLEST SUFFICIENT CHANGE (минимальное достаточное изменение)
+
+- Вносите минимальное изменение, которое полностью решает поставленную задачу. Предпочитайте удаление дублирующих реализаций добавлению ещё одной.
+- Не переписывайте работающий код без веской причины и не перестраивайте посторонние подсистемы.
+- Если изменение затрагивает безопасность, не решайте вопрос обратной совместимости в разрешающую сторону.
+
+### SURGICAL SCOPE (хирургическая область изменений)
+
+- Не расширяйте область задачи молча. Если задача разрастается за пределы запрошенного, остановитесь и сообщите об обнаруженной области вместо её реализации.
+- Никогда не изменяйте постороннюю незакоммиченную работу в рабочем дереве. Сначала проверьте `git status` и оставьте чужие и ожидающие изменения нетронутыми.
+- Никогда не изменяйте настоящий файл `.env` и не касайтесь значений секретов.
+
+### DONE MUST BE PROVEN (готово только то, что доказано)
+
+- Для важной функциональности тесты обязательны. Исправление безопасности требует регрессионного теста, который падает до исправления и проходит после.
+- Перед объявлением завершения запускайте полный набор тестов, а не только затронутые файлы.
+- Перед завершением запустите `python -m compileall -q app tests` и `git diff --check` и сообщите их результаты.
+- Перед любым коммитом просмотрите `git diff`, держите коммиты в границах задачи и никогда не коммитьте секреты.
+- Не заявляйте об успехе без доказательств проверки. Если проверку выполнить не удалось, скажите об этом прямо.
+- Не делайте push и не делайте commit, если задача явно этого не требует.

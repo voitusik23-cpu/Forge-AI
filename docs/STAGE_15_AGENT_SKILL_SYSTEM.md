@@ -193,7 +193,7 @@ The test suite in `tests/test_skill_system.py` executes 18 automated tests:
 
 ---
 
-# Система навыков агента Forge AI — Этап 15 (Русская версия)
+# Система навыков агента Forge AI — Этап 15 — русская версия
 
 **Статус:** РЕАЛИЗОВАНО И ПРОВЕРЕНО
 
@@ -278,3 +278,76 @@ $$\text{Рекомендация навыка} \neq \text{Авторизация
 - Композиция множества навыков со сложным разрешением конфликтов приоритетов.
 - Динамическое согласование capabilities во время выполнения.
 - Вызов навыков агентом через механизм function calling / tool calling модели.
+
+---
+
+## 4. Детали реализации
+
+### 4.1 Модели данных (`app/skills/models.py`)
+
+- `SkillTrustLevel`: Enum со значениями `BUILTIN`, `LOCAL`, `UNTRUSTED`.
+- `SkillProvenance`: неизменяемый dataclass, фиксирующий origin, author, version, commit_hash и sha256 content_hash.
+- `SkillManifest`: неизменяемый dataclass со строгой валидацией полей в `__post_init__`:
+  - `skill_id`: должен соответствовать `^[a-z0-9_.-]+$`.
+  - `required_capabilities` / `optional_capabilities`: должны быть строками с пространством имён, соответствующими `^[a-z0-9_-]+:[a-z0-9_-]+$`.
+  - `requested_tools`: должны быть абстрактными идентификаторами, соответствующими `^[a-zA-Z0-9_-]+$`.
+  - `parameters` / `metadata`: преобразуются в неизменяемые отображения; metadata проверяются на чувствительные паттерны.
+- `SkillDefinition`: неизменяемый dataclass, связывающий `SkillManifest` с ограниченными процедурными `instructions` (<= 10000 символов).
+- `SkillApplicability`: детерминированный булев результат, содержащий `skill_id`, `is_applicable`, `reason`, `matched_capabilities` и `missing_capabilities`.
+
+### 4.2 Реестр в памяти (`app/skills/registry.py`)
+
+- `SkillRegistry`: реестр в памяти, поддерживающий `register()`, `get()`, `list_skills()` и `contains()`. Явно отклоняет повторную регистрацию, чтобы предотвратить молчаливое переопределение.
+
+### 4.3 Детерминированный evaluator (`app/skills/evaluator.py`)
+
+- `SkillEvaluator`: оценивает skills относительно доступных capabilities, инструментов и ограничений без побочных эффектов:
+  - Проверяет ограничения доверия, если задан `allowed_trust_levels`.
+  - Проверяет, что все требуемые capabilities присутствуют в `available_capabilities`.
+  - Проверяет, что запрошенные инструменты присутствуют в `available_tool_ids`.
+  - Проверяет явные предусловия задачи (`target_task_types`).
+  - Возвращает `SkillApplicability` с булевым `is_applicable`, детерминированным `reason`, `matched_capabilities` и `missing_capabilities`.
+  - Упорядочивает применимые skills детерминированно по `skill_id`.
+
+### 4.4 Встроенный skill (`app/skills/builtin.py`)
+
+- `forge.builtin.python_test_runner`: встроенный эталонный skill, дающий процедурные указания о запуске python-юнит-тестов, анализе вывода отказов и диагностике ошибок тестов. Объявляет требуемые capabilities `("process:execute",)` и запрошенный инструмент `("python_test_runner",)`.
+
+### 4.5 Интеграция со сборщиком контекста (`app/context/assembler.py`)
+
+- Добавлен `ContextSourceType.SKILL = "SKILL"`.
+- `DecisionContextAssembler.assemble()` принимает типизированный параметр `skills: Iterable[SkillDefinition] = ()`.
+- Каждый skill форматируется как структурированный JSON-нагрузка, ограниченная 1000 символами, с `name` и `skill_id` в начале, чтобы усечение промпта не скрыло идентичность skill.
+
+### 4.6 Интеграция с harness (`app/agent_runtime/harness.py` и `models.py`)
+
+- `HarnessRequest` типизирован полями `available_skills: tuple[SkillDefinition, ...] = ()` и `available_capabilities: tuple[str, ...] = ()`.
+- На фазе 2 `CONTEXT` `AgentHarness` вызывает `SkillEvaluator` для переданных skills и capabilities.
+- Применимые skills передаются в `DecisionContextAssembler.assemble()`, делая рекомендательные указания видимыми для decision provider.
+
+---
+
+## 5. Матрица верификации
+
+Набор тестов в `tests/test_skill_system.py` выполняет 18 автоматических тестов:
+
+| Test ID | Имя метода | Описание / проверяемый инвариант | Результат |
+| :--- | :--- | :--- | :--- |
+| **A** | `test_scenario_a_registration_and_retrieval` | Регистрация и получение встроенного skill `python_test_runner` из `SkillRegistry`. | **PASS** |
+| **B** | `test_scenario_b_deterministic_applicability` | Evaluator помечает skill применимым, когда все capabilities и инструменты совпадают. | **PASS** |
+| **C** | `test_scenario_c_missing_capability_rejection` | Evaluator помечает skill неприменимым, когда требуемые capabilities отсутствуют. | **PASS** |
+| **D** | `test_scenario_d_no_execution_authority` | Доказывает через reflection, что классы Skill не предоставляют ни одного метода или хука выполнения. | **PASS** |
+| **E** | `test_scenario_e_permission_cannot_be_bypassed_by_skill` | PermissionPolicy строго блокирует неавторизованную команду, рекомендованную skill. | **PASS** |
+| **F** | `test_scenario_f_approval_cannot_be_bypassed_by_skill` | ApprovalPolicy останавливает выполнение в `WAITING_FOR_APPROVAL`, даже когда это рекомендовано skill. | **PASS** |
+| **G** | `test_scenario_g_context_assembly_includes_skill` | Сборщик контекста формирует ограниченный `ContextItem` с источником `SKILL`. | **PASS** |
+| **H** | `test_scenario_h_secret_safe_skill_context` | Доказывает, что skills и элементы контекста не раскрывают секретные ключи. | **PASS** |
+| **I** | `test_scenario_i_untrusted_skill_handling` | Evaluator проверяет ограничения доверия; доказывает, что применимость skill не подразумевает разрешения. | **PASS** |
+| **J** | `test_scenario_j_multiple_applicable_skills_structurally_supported` | Evaluator и Assembler принимают несколько skills и детерминированно их упорядочивают. | **PASS** |
+| **K** | `test_scenario_k_real_bounded_run_using_python_test_runner` | Многоходовый запуск под управлением контекста skill до успешного прохождения приёмки. | **PASS** |
+| **L** | `test_scenario_l_deterministic_provider_regression` | Детерминированный провайдер работает без регрессий при наличии skills. | **PASS** |
+| **Extra 1** | `test_duplicate_skill_id_rejection` | Реестр выбрасывает `DuplicateSkillError` при повторной регистрации. | **PASS** |
+| **Extra 2** | `test_immutable_skill_objects` | Manifest, Definition и Provenance являются строго неизменяемыми dataclasses. | **PASS** |
+| **Extra 3** | `test_malformed_skill_metadata_rejection` | Проверяет отклонение чувствительных паттернов в metadata манифеста. | **PASS** |
+| **Extra 4** | `test_raw_shell_command_rejected_in_requested_tools` | Отклоняет сырые shell-команды, флаги и пробелы в `requested_tools`. | **PASS** |
+| **Extra 5** | `test_provenance_hash_determinism` | Проверяет детерминизм sha256 content hash для определений skill. | **PASS** |
+| **Extra 6** | `test_cross_run_skill_and_context_isolation` | Доказывает, что элементы контекста skill не вносят загрязнение между запусками. | **PASS** |

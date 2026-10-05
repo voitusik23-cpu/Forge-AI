@@ -105,7 +105,7 @@ The test suite in `tests/test_agent_harness.py` validates 26 distinct scenarios:
 
 ---
 
-# Forge AI — Этап 12: Bounded Agent Harness / Controlled Run Loop v0.1 (Русская версия)
+# Forge AI — Этап 12: Bounded Agent Harness / Controlled Run Loop v0.1 — русская версия
 
 **Статус:** РЕАЛИЗОВАНО И ПРОТЕСТИРОВАНО
 
@@ -153,3 +153,60 @@ Harness выступает координатором, строго соблюд
 5. **Жёсткие ограничения ресурсов**: лимиты итераций и действий исключают бесконечные циклы.
 6. **Безопасность наблюдений и событий**: сырые потоки stdout/stderr и секреты исключаются из наблюдений и трассировки.
 7. **Изоляция прогонов**: несоответствие `run_id` приводит к безопасному завершению со статусом `FAILED`.
+
+### 2.3 Непреодолимые инварианты
+
+1. **Не более одного авторитетного действия за итерацию:** harness выполняет ровно одно
+   действие (`EXECUTE`, `RUN_VERIFICATION`, `REQUEST_REVISION`, `COMPLETE_RUN`,
+   `FAIL_RUN` или `WAIT_FOR_APPROVAL`) за цикл.
+2. **Сохранение полномочий:** выполнение подпроцессов диспетчеризуется исключительно
+   через `ExecutionCoordinator`. Ни один подпроцесс никогда не запускается harness
+   напрямую.
+3. **Сохранение границы approval:** когда требуется одобрение человека
+   (`ApprovalState.REQUIRED`), выполнение приостанавливается, а harness переходит в
+   `HarnessPhase.WAITING` со статусом `WAITING_FOR_APPROVAL`.
+4. **Сохранение границы acceptance:** решение, предлагающее `COMPLETE_RUN`,
+   авторизуется только если `acceptance_result` существует и равен
+   `AcceptanceStatus.PASS`.
+5. **Консервативные границы:** строгие лимиты (`max_iterations`, `max_actions`,
+   `max_execution_attempts`, `max_revision_attempts`) предотвращают бесконечные циклы,
+   останавливаясь со статусом `HarnessStatus.LIMIT_REACHED`.
+6. **Безопасные наблюдения и события:** `StructuredObservation` и `RunEvent` очищают
+   все сырые stdout, stderr, пароли, токены и запрещённые подстроки метаданных.
+7. **Изоляция между запусками:** сборка контекста отклоняет ссылки с несовпадающим
+   `run_id`, переводя harness в `FAILED`.
+
+---
+
+## 3. Сводка тестовых сценариев
+
+Набор тестов в `tests/test_agent_harness.py` проверяет 26 отдельных сценариев:
+
+| Сценарий | Цель | Результат |
+| :--- | :--- | :--- |
+| **A: Single Successful Action** | Авторизует и чисто выполняет одно действие в границах | **PASS** |
+| **B: Multi-Iteration Successful Loop** | Полный цикл: `INITIAL` -> `EXECUTE` -> `VERIFY` -> `COMPLETE` | **PASS** |
+| **C: Permission Denial** | Команда вне разрешённого набора останавливается без запуска подпроцесса | **PASS** |
+| **D: Approval Waiting** | Неразрешённое одобрение человека останавливает выполнение и переводит в `WAITING` | **PASS** |
+| **E: Approval Rejection** | Явный отказ безопасно останавливает выполнение со статусом `FAILED` | **PASS** |
+| **F: Execution Failure** | Ненулевой код возврата даёт отказ выполнения и останавливает продвижение | **PASS** |
+| **G: Verification Failure** | Неуспешное условие верификации останавливает продвижение приёмки | **PASS** |
+| **H: Revision Trigger** | Неуспешная верификация запускает запрос ревизии и увеличение номера попытки | **PASS** |
+| **I: Acceptance Success** | Успешные верификации приводят к приёмке `PASS` и `COMPLETE_RUN` | **PASS** |
+| **J: Acceptance Failure** | Отсутствующая верификация проваливает приёмку и предотвращает завершение | **PASS** |
+| **K: Unknown Decision Rejection** | Некорректные или неавторизованные типы решений вызывают безопасный отказ | **PASS** |
+| **L: Max Iteration Limit** | Harness строго останавливается при достижении `max_iterations` | **PASS** |
+| **M: Max Action Limit** | Harness строго останавливается при достижении `max_actions` | **PASS** |
+| **N: No Infinite Loop Guarantee** | Зацикленный/некооперативный провайдер безопасно завершается на настроенных границах | **PASS** |
+| **O: One Action Per Iteration** | За итерацию выполняется ровно одно авторитетное действие и наблюдается ровно одно | **PASS** |
+| **P: Decision Cannot Bypass Permission** | Враждебное решение не может вынудить выполнить неразрешённую команду | **PASS** |
+| **Q: Decision Cannot Bypass Approval** | Враждебное решение не может выполниться при ожидающем одобрении | **PASS** |
+| **R: Decision Cannot Bypass ExecutionPolicy** | `ExecutionPolicy` отклоняет запрещённые бинарники вопреки требованию решения | **PASS** |
+| **S: COMPLETE Cannot Bypass Acceptance** | Враждебное решение `COMPLETE` не проходит валидацию, если приёмка не `PASS` | **PASS** |
+| **T: ProjectState Authoritative** | `ProjectState` выводится из артефактов и никогда не фабрикуется harness | **PASS** |
+| **U: Context Fingerprint Deterministic** | Идентичные входы дают побитово идентичные fingerprint контекста | **PASS** |
+| **V: Harness State Immutability** | `HarnessState` и `StructuredObservation` неизменяемы (frozen) | **PASS** |
+| **W: Trace Lifecycle Ordering** | Порядковые номера RunTrace строго монотонны и последовательны | **PASS** |
+| **X: Cross-Run Rejection** | Чужой `run_id` во входном состоянии безопасно останавливает harness | **PASS** |
+| **Y: Observation Privacy** | Сырые stdout/stderr/секреты/пароли вычищаются из наблюдений | **PASS** |
+| **Z: Purity & Side-Effect Freedom** | Логика управления harness не выполняет ни одной сетевой или сокетной операции | **PASS** |

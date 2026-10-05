@@ -103,7 +103,7 @@ The test suite in `tests/test_ai_decision_provider.py` verifies 12 comprehensive
 
 ---
 
-# Forge AI — Этап 13: Real AI Decision Provider v0.1 (Русская версия)
+# Forge AI — Этап 13: Real AI Decision Provider v0.1 — русская версия
 
 **Статус:** РЕАЛИЗОВАНО И ПРОТЕСТИРОВАНО
 
@@ -153,3 +153,24 @@ AI-модель выступает исключительно как **реко�
 - **Ошибки провайдера:** сетевые сбои, тайм-ауты или превышения лимитов API перехватываются, возвращая `FAIL_RUN` с `reason_code="provider_failure"` без утечки секретов и стека вызовов.
 - **Преждевременное завершение:** попытка модели вернуть `COMPLETE_RUN` до успешной приёмки отклоняется `validate_decision` с кодом ошибки `premature_completion:acceptance_not_passed`.
 - **Отказ в разрешениях:** при рекомендации `EXECUTE` авторизационный слой harness независимо применяет `PermissionPolicy` и требует подтверждения человеком при необходимости.
+
+---
+
+## 3. Сводка тестовых сценариев
+
+Набор тестов в `tests/test_ai_decision_provider.py` проверяет 12 комплексных сценариев:
+
+| Сценарий | Цель | Результат |
+| :--- | :--- | :--- |
+| **A: Valid AI Decision** | Разбирает чистый JSON, валидирует решение, выполняет через harness | **PASS** |
+| **B: Malformed JSON** | Разговорный / не-JSON вывод модели запускает fail-closed `FAIL_RUN` | **PASS** |
+| **C: Unknown Action** | Несуществующие или враждебные действия безопасно отклоняются fail-closed | **PASS** |
+| **D: Premature COMPLETE_RUN** | Валидатор отклоняет завершение, когда приёмка не пройдена | **PASS** |
+| **E: EXECUTE with Permission DENY** | PermissionPolicy отклоняет неразрешённые команды, рекомендованные ИИ | **PASS** |
+| **F: Approval Required** | ApprovalPolicy останавливает выполнение в `WAITING` вопреки рекомендации ИИ | **PASS** |
+| **G: Provider Failure** | Исключения вышестоящего API безопасно завершаются fail-closed без падения и утечки | **PASS** |
+| **H: Deterministic Provider Operational** | `DeterministicDecisionProvider` остаётся полностью неизменным и работоспособным | **PASS** |
+| **I: No Secret Leakage** | Пароли, токены и ключи вычищаются из промптов и метаданных | **PASS** |
+| **J: Normalized Prompt Structure** | Идентичные входы дают побитово идентичные отсортированные строки промпта | **PASS** |
+| **K: No Direct Tool Execution** | AI Decision Provider не имеет методов выполнения и нулевых файловых побочных эффектов | **PASS** |
+| **L: Cross-Run Isolation** | Решения и валидация обеспечивают строгую привязку `run_id` | **PASS** |
