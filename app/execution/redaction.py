@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Protocol, runtime_checkable
 
 from app.execution.request import ExecutionRequest, ExecutionResult
@@ -14,14 +15,59 @@ _SENSITIVE_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Known credential prefixes. A value starting with one of these is treated as a
+# credential regardless of the name of the key or argument that carries it, so a
+# leaked secret cannot slip through merely because the caller chose a key name
+# like `GH_PAT` instead of `GITHUB_TOKEN`.
+_CREDENTIAL_PREFIX_PATTERN = re.compile(
+    r"(?:github_pat_|gh[opsrut]_|sk-|xox[baprs]-|AIza[0-9A-Za-z_-]{20,})"
+)
+
+# GitHub App installation tokens became stateless on 2026-10-02: still prefixed
+# `ghs_`, but roughly 520 characters instead of 40. There is deliberately no
+# upper bound here: an upper bound would let an over-long value be redacted only
+# partially, leaving a usable fragment behind. Length is never used to validate a
+# credential, only to recognise its prefix.
+_GH_APP_TOKEN_PATTERN = r"gh[opsrut]_[A-Za-z0-9]{16,}"
+_GH_FINE_GRAINED_TOKEN_PATTERN = r"github_pat_[A-Za-z0-9]{16,}_[A-Za-z0-9]{16,}"
+
+# Suffix is a superset of GitHub's own character set (it appends a checksum),
+# and the leading prefix is required so this cannot leak into ordinary prose.
+_TOKEN_PREFIX = r"(?:github_pat_|gh[opsrut]_|xox[baprs]-|glpat-|npm_|pypi-)"
+
 _COMMON_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
     re.compile(r"ghp_[a-zA-Z0-9]{20,}"),
+    re.compile(_GH_APP_TOKEN_PATTERN),
+    re.compile(_GH_FINE_GRAINED_TOKEN_PATTERN),
     re.compile(r"xox[baprs]-[a-zA-Z0-9-]+"),
-    re.compile(r"Bearer\s+[a-zA-Z0-9_\-\.]{16,}", re.IGNORECASE),
+    # `~` is allowed because GitHub tokens may carry a checksum suffix.
+    re.compile(r"Bearer\s+[a-zA-Z0-9_\-\.~]{16,}", re.IGNORECASE),
+    re.compile(rf"{_TOKEN_PREFIX}[A-Za-z0-9_\-\.~]{{16,}}"),
+    # Bare `token=`-style assignments, including `access_token=`, `auth_token=`
+    # and `TOKEN:`. The existing key-name heuristic does not catch these when the
+    # value is quoted, JSON-escaped, or embedded in free text.
+    re.compile(
+        r"(?:access[_-]?|auth[_-]?|api[_-]?)?token\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.~]{16,}",
+        re.IGNORECASE,
+    ),
 )
 
 REDACTED_PLACEHOLDER = "[REDACTED]"
+
+
+def looks_like_credential(value: object) -> bool:
+    """Report whether a value carries a known credential prefix.
+
+    Used to register secret *values* for redaction regardless of the name of the
+    key, environment variable, or argument that carries them.
+    """
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if len(candidate) < 20:
+        return False
+    return _CREDENTIAL_PREFIX_PATTERN.match(candidate) is not None
 
 
 @runtime_checkable
@@ -135,14 +181,13 @@ class DefaultSecretRedactor:
             for k, v in request.environment_variables.items()
         }
         sanitized_metadata = self.redact_mapping(request.metadata)
-        return ExecutionRequest(
-            request_id=request.request_id,
+        # Preserve every declared field. Dropping one here would change how the
+        # sanitized request behaves if a caller ever executed it, so the redacted
+        # value object must be equivalent to the original except for secrets.
+        return replace(
+            request,
             command=sanitized_command,
-            working_directory=request.working_directory,
             environment_variables=sanitized_env,
-            timeout_seconds=request.timeout_seconds,
-            profile=request.profile,
-            artifact_targets=getattr(request, "artifact_targets", ()),
             metadata=sanitized_metadata,
         )
 

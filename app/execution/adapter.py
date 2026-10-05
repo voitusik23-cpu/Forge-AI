@@ -16,6 +16,7 @@ from app.execution.redaction import (
     _SENSITIVE_KEY_PATTERN,
     DefaultSecretRedactor,
     SecretRedactor,
+    looks_like_credential,
 )
 from app.execution.request import (
     ExecutionOutcomeStatus,
@@ -234,7 +235,12 @@ class LocalExecutionAdapter:
         secrets_to_register: list[str] = []
         for k, v in intent.environment_variables:
             val_str = str(v).strip()
-            if val_str and _SENSITIVE_KEY_PATTERN.search(str(k)):
+            if not val_str:
+                continue
+            # Register by sensitive key name, and also by credential *value*
+            # shape so a credential cannot bypass redaction merely because the
+            # caller named its variable something innocent such as `GH_PAT`.
+            if _SENSITIVE_KEY_PATTERN.search(str(k)) or looks_like_credential(val_str):
                 secrets_to_register.append(val_str)
 
         if secrets_to_register and isinstance(self._redactor, DefaultSecretRedactor):

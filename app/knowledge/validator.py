@@ -36,6 +36,13 @@ _SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _EXTRA_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:password|passwd|pwd)\s*[:=]\s*[^\s]{4,}", re.IGNORECASE),
     re.compile(r"(?:api[_-]?key|secret[_-]?key)\s*[:=]\s*[^\s]{6,}", re.IGNORECASE),
+    # Tokens are a first-class credential class and were previously only caught
+    # by key-name heuristics. Cover bare assignments, including quoted and
+    # JSON-escaped values.
+    re.compile(
+        r"(?:access[_-]?|auth[_-]?)?token\s*[:=]\s*[\"']?[^\s\"',}]{16,}",
+        re.IGNORECASE,
+    ),
 )
 
 
