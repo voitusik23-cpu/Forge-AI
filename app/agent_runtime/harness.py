@@ -24,6 +24,7 @@ from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
 from app.execution.identity import command_is_allowed
 from app.execution.request import ExecutionOutcomeStatus, ExecutionResult
+from app.runtime.run_scope import RunScope, RunScopeError
 from app.orchestrator.models import EventType
 from app.orchestrator.trace import RunEvent, RunEventCollector, RunTrace
 from app.projects.state import ProjectState, ProjectStateStatus, derive_project_state
@@ -77,8 +78,36 @@ class AgentHarness:
         self._skill_evaluator = skill_evaluator or SkillEvaluator()
         self._memory_store = memory_store
 
+    def _enforce_run_scope(self, request: HarnessRequest) -> None:
+        """Freeze and enforce the run's security perimeter before any read.
+
+        This runs before context assembly, memory, knowledge, or provider output
+        is touched. It fails closed when the request tries to carry authority
+        that the frozen scope does not grant.
+        """
+        scope = getattr(request, "run_scope", None)
+        if scope is None:
+            # A frozen scope must not be silently abandoned once one exists.
+            if RunScope.frozen_fingerprint(request.run_id) is not None:
+                raise RunScopeError(
+                    f"run '{request.run_id}' has a frozen scope and cannot run without it"
+                )
+            return
+        if not isinstance(scope, RunScope):
+            raise RunScopeError("run_scope must be a RunScope")
+        if scope.run_id != request.run_id:
+            raise RunScopeError("run scope does not belong to this run")
+
+        scope.validate_workspace(request.workspace)
+        scope.validate_command_set(request.allowed_execution_commands)
+        scope.validate_acceptance_criteria(request.acceptance_criteria)
+
+        scope.freeze()
+        scope.assert_current()
+
     def run(self, request: HarnessRequest) -> HarnessResult:
         """Execute the controlled, bounded Run Loop according to configured policy."""
+        self._enforce_run_scope(request)
         collector = RunEventCollector(request.run_id)
 
         current_state = HarnessState(
@@ -98,7 +127,6 @@ class AgentHarness:
             )
 
         emit(EventType.HARNESS_STARTED, {"policy": repr(self.policy)})
-
         iterations_history: list[HarnessState] = []
         observations: list[StructuredObservation] = []
         decisions: list[Decision] = []

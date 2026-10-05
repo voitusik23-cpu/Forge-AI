@@ -428,14 +428,19 @@ class TogetherArchitectureInvariantTests(unittest.TestCase):
         root = pathlib.Path(__file__).resolve().parents[1]
         mentions = {}
         for path in (root / "app").rglob("*.py"):
+            if path.name == "together.py":
+                continue
             source = path.read_text(encoding="utf-8")
-            code_lines = [
-                line
-                for line in source.splitlines()
-                if "together" in line.lower() and not line.strip().startswith("#")
-            ]
-            if code_lines and path.name != "together.py":
-                mentions[path.relative_to(root).as_posix()] = len(code_lines)
+            tree = ast.parse(source, filename=str(path))
+            # Only real code references count: a string constant or an
+            # identifier equal to the provider name. Prose in comments and
+            # docstrings (for example the English word "together") is not an
+            # integration point.
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if node.value.strip().lower() == "together":
+                        key = path.relative_to(root).as_posix()
+                        mentions[key] = mentions.get(key, 0) + 1
         self.assertEqual(
             sorted(mentions),
             ["app/agents/providers/capabilities.py", "app/agents/providers/factory.py"],

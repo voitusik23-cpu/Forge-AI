@@ -12,9 +12,9 @@
 > is authoritative. For **current** architecture in detail, see
 > [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Verified baseline.** Commit `fe8fc72` (`security: harden credential redaction
-> for GitHub tokens`), working tree at the time of writing. Verification command:
-> `python -m unittest discover tests` → **716 tests, OK (skipped=2)**.
+> **Verified baseline.** Commit `33d3af5` (`feat: add Together AI provider`),
+> working tree at the time of writing. Verification command:
+> `python -m unittest discover tests` → **755 tests, OK (skipped=2)**.
 
 ## Status legend
 
@@ -136,6 +136,7 @@ review-engine module; the reviewer exists as an agent inside
 | Permission boundary | **CURRENT / VERIFIED** | `app/execution/authorizer.py` (`allowed_commands` default-deny) — `tests/test_execution_authorization_hardening.py`, `tests/test_execution_authorization_hardening_v02.py` |
 | Approval boundary (intent-bound, single-use) | **CURRENT / VERIFIED** | `app/tools/approval.py`, `app/execution/authorizer.py` — `tests/test_approval_boundary.py`, `tests/test_execution_authorization_hardening_v02.py` |
 | Workspace boundary for tools (`Workspace`) | **CURRENT / VERIFIED** | `app/tools/workspace.py` — `tests/test_workspace_boundary.py` |
+| Immutable `RunScope` trust boundary (external content is data, never authority) | **CURRENT / VERIFIED** | `app/runtime/run_scope.py`, `app/agent_runtime/harness.py` — `tests/test_run_scope_trust_boundary.py` |
 | Canonical path security (`ProgramIdentity`, `WorkspaceRelativePath`) | **CURRENT / VERIFIED** | `app/execution/paths.py` — `tests/test_execution_authorization_hardening_v02.py` |
 | Immutable `ExecutionIntent` + canonical fingerprint | **CURRENT / VERIFIED** | `app/execution/intent.py` (`IntentBuilder`, `ExecutionIntent.fingerprint`) — `tests/test_execution_authorization_hardening_v02.py` |
 | Capability-based invocation classification | **PARTIAL** — see §4.2 | `app/execution/capabilities.py` |
@@ -306,9 +307,9 @@ they become reachable when a production run loop is wired to the execution plane
 > [`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md). Подробное описание
 > **текущей** архитектуры — в [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Проверенная база.** Коммит `fe8fc72` (`security: harden credential redaction
-> for GitHub tokens`), рабочее дерево на момент написания. Команда проверки:
-> `python -m unittest discover tests` → **716 tests, OK (skipped=2)**.
+> **Проверенная база.** Коммит `33d3af5` (`feat: add Together AI provider`),
+> рабочее дерево на момент написания. Команда проверки:
+> `python -m unittest discover tests` → **755 tests, OK (skipped=2)**.
 
 ## Легенда статусов
 
@@ -430,6 +431,7 @@ review-engine **нет**; reviewer существует как агент вну
 | Граница Permission | **CURRENT / VERIFIED** | `app/execution/authorizer.py` (`allowed_commands` default-deny) — `tests/test_execution_authorization_hardening.py`, `tests/test_execution_authorization_hardening_v02.py` |
 | Граница Approval (привязана к интенту, одноразовая) | **CURRENT / VERIFIED** | `app/tools/approval.py`, `app/execution/authorizer.py` — `tests/test_approval_boundary.py`, `tests/test_execution_authorization_hardening_v02.py` |
 | Граница Workspace для инструментов (`Workspace`) | **CURRENT / VERIFIED** | `app/tools/workspace.py` — `tests/test_workspace_boundary.py` |
+| Неизменяемая граница доверия `RunScope` (внешнее содержимое — данные, а не полномочия) | **CURRENT / VERIFIED** | `app/runtime/run_scope.py`, `app/agent_runtime/harness.py` — `tests/test_run_scope_trust_boundary.py` |
 | Каноническая безопасность путей (`ProgramIdentity`, `WorkspaceRelativePath`) | **CURRENT / VERIFIED** | `app/execution/paths.py` — `tests/test_execution_authorization_hardening_v02.py` |
 | Неизменяемый `ExecutionIntent` + канонический fingerprint | **CURRENT / VERIFIED** | `app/execution/intent.py` (`IntentBuilder`, `ExecutionIntent.fingerprint`) — `tests/test_execution_authorization_hardening_v02.py` |
 | Классификация инвокаций на основе capabilities | **PARTIAL** — см. §4.2 | `app/execution/capabilities.py` |
