@@ -9,6 +9,7 @@ from typing import Optional
 
 from app.execution.adapter import ExecutionBackend, LocalExecutionAdapter
 from app.execution.policy import ExecutionPolicy
+from app.execution.identity import command_identity, command_is_allowed
 from app.execution.redaction import DefaultSecretRedactor, SecretRedactor
 from app.execution.request import (
     ExecutionOutcomeStatus,
@@ -68,22 +69,41 @@ class ExecutionCoordinator:
         )
 
         # 2. Permission check
-        if allowed_commands is not None and request.command:
-            executable = request.command[0]
-            if not self._is_permission_allowed(executable, allowed_commands):
-                return self._deny(
-                    request=request,
-                    run_id=run_id,
-                    profile_id=profile_id,
-                    outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED,
-                    reason="permission_denied",
-                    message="Execution denied by permission check: command not permitted",
-                    observer=observer,
-                )
+        if allowed_commands is None or not request.command:
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED,
+                reason="permission_missing",
+                message="Execution denied: explicit command permission is required",
+                observer=observer,
+            )
+        if not command_is_allowed(request.command, allowed_commands):
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED,
+                reason="permission_denied",
+                message="Execution denied by permission check: command not permitted",
+                observer=observer,
+            )
 
         # 3. Approval check
+        if request.approval_required and approval_policy is None:
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
+                reason="approval_policy_missing",
+                message="Execution denied: approval policy is required",
+                observer=observer,
+            )
         if approval_policy is not None and request.command:
             executable = request.command[0]
+            identity = command_identity(request.command)
             approval_state = approval_policy.evaluate(executable)
             if approval_state != ApprovalState.REQUIRED:
                 approval_state = approval_policy.evaluate("execute")
@@ -106,6 +126,7 @@ class ExecutionCoordinator:
                     invocation_id=request.request_id,
                     tool_id=executable,
                     reason="execution approval required",
+                    intent_fingerprint=self._intent_fingerprint(request, identity),
                 )
                 decision = approval_resolver.resolve(approval_req)
                 if decision is None or decision == ApprovalState.REQUIRED:
@@ -241,16 +262,24 @@ class ExecutionCoordinator:
 
     @staticmethod
     def _is_permission_allowed(executable: str, allowed_commands: frozenset[str]) -> bool:
-        exec_str = executable.strip()
-        if exec_str in allowed_commands:
-            return True
-        from pathlib import Path
-        name = Path(exec_str).name
-        stem = Path(exec_str).stem
-        for allowed in allowed_commands:
-            if name == allowed or stem == allowed or name.lower() == allowed.lower():
-                return True
-        return False
+        return command_is_allowed((executable,), allowed_commands)
+
+    @staticmethod
+    def _intent_fingerprint(request: ExecutionRequest, identity) -> str:
+        import hashlib
+        import json
+
+        profile = request.profile
+        payload = {
+            "command": {"executable": identity.executable, "argv": list(identity.argv)},
+            "working_directory": request.working_directory,
+            "profile_id": profile.profile_id if profile else None,
+            "network_access": profile.network_access if profile else None,
+            "timeout_seconds": request.timeout_seconds,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
     @staticmethod
     def _map_outcome_status(status: ExecutionStatus) -> ExecutionOutcomeStatus:

@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
+from app.execution.identity import CommandIdentity
+
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -113,6 +115,8 @@ class ProjectExecutionProfile:
             errors.append("allowed_commands_must_be_tuple")
         else:
             for cmd in self.allowed_commands:
+                if isinstance(cmd, CommandIdentity):
+                    continue
                 if not isinstance(cmd, str) or not cmd.strip():
                     errors.append("invalid_allowed_command")
                     break

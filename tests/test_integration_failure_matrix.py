@@ -1061,7 +1061,7 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             profile=self.profile,
         )
         res = coord.execute(req, run_id="run-n")
-        self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
+        self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
 
         # 2. Decision cannot approve approval
         resolver = _TrackingResolver(decision=ApprovalState.REQUIRED)

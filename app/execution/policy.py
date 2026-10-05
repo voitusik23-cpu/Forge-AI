@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import ExecutionRequest
+from app.execution.identity import command_identity, command_is_allowed, dangerous_interpreter_argv
 
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -56,16 +56,22 @@ class ExecutionPolicy:
         if not profile.allowed_commands:
             return ExecutionPolicyDecision(allowed=False, reason="no_commands_allowed_by_profile")
 
-        executable = request.command[0]
-        if not self._is_command_allowed(executable, profile.allowed_commands):
+        identity = command_identity(request.command)
+        if not command_is_allowed(request.command, profile.allowed_commands):
             return ExecutionPolicyDecision(
                 allowed=False,
-                reason=f"command_not_allowed:{executable}",
+                reason=f"command_not_allowed:{request.command[0]}",
             )
 
+        # Interpreter evaluation flags require a full CommandIdentity entry,
+        # preventing an executable-only allowlist from authorizing arbitrary code.
+        if dangerous_interpreter_argv(identity) and \
+                not command_is_allowed(request.command, profile.allowed_commands, exact_argv=True):
+            return ExecutionPolicyDecision(allowed=False, reason="argv_not_authorized")
+
         # Check command-specific forbidden flags
-        exec_name = Path(executable.strip()).name.lower()
-        exec_stem = Path(executable.strip()).stem.lower()
+        exec_name = identity.executable.rsplit("/", 1)[-1].lower()
+        exec_stem = exec_name.rsplit(".", 1)[0]
         if exec_name == "git" or exec_stem == "git":
             for part in request.command[1:]:
                 clean_part = part.strip().lower()
@@ -109,18 +115,5 @@ class ExecutionPolicy:
 
     @staticmethod
     def _is_command_allowed(executable: str, allowed_commands: tuple[str, ...]) -> bool:
-        """Match command against allowed list supporting path basenames and case-insensitivity."""
-        exec_str = executable.strip()
-        exec_name = Path(exec_str).name.lower()
-        exec_stem = Path(exec_str).stem.lower()
-
-        for allowed in allowed_commands:
-            allowed_str = allowed.strip()
-            if exec_str == allowed_str:
-                return True
-            allowed_name = Path(allowed_str).name.lower()
-            allowed_stem = Path(allowed_str).stem.lower()
-            if exec_name == allowed_name or exec_stem == allowed_stem:
-                return True
-
-        return False
+        """Compatibility wrapper over the authoritative identity matcher."""
+        return command_is_allowed((executable,), allowed_commands)

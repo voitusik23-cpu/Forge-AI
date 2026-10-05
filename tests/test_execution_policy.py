@@ -68,11 +68,32 @@ class TestExecutionPolicy(unittest.TestCase):
         self.assertEqual(decision.reason, "command_not_allowed:rm")
 
     def test_allowed_command_matches(self) -> None:
-        req1 = ExecutionRequest(command=("python", "-c", "print(1)"), profile=self.profile)
-        self.assertTrue(self.policy.evaluate(req1).allowed)
+        from app.execution.identity import CommandIdentity
 
+        req1 = ExecutionRequest(command=("python", "-c", "print(1)"), profile=self.profile)
+        self.assertFalse(self.policy.evaluate(req1).allowed)
+        self.assertEqual(self.policy.evaluate(req1).reason, "argv_not_authorized")
+
+        # sys.executable with dangerous eval flag is also denied without exact argv authorization
         req2 = ExecutionRequest(command=(sys.executable, "-c", "print(1)"), profile=self.profile)
-        self.assertTrue(self.policy.evaluate(req2).allowed)
+        self.assertFalse(self.policy.evaluate(req2).allowed)
+        self.assertEqual(self.policy.evaluate(req2).reason, "argv_not_authorized")
+
+        # When exact CommandIdentity is authorized, it is allowed
+        exact_profile = ProjectExecutionProfile(
+            profile_id="exact-profile",
+            allowed_commands=(
+                "python",
+                CommandIdentity(sys.executable, ("-c", "print(1)")),
+            ),
+            timeout_seconds=30.0,
+        )
+        req3 = ExecutionRequest(command=(sys.executable, "-c", "print(1)"), profile=exact_profile)
+        self.assertTrue(self.policy.evaluate(req3).allowed)
+
+        # Standard non-eval Python command is allowed with executable-only allowlist
+        req_script = ExecutionRequest(command=(sys.executable, "test.py"), profile=self.profile)
+        self.assertTrue(self.policy.evaluate(req_script).allowed)
 
     def test_unsafe_working_directory_denied(self) -> None:
         for unsafe in ("/root", "../escape", "subdir/../../escape"):

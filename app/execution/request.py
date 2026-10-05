@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from app.execution.artifacts import Artifact
 from app.execution.profile import ProjectExecutionProfile
+from app.execution.identity import command_is_allowed
 
 
 class ExecutionStatus(str, Enum):
@@ -33,6 +34,7 @@ class ExecutionRequest:
     profile: ProjectExecutionProfile | None = None
     artifact_targets: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+    approval_required: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.command, list):
@@ -52,6 +54,9 @@ class ExecutionRequest:
 
         if not isinstance(self.request_id, str) or not self.request_id.strip():
             errors.append("request_id_required")
+
+        if not isinstance(self.approval_required, bool):
+            errors.append("approval_required_must_be_bool")
 
         if not isinstance(self.command, tuple) or not self.command:
             errors.append("command_required")
@@ -86,9 +91,8 @@ class ExecutionRequest:
             if not profile_validation.valid:
                 errors.extend(f"profile_error:{err}" for err in profile_validation.errors)
             elif self.profile.allowed_commands and self.command:
-                executable = self.command[0]
-                if executable not in self.profile.allowed_commands:
-                    errors.append(f"command_not_allowed:{executable}")
+                if not command_is_allowed(self.command, self.profile.allowed_commands):
+                    errors.append(f"command_not_allowed:{self.command[0]}")
 
         return tuple(errors)
 

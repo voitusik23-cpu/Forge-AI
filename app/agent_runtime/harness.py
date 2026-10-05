@@ -22,6 +22,7 @@ from app.decision.provider import DecisionProvider, DeterministicDecisionProvide
 from app.decision.validator import DecisionValidationReport, validate_decision
 from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
+from app.execution.identity import command_is_allowed
 from app.execution.request import ExecutionOutcomeStatus, ExecutionResult
 from app.orchestrator.models import EventType
 from app.orchestrator.trace import RunEvent, RunEventCollector, RunTrace
@@ -380,7 +381,10 @@ class AgentHarness:
                         current_exec_req = request.execution_requests[exec_index]
                         cmd = current_exec_req.command[0] if current_exec_req.command else ""
                         allowed_cmds = request.allowed_execution_commands
-                        if allowed_cmds is not None and cmd not in allowed_cmds:
+                        if allowed_cmds is None:
+                            authorized = False
+                            auth_denial_reason = "permission_missing"
+                        elif not command_is_allowed(current_exec_req.command, allowed_cmds):
                             authorized = False
                             auth_denial_reason = "permission_denied"
                         else:

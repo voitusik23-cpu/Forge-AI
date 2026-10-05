@@ -11,6 +11,7 @@ from app.execution.artifacts import (
     create_artifact_from_file,
 )
 from app.execution.authorizer import ExecutionCoordinator
+from app.execution.identity import CommandIdentity, canonical_executable, command_identity
 from app.execution.policy import (
     ExecutionPolicy,
     ExecutionPolicyDecision,
@@ -42,6 +43,9 @@ __all__ = [
     "EphemeralWorkspaceManager",
     "ExecutionBackend",
     "ExecutionCoordinator",
+    "CommandIdentity",
+    "canonical_executable",
+    "command_identity",
     "ExecutionEnvironmentType",
     "ExecutionOutcomeStatus",
     "ExecutionPolicy",

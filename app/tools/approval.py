@@ -20,6 +20,7 @@ class ApprovalRequest:
     invocation_id: str
     tool_id: str
     reason: str
+    intent_fingerprint: str | None = None
 
 
 class ApprovalPolicy:
@@ -48,16 +49,34 @@ class InMemoryApprovalResolver:
 
     def __init__(self) -> None:
         self._decisions: dict[tuple[str, str], ApprovalState] = {}
+        self._fingerprints: dict[tuple[str, str], str] = {}
 
     def submit(
-        self, run_id: str, invocation_id: str, decision: ApprovalState
+        self,
+        run_id: str,
+        invocation_id: str,
+        decision: ApprovalState,
+        intent_fingerprint: str | None = None,
     ) -> None:
         if not isinstance(decision, ApprovalState) or decision not in (
             ApprovalState.APPROVED,
             ApprovalState.REJECTED,
         ):
             raise ValueError("approval decision must be APPROVED or REJECTED")
-        self._decisions[(run_id, invocation_id)] = decision
+        key = (run_id, invocation_id)
+        self._decisions[key] = decision
+        if intent_fingerprint is not None:
+            self._fingerprints[key] = intent_fingerprint
 
     def resolve(self, request: ApprovalRequest) -> ApprovalState | None:
-        return self._decisions.pop((request.run_id, request.invocation_id), None)
+        key = (request.run_id, request.invocation_id)
+        if key not in self._decisions:
+            return None
+        if key in self._fingerprints:
+            expected_fp = self._fingerprints[key]
+            if request.intent_fingerprint != expected_fp:
+                return None
+        elif request.intent_fingerprint is not None:
+            return None
+        self._fingerprints.pop(key, None)
+        return self._decisions.pop(key, None)
