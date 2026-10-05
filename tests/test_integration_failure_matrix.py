@@ -167,12 +167,25 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
         self.revision_executor = RevisionLoopExecutor(self.run_executor)
         self.engineering_executor = EngineeringRunExecutor(self.revision_executor)
 
+        from app.execution.identity import CommandIdentity
+
+        self.cmd_happy = CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('happy'); sys.exit(0)"))
+        self.cmd_fail = CommandIdentity(sys.executable, ("-c", "import sys; sys.exit(1)"))
+        self.cmd_exit0 = CommandIdentity(sys.executable, ("-c", "import sys; sys.exit(0)"))
+
         self.profile = ProjectExecutionProfile(
             profile_id="py-test-profile",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
             target_os=TargetOS.WINDOWS if sys.platform == "win32" else TargetOS.LINUX,
-            allowed_commands=(sys.executable, "python", "python.exe"),
+            allowed_commands=(
+                sys.executable,
+                "python",
+                "python.exe",
+                self.cmd_happy,
+                self.cmd_fail,
+                self.cmd_exit0,
+            ),
             timeout_seconds=10.0,
         )
 
@@ -217,7 +230,7 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 "crit-happy": VerificationExpectation(relative_path="output.txt", exists=True)
             },
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_happy),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -508,7 +521,7 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 "crit-e": VerificationExpectation(relative_path="nonexistent.txt", exists=True)
             },
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_fail),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -569,7 +582,7 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 "crit-f": VerificationExpectation(relative_path="missing_file.txt", exists=True)
             },
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_exit0),
         )
 
         result = self.engineering_executor.execute(run_req)

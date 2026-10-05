@@ -379,7 +379,6 @@ class AgentHarness:
                 else:
                     if exec_index < len(request.execution_requests):
                         current_exec_req = request.execution_requests[exec_index]
-                        cmd = current_exec_req.command[0] if current_exec_req.command else ""
                         allowed_cmds = request.allowed_execution_commands
                         if allowed_cmds is None:
                             authorized = False
@@ -388,36 +387,7 @@ class AgentHarness:
                             authorized = False
                             auth_denial_reason = "permission_denied"
                         else:
-                            if request.approval_policy is not None:
-                                appr_state = request.approval_policy.evaluate(cmd)
-                            else:
-                                appr_state = ApprovalState.NOT_REQUIRED
-                            if appr_state == ApprovalState.REQUIRED:
-                                # Needs human approval — check resolver
-                                if request.approval_resolver is not None:
-                                    appr_request = ApprovalRequest(
-                                        run_id=request.run_id,
-                                        invocation_id=current_exec_req.request_id,
-                                        tool_id=cmd,
-                                        reason="execution_requires_approval",
-                                    )
-                                    resolved = request.approval_resolver.resolve(appr_request)
-                                    if resolved == ApprovalState.APPROVED:
-                                        authorized = True
-                                    elif resolved == ApprovalState.REJECTED:
-                                        authorized = False
-                                        auth_denial_reason = "approval_rejected"
-                                    else:
-                                        # None → still pending
-                                        authorized = False
-                                        auth_waiting = True
-                                        auth_denial_reason = "approval_waiting"
-                                else:
-                                    authorized = False
-                                    auth_waiting = True
-                                    auth_denial_reason = "approval_waiting"
-                            else:
-                                authorized = True
+                            authorized = True
                     else:
                         authorized = False
                         auth_denial_reason = "no_execution_request"
@@ -549,11 +519,10 @@ class AgentHarness:
                         approval_resolver=request.approval_resolver,
                         observer=lambda event_type, data: emit(event_type, data),
                     )
-                    execution_results.append(exec_res)
-                    action_outcome = exec_res.outcome_status.value
                     latest_exec_id = exec_res.request_id
 
                     if exec_res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
+                        action_outcome = "approval_waiting"
                         current_state = replace(
                             current_state,
                             phase=HarnessPhase.WAITING,
@@ -562,11 +531,21 @@ class AgentHarness:
                             metadata={"reason": "approval_waiting"},
                         )
                         emit(EventType.HARNESS_PHASE_CHANGED, {"phase": HarnessPhase.WAITING.value})
+                    elif exec_res.outcome_status == ExecutionOutcomeStatus.APPROVAL_REJECTED:
+                        action_outcome = "approval_rejected"
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.FAILED,
+                            status=HarnessStatus.FAILED,
+                            terminal=True,
+                            metadata={"reason": "approval_rejected"},
+                        )
+                        emit(EventType.HARNESS_FAILED, {"reason": "approval_rejected"})
                     elif exec_res.outcome_status in (
                         ExecutionOutcomeStatus.PERMISSION_DENIED,
                         ExecutionOutcomeStatus.POLICY_DENIED,
-                        ExecutionOutcomeStatus.APPROVAL_REJECTED,
                     ):
+                        action_outcome = exec_res.outcome_status.value
                         current_state = replace(
                             current_state,
                             phase=HarnessPhase.FAILED,
@@ -575,15 +554,18 @@ class AgentHarness:
                             metadata={"reason": exec_res.outcome_status.value},
                         )
                         emit(EventType.HARNESS_FAILED, {"reason": exec_res.outcome_status.value})
-                    elif exec_res.outcome_status != ExecutionOutcomeStatus.EXECUTION_SUCCESS:
-                        current_state = replace(
-                            current_state,
-                            phase=HarnessPhase.FAILED,
-                            status=HarnessStatus.FAILED,
-                            terminal=True,
-                            metadata={"reason": exec_res.outcome_status.value},
-                        )
-                        emit(EventType.HARNESS_FAILED, {"reason": exec_res.outcome_status.value})
+                    else:
+                        execution_results.append(exec_res)
+                        action_outcome = exec_res.outcome_status.value
+                        if exec_res.outcome_status != ExecutionOutcomeStatus.EXECUTION_SUCCESS:
+                            current_state = replace(
+                                current_state,
+                                phase=HarnessPhase.FAILED,
+                                status=HarnessStatus.FAILED,
+                                terminal=True,
+                                metadata={"reason": exec_res.outcome_status.value},
+                            )
+                            emit(EventType.HARNESS_FAILED, {"reason": exec_res.outcome_status.value})
 
                 elif action == DecisionAction.RUN_VERIFICATION:
                     current_state = replace(current_state, phase=HarnessPhase.VERIFY)

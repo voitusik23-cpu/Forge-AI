@@ -94,6 +94,15 @@ class TestAgentSkillSystem(unittest.TestCase):
         self.evaluator = SkillEvaluator()
         self.registry = SkillRegistry()
 
+    def _make_exec_request(self, command: tuple[str, ...], metadata: dict | None = None) -> tuple[ExecutionRequest, object]:
+        from app.execution.identity import CommandIdentity
+        cid = CommandIdentity(command[0], command[1:])
+        profile = ProjectExecutionProfile(
+            profile_id=self.profile.profile_id,
+            allowed_commands=(*self.profile.allowed_commands, cid),
+        )
+        return ExecutionRequest(command=command, profile=profile, metadata=metadata or {}), cid
+
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
@@ -562,16 +571,12 @@ class TestAgentSkillSystem(unittest.TestCase):
 
         skill = get_builtin_python_test_runner()
 
-        # Command writes test_success.txt to simulate successful test run
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('tests_passed')",
-            ),
-            profile=self.profile,
-            metadata={"tool_id": "python_test_runner"},
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('tests_passed')",
         )
+        exec_req, cid = self._make_exec_request(cmd, metadata={"tool_id": "python_test_runner"})
         crit = AcceptanceCriterion(
             criterion_id="crit-15-k",
             requirement_id="req-15-k",
@@ -588,7 +593,7 @@ class TestAgentSkillSystem(unittest.TestCase):
             available_skills=(skill,),
             available_capabilities=("process:execute",),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             verification_expectations={
                 "crit-15-k": VerificationExpectation(relative_path="test_success.txt", exists=True)
             },
@@ -622,14 +627,12 @@ class TestAgentSkillSystem(unittest.TestCase):
         skill = get_builtin_python_test_runner()
 
         target_file = self.workspace_path / "det_test.txt"
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('det_done')",
-            ),
-            profile=self.profile,
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('det_done')",
         )
+        exec_req, cid = self._make_exec_request(cmd)
         crit = AcceptanceCriterion(
             criterion_id="crit-15-l",
             requirement_id="req-15-l",
@@ -645,7 +648,7 @@ class TestAgentSkillSystem(unittest.TestCase):
             available_skills=(skill,),
             available_capabilities=("process:execute",),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             verification_expectations={
                 "crit-15-l": VerificationExpectation(relative_path="det_test.txt", exists=True)
             },

@@ -57,12 +57,16 @@ class TestTestVerificationAdapter(unittest.TestCase):
         self.exec_adapter = LocalExecutionAdapter(workspace_root=self.workspace_root)
         self.coordinator = ExecutionCoordinator(adapter=self.exec_adapter, policy=self.policy)
 
+        from app.execution.identity import CommandIdentity
+
+        self.ok_cmd = CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('test_ok'); sys.exit(0)"))
+        self.fail_cmd = CommandIdentity(sys.executable, ("-c", "import sys; sys.stderr.write('test_fail'); sys.exit(1)"))
         self.profile = ProjectExecutionProfile(
             profile_id="py-test-env",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
             target_os=TargetOS.WINDOWS if sys.platform == "win32" else TargetOS.LINUX,
-            allowed_commands=(sys.executable, "python", "python.exe", "pytest"),
+            allowed_commands=(sys.executable, "python", "python.exe", "pytest", self.ok_cmd, self.fail_cmd),
             timeout_seconds=10.0,
         )
 
@@ -280,7 +284,7 @@ class TestTestVerificationAdapter(unittest.TestCase):
         exec_res = self.coordinator.execute(
             exec_req,
             workspace_root=self.workspace_root,
-            allowed_commands=frozenset({sys.executable}),
+            allowed_commands=frozenset({sys.executable, self.ok_cmd}),
         )
         self.assertEqual(exec_res.status, ExecutionStatus.SUCCESS)
         self.assertEqual(exec_res.exit_code, 0)
@@ -304,7 +308,7 @@ class TestTestVerificationAdapter(unittest.TestCase):
         exec_res = self.coordinator.execute(
             exec_req,
             workspace_root=self.workspace_root,
-            allowed_commands=frozenset({sys.executable}),
+            allowed_commands=frozenset({sys.executable, self.fail_cmd}),
         )
         self.assertEqual(exec_res.status, ExecutionStatus.FAILURE)
         self.assertEqual(exec_res.exit_code, 1)

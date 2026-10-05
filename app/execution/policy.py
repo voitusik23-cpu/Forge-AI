@@ -56,12 +56,19 @@ class ExecutionPolicy:
         if not profile.allowed_commands:
             return ExecutionPolicyDecision(allowed=False, reason="no_commands_allowed_by_profile")
 
-        identity = command_identity(request.command)
+        try:
+            identity = command_identity(request.command)
+        except ValueError:
+            return ExecutionPolicyDecision(
+                allowed=False,
+                reason=f"command_not_allowed:{request.command[0] if request.command else ''}",
+            )
         if not command_is_allowed(request.command, profile.allowed_commands):
             return ExecutionPolicyDecision(
                 allowed=False,
                 reason=f"command_not_allowed:{request.command[0]}",
             )
+
 
         # Interpreter evaluation flags require a full CommandIdentity entry,
         # preventing an executable-only allowlist from authorizing arbitrary code.

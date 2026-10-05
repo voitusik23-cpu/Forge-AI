@@ -158,6 +158,15 @@ class TestAgentHarness(unittest.TestCase):
         )
         self.harness = AgentHarness()
 
+    def _make_exec_request(self, command: tuple[str, ...]) -> tuple[ExecutionRequest, object]:
+        from app.execution.identity import CommandIdentity
+        cid = CommandIdentity(command[0], command[1:])
+        profile = ProjectExecutionProfile(
+            profile_id=self.profile.profile_id,
+            allowed_commands=(*self.profile.allowed_commands, cid),
+        )
+        return ExecutionRequest(command=command, profile=profile), cid
+
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -167,19 +176,17 @@ class TestAgentHarness(unittest.TestCase):
     def test_scenario_a_single_successful_action(self) -> None:
         """Prove that a single authoritative action can be authorized and executed cleanly."""
         target_file = self.workspace_root / "out.txt"
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('hello')",
-            ),
-            profile=self.profile,
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('hello')",
         )
+        exec_req, cid = self._make_exec_request(cmd)
         req = HarnessRequest(
             run_id="run-a",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-a",
                 attempt_number=0,
@@ -209,28 +216,26 @@ class TestAgentHarness(unittest.TestCase):
         crit = AcceptanceCriterion(
             criterion_id="crit-b", requirement_id="req-b", description="step.txt must exist"
         )
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('step content')",
+        )
+        exec_req, cid = self._make_exec_request(cmd)
         spec = TaskSpecification(
             task_id="task-b",
             title="Step Task",
             description="Run full cycle",
             requirements=(req,),
             acceptance_criteria=(crit,),
-            execution_profile=self.profile,
-        )
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('step content')",
-            ),
-            profile=self.profile,
+            execution_profile=exec_req.profile,
         )
         h_req = HarnessRequest(
             run_id="run-b",
             task_specification=spec,
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             verification_expectations={
                 "crit-b": VerificationExpectation(relative_path="step.txt", exists=True)
             },
@@ -357,15 +362,13 @@ class TestAgentHarness(unittest.TestCase):
     # =========================================================================
     def test_scenario_f_execution_failure(self) -> None:
         """Prove that a non-zero exit code produces execution failure and halts progress."""
-        exec_req = ExecutionRequest(
-            command=(sys.executable, "-c", "import sys; sys.exit(7)"),
-            profile=self.profile,
-        )
+        cmd = (sys.executable, "-c", "import sys; sys.exit(7)")
+        exec_req, cid = self._make_exec_request(cmd)
         h_req = HarnessRequest(
             run_id="run-f",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-f", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),

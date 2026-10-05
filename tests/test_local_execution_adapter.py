@@ -30,11 +30,24 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             policy=self.policy,
             redactor=self.redactor,
         )
+        from app.execution.identity import CommandIdentity
+
         self.profile = ProjectExecutionProfile(
             profile_id="local-py",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
-            allowed_commands=(sys.executable, "python", "python.exe"),
+            allowed_commands=(
+                sys.executable,
+                "python",
+                "python.exe",
+                CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('forge_stdout'); sys.exit(0)")),
+                CommandIdentity(sys.executable, ("-c", "import sys; sys.stderr.write('forge_failed'); sys.exit(42)")),
+                CommandIdentity(sys.executable, ("-c", "import time; time.sleep(3)")),
+                CommandIdentity(sys.executable, ("-c", "print('A' * 200)")),
+                CommandIdentity(sys.executable, ("-c", "print('Found token: sensitive_token_999 in stream')")),
+                CommandIdentity(sys.executable, ("-c", "import os, pathlib; print(pathlib.Path.cwd().name)")),
+                CommandIdentity(sys.executable, ("-c", "print(1)")),
+            ),
             timeout_seconds=10.0,
             max_output_bytes=1048576,
         )
@@ -92,9 +105,14 @@ class TestLocalExecutionAdapter(unittest.TestCase):
         self.assertFalse(result.success)
 
     def test_output_truncation(self) -> None:
+        from app.execution.identity import CommandIdentity
+
         small_output_profile = ProjectExecutionProfile(
             profile_id="small-output",
-            allowed_commands=(sys.executable,),
+            allowed_commands=(
+                sys.executable,
+                CommandIdentity(sys.executable, ("-c", "print('A' * 200)")),
+            ),
             max_output_bytes=25,
             timeout_seconds=5.0,
         )

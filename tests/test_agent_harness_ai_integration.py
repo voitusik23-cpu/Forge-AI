@@ -160,6 +160,15 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             allowed_commands=(sys.executable,),
         )
 
+    def _make_exec_request(self, command: tuple[str, ...]) -> tuple[ExecutionRequest, object]:
+        from app.execution.identity import CommandIdentity
+        cid = CommandIdentity(command[0], command[1:])
+        profile = ProjectExecutionProfile(
+            profile_id=self.profile.profile_id,
+            allowed_commands=(*self.profile.allowed_commands, cid),
+        )
+        return ExecutionRequest(command=command, profile=profile), cid
+
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -184,19 +193,17 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         )
 
         exec_file = self.workspace_root / "test_a.txt"
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{exec_file}').write_text('scenario_a')",
-            ),
-            profile=self.profile,
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{exec_file}').write_text('scenario_a')",
         )
+        exec_req, cid = self._make_exec_request(cmd)
         h_req = HarnessRequest(
             run_id="run-14-a",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-14-a", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
@@ -239,19 +246,17 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         )
 
         exec_file = self.workspace_root / "test_b.txt"
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{exec_file}').write_text('scenario_b')",
-            ),
-            profile=self.profile,
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{exec_file}').write_text('scenario_b')",
         )
+        exec_req, cid = self._make_exec_request(cmd)
         h_req = HarnessRequest(
             run_id="run-14-b",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-14-b", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
@@ -368,15 +373,13 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             policy=AgentHarnessPolicy(max_actions=1),
         )
 
-        exec_req = ExecutionRequest(
-            command=(sys.executable, "-c", "print('hello_stdout')"),
-            profile=self.profile,
-        )
+        cmd = (sys.executable, "-c", "print('hello_stdout')")
+        exec_req, cid = self._make_exec_request(cmd)
         h_req = HarnessRequest(
             run_id="run-14-e",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-14-e", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
@@ -473,19 +476,17 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         ai_provider = AIDecisionProvider(provider=scripted_model)
         harness = AgentHarness(decision_provider=ai_provider)
 
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('artifact')",
-            ),
-            profile=self.profile,
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('artifact')",
         )
+        exec_req, cid = self._make_exec_request(cmd)
         h_req = HarnessRequest(
             run_id="run-14-g",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             verification_expectations={
                 "crit-g": VerificationExpectation(relative_path="app_result.txt", exists=True)
             },
@@ -730,19 +731,17 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         )
 
         target_file = self.workspace_root / "det.txt"
-        exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('deterministic')",
-            ),
-            profile=self.profile,
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('deterministic')",
         )
+        exec_req, cid = self._make_exec_request(cmd)
         h_req = HarnessRequest(
             run_id="run-14-o",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-14-o", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),

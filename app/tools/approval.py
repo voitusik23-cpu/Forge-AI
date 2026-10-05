@@ -31,10 +31,23 @@ class ApprovalPolicy:
     def __init__(self, approval_required_tools=()) -> None:
         self._required_tools = frozenset(approval_required_tools) | self.MANDATORY_APPROVAL_TOOLS
 
-    def evaluate(self, tool_id: str) -> ApprovalState:
-        if tool_id in self._required_tools:
+    def evaluate(self, tool_or_cmd: object) -> ApprovalState:
+        if tool_or_cmd in self._required_tools:
             return ApprovalState.REQUIRED
+        from app.execution.identity import CommandIdentity, executable_matches
+        if isinstance(tool_or_cmd, CommandIdentity):
+            for required in self._required_tools:
+                if isinstance(required, CommandIdentity):
+                    if executable_matches(tool_or_cmd.executable, required.executable) and tool_or_cmd.argv == required.argv:
+                        return ApprovalState.REQUIRED
+                elif isinstance(required, str) and executable_matches(tool_or_cmd.executable, required):
+                    return ApprovalState.REQUIRED
+        elif isinstance(tool_or_cmd, str):
+            for required in self._required_tools:
+                if isinstance(required, str) and executable_matches(tool_or_cmd, required):
+                    return ApprovalState.REQUIRED
         return ApprovalState.NOT_REQUIRED
+
 
 
 class ApprovalResolver(Protocol):

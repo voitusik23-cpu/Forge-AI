@@ -91,64 +91,80 @@ class ExecutionCoordinator:
             )
 
         # 3. Approval check
-        if request.approval_required and approval_policy is None:
-            return self._deny(
-                request=request,
-                run_id=run_id,
-                profile_id=profile_id,
-                outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
-                reason="approval_policy_missing",
-                message="Execution denied: approval policy is required",
-                observer=observer,
-            )
-        if approval_policy is not None and request.command:
-            executable = request.command[0]
-            identity = command_identity(request.command)
-            approval_state = approval_policy.evaluate(executable)
-            if approval_state != ApprovalState.REQUIRED:
-                approval_state = approval_policy.evaluate("execute")
-            if approval_state != ApprovalState.REQUIRED:
-                from pathlib import Path as _P
-                approval_state = approval_policy.evaluate(_P(executable).name)
-            if approval_state == ApprovalState.REQUIRED:
-                if approval_resolver is None:
-                    return self._deny(
-                        request=request,
-                        run_id=run_id,
-                        profile_id=profile_id,
-                        outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
-                        reason="approval_waiting",
-                        message="Execution waiting for approval",
-                        observer=observer,
-                    )
-                approval_req = ApprovalRequest(
+        needs_approval = bool(request.approval_required)
+        if not needs_approval and approval_policy is not None and request.command:
+            try:
+                identity = command_identity(request.command)
+            except ValueError:
+                return self._deny(
+                    request=request,
                     run_id=run_id,
-                    invocation_id=request.request_id,
-                    tool_id=executable,
-                    reason="execution approval required",
-                    intent_fingerprint=self._intent_fingerprint(request, identity),
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED,
+                    reason="invalid_command",
+                    message="Execution denied: command identity is invalid",
+                    observer=observer,
                 )
-                decision = approval_resolver.resolve(approval_req)
-                if decision is None or decision == ApprovalState.REQUIRED:
-                    return self._deny(
-                        request=request,
-                        run_id=run_id,
-                        profile_id=profile_id,
-                        outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
-                        reason="approval_waiting",
-                        message="Execution waiting for approval",
-                        observer=observer,
-                    )
-                if decision == ApprovalState.REJECTED:
-                    return self._deny(
-                        request=request,
-                        run_id=run_id,
-                        profile_id=profile_id,
-                        outcome_status=ExecutionOutcomeStatus.APPROVAL_REJECTED,
-                        reason="approval_rejected",
-                        message="Execution rejected by approval resolver",
-                        observer=observer,
-                    )
+            if approval_policy.evaluate("execute") == ApprovalState.REQUIRED:
+                needs_approval = True
+            elif approval_policy.evaluate(identity) == ApprovalState.REQUIRED:
+                needs_approval = True
+            elif approval_policy.evaluate(identity.executable) == ApprovalState.REQUIRED:
+                needs_approval = True
+
+        if needs_approval:
+            if approval_resolver is None:
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
+                    reason="approval_waiting",
+                    message="Execution waiting for approval: approval resolver is missing",
+                    observer=observer,
+                )
+            try:
+                identity = command_identity(request.command)
+            except ValueError:
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED,
+                    reason="invalid_command",
+                    message="Execution denied: command identity is invalid",
+                    observer=observer,
+                )
+            approval_req = ApprovalRequest(
+                run_id=run_id,
+                invocation_id=request.request_id,
+                tool_id=request.command[0] if request.command else "execute",
+                reason="execution approval required",
+                intent_fingerprint=self._intent_fingerprint(request, identity),
+            )
+            decision = approval_resolver.resolve(approval_req)
+            if decision != ApprovalState.APPROVED:
+                outcome = (
+                    ExecutionOutcomeStatus.APPROVAL_REJECTED
+                    if decision == ApprovalState.REJECTED
+                    else ExecutionOutcomeStatus.APPROVAL_WAITING
+                )
+                reason = "approval_rejected" if decision == ApprovalState.REJECTED else "approval_waiting"
+                msg = (
+                    "Execution rejected by approval resolver"
+                    if decision == ApprovalState.REJECTED
+                    else "Execution waiting for approval"
+                )
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=outcome,
+                    reason=reason,
+                    message=msg,
+                    observer=observer,
+                )
+
 
         # 4. ExecutionPolicy check
         policy_decision = self._policy.evaluate(request)

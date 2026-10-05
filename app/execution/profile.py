@@ -120,6 +120,13 @@ class ProjectExecutionProfile:
                 if not isinstance(cmd, str) or not cmd.strip():
                     errors.append("invalid_allowed_command")
                     break
+                from app.execution.identity import canonical_executable
+                try:
+                    canonical_executable(cmd)
+                except ValueError:
+                    errors.append("invalid_allowed_command")
+                    break
+
 
         if not isinstance(self.environment_variables, Mapping):
             errors.append("environment_variables_must_be_mapping")
@@ -147,14 +154,19 @@ class ProjectExecutionProfile:
             if isinstance(self.target_os, TargetOS)
             else str(self.target_os)
         )
+        allowed_cmds = [
+            cmd.to_dict() if isinstance(cmd, CommandIdentity) else cmd
+            for cmd in self.allowed_commands
+        ]
         return {
             "profile_id": self.profile_id,
             "environment_type": env_type,
             "runtime_name": self.runtime_name,
             "runtime_version": self.runtime_version,
             "target_os": target_os,
+
             "working_directory": self.working_directory,
-            "allowed_commands": list(self.allowed_commands),
+            "allowed_commands": allowed_cmds,
             "environment_variables": dict(self.environment_variables),
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,

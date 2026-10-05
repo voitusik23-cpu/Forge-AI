@@ -95,6 +95,57 @@ class TestExecutionPolicy(unittest.TestCase):
         req_script = ExecutionRequest(command=(sys.executable, "test.py"), profile=self.profile)
         self.assertTrue(self.policy.evaluate(req_script).allowed)
 
+        # String-only python does NOT authorize arbitrary or test -m modules
+        req_unittest = ExecutionRequest(
+            command=(sys.executable, "-m", "unittest", "discover", "-s", "tests"),
+            profile=self.profile,
+        )
+        self.assertFalse(self.policy.evaluate(req_unittest).allowed)
+        self.assertEqual(self.policy.evaluate(req_unittest).reason, "argv_not_authorized")
+
+        req_pytest = ExecutionRequest(
+            command=(sys.executable, "-m", "pytest", "tests"),
+            profile=self.profile,
+        )
+        self.assertFalse(self.policy.evaluate(req_pytest).allowed)
+        self.assertEqual(self.policy.evaluate(req_pytest).reason, "argv_not_authorized")
+
+        req_module = ExecutionRequest(
+            command=(sys.executable, "-m", "http.server", "8000"),
+            profile=self.profile,
+        )
+        self.assertFalse(self.policy.evaluate(req_module).allowed)
+        self.assertEqual(self.policy.evaluate(req_module).reason, "argv_not_authorized")
+
+        # Exact approved CommandIdentity for -m unittest and -m pytest is allowed
+        cmd_unittest = CommandIdentity(sys.executable, ("-m", "unittest", "discover", "-s", "tests"))
+        cmd_pytest = CommandIdentity(sys.executable, ("-m", "pytest", "tests"))
+        exact_module_profile = ProjectExecutionProfile(
+            profile_id="p-exact-mod",
+            allowed_commands=(sys.executable, "python", cmd_unittest, cmd_pytest),
+            timeout_seconds=30.0,
+        )
+
+        self.assertTrue(self.policy.evaluate(ExecutionRequest(command=(sys.executable, "-m", "unittest", "discover", "-s", "tests"), profile=exact_module_profile)).allowed)
+        self.assertTrue(self.policy.evaluate(ExecutionRequest(command=(sys.executable, "-m", "pytest", "tests"), profile=exact_module_profile)).allowed)
+
+        # Modified argv for approved module command is rejected
+        modified_unittest = ExecutionRequest(
+            command=(sys.executable, "-m", "unittest", "discover", "-s", "other_tests"),
+            profile=exact_module_profile,
+        )
+        self.assertFalse(self.policy.evaluate(modified_unittest).allowed)
+        self.assertEqual(self.policy.evaluate(modified_unittest).reason, "argv_not_authorized")
+
+        # python -c "EVIL" -m unittest is rejected
+        evil_combined = ExecutionRequest(
+            command=(sys.executable, "-c", "import os", "-m", "unittest"),
+            profile=exact_module_profile,
+        )
+        self.assertFalse(self.policy.evaluate(evil_combined).allowed)
+        self.assertEqual(self.policy.evaluate(evil_combined).reason, "argv_not_authorized")
+
+
     def test_unsafe_working_directory_denied(self) -> None:
         for unsafe in ("/root", "../escape", "subdir/../../escape"):
             req = ExecutionRequest(

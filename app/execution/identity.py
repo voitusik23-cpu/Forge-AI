@@ -6,6 +6,7 @@ import hashlib
 import json
 import ntpath
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -32,23 +33,49 @@ class CommandIdentity:
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
+    def to_dict(self) -> dict[str, object]:
+        return {"executable": self.executable, "argv": list(self.argv)}
+
+
+
+def is_bare_executable(raw: str) -> bool:
+    if "/" in raw or "\\" in raw:
+        return False
+    if raw.startswith("."):
+        return False
+    return True
+
+
+def is_absolute_executable_path(raw: str) -> bool:
+    norm = raw.replace("\\", "/")
+    parts = norm.split("/")
+    if any(p == ".." or p == "." for p in parts if p):
+        return False
+    drive, rest = ntpath.splitdrive(raw)
+    if drive:
+        return rest.startswith(("/", "\\"))
+    return raw.startswith(("/", "\\"))
+
 
 def canonical_executable(value: object) -> str:
-    """Canonicalize an executable without basename substitution."""
+    """Canonicalize an executable without basename substitution or relative paths.
+
+    Allowed:
+    - Bare executable names (e.g. 'python', 'git')
+    - Exact absolute paths (e.g. '/usr/bin/python', 'C:\\Python313\\python.exe')
+
+    Rejected:
+    - Relative paths (e.g. './x', '../x', 'sub/x')
+    """
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ValueError("executable must be a non-empty string")
-    raw = value.strip().replace("\\", "/")
-    # Bare commands remain exact tokens. Path-bearing commands are canonicalized
-    # as paths, never reduced to a basename or stem.
-    has_path = "/" in raw or bool(ntpath.splitdrive(raw)[0]) or raw.startswith(".")
-    if has_path:
+    raw = value.strip()
+    if is_bare_executable(raw):
+        return os.path.normcase(raw)
+    if is_absolute_executable_path(raw):
         path = Path(raw)
-        if not path.is_absolute() and not raw.startswith("."):
-            path = Path(os.path.abspath(raw))
-        else:
-            path = path.resolve(strict=False)
-        raw = path.as_posix()
-    return os.path.normcase(raw)
+        return os.path.normcase(path.as_posix())
+    raise ValueError(f"relative executable paths are not allowed: {value!r}")
 
 
 def command_identity(command: Iterable[object]) -> CommandIdentity:
@@ -92,17 +119,117 @@ def command_is_allowed(
     return False
 
 
+_PYTHON_SHORT_EVAL_PATTERN = re.compile(r"^-[bBdEiIOPqsuv]*[cm]")
+_NODE_SHORT_EVAL_PATTERN = re.compile(r"^-[a-zA-Z]*[ep]")
+_RUBY_SHORT_EVAL_PATTERN = re.compile(r"^-[a-zA-Z]*e")
+_PERL_SHORT_EVAL_PATTERN = re.compile(r"^-[a-zA-Z]*[eE]")
+_PHP_SHORT_EVAL_PATTERN = re.compile(r"^-[a-zA-Z]*[rR]")
+
+
 def dangerous_interpreter_argv(identity: CommandIdentity) -> bool:
-    """Identify interpreter eval flags that must have an exact approved intent."""
+    """Identify interpreter eval, module, or shell flags that must have an exact approved intent."""
     name = identity.executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
     stem = name.rsplit(".", 1)[0]
-    is_interpreter = (
-        stem == "python"
-        or stem.startswith("python3")
-        or stem.startswith("pypy")
-        or stem in {"node", "nodejs", "ruby", "perl"}
-    )
-    return is_interpreter and any(
-        arg in {"-c", "--command", "-e", "--eval", "-m", "--module", "-"}
-        for arg in identity.argv
-    )
+
+    # 1. Python family
+    if stem == "python" or stem.startswith("python3") or stem.startswith("pypy"):
+        for arg in identity.argv:
+            if arg == "-":
+                return True
+            if arg.startswith("--"):
+                low = arg.lower()
+                if low in {"--command", "--module", "--eval"} or low.startswith(
+                    ("--command=", "--module=", "--eval=")
+                ):
+                    return True
+            elif arg.startswith("-") and len(arg) > 1:
+                if _PYTHON_SHORT_EVAL_PATTERN.match(arg):
+                    return True
+        return False
+
+    # 2. Shell family
+    if stem in {"bash", "sh", "zsh", "dash"}:
+        for arg in identity.argv:
+            if arg in {"-", "-s"}:
+                return True
+            if arg.startswith("--"):
+                if arg.lower() in {"--command"} or arg.lower().startswith("--command="):
+                    return True
+            elif arg.startswith("-") and len(arg) > 1:
+                if "c" in arg or "s" in arg:
+                    return True
+        return False
+
+    # 3. PowerShell family
+    if stem in {"powershell", "pwsh"}:
+        for arg in identity.argv:
+            if arg.startswith(("-", "/")) and len(arg) > 1:
+                norm = arg.lstrip("-/").lower()
+                if norm in {"c", "e", "ec"} or norm.startswith(("c:", "c=", "e:", "e=")):
+                    return True
+                if norm.startswith(("command", "comm", "encodedcommand", "enc")):
+                    return True
+        return False
+
+    # 4. Windows CMD family
+    if stem == "cmd":
+        for arg in identity.argv:
+            if arg.startswith(("/", "-")) and len(arg) > 1:
+                low = arg.lower()
+                if low.startswith(("/c", "/k", "-c", "-k")):
+                    return True
+        return False
+
+    # 5. Node family
+    if stem in {"node", "nodejs"}:
+        for arg in identity.argv:
+            if arg == "-":
+                return True
+            if arg.startswith("--"):
+                low = arg.lower()
+                if low in {"--eval", "--print"} or low.startswith(("--eval=", "--print=")):
+                    return True
+            elif arg.startswith("-") and len(arg) > 1:
+                if _NODE_SHORT_EVAL_PATTERN.match(arg):
+                    return True
+        return False
+
+    # 6. Ruby family
+    if stem == "ruby":
+        for arg in identity.argv:
+            if arg == "-":
+                return True
+            if arg.startswith("--"):
+                low = arg.lower()
+                if low in {"--eval"} or low.startswith("--eval="):
+                    return True
+            elif arg.startswith("-") and len(arg) > 1:
+                if _RUBY_SHORT_EVAL_PATTERN.match(arg):
+                    return True
+        return False
+
+    # 7. Perl family
+    if stem == "perl":
+        for arg in identity.argv:
+            if arg == "-":
+                return True
+            if arg.startswith("--"):
+                low = arg.lower()
+                if low in {"--eval"} or low.startswith("--eval="):
+                    return True
+            elif arg.startswith("-") and len(arg) > 1:
+                if _PERL_SHORT_EVAL_PATTERN.match(arg):
+                    return True
+        return False
+
+    # 8. PHP family
+    if stem == "php":
+        for arg in identity.argv:
+            if arg == "-":
+                return True
+            if arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
+                if _PHP_SHORT_EVAL_PATTERN.match(arg):
+                    return True
+        return False
+
+    return False

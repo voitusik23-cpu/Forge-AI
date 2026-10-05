@@ -83,15 +83,92 @@ class TestExecutionPlane(unittest.TestCase):
         data_dir.mkdir()
         (data_dir / "input.txt").write_text("initial data\n", encoding="utf-8")
 
+        from app.execution.identity import CommandIdentity
+
+        content = b"deterministic artifact content\n"
+        allowed = [
+            sys.executable,
+            "python",
+            "python.exe",
+            CommandIdentity(
+                sys.executable,
+                (
+                    "-c",
+                    "import pathlib; "
+                    "pathlib.Path('main.py').write_text('mutated'); "
+                    "pathlib.Path('new_file.txt').write_text('scratch only'); "
+                    "pathlib.Path('data/input.txt').unlink()",
+                ),
+            ),
+            CommandIdentity(sys.executable, ("-c", "print('clean-success')")),
+            CommandIdentity(sys.executable, ("-c", "import sys; sys.exit(42)")),
+            CommandIdentity(sys.executable, ("-c", "print(1)")),
+            CommandIdentity(
+                sys.executable,
+                (
+                    "-c",
+                    "import pathlib; "
+                    "pathlib.Path('output.txt').write_text('build artifact data\\n'); "
+                    "pathlib.Path('report.json').write_text('report_data\\n')",
+                ),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", f"import pathlib; pathlib.Path('digest.bin').write_bytes({repr(content)})"),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import pathlib; pathlib.Path('prov.txt').write_text('provenance test')"),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import os; print('ENV_VAL=' + os.environ.get('MY_JOB_TOKEN', 'missing'))"),
+            ),
+            CommandIdentity(sys.executable, ("-c", "import os; print('Leaking: ' + os.environ['AUTH_KEY'])")),
+            CommandIdentity(sys.executable, ("-c", "print('should not execute')")),
+            CommandIdentity(sys.executable, ("-c", "import time; time.sleep(10)")),
+            CommandIdentity(
+                sys.executable,
+                (
+                    "-c",
+                    "import subprocess, sys, time; "
+                    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+                    "time.sleep(10)",
+                ),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import os; print('PROXY=' + os.environ.get('http_proxy', 'none'))"),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import pathlib; pathlib.Path('marker_run1.txt').write_text('run1')"),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import pathlib; print('EXISTS=' + str(pathlib.Path('marker_run1.txt').exists()))"),
+            ),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import pathlib; pathlib.Path('art1.txt').write_text('art1 data')"),
+            ),
+            CommandIdentity(sys.executable, ("-c", "print('run2')")),
+            CommandIdentity(
+                sys.executable,
+                ("-c", "import os; print('PYTHONPATH=' + os.environ.get('PYTHONPATH', 'unset'))"),
+            ),
+        ]
+
         self.profile = ProjectExecutionProfile(
             profile_id="test-exec-profile",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
-            allowed_commands=(sys.executable, "python", "python.exe"),
+            allowed_commands=tuple(allowed),
             timeout_seconds=10.0,
             max_output_bytes=1048576,
             network_access=False,
         )
+
         self.policy = ExecutionPolicy()
         self.redactor = DefaultSecretRedactor()
         self.adapter = LocalExecutionAdapter(

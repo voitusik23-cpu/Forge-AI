@@ -86,12 +86,35 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
         self.revision_executor = RevisionLoopExecutor(self.run_executor)
         self.engineering_executor = EngineeringRunExecutor(self.revision_executor)
 
+        from app.execution.identity import CommandIdentity
+
+        self.cmd_ok = CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('run_ok'); sys.exit(0)"))
+        self.cmd_exit0 = CommandIdentity(sys.executable, ("-c", "import sys; sys.exit(0)"))
+        self.cmd_nonzero = CommandIdentity(sys.executable, ("-c", "import sys; sys.stderr.write('failed_job'); sys.exit(42)"))
+        self.cmd_verif = CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('test_suite_passed'); sys.exit(0)"))
+        self.cmd_unmapped = CommandIdentity(sys.executable, ("-c", "import sys; sys.exit(1)"))
+        self.cmd_leak = CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('super_secret_payload_12345'); sys.stderr.write('err_msg'); sys.exit(0)"))
+        self.cmd_secret = CommandIdentity(sys.executable, ("-c", "import sys; sys.stdout.write('Token is very_secret_api_token'); sys.exit(0)"))
+        self.cmd_timeout = CommandIdentity(sys.executable, ("-c", "import time; time.sleep(3)"))
+
         self.profile = ProjectExecutionProfile(
             profile_id="py-env-stage4",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
             target_os=TargetOS.WINDOWS if sys.platform == "win32" else TargetOS.LINUX,
-            allowed_commands=(sys.executable, "python", "python.exe"),
+            allowed_commands=(
+                sys.executable,
+                "python",
+                "python.exe",
+                self.cmd_ok,
+                self.cmd_exit0,
+                self.cmd_nonzero,
+                self.cmd_verif,
+                self.cmd_unmapped,
+                self.cmd_leak,
+                self.cmd_secret,
+                self.cmd_timeout,
+            ),
             timeout_seconds=10.0,
         )
 
@@ -124,8 +147,9 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_ok),
         )
+
         result = self.engineering_executor.execute(request)
 
         self.assertEqual(result.final_status, EngineeringRunStatus.SUCCESS)
@@ -190,7 +214,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_exit0),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
         )
@@ -220,10 +244,11 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_exit0),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
         )
+
         result = self.engineering_executor.execute(request)
 
         self.assertEqual(len(result.execution_results), 1)
@@ -293,7 +318,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_leak),
         )
         result = self.engineering_executor.execute(request)
 
@@ -327,7 +352,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_secret),
         )
         result = engineering_executor.execute(request)
 
@@ -340,7 +365,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             profile_id="timeout-profile",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
-            allowed_commands=(sys.executable,),
+            allowed_commands=(sys.executable, self.cmd_timeout),
             timeout_seconds=0.2,
         )
         exec_req = ExecutionRequest(
@@ -358,7 +383,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_timeout),
         )
         result = self.engineering_executor.execute(request)
 
@@ -382,7 +407,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_nonzero),
         )
         result = self.engineering_executor.execute(request)
 
@@ -421,7 +446,7 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
         exec_res = coordinator.execute_request(
             request=exec_req,
             workspace_root=self.workspace_root,
-            allowed_commands=(sys.executable,),
+            allowed_commands=(sys.executable, self.cmd_verif),
         )
 
         evidence = create_execution_verification_evidence("crit-exec", exec_res)
@@ -456,9 +481,10 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             verification_expectations=self.expectations,
             acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, self.cmd_unmapped),
         )
         result = self.engineering_executor.execute(request)
+
 
         self.assertEqual(len(result.execution_results), 1)
         self.assertEqual(result.execution_results[0].outcome_status, ExecutionOutcomeStatus.EXECUTION_FAILURE)

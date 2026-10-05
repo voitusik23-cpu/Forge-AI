@@ -130,19 +130,27 @@ class TestAIDecisionProvider(unittest.TestCase):
         provider = _ConfigurableModelProvider(model_output)
         ai_decision_provider = AIDecisionProvider(provider=provider)
 
+        from app.execution.identity import CommandIdentity
+
+        cmd = (
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path(r'{target_file}').write_text('ai_generated')",
+        )
+        cid = CommandIdentity(cmd[0], cmd[1:])
+        exec_profile = ProjectExecutionProfile(
+            profile_id=self.profile.profile_id,
+            allowed_commands=(*self.profile.allowed_commands, cid),
+        )
         exec_req = ExecutionRequest(
-            command=(
-                sys.executable,
-                "-c",
-                f"import pathlib; pathlib.Path(r'{target_file}').write_text('ai_generated')",
-            ),
-            profile=self.profile,
+            command=cmd,
+            profile=exec_profile,
         )
         h_req = HarnessRequest(
             run_id="run-a-ai",
             workspace=self.workspace,
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
+            allowed_execution_commands=(sys.executable, cid),
             initial_project_state=ProjectState(
                 run_id="run-a-ai", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
