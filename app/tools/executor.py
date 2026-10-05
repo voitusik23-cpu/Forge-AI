@@ -109,7 +109,8 @@ class ToolExecutor:
                 if self._approval_resolver is not None
                 else None
             )
-            if not isinstance(resolution, ApprovalState) or resolution not in (
+            resolution_decision = getattr(resolution, "decision", resolution)
+            if resolution_decision not in (
                 ApprovalState.APPROVED,
                 ApprovalState.REJECTED,
             ):

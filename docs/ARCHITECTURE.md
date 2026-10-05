@@ -587,6 +587,56 @@ target when valid, outcome code, and content fingerprint when computed. It does 
 contents. This boundary is read-only and is not an OS sandbox; a hostile concurrent filesystem
 change between checks and open remains a limitation of the existing Workspace boundary.
 
+## Execution Authorization Hardening v0.1
+
+Block 1 makes execution authorization fail closed. `app.execution.identity` is the single
+authoritative command identity mechanism used by request validation, Agent Harness,
+`ExecutionCoordinator`, and `ExecutionPolicy`. Identity preserves the canonical executable
+identity and the complete argv; basename/stem substitution is not accepted. Exact full
+`CommandIdentity` entries can authorize one exact argv sequence. Interpreter evaluation flags
+such as `python -c` require that exact argv authorization.
+
+The execution order remains:
+
+```text
+Command Identity → Permission → Approval → Execution Policy → Execution
+```
+
+Missing `allowed_commands` is denied before execution. If a request explicitly requires approval,
+missing `ApprovalPolicy`, a missing resolver, or a non-approved decision is denied or held. When
+approval is required, the `ApprovalRequest` carries a deterministic intent fingerprint derived
+from executable identity, argv, workspace-relative directory, profile identity, network policy,
+and timeout. Secret environment values are excluded. The direct EngineeringRun path uses this
+same coordinator and identity mechanism.
+
+This block does not provide an OS sandbox, network isolation, environment hardening, dotfile
+filtering, host filesystem isolation, hardlink protection, or durable approval persistence.
+
+## Усиление авторизации выполнения v0.1
+
+Block 1 переводит авторизацию выполнения в fail-closed режим. `app.execution.identity` является
+единым authoritative-механизмом идентичности команды для валидации запроса, Agent Harness,
+`ExecutionCoordinator` и `ExecutionPolicy`. Идентичность сохраняет каноническое имя executable
+и полный argv; подмена через basename/stem не принимается. Точная запись `CommandIdentity`
+может разрешить только одну точную последовательность argv. Флаги вычисления интерпретатора,
+например `python -c`, требуют такой точной авторизации argv.
+
+Порядок выполнения сохраняется:
+
+```text
+Command Identity → Permission → Approval → Execution Policy → Execution
+```
+
+Отсутствующий `allowed_commands` приводит к отказу до запуска. Если запрос явно требует approval,
+отсутствующие `ApprovalPolicy` или resolver, а также неутверждённое решение приводят к отказу
+или ожиданию. При необходимости approval объект `ApprovalRequest` получает детерминированный
+fingerprint намерения, рассчитанный по executable, argv, относительной рабочей директории,
+идентичности профиля, сетевой политике и таймауту. Секретные значения окружения не включаются.
+Прямой путь EngineeringRun использует тот же coordinator и механизм идентичности.
+
+Этот блок не реализует OS sandbox, изоляцию сети, усиление окружения, фильтрацию dotfiles,
+изоляцию файловой системы хоста, защиту от hardlink или долговременное хранение approval.
+
 ## Acceptance Gate v0.1
 
 `AcceptanceGate` makes a deterministic aggregate decision from provider-neutral

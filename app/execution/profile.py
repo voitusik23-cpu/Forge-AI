@@ -7,7 +7,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
+from app.execution.capabilities import ExecutionCapability
 from app.execution.identity import CommandIdentity
+from app.execution.paths import (
+    PathSecurityError,
+    canonical_executable,
+    normalize_workspace_relative_path,
+)
 
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -61,6 +67,7 @@ class ProjectExecutionProfile:
     timeout_seconds: float = 30.0
     max_output_bytes: int = 1048576  # 1 MB
     network_access: bool = False
+    capabilities: frozenset[ExecutionCapability] = frozenset()
 
     def __post_init__(self) -> None:
         if isinstance(self.allowed_commands, list):
@@ -69,6 +76,8 @@ class ProjectExecutionProfile:
             object.__setattr__(
                 self, "environment_variables", dict(self.environment_variables)
             )
+        if not isinstance(self.capabilities, frozenset):
+            object.__setattr__(self, "capabilities", frozenset(self.capabilities))
 
     def validate(self) -> ProfileValidationResult:
         errors: list[str] = []
@@ -98,8 +107,9 @@ class ProjectExecutionProfile:
         if not isinstance(self.working_directory, str) or not self.working_directory.strip():
             errors.append("working_directory_required")
         else:
-            norm = self.working_directory.replace("\\", "/")
-            if norm.startswith("/") or norm.startswith("..") or "/../" in norm:
+            try:
+                normalize_workspace_relative_path(self.working_directory)
+            except PathSecurityError:
                 errors.append("unsafe_working_directory")
 
         if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0:
@@ -120,9 +130,10 @@ class ProjectExecutionProfile:
                 if not isinstance(cmd, str) or not cmd.strip():
                     errors.append("invalid_allowed_command")
                     break
-                from app.execution.identity import canonical_executable
                 try:
                     canonical_executable(cmd)
+                except PathSecurityError:
+                    errors.append("invalid_allowed_command")
                 except ValueError:
                     errors.append("invalid_allowed_command")
                     break
@@ -171,4 +182,7 @@ class ProjectExecutionProfile:
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,
             "network_access": self.network_access,
+            "capabilities": sorted(
+                c.value if hasattr(c, "value") else str(c) for c in self.capabilities
+            ),
         }

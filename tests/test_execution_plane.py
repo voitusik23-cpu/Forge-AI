@@ -176,6 +176,27 @@ class TestExecutionPlane(unittest.TestCase):
             policy=self.policy,
             redactor=self.redactor,
         )
+        self.coordinator = ExecutionCoordinator(
+            adapter=self.adapter,
+            policy=self.policy,
+            redactor=self.redactor,
+        )
+        orig_execute = self.adapter.execute
+
+        def _compat_execute(target):
+            if isinstance(target, ExecutionRequest):
+                allowed = frozenset(
+                    cmd.executable if hasattr(cmd, "executable") else str(cmd)
+                    for cmd in (target.profile.allowed_commands if target.profile else ())
+                )
+                return self.coordinator.execute(
+                    target,
+                    workspace_root=self.source_root,
+                    allowed_commands=allowed,
+                )
+            return orig_execute(target)
+
+        self.adapter.execute = _compat_execute
 
     def tearDown(self) -> None:
         self.source_dir.cleanup()
@@ -252,7 +273,12 @@ class TestExecutionPlane(unittest.TestCase):
             command=(sys.executable, "-c", "print('clean-success')"),
             profile=self.profile,
         )
-        result = adapter.execute(req)
+        coord = ExecutionCoordinator(adapter=adapter, policy=self.policy, redactor=self.redactor)
+        allowed = frozenset(
+            cmd.executable if hasattr(cmd, "executable") else str(cmd)
+            for cmd in self.profile.allowed_commands
+        )
+        result = coord.execute(req, workspace_root=self.source_root, allowed_commands=allowed)
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(len(captured_scratch), 1)
         self.assertFalse(captured_scratch[0].exists())
@@ -278,7 +304,12 @@ class TestExecutionPlane(unittest.TestCase):
             command=(sys.executable, "-c", "import sys; sys.exit(42)"),
             profile=self.profile,
         )
-        result = adapter.execute(req)
+        coord = ExecutionCoordinator(adapter=adapter, policy=self.policy, redactor=self.redactor)
+        allowed = frozenset(
+            cmd.executable if hasattr(cmd, "executable") else str(cmd)
+            for cmd in self.profile.allowed_commands
+        )
+        result = coord.execute(req, workspace_root=self.source_root, allowed_commands=allowed)
         self.assertEqual(result.status, ExecutionStatus.FAILURE)
         self.assertEqual(len(captured_scratch), 1)
         self.assertFalse(captured_scratch[0].exists())

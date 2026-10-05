@@ -185,6 +185,7 @@ class EngineeringRunExecutor:
                 )
                 res = coordinator.execute(
                     effective_req,
+                    workspace_root=request.workspace.root if request.workspace else None,
                     run_id=run.id,
                     allowed_commands=allowed_cmds,
                     approval_policy=request.approval_policy,

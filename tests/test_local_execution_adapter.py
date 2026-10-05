@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.execution.adapter import LocalExecutionAdapter
+from app.execution.adapter import ExecutionAuthorizationError, LocalExecutionAdapter
+from app.execution.authorizer import ExecutionCoordinator
+from app.execution.identity import CommandIdentity
 from app.execution.policy import ExecutionPolicy
 from app.execution.profile import (
     ExecutionEnvironmentType,
@@ -30,7 +32,11 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             policy=self.policy,
             redactor=self.redactor,
         )
-        from app.execution.identity import CommandIdentity
+        self.coordinator = ExecutionCoordinator(
+            adapter=self.adapter,
+            policy=self.policy,
+            redactor=self.redactor,
+        )
 
         self.profile = ProjectExecutionProfile(
             profile_id="local-py",
@@ -55,6 +61,25 @@ class TestLocalExecutionAdapter(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def _execute(self, req: ExecutionRequest) -> ExecutionResult:
+        allowed = frozenset(
+            cmd.executable if hasattr(cmd, "executable") else str(cmd)
+            for cmd in (req.profile.allowed_commands if req.profile else ())
+        )
+        return self.coordinator.execute(
+            req,
+            workspace_root=self.workspace_root,
+            allowed_commands=allowed,
+        )
+
+    def test_direct_call_without_authorized_execution_rejected(self) -> None:
+        req = ExecutionRequest(
+            command=(sys.executable, "-c", "print(1)"),
+            profile=self.profile,
+        )
+        with self.assertRaises(ExecutionAuthorizationError):
+            self.adapter.execute(req)
+
     def test_successful_execution(self) -> None:
         req = ExecutionRequest(
             command=(
@@ -64,7 +89,7 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.stdout, "forge_stdout")
@@ -82,7 +107,7 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.FAILURE)
         self.assertEqual(result.exit_code, 42)
         self.assertIn("forge_failed", result.stderr)
@@ -98,15 +123,13 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             timeout_seconds=0.2,
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.TIMEOUT)
         self.assertIsNone(result.exit_code)
         self.assertTrue(result.timed_out)
         self.assertFalse(result.success)
 
     def test_output_truncation(self) -> None:
-        from app.execution.identity import CommandIdentity
-
         small_output_profile = ProjectExecutionProfile(
             profile_id="small-output",
             allowed_commands=(
@@ -124,7 +147,7 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             ),
             profile=small_output_profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertTrue(result.truncated)
         self.assertLessEqual(len(result.stdout.encode("utf-8")), 25)
@@ -138,7 +161,11 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             command=(sys.executable, "-c", "print('should not run')"),
             profile=restricted_profile,
         )
-        result = self.adapter.execute(req)
+        result = self.coordinator.execute(
+            req,
+            workspace_root=self.workspace_root,
+            allowed_commands=frozenset({sys.executable, "allowed_only_bin"}),
+        )
         self.assertEqual(result.status, ExecutionStatus.DENIED)
         self.assertIsNone(result.exit_code)
         self.assertIn("Execution denied by policy", result.stderr)
@@ -153,7 +180,7 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertNotIn("sensitive_token_999", result.stdout)
         self.assertIn(REDACTED_PLACEHOLDER, result.stdout)
@@ -170,7 +197,7 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             working_directory="nested",
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(result.stdout.strip(), "nested")
 
@@ -180,7 +207,7 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             working_directory="non_existent_subdir",
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self._execute(req)
         self.assertEqual(result.status, ExecutionStatus.ERROR)
         self.assertIn("Working directory does not exist", result.stderr)
 

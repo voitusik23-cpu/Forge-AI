@@ -37,45 +37,11 @@ class CommandIdentity:
         return {"executable": self.executable, "argv": list(self.argv)}
 
 
-
-def is_bare_executable(raw: str) -> bool:
-    if "/" in raw or "\\" in raw:
-        return False
-    if raw.startswith("."):
-        return False
-    return True
-
-
-def is_absolute_executable_path(raw: str) -> bool:
-    norm = raw.replace("\\", "/")
-    parts = norm.split("/")
-    if any(p == ".." or p == "." for p in parts if p):
-        return False
-    drive, rest = ntpath.splitdrive(raw)
-    if drive:
-        return rest.startswith(("/", "\\"))
-    return raw.startswith(("/", "\\"))
-
-
-def canonical_executable(value: object) -> str:
-    """Canonicalize an executable without basename substitution or relative paths.
-
-    Allowed:
-    - Bare executable names (e.g. 'python', 'git')
-    - Exact absolute paths (e.g. '/usr/bin/python', 'C:\\Python313\\python.exe')
-
-    Rejected:
-    - Relative paths (e.g. './x', '../x', 'sub/x')
-    """
-    if not isinstance(value, str) or not value.strip() or "\x00" in value:
-        raise ValueError("executable must be a non-empty string")
-    raw = value.strip()
-    if is_bare_executable(raw):
-        return os.path.normcase(raw)
-    if is_absolute_executable_path(raw):
-        path = Path(raw)
-        return os.path.normcase(path.as_posix())
-    raise ValueError(f"relative executable paths are not allowed: {value!r}")
+from app.execution.paths import (
+    PathSecurityError,
+    canonical_executable,
+    is_bare_executable,
+)
 
 
 def command_identity(command: Iterable[object]) -> CommandIdentity:

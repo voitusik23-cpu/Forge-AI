@@ -513,6 +513,7 @@ class AgentHarness:
                     )
                     exec_res = coordinator.execute(
                         current_exec_req,
+                        workspace_root=request.workspace.root if request.workspace else None,
                         run_id=request.run_id,
                         allowed_commands=allowed_cmds,
                         approval_policy=request.approval_policy,

@@ -8,8 +8,9 @@ import subprocess
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
+from app.execution.intent import AuthorizedExecution, ExecutionIntent
 from app.execution.policy import ExecutionPolicy
 from app.execution.redaction import (
     _SENSITIVE_KEY_PATTERN,
@@ -17,11 +18,15 @@ from app.execution.redaction import (
     SecretRedactor,
 )
 from app.execution.request import (
-    ExecutionRequest,
+    ExecutionOutcomeStatus,
     ExecutionResult,
     ExecutionStatus,
 )
 from app.execution.workspace_manager import EphemeralWorkspaceManager
+
+
+class ExecutionAuthorizationError(Exception):
+    """Raised when LocalExecutionAdapter is invoked without proper authorization."""
 
 
 SAFE_ENV_WHITELIST_KEYS: frozenset[str] = frozenset({
@@ -81,13 +86,16 @@ SAFE_ENV_WHITELIST_KEYS: frozenset[str] = frozenset({
 class ExecutionBackend(Protocol):
     """Contract for Forge execution backends."""
 
-    def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        """Execute an authorized, approved execution request in an isolated environment."""
+    def execute(self, target: Any) -> ExecutionResult:
+        """Execute an authorized execution in an isolated environment."""
         ...
 
 
 class LocalExecutionAdapter:
-    """Executes authorized ExecutionRequests as isolated local processes in ephemeral workspaces."""
+    """Executes AuthorizedExecution tokens as isolated local processes in ephemeral workspaces.
+
+    Direct execution without AuthorizedExecution from ExecutionCoordinator is rejected fail-closed (resolves F5).
+    """
 
     def __init__(
         self,
@@ -104,49 +112,51 @@ class LocalExecutionAdapter:
         self._workspace_manager = workspace_manager
         self._isolate_workspace = isolate_workspace
 
-    def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        """Evaluate policy, stage ephemeral workspace, execute safely, harvest artifacts, and clean up."""
-        # 1. Policy evaluation (Default Deny before touching any resources)
-        decision = self._policy.evaluate(request)
-        if not decision.allowed:
-            return self._redactor.redact_result(
-                ExecutionResult(
-                    request_id=request.request_id if request else "unknown",
-                    status=ExecutionStatus.DENIED,
-                    exit_code=None,
-                    stdout="",
-                    stderr=f"Execution denied by policy: {decision.reason}",
-                    duration_seconds=0.0,
-                    metadata={"denial_reason": decision.reason},
-                )
+    def execute(self, target: Any) -> ExecutionResult:
+        """Execute an AuthorizedExecution token safely."""
+        # Backend authority check: direct calls without AuthorizedExecution are rejected fail-closed (resolves F5)
+        if not isinstance(target, AuthorizedExecution):
+            raise ExecutionAuthorizationError(
+                "Execution denied: LocalExecutionAdapter requires AuthorizedExecution from ExecutionCoordinator"
+            )
+        if not target.is_valid():
+            raise ExecutionAuthorizationError(
+                "Execution denied: Invalid or forged coordinator token in AuthorizedExecution"
             )
 
-        assert request.profile is not None  # Guaranteed by policy evaluation
+        intent = target.intent
+        workspace_root = target.workspace_root
+        request_id = target.request_id
+        metadata = dict(target.metadata)
 
-        # 2. Secret registration & environment preparation
-        active_redactor = self._prepare_redactor(request)
-        env = self._build_scoped_environment(request)
+        # Secret registration & environment preparation
+        active_redactor = self._prepare_redactor(intent)
+        env = self._build_scoped_environment(intent)
 
-        # 3. Ephemeral workspace isolation & execution
+        # Ephemeral workspace isolation & execution
         if self._isolate_workspace:
             ws_mgr = self._workspace_manager or EphemeralWorkspaceManager(
-                source_workspace_root=self._workspace_root
+                source_workspace_root=workspace_root
             )
             with ws_mgr:
                 scratch_root = ws_mgr.scratch_root
-                resolved_cwd, err_res = self._resolve_working_directory(request, scratch_root)
+                resolved_cwd, err_res = self._resolve_working_directory(
+                    intent.working_directory, scratch_root, request_id, metadata
+                )
                 if err_res is not None:
                     return active_redactor.redact_result(err_res)
 
-                raw_result = self._run_process(request, resolved_cwd, env)
+                raw_result = self._run_process(
+                    intent, resolved_cwd, env, request_id, metadata
+                )
 
                 # Harvest artifacts before workspace cleanup
-                if request.artifact_targets:
-                    run_id = str(request.metadata.get("run_id") or request.request_id)
-                    provenance = request.command[0] if request.command else "execution"
+                if intent.artifact_targets:
+                    run_id = str(metadata.get("run_id") or request_id)
+                    provenance = str(metadata.get("command_executable") or intent.executable)
                     try:
                         artifacts = ws_mgr.harvest_artifacts(
-                            request.artifact_targets,
+                            intent.artifact_targets,
                             run_id=run_id,
                             provenance_source=provenance,
                         )
@@ -175,47 +185,54 @@ class LocalExecutionAdapter:
                             outcome_status=raw_result.outcome_status,
                         )
         else:
-            root = self._workspace_root or Path(".")
-            resolved_cwd, err_res = self._resolve_working_directory(request, root)
+            resolved_cwd, err_res = self._resolve_working_directory(
+                intent.working_directory, workspace_root, request_id, metadata
+            )
             if err_res is not None:
                 return active_redactor.redact_result(err_res)
-            raw_result = self._run_process(request, resolved_cwd, env)
+            raw_result = self._run_process(
+                intent, resolved_cwd, env, request_id, metadata
+            )
 
         return active_redactor.redact_result(raw_result)
 
     def _resolve_working_directory(
-        self, request: ExecutionRequest, root: Path
+        self,
+        working_directory: str,
+        root: Path,
+        request_id: str,
+        metadata: dict[str, object],
     ) -> tuple[Path, ExecutionResult | None]:
-        resolved_cwd = (root / request.working_directory).resolve()
+        resolved_cwd = (root / working_directory).resolve()
         try:
             resolved_cwd.relative_to(root)
         except ValueError:
             return resolved_cwd, ExecutionResult(
-                request_id=request.request_id,
+                request_id=request_id,
                 status=ExecutionStatus.DENIED,
                 exit_code=None,
                 stdout="",
                 stderr="Execution denied: working directory escapes workspace root",
                 duration_seconds=0.0,
-                metadata={"denial_reason": "working_directory_escapes_workspace"},
+                metadata={"denial_reason": "working_directory_escapes_workspace", **metadata},
             )
 
         if not resolved_cwd.exists() or not resolved_cwd.is_dir():
             return resolved_cwd, ExecutionResult(
-                request_id=request.request_id,
+                request_id=request_id,
                 status=ExecutionStatus.ERROR,
                 exit_code=None,
                 stdout="",
                 stderr=f"Working directory does not exist: {resolved_cwd}",
                 duration_seconds=0.0,
-                metadata={"error": "working_directory_missing"},
+                metadata={"error": "working_directory_missing", **metadata},
             )
 
         return resolved_cwd, None
 
-    def _prepare_redactor(self, request: ExecutionRequest) -> SecretRedactor:
+    def _prepare_redactor(self, intent: ExecutionIntent) -> SecretRedactor:
         secrets_to_register: list[str] = []
-        for k, v in request.environment_variables.items():
+        for k, v in intent.environment_variables:
             val_str = str(v).strip()
             if val_str and _SENSITIVE_KEY_PATTERN.search(str(k)):
                 secrets_to_register.append(val_str)
@@ -224,7 +241,7 @@ class LocalExecutionAdapter:
             return self._redactor.with_registered_secrets(secrets_to_register)
         return self._redactor
 
-    def _build_scoped_environment(self, request: ExecutionRequest) -> dict[str, str]:
+    def _build_scoped_environment(self, intent: ExecutionIntent) -> dict[str, str]:
         env: dict[str, str] = {}
         for k in SAFE_ENV_WHITELIST_KEYS:
             if k in os.environ:
@@ -235,15 +252,11 @@ class LocalExecutionAdapter:
                         env[ek] = ev
                         break
 
-        assert request.profile is not None
-        for k, v in request.profile.environment_variables.items():
-            env[str(k)] = str(v)
-
-        for k, v in request.environment_variables.items():
+        for k, v in intent.environment_variables:
             env[str(k)] = str(v)
 
         # Best-effort network restrictions
-        if not request.profile.network_access:
+        if not intent.network_access:
             env["http_proxy"] = "http://127.0.0.1:0"
             env["https_proxy"] = "http://127.0.0.1:0"
             env["all_proxy"] = "http://127.0.0.1:0"
@@ -255,15 +268,16 @@ class LocalExecutionAdapter:
         return env
 
     def _run_process(
-        self, request: ExecutionRequest, cwd_path: Path, env: dict[str, str]
+        self,
+        intent: ExecutionIntent,
+        cwd_path: Path,
+        env: dict[str, str],
+        request_id: str,
+        metadata: dict[str, object],
     ) -> ExecutionResult:
-        assert request.profile is not None
-        timeout = (
-            request.timeout_seconds
-            if request.timeout_seconds is not None
-            else request.profile.timeout_seconds
-        )
-        max_output_bytes = request.profile.max_output_bytes
+        timeout = intent.timeout_seconds
+        max_output_bytes = intent.max_output_bytes
+        full_command = (intent.executable,) + intent.argv
 
         start_time = time.monotonic()
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -271,7 +285,7 @@ class LocalExecutionAdapter:
 
         try:
             proc = subprocess.Popen(
-                list(request.command),
+                list(full_command),
                 cwd=str(cwd_path),
                 env=env,
                 stdout=subprocess.PIPE,
@@ -283,24 +297,24 @@ class LocalExecutionAdapter:
         except FileNotFoundError:
             duration = time.monotonic() - start_time
             return ExecutionResult(
-                request_id=request.request_id,
+                request_id=request_id,
                 status=ExecutionStatus.ERROR,
                 exit_code=None,
                 stdout="",
-                stderr=f"Executable not found: {request.command[0]}",
+                stderr=f"Executable not found: {full_command[0]}",
                 duration_seconds=duration,
-                metadata=dict(request.metadata),
+                metadata=dict(metadata),
             )
         except Exception as exc:
             duration = time.monotonic() - start_time
             return ExecutionResult(
-                request_id=request.request_id,
+                request_id=request_id,
                 status=ExecutionStatus.ERROR,
                 exit_code=None,
                 stdout="",
                 stderr=f"Adapter execution exception: {type(exc).__name__}: {str(exc)}",
                 duration_seconds=duration,
-                metadata=dict(request.metadata),
+                metadata=dict(metadata),
             )
 
         try:
@@ -346,14 +360,14 @@ class LocalExecutionAdapter:
             truncated = True
 
         return ExecutionResult(
-            request_id=request.request_id,
+            request_id=request_id,
             status=status,
             exit_code=exit_code,
             stdout=raw_stdout,
             stderr=raw_stderr,
             duration_seconds=duration,
             truncated=truncated,
-            metadata=dict(request.metadata),
+            metadata=dict(metadata),
         )
 
     def _terminate_process_tree(self, proc: subprocess.Popen[bytes]) -> None:

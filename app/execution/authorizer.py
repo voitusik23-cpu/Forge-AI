@@ -1,15 +1,23 @@
-"""Execution authorization pipeline enforcing Permission, Approval, and Policy boundaries."""
+"""Execution authorization pipeline enforcing Permission, Approval, Policy, and AuthorizedExecution boundaries."""
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
 from app.execution.adapter import ExecutionBackend, LocalExecutionAdapter
+from app.execution.identity import CommandIdentity, command_identity, command_is_allowed
+from app.execution.intent import (
+    _COORDINATOR_SENTINEL,
+    AuthorizedExecution,
+    ExecutionIntent,
+    IntentBuilder,
+)
+from app.execution.paths import PathSecurityError
 from app.execution.policy import ExecutionPolicy
-from app.execution.identity import command_identity, command_is_allowed
 from app.execution.redaction import DefaultSecretRedactor, SecretRedactor
 from app.execution.request import (
     ExecutionOutcomeStatus,
@@ -18,18 +26,26 @@ from app.execution.request import (
     ExecutionStatus,
 )
 from app.orchestrator.models import EventType
-from app.tools.approval import ApprovalPolicy, ApprovalRequest, ApprovalResolver, ApprovalState
+from app.tools.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalResolver,
+    ApprovalState,
+)
 
 
 class ExecutionCoordinator:
     """Coordinates deterministic execution authorization and dispatch.
 
     Enforces strict sequence:
-    1. ExecutionRequest
-    2. Permission check
-    3. Approval check (if required)
-    4. ExecutionPolicy
-    5. LocalExecutionAdapter / ExecutionBackend
+    1. Validate ExecutionRequest and profile.
+    2. Permission check against allowed_commands.
+    3. Build ExecutionIntent via IntentBuilder.
+    4. Approval check (intent fingerprint verification and single-use consumption).
+    5. ExecutionPolicy check.
+    6. Mandatory workspace_root validation (fail-closed if missing, relative, or not dir).
+    7. AuthorizedExecution creation (internal marker token).
+    8. ExecutionBackend / LocalExecutionAdapter dispatch.
     """
 
     def __init__(
@@ -54,7 +70,9 @@ class ExecutionCoordinator:
         observer: Optional[Callable[[EventType, dict[str, object]], None]] = None,
     ) -> ExecutionResult:
         """Run through the strict authorization chain before dispatching to adapter."""
-        profile_id = request.profile.profile_id if request.profile else None
+        profile = request.profile if request else None
+        profile_id = profile.profile_id if profile else None
+        run_id = run_id or str(getattr(request, "metadata", {}).get("run_id") or "")
 
         # 1. Notify execution requested
         self._emit(
@@ -62,11 +80,33 @@ class ExecutionCoordinator:
             EventType.EXECUTION_REQUESTED,
             {
                 "run_id": run_id,
-                "request_id": request.request_id,
+                "request_id": request.request_id if request else "unknown",
                 "profile_id": profile_id,
                 "status": "REQUESTED",
             },
         )
+
+        if request is None or not isinstance(request, ExecutionRequest):
+            return self._deny(
+                request=request or ExecutionRequest(command=()),
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                reason="request_invalid",
+                message="Execution denied: execution request is invalid",
+                observer=observer,
+            )
+
+        if profile is None:
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                reason="profile_missing",
+                message="Execution denied: profile is required",
+                observer=observer,
+            )
 
         # 2. Permission check
         if allowed_commands is None or not request.command:
@@ -90,7 +130,31 @@ class ExecutionCoordinator:
                 observer=observer,
             )
 
-        # 3. Approval check
+        # 3. Build ExecutionIntent via IntentBuilder
+        try:
+            intent = IntentBuilder.from_request(request, profile).build()
+        except PathSecurityError as exc:
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                reason="unsafe_working_directory" if "working" in str(exc).lower() else f"path_error:{exc}",
+                message=f"Execution denied by policy: path security validation failed: {exc}",
+                observer=observer,
+            )
+        except Exception as exc:
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                reason=f"intent_build_failed:{exc}",
+                message=f"Execution denied: failed to build execution intent: {exc}",
+                observer=observer,
+            )
+
+        # 4. Approval check
         needs_approval = bool(request.approval_required)
         if not needs_approval and approval_policy is not None and request.command:
             try:
@@ -123,36 +187,28 @@ class ExecutionCoordinator:
                     message="Execution waiting for approval: approval resolver is missing",
                     observer=observer,
                 )
-            try:
-                identity = command_identity(request.command)
-            except ValueError:
-                return self._deny(
-                    request=request,
-                    run_id=run_id,
-                    profile_id=profile_id,
-                    outcome_status=ExecutionOutcomeStatus.PERMISSION_DENIED,
-                    reason="invalid_command",
-                    message="Execution denied: command identity is invalid",
-                    observer=observer,
-                )
+
             approval_req = ApprovalRequest(
                 run_id=run_id,
                 invocation_id=request.request_id,
                 tool_id=request.command[0] if request.command else "execute",
                 reason="execution approval required",
-                intent_fingerprint=self._intent_fingerprint(request, identity),
+                intent_fingerprint=intent.fingerprint,
             )
-            decision = approval_resolver.resolve(approval_req)
-            if decision != ApprovalState.APPROVED:
+            resolution = approval_resolver.resolve(approval_req)
+            res_decision = getattr(resolution, "decision", resolution)
+            res_fp = getattr(resolution, "approved_fingerprint", "")
+
+            if res_decision != ApprovalState.APPROVED:
                 outcome = (
                     ExecutionOutcomeStatus.APPROVAL_REJECTED
-                    if decision == ApprovalState.REJECTED
+                    if res_decision == ApprovalState.REJECTED
                     else ExecutionOutcomeStatus.APPROVAL_WAITING
                 )
-                reason = "approval_rejected" if decision == ApprovalState.REJECTED else "approval_waiting"
+                reason = "approval_rejected" if res_decision == ApprovalState.REJECTED else "approval_waiting"
                 msg = (
                     "Execution rejected by approval resolver"
-                    if decision == ApprovalState.REJECTED
+                    if res_decision == ApprovalState.REJECTED
                     else "Execution waiting for approval"
                 )
                 return self._deny(
@@ -165,9 +221,21 @@ class ExecutionCoordinator:
                     observer=observer,
                 )
 
+            # Invariant I1: Intent A cannot authorize Intent B
+            # Independently verify fingerprint
+            if res_fp and res_fp != intent.fingerprint:
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
+                    reason="intent_fingerprint_mismatch",
+                    message="Execution denied: approval fingerprint does not match execution intent",
+                    observer=observer,
+                )
 
-        # 4. ExecutionPolicy check
-        policy_decision = self._policy.evaluate(request)
+        # 5. ExecutionPolicy check
+        policy_decision = self._policy.evaluate(intent, profile)
         self._emit(
             observer,
             EventType.EXECUTION_POLICY_CHECKED,
@@ -190,7 +258,53 @@ class ExecutionCoordinator:
                 observer=observer,
             )
 
-        # 5. LocalExecutionAdapter execution
+        # 6. Mandatory workspace_root validation (resolves F2)
+        ws_root = workspace_root
+        if ws_root is None and hasattr(self._adapter, "_workspace_root") and self._adapter._workspace_root is not None:
+            ws_root = self._adapter._workspace_root
+
+        is_local_spawner = self._adapter is None or isinstance(self._adapter, LocalExecutionAdapter)
+
+        if ws_root is None:
+            if is_local_spawner:
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="workspace_root_required",
+                    message="Execution denied: mandatory workspace_root is required",
+                    observer=observer,
+                )
+            else:
+                ws_root = Path(tempfile.gettempdir())
+        else:
+            if not isinstance(ws_root, Path) or not ws_root.is_absolute() or not ws_root.exists() or not ws_root.is_dir():
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="workspace_root_invalid",
+                    message="Execution denied: workspace_root must be an existing absolute directory",
+                    observer=observer,
+                )
+
+        # 7. Create AuthorizedExecution
+        authorized = AuthorizedExecution.create(
+            intent=intent,
+            workspace_root=ws_root,
+            run_id=run_id,
+            metadata={
+                **request.metadata,
+                "command_executable": request.command[0] if request.command else "",
+                "run_id": run_id,
+                "request_id": request.request_id,
+            },
+            coordinator_token=_COORDINATOR_SENTINEL,
+        )
+
+        # 8. LocalExecutionAdapter / ExecutionBackend dispatch
         self._emit(
             observer,
             EventType.EXECUTION_STARTED,
@@ -204,13 +318,12 @@ class ExecutionCoordinator:
         adapter = self._adapter
         if adapter is None:
             adapter = LocalExecutionAdapter(
-                workspace_root=workspace_root or Path("."),
+                workspace_root=ws_root,
                 policy=self._policy,
                 redactor=self._redactor,
             )
-        if run_id and "run_id" not in request.metadata:
-            request = replace(request, metadata={**request.metadata, "run_id": run_id})
-        raw_result = adapter.execute(request)
+
+        raw_result = adapter.execute(authorized)
         outcome_status = self._map_outcome_status(raw_result.status)
         result = replace(
             raw_result,
@@ -280,22 +393,11 @@ class ExecutionCoordinator:
     def _is_permission_allowed(executable: str, allowed_commands: frozenset[str]) -> bool:
         return command_is_allowed((executable,), allowed_commands)
 
-    @staticmethod
-    def _intent_fingerprint(request: ExecutionRequest, identity) -> str:
-        import hashlib
-        import json
-
-        profile = request.profile
-        payload = {
-            "command": {"executable": identity.executable, "argv": list(identity.argv)},
-            "working_directory": request.working_directory,
-            "profile_id": profile.profile_id if profile else None,
-            "network_access": profile.network_access if profile else None,
-            "timeout_seconds": request.timeout_seconds,
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+    @classmethod
+    def _intent_fingerprint(cls, request: ExecutionRequest, identity: object = None) -> str:
+        """Deterministic canonical intent fingerprint computed from complete ExecutionIntent."""
+        intent = IntentBuilder.from_request(request, request.profile).build()
+        return intent.fingerprint
 
     @staticmethod
     def _map_outcome_status(status: ExecutionStatus) -> ExecutionOutcomeStatus:

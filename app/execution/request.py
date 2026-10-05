@@ -8,8 +8,9 @@ from enum import Enum
 from uuid import uuid4
 
 from app.execution.artifacts import Artifact
-from app.execution.profile import ProjectExecutionProfile
 from app.execution.identity import command_is_allowed
+from app.execution.paths import PathSecurityError, normalize_workspace_relative_path
+from app.execution.profile import ProjectExecutionProfile
 
 
 class ExecutionStatus(str, Enum):
@@ -69,8 +70,9 @@ class ExecutionRequest:
         if not isinstance(self.working_directory, str) or not self.working_directory.strip():
             errors.append("working_directory_required")
         else:
-            norm = self.working_directory.replace("\\", "/")
-            if norm.startswith("/") or norm.startswith("..") or "/../" in norm:
+            try:
+                normalize_workspace_relative_path(self.working_directory)
+            except PathSecurityError:
                 errors.append("unsafe_working_directory")
 
         if self.timeout_seconds is not None:
@@ -81,8 +83,9 @@ class ExecutionRequest:
             if not isinstance(target, str) or not target.strip():
                 errors.append("invalid_artifact_target")
                 break
-            norm_target = target.replace("\\", "/")
-            if norm_target.startswith("/") or norm_target.startswith("..") or "/../" in norm_target:
+            try:
+                normalize_workspace_relative_path(target)
+            except PathSecurityError:
                 errors.append("unsafe_artifact_target")
                 break
 
@@ -149,3 +152,7 @@ class ExecutionResult:
     @property
     def timed_out(self) -> bool:
         return self.status == ExecutionStatus.TIMEOUT
+
+    @property
+    def failure_reason(self) -> str:
+        return str(self.metadata.get("denial_reason") or self.stderr or "")
