@@ -90,6 +90,21 @@ def _executable_of(entry: object) -> str:
     return executable if isinstance(executable, str) else str(entry)
 
 
+def _capability_name(entry: object) -> str:
+    """Return the canonical name of one execution capability entry.
+
+    Capabilities are enum members in practice. Comparing their ``value`` keeps
+    the check stable across enum classes without falling back to ``str()`` of the
+    member, which would make two different members compare as distinct names.
+    """
+    value = getattr(entry, "value", None)
+    if isinstance(value, str):
+        return value
+    if isinstance(entry, str):
+        return entry
+    return ""
+
+
 def _command_sort_key(entry: object) -> str:
     """Order entries deterministically when identities are mixed with strings."""
     argv = getattr(entry, "argv", ())
@@ -234,6 +249,21 @@ class RunScope:
                 for criterion in self.acceptance_criteria
             ],
         }
+
+    @property
+    def workspace_root(self) -> Path:
+        """The canonical workspace root path."""
+        return self.workspace.root
+
+    @property
+    def capabilities(self) -> frozenset:
+        """The frozen set of allowed execution capabilities."""
+        return self.execution_profile.capabilities
+
+    @property
+    def environment_variables(self) -> Mapping[str, str]:
+        """The frozen mapping of scope-authorized environment variables."""
+        return self.execution_profile.environment_variables
 
     @property
     def fingerprint(self) -> str:
@@ -527,6 +557,45 @@ class RunScope:
             raise RunScopeError(
                 "run scope cannot change the execution profile: " + ", ".join(unknown)
             )
+        # Capabilities are authority: INTERPRET_TEXT, INTERPRET_MODULE and
+        # EXEC_CHILD decide whether inline or module code may run at all. A
+        # request may only narrow the frozen capability set, so a capability the
+        # scope does not grant is a denial, never silently intersected away.
+        granted = {_capability_name(entry) for entry in fixed.capabilities}
+        requested = {_capability_name(entry) for entry in profile.capabilities}
+        unauthorized = sorted(name for name in requested - granted if name)
+        if unauthorized:
+            raise RunScopeError(
+                "run scope cannot grant capabilities the frozen perimeter does not "
+                "hold: " + ", ".join(unauthorized)
+            )
+
+    def validate_request_environment(self, request: object) -> None:
+        """Reject request environment that the frozen perimeter does not authorise.
+
+        The frozen scope owns environment authority. A request may omit a key the
+        scope grants, but it may never add a key the scope does not declare and may
+        never change the value of one it does. This closes the injection channel
+        where a request-level PYTHONPATH, LD_PRELOAD, PATH or similar variable
+        reaches the child process outside the perimeter.
+        """
+        declared = getattr(request, "environment_variables", None)
+        if not declared:
+            return
+        if not isinstance(declared, Mapping):
+            raise RunScopeError("environment_variables must be a mapping")
+        fixed = self.execution_profile.environment_variables
+        for key, value in declared.items():
+            if not isinstance(key, str) or not key.strip():
+                raise RunScopeError("environment variable names must be non-empty strings")
+            if key not in fixed:
+                raise RunScopeError(
+                    "run scope does not authorise environment variable " f"{key!r}"
+                )
+            if fixed[key] != value:
+                raise RunScopeError(
+                    f"run scope cannot change environment variable '{key}'"
+                )
 
     def validate_workspace_root(self, workspace_root: object) -> None:
         """Reject a raw workspace root path that differs from the perimeter.
@@ -548,6 +617,7 @@ class RunScope:
     def validate_execution_request(self, request: ExecutionRequest) -> None:
         """Reject an execution request that leaves the frozen perimeter."""
         self.validate_execution_profile(getattr(request, "profile", None))
+        self.validate_request_environment(request)
         self.assert_command_allowed(getattr(request, "command", ()))
         working_directory = getattr(request, "working_directory", ".")
         if not isinstance(working_directory, str) or not working_directory.strip():

@@ -29,6 +29,7 @@ from app.orchestrator.models import EventType
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalResolver,
     ApprovalState,
 )
@@ -279,19 +280,37 @@ class ExecutionCoordinator:
                 intent_fingerprint=intent.fingerprint,
             )
             resolution = approval_resolver.resolve(approval_req)
-            res_decision = getattr(resolution, "decision", resolution)
-            res_fp = getattr(resolution, "approved_fingerprint", "")
+            if resolution is None:
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.APPROVAL_WAITING,
+                    reason="approval_waiting",
+                    message="Execution waiting for approval",
+                    observer=observer,
+                )
+            if not isinstance(resolution, ApprovalResolution):
+                return self._deny(
+                    request=request,
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="invalid_approval_resolution",
+                    message=f"Execution denied: approval resolver returned unexpected type {type(resolution).__name__}",
+                    observer=observer,
+                )
 
-            if res_decision != ApprovalState.APPROVED:
+            if resolution.decision != ApprovalState.APPROVED:
                 outcome = (
                     ExecutionOutcomeStatus.APPROVAL_REJECTED
-                    if res_decision == ApprovalState.REJECTED
+                    if resolution.decision == ApprovalState.REJECTED
                     else ExecutionOutcomeStatus.APPROVAL_WAITING
                 )
-                reason = "approval_rejected" if res_decision == ApprovalState.REJECTED else "approval_waiting"
+                reason = "approval_rejected" if resolution.decision == ApprovalState.REJECTED else "approval_waiting"
                 msg = (
                     "Execution rejected by approval resolver"
-                    if res_decision == ApprovalState.REJECTED
+                    if resolution.decision == ApprovalState.REJECTED
                     else "Execution waiting for approval"
                 )
                 return self._deny(
@@ -305,8 +324,8 @@ class ExecutionCoordinator:
                 )
 
             # Invariant I1: Intent A cannot authorize Intent B
-            # Independently verify fingerprint
-            if res_fp and res_fp != intent.fingerprint:
+            # Independently verify fingerprint (fail closed if missing or mismatched)
+            if not resolution.approved_fingerprint or resolution.approved_fingerprint != intent.fingerprint:
                 return self._deny(
                     request=request,
                     run_id=run_id,

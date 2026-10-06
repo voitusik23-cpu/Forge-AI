@@ -33,7 +33,7 @@ from app.orchestrator.revision import RevisionLoopExecutor
 from app.orchestrator.run import RunExecutor
 from app.tasks.specification import Requirement, TaskSpecification
 from app.tools.acceptance import AcceptanceCriterion, AcceptanceStatus
-from app.tools.approval import ApprovalPolicy, ApprovalState
+from app.tools.approval import ApprovalPolicy, ApprovalResolution, ApprovalState
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
 from app.tools.verification import (
@@ -61,7 +61,11 @@ class _TrackingResolver:
 
     def resolve(self, request):
         self.requests.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="track-resolver-id",
+        )
 
 
 class TestEngineeringExecutionIntegration(unittest.TestCase):

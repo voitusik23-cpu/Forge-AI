@@ -112,6 +112,7 @@ from app.tools.acceptance import (
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalResolver,
     ApprovalState,
 )
@@ -140,9 +141,13 @@ class _TrackingResolver:
         self.decision = decision
         self.requests: list[ApprovalRequest] = []
 
-    def resolve(self, request: ApprovalRequest) -> ApprovalState:
+    def resolve(self, request: ApprovalRequest) -> ApprovalResolution:
         self.requests.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="ifm-resolver-id",
+        )
 
 
 class TestIntegrationFailureMatrix(unittest.TestCase):

@@ -53,6 +53,7 @@ from app.projects.state import ProjectState, ProjectStateStatus
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalState,
 )
 from app.runtime.run_scope import RunScope
@@ -95,11 +96,15 @@ class _TrackingApprovalResolver:
         self.decision = decision
         self.requests: list[ApprovalRequest] = []
 
-    def resolve(self, request: ApprovalRequest) -> ApprovalState | None:
+    def resolve(self, request: ApprovalRequest) -> ApprovalResolution | None:
         self.requests.append(request)
         if self.decision == ApprovalState.REQUIRED:
             return None
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="ai-dec-appr-id",
+        )
 
 
 class TestAIDecisionProvider(unittest.TestCase):

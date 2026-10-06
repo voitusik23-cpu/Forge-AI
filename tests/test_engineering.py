@@ -17,7 +17,7 @@ from app.orchestrator.orchestrator import Orchestrator
 from app.orchestrator.revision import RevisionLoopExecutor
 from app.orchestrator.run import RunExecutor
 from app.tools.acceptance import AcceptanceCriterion
-from app.tools.approval import ApprovalPolicy, ApprovalState
+from app.tools.approval import ApprovalPolicy, ApprovalResolution, ApprovalState
 from app.tools.contracts import ToolInvocation
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
@@ -77,7 +77,11 @@ class _Resolver:
 
     def resolve(self, request):
         self.requests.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="eng-resolver-id",
+        )
 
 
 class EngineeringRunTests(unittest.TestCase):

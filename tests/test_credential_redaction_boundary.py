@@ -295,9 +295,22 @@ class TestExecutionCredentialBoundary(unittest.TestCase):
         self._tmp.cleanup()
 
     def _execute_with_env(self, key: str, value: str):
-        """Run a real subprocess that echoes the variable, then inspect artefacts."""
+        """Run a real subprocess that echoes the variable, then inspect artefacts.
+
+        The variable is declared on the Run's frozen perimeter and then restated by
+        the request. Environment authority belongs to the scope, so a request may
+        only restate a value the perimeter already holds; declaring it here keeps
+        the test exercising redaction rather than scope rejection.
+        """
         program = f"import os;print('OUT=' + os.environ.get({key!r}, 'missing'))"
-        profile = ProjectExecutionProfile("p", allowed_commands=(CommandIdentity(sys.executable, ("-c", program)),))
+        identity = CommandIdentity(sys.executable, ("-c", program))
+        # The perimeter declares the variable and its value; the request below
+        # restates exactly that. Environment authority stays with the frozen scope.
+        profile = ProjectExecutionProfile(
+            "p",
+            allowed_commands=(identity,),
+            environment_variables={key: value},
+        )
         request = ExecutionRequest(
             (sys.executable, "-c", program),
             profile=profile,

@@ -7,8 +7,10 @@ from app.orchestrator.models import EventType
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalResolver,
     ApprovalState,
+    tool_invocation_fingerprint,
 )
 from app.tools.contracts import ToolInvocation, ToolResult, ToolStatus
 from app.tools.changesets import ChangeSetCollector
@@ -89,11 +91,16 @@ class ToolExecutor:
 
         approval_state = self._approval_policy.evaluate(permission.tool_id)
         if approval_state == ApprovalState.REQUIRED:
+            # The approval is cryptographically bound to this exact payload.
+            fingerprint = tool_invocation_fingerprint(
+                permission.tool_id, getattr(invocation, "input", None)
+            )
             request = ApprovalRequest(
                 run_id=permission.run_id,
                 invocation_id=permission.invocation_id,
                 tool_id=permission.tool_id,
                 reason="tool requires explicit approval",
+                intent_fingerprint=fingerprint,
             )
             self._emit(
                 observer,
@@ -109,8 +116,20 @@ class ToolExecutor:
                 if self._approval_resolver is not None
                 else None
             )
-            resolution_decision = getattr(resolution, "decision", resolution)
-            if resolution_decision not in (
+            if resolution is None:
+                return ToolResult(
+                    permission.invocation_id,
+                    ToolStatus.WAITING_FOR_APPROVAL,
+                    error="approval required",
+                )
+            if not isinstance(resolution, ApprovalResolution):
+                return ToolResult(
+                    permission.invocation_id,
+                    ToolStatus.FAILED,
+                    error=f"approval resolver returned unexpected type: {type(resolution).__name__}",
+                )
+
+            if resolution.decision not in (
                 ApprovalState.APPROVED,
                 ApprovalState.REJECTED,
             ):
@@ -119,19 +138,31 @@ class ToolExecutor:
                     ToolStatus.WAITING_FOR_APPROVAL,
                     error="approval required",
                 )
+
             self._emit(
                 observer,
                 EventType.APPROVAL_RESOLVED,
                 run_id=request.run_id,
                 invocation_id=request.invocation_id,
                 tool_id=request.tool_id,
-                resolution=resolution.value,
+                resolution=resolution.decision.value,
             )
-            if resolution == ApprovalState.REJECTED:
+            if resolution.decision == ApprovalState.REJECTED:
                 return ToolResult(
                     permission.invocation_id,
                     ToolStatus.DENIED,
                     error="approval rejected",
+                )
+
+            # Cryptographic payload binding check: resolution.approved_fingerprint must match request.intent_fingerprint
+            if (
+                not resolution.approved_fingerprint
+                or resolution.approved_fingerprint != request.intent_fingerprint
+            ):
+                return ToolResult(
+                    permission.invocation_id,
+                    ToolStatus.DENIED,
+                    error="approval payload fingerprint mismatch",
                 )
 
         if tool is None:

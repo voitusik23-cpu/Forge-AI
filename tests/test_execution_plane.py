@@ -21,6 +21,7 @@ from app.execution.artifacts import (
     create_artifact_from_file,
 )
 from app.execution.authorizer import ExecutionCoordinator
+from app.execution.capabilities import ExecutionCapability
 from app.execution.policy import ExecutionPolicy
 from app.execution.profile import (
     ExecutionEnvironmentType,
@@ -48,6 +49,7 @@ from app.tools.acceptance import (
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalResolver,
     ApprovalState,
 )
@@ -67,9 +69,13 @@ class _MockApprovalResolver:
         self.decision = decision
         self.calls: list[ApprovalRequest] = []
 
-    def resolve(self, request: ApprovalRequest) -> ApprovalState:
+    def resolve(self, request: ApprovalRequest) -> ApprovalResolution:
         self.calls.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="mock-plane-resolver",
+        )
 
 
 class TestExecutionPlane(unittest.TestCase):
@@ -168,6 +174,15 @@ class TestExecutionPlane(unittest.TestCase):
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
             allowed_commands=tuple(allowed),
+            # The request declares the capability its inline `python -c` commands
+            # require. The frozen scope grants the same capability, so this is a
+            # subset declaration, not a widening.
+            capabilities=frozenset({ExecutionCapability.INTERPRET_TEXT}),
+            environment_variables={
+                "MY_JOB_TOKEN": "injected_secret_token_abc",
+                "AUTH_KEY": "super_secret_auth_token_999",
+                "PYTHONPATH": "explicit_project_path",
+            },
             timeout_seconds=10.0,
             max_output_bytes=1048576,
             network_access=False,
@@ -196,6 +211,20 @@ class TestExecutionPlane(unittest.TestCase):
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
             allowed_commands=scope_commands,
+            # Environment authority belongs to the frozen RunScope. These are the
+            # explicit variables this Run may pass to its child: the two credentials
+            # the redaction tests push through, and the PYTHONPATH the injection test
+            # sets by hand. The perimeter holds the value, so a request can only
+            # narrow (omit or restate it), never inject a new variable.
+            environment_variables={
+                "MY_JOB_TOKEN": "injected_secret_token_abc",
+                "AUTH_KEY": "super_secret_auth_token_999",
+                "PYTHONPATH": "explicit_project_path",
+            },
+            # This Run executes `python -c ...`, which the capability classifier
+            # treats as inline text interpretation. Declaring it here keeps the
+            # perimeter consistent with the commands it already authorises.
+            capabilities=frozenset({ExecutionCapability.INTERPRET_TEXT}),
             timeout_seconds=10.0,
             max_output_bytes=1048576,
             network_access=False,

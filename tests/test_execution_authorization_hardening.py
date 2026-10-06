@@ -12,7 +12,12 @@ from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import ExecutionOutcomeStatus, ExecutionRequest
 from app.runtime.run_scope import RunScope
 from app.tools.acceptance import AcceptanceCriterion
-from app.tools.approval import ApprovalPolicy, ApprovalState
+from app.tools.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalResolution,
+    ApprovalState,
+)
 from app.tools.workspace import Workspace
 
 
@@ -49,7 +54,11 @@ class _Resolver:
 
     def resolve(self, request):
         self.requests.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="hardening-appr-id",
+        )
 
 
 class ExecutionAuthorizationHardeningTests(unittest.TestCase):

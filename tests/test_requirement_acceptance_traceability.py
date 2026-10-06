@@ -39,7 +39,7 @@ from app.tools.acceptance import (
     RequirementEvaluation,
     RequirementStatus,
 )
-from app.tools.approval import ApprovalPolicy, ApprovalState
+from app.tools.approval import ApprovalPolicy, ApprovalResolution, ApprovalState
 from app.tools.contracts import ToolInvocation
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
@@ -57,7 +57,11 @@ from app.tools.write_project_file import WriteProjectFile
 
 class _AlwaysApproved:
     def resolve(self, request):
-        return ApprovalState.APPROVED
+        return ApprovalResolution(
+            decision=ApprovalState.APPROVED,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="req-resolver-id",
+        )
 
 
 class _SequenceAgent:

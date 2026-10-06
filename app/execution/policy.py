@@ -164,12 +164,22 @@ class ExecutionPolicy:
                 reason=f"max_output_bytes_exceeds_profile_limit:{intent.max_output_bytes}>{profile.max_output_bytes}",
             )
 
-        # Check environment variable names
+        # Check environment variable names and bounds against profile
         for key, val in intent.environment_variables:
             if not isinstance(key, str) or not _ENV_VAR_NAME.match(key):
                 return ExecutionPolicyDecision(allowed=False, reason=f"invalid_env_var_name:{key}")
             if not isinstance(val, str):
                 return ExecutionPolicyDecision(allowed=False, reason=f"invalid_env_var_value:{key}")
+            if key not in profile.environment_variables:
+                return ExecutionPolicyDecision(
+                    allowed=False,
+                    reason=f"unauthorized_env_var:{key}",
+                )
+            if profile.environment_variables[key] != val:
+                return ExecutionPolicyDecision(
+                    allowed=False,
+                    reason=f"mismatched_env_var_value:{key}",
+                )
 
         return ExecutionPolicyDecision(allowed=True, reason="authorized")
 

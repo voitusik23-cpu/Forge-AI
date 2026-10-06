@@ -14,6 +14,7 @@ from app.orchestrator.run import RunExecutor
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalState,
     InMemoryApprovalResolver,
 )
@@ -30,7 +31,11 @@ class _FixedResolver:
 
     def resolve(self, request):
         self.requests.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="fixed-appr",
+        )
 
 
 class ApprovalBoundaryRunTests(unittest.TestCase):
@@ -160,14 +165,17 @@ class ApprovalBoundaryRunTests(unittest.TestCase):
 
     def test_approval_resolver_requires_exact_run_and_invocation(self):
         resolver = InMemoryApprovalResolver()
-        resolver.submit("run-1", "invoke-1", ApprovalState.APPROVED)
-        wrong_run = ApprovalRequest("run-2", "invoke-1", "read_project_file", "test")
-        wrong_invocation = ApprovalRequest("run-1", "invoke-2", "read_project_file", "test")
-        exact = ApprovalRequest("run-1", "invoke-1", "read_project_file", "test")
+        resolver.submit("run-1", "invoke-1", ApprovalState.APPROVED, intent_fingerprint="fp-1")
+        wrong_run = ApprovalRequest("run-2", "invoke-1", "read_project_file", "test", intent_fingerprint="fp-1")
+        wrong_invocation = ApprovalRequest("run-1", "invoke-2", "read_project_file", "test", intent_fingerprint="fp-1")
+        exact = ApprovalRequest("run-1", "invoke-1", "read_project_file", "test", intent_fingerprint="fp-1")
 
         self.assertIsNone(resolver.resolve(wrong_run))
         self.assertIsNone(resolver.resolve(wrong_invocation))
-        self.assertEqual(resolver.resolve(exact), ApprovalState.APPROVED)
+        res = resolver.resolve(exact)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.decision, ApprovalState.APPROVED)
+        self.assertEqual(res.approved_fingerprint, "fp-1")
         self.assertIsNone(resolver.resolve(exact))  # decisions are consumed once
 
     @staticmethod

@@ -2,10 +2,44 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
+
+
+def tool_invocation_fingerprint(tool_id: object, tool_input: object) -> str:
+    """Return a deterministic canonical SHA-256 fingerprint of a concrete tool invocation.
+
+    The approval boundary binds cryptographically to the tool payload. An approval
+    granted for one tool invocation (e.g. write_project_file with path A) cannot
+    authorize a different payload (e.g. path B) reusing the same invocation id.
+
+    Canonicalisation is recursively order-insensitive for mappings. Sets/frozensets
+    are sorted deterministically. Nested lists, primitives, and nulls are preserved.
+    """
+    def _canonical(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(k): _canonical(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+        if isinstance(value, (list, tuple)):
+            return [_canonical(v) for v in value]
+        if isinstance(value, (set, frozenset)):
+            items = [_canonical(v) for v in value]
+            return sorted(items, key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":")))
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    payload = json.dumps(
+        {"input": _canonical(tool_input), "tool_id": str(tool_id)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class ApprovalState(str, Enum):
@@ -84,7 +118,7 @@ class ApprovalPolicy:
 class ApprovalResolver(Protocol):
     """Resolve a request independently from the agent's proposal."""
 
-    def resolve(self, request: ApprovalRequest) -> ApprovalResolution | ApprovalState | None:
+    def resolve(self, request: ApprovalRequest) -> ApprovalResolution | None:
         """Return an approval resolution, or None while pending."""
         ...
 
@@ -138,20 +172,19 @@ class InMemoryApprovalResolver:
         if entry.consumed:
             return None
 
-        # Invariant I1: Intent A cannot authorize Intent B
-        if entry.intent_fingerprint is not None:
-            if request.intent_fingerprint != entry.intent_fingerprint:
-                # Fingerprint mismatch
-                return None
-        elif request.intent_fingerprint is not None:
-            # Approval had no fingerprint (wildcard) but request requires fingerprint
+        # Fail closed: fingerprint must be non-empty and match exactly (None is never a wildcard)
+        if not request.intent_fingerprint or not entry.intent_fingerprint:
             return None
 
-        # Mark consumed on consumption
+        # Invariant I1: Intent A cannot authorize Intent B
+        if request.intent_fingerprint != entry.intent_fingerprint:
+            return None
+
+        # Mark consumed on consumption (single-use)
         entry.consumed = True
 
         return ApprovalResolution(
             decision=entry.decision,
-            approved_fingerprint=entry.intent_fingerprint or (request.intent_fingerprint or ""),
+            approved_fingerprint=entry.intent_fingerprint,
             approval_id=entry.approval_id,
         )

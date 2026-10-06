@@ -55,6 +55,7 @@ from app.tools.acceptance import AcceptanceGate, AcceptanceResult, AcceptanceSta
 from app.tools.approval import (
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalResolution,
     ApprovalResolver,
     ApprovalState,
     InMemoryApprovalResolver,
@@ -80,12 +81,16 @@ class _TrackingApprovalResolver:
         self.decision = decision
         self.requests: list[ApprovalRequest] = []
 
-    def resolve(self, request: ApprovalRequest) -> ApprovalState | None:
+    def resolve(self, request: ApprovalRequest) -> ApprovalResolution | None:
         self.requests.append(request)
         # REQUIRED → pending (caller treats None as still waiting)
         if self.decision == ApprovalState.REQUIRED:
             return None
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="harness-approval-id",
+        )
 
 
 class _MaliciousCompleteProvider:

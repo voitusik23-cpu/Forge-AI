@@ -25,7 +25,12 @@ from app.execution.request import (
 from app.orchestrator.models import EventType
 from app.tasks.specification import Requirement
 from app.tools.acceptance import AcceptanceCriterion, AcceptanceGate, AcceptanceStatus
-from app.tools.approval import ApprovalPolicy, ApprovalRequest, ApprovalState
+from app.tools.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalResolution,
+    ApprovalState,
+)
 from app.tools.test_verification import (
     TestFramework,
     TestVerificationAdapter,
@@ -48,7 +53,11 @@ class _TrackingApprovalResolver:
 
     def resolve(self, request: ApprovalRequest):
         self.requests.append(request)
-        return self.decision
+        return ApprovalResolution(
+            decision=self.decision,
+            approved_fingerprint=request.intent_fingerprint or "",
+            approval_id="test-verif-resolver-id",
+        )
 
 
 def _scope_for(req, run_id, declared, *, workspace):
