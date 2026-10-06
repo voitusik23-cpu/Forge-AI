@@ -10,10 +10,11 @@ from app.agents.providers.capabilities import (
     CostTier,
     ProviderCapabilitiesRegistry,
 )
+from app.agents.providers.model_registry import ModelRegistry
 from app.agents.providers.registry import ProviderNotFoundError, ProviderRegistry
 from app.agents.registry import AgentNotFoundError, AgentRegistry
-from app.orchestrator.executor import TaskExecutor
 from app.orchestrator.classification import classify_task
+from app.orchestrator.executor import TaskExecutor
 from app.orchestrator.models import EventType, Task, TaskCategory, TaskResult
 
 
@@ -56,14 +57,69 @@ class DispatchPolicy:
         default_provider: str,
         *,
         capabilities: Optional[ProviderCapabilitiesRegistry] = None,
+        model_registry: Optional[ModelRegistry] = None,
         registered_provider_names: Optional[Sequence[str]] = None,
         registered_agent_names: Optional[Sequence[str]] = None,
         allow_paid_providers: bool = False,
     ) -> DispatchDecision:
         """Return the preferred provider and retain the remaining candidates."""
+        provider_names = set(registered_provider_names or ())
+        agent_names = set(registered_agent_names or ())
+
+        # 1. ModelRegistry-based routing (v0.2 preferred path)
+        if model_registry is not None:
+            # Check for model override in task parameters
+            requested_model = task.parameters.get("model") or task.parameters.get("model_override")
+            if requested_model and isinstance(requested_model, str):
+                try:
+                    model_info = model_registry.get_model(requested_model)
+                    if (
+                        (not provider_names or model_info.provider_id in provider_names)
+                        and (not agent_names or model_info.provider_id in agent_names)
+                        and (allow_paid_providers or model_info.cost_tier != CostTier.PAID)
+                    ):
+                        return DispatchDecision(
+                            category=task.category,
+                            candidates=(model_info.provider_id,),
+                            selected_provider=model_info.provider_id,
+                            reason=f"Explicit model '{requested_model}' selected via ModelRegistry",
+                        )
+                except LookupError:
+                    pass
+
+            # Search by task category and capabilities
+            min_ctx = task.parameters.get("min_context")
+            min_ctx_val = int(min_ctx) if isinstance(min_ctx, (int, float)) and min_ctx > 0 else None
+            req_caps = task.parameters.get("required_capabilities")
+
+            eligible_models = model_registry.find_models(
+                task_category=task.category.value if task.category in self._SPECIALIZED_CATEGORIES else None,
+                capabilities=req_caps if isinstance(req_caps, (list, tuple, set, frozenset)) else None,
+                min_context=min_ctx_val,
+                max_cost_tier=None if allow_paid_providers else CostTier.CHEAP,
+                allowed_providers=list(provider_names) if provider_names else None,
+            )
+
+            # Filter candidates where provider is also in agent_names
+            ordered_providers: list[str] = []
+            for m in eligible_models:
+                if (not agent_names or m.provider_id in agent_names) and m.provider_id not in ordered_providers:
+                    ordered_providers.append(m.provider_id)
+
+            if ordered_providers:
+                candidates_tuple = tuple(ordered_providers)
+                return DispatchDecision(
+                    category=task.category,
+                    candidates=candidates_tuple,
+                    selected_provider=candidates_tuple[0],
+                    reason=(
+                        f"Category '{task.category.value}' matched {len(eligible_models)} models "
+                        "via ModelRegistry capability and cost-tier metadata"
+                    ),
+                )
+
+        # 2. Legacy ProviderCapabilitiesRegistry routing
         if task.category in self._SPECIALIZED_CATEGORIES and capabilities is not None:
-            provider_names = set(registered_provider_names or ())
-            agent_names = set(registered_agent_names or ())
             cost_order = {
                 CostTier.FREE: 0,
                 CostTier.CHEAP: 1,
@@ -72,8 +128,8 @@ class DispatchPolicy:
             eligible = [
                 capability
                 for capability in capabilities.list_capabilities()
-                if capability.provider_name in provider_names
-                and capability.provider_name in agent_names
+                if (not provider_names or capability.provider_name in provider_names)
+                and (not agent_names or capability.provider_name in agent_names)
                 and task.category.value in capability.task_categories
                 and (allow_paid_providers or capability.cost_tier != CostTier.PAID)
             ]
@@ -91,8 +147,6 @@ class DispatchPolicy:
             )
 
         if task.category == TaskCategory.OTHER and capabilities is not None:
-            provider_names = set(registered_provider_names or ())
-            agent_names = set(registered_agent_names or ())
             cost_order = {
                 CostTier.FREE: 0,
                 CostTier.CHEAP: 1,
@@ -101,8 +155,8 @@ class DispatchPolicy:
             eligible = [
                 capability
                 for capability in capabilities.list_capabilities()
-                if capability.provider_name in provider_names
-                and capability.provider_name in agent_names
+                if (not provider_names or capability.provider_name in provider_names)
+                and (not agent_names or capability.provider_name in agent_names)
                 and (allow_paid_providers or capability.cost_tier != CostTier.PAID)
             ]
             eligible.sort(key=lambda item: cost_order[item.cost_tier])
@@ -115,6 +169,7 @@ class DispatchPolicy:
                 reason="Cost tier preference: free, then cheap, then permitted paid",
             )
 
+        # 3. Static Preferences Fallback
         candidates = self._PREFERENCES.get(task.category, (default_provider,))
         return DispatchDecision(
             category=task.category,
@@ -141,6 +196,7 @@ class Dispatcher:
         fallback_chain: Sequence[str] = (),
         provider_registry: Optional[ProviderRegistry] = None,
         capabilities_registry: Optional[ProviderCapabilitiesRegistry] = None,
+        model_registry: Optional[ModelRegistry] = None,
         allow_paid_providers: bool = False,
     ) -> None:
         self._registry = agent_registry
@@ -149,6 +205,7 @@ class Dispatcher:
         self._executor = TaskExecutor(agent_registry)
         self._provider_registry = provider_registry
         self._capabilities_registry = capabilities_registry
+        self._model_registry = model_registry
         self._allow_paid_providers = allow_paid_providers
         if isinstance(fallback_chain, str):
             fallback_chain = tuple(
@@ -172,6 +229,7 @@ class Dispatcher:
             task,
             self._default_provider,
             capabilities=self._capabilities_registry,
+            model_registry=self._model_registry,
             registered_provider_names=(
                 self._provider_registry.list_providers()
                 if self._provider_registry is not None
@@ -198,9 +256,12 @@ class Dispatcher:
         )
         allow_fallback = provider_name is None
         cost_aware = (
-            task.category == TaskCategory.OTHER
-            or task.category in self._SPECIALIZED_CATEGORIES
-        ) and self._capabilities_registry is not None
+            (
+                task.category == TaskCategory.OTHER
+                or task.category in self._SPECIALIZED_CATEGORIES
+            )
+            and (self._capabilities_registry is not None or self._model_registry is not None)
+        )
         if provider_name is not None:
             attempts = [selected]
         elif cost_aware:
@@ -223,26 +284,36 @@ class Dispatcher:
                 task.category == TaskCategory.OTHER
                 or task.category in self._SPECIALIZED_CATEGORIES
             )
-            and self._capabilities_registry is not None
+            and (self._capabilities_registry is not None or self._model_registry is not None)
         ):
             permitted_fallbacks = []
             for name in self._fallback_chain:
                 if name in attempts:
                     continue
-                try:
-                    fallback_capability = self._capabilities_registry.get(name)
-                except LookupError:
+                if self._capabilities_registry is not None:
+                    try:
+                        fallback_capability = self._capabilities_registry.get(name)
+                    except LookupError:
+                        if (
+                            self._provider_registry is not None
+                            and name not in self._provider_registry.list_providers()
+                        ):
+                            permitted_fallbacks.append(name)
+                        continue
                     if (
-                        self._provider_registry is not None
-                        and name not in self._provider_registry.list_providers()
+                        fallback_capability.cost_tier == CostTier.PAID
+                        and not self._allow_paid_providers
                     ):
-                        permitted_fallbacks.append(name)
-                    continue
-                if (
-                    fallback_capability.cost_tier == CostTier.PAID
-                    and not self._allow_paid_providers
-                ):
-                    continue
+                        continue
+                elif self._model_registry is not None:
+                    models = self._model_registry.list_models(name)
+                    if not models:
+                        continue
+                    if (
+                        all(m.cost_tier == CostTier.PAID for m in models)
+                        and not self._allow_paid_providers
+                    ):
+                        continue
                 permitted_fallbacks.append(name)
             attempts.extend(permitted_fallbacks)
 
@@ -340,8 +411,6 @@ class Dispatcher:
                 previous_name = name
                 continue
             except Exception as exc:
-                # Preserve the dispatch exception while recording a non-secret
-                # failure marker for the Run observer.
                 reason = f"Execution raised {type(exc).__name__}"
                 self._emit_provider_result(
                     observer, name, model_name, attempt_number,
@@ -428,37 +497,52 @@ class Dispatcher:
 
     def _automatic_route_rejection(self, name: str, task: Task) -> Optional[str]:
         """Reject auto-route candidates that are disabled, unconfigured, or incapable."""
-        if self._provider_registry is None or self._capabilities_registry is None:
+        if self._provider_registry is None:
             return None
         try:
             provider = self._provider_registry.get(name)
         except ProviderNotFoundError:
             return "provider is unavailable or not registered"
-        try:
-            capability = self._capabilities_registry.get(name)
-        except LookupError:
-            return "provider capabilities are not registered"
 
-        if not capability.enabled_by_config:
-            return "provider is disabled by configuration"
-        if capability.cost_tier == CostTier.PAID and not self._allow_paid_providers:
-            return "paid provider is disabled by cost policy"
-        if capability.api_key_env:
+        if self._capabilities_registry is not None:
             try:
-                key_available = provider.secret_store.get_secret(capability.api_key_env)
-            except (OSError, RuntimeError):
-                key_available = None
-            if not key_available:
-                return f"required key {capability.api_key_env} is not configured"
+                capability = self._capabilities_registry.get(name)
+            except LookupError:
+                return "provider capabilities are not registered"
 
-        requirements = {
-            "requires_tools": capability.supports_tools,
-            "requires_streaming": capability.supports_streaming,
-            "requires_large_context": capability.supports_large_context,
-        }
-        if task.category == TaskCategory.LARGE_CONTEXT:
-            requirements["requires_large_context"] = capability.supports_large_context
-        for parameter, supported in requirements.items():
-            if task.parameters.get(parameter) is True and not supported:
-                return f"provider does not support {parameter.removeprefix('requires_')}"
+            if not capability.enabled_by_config:
+                return "provider is disabled by configuration"
+            if capability.cost_tier == CostTier.PAID and not self._allow_paid_providers:
+                return "paid provider is disabled by cost policy"
+            if capability.api_key_env:
+                try:
+                    key_available = provider.secret_store.get_secret(capability.api_key_env)
+                except (OSError, RuntimeError):
+                    key_available = None
+                if not key_available:
+                    return f"required key {capability.api_key_env} is not configured"
+
+            requirements = {
+                "requires_tools": capability.supports_tools,
+                "requires_streaming": capability.supports_streaming,
+                "requires_large_context": capability.supports_large_context,
+            }
+            if task.category == TaskCategory.LARGE_CONTEXT:
+                requirements["requires_large_context"] = capability.supports_large_context
+            for parameter, supported in requirements.items():
+                if task.parameters.get(parameter) is True and not supported:
+                    return f"provider does not support {parameter.removeprefix('requires_')}"
+
+        elif self._model_registry is not None:
+            if not self._model_registry.has_provider(name):
+                return "provider is not registered in ModelRegistry"
+            provider_info = self._model_registry.get_provider(name)
+            if provider_info.default_secret_env:
+                try:
+                    key_available = provider.secret_store.get_secret(provider_info.default_secret_env)
+                except (OSError, RuntimeError):
+                    key_available = None
+                if not key_available:
+                    return f"required key {provider_info.default_secret_env} is not configured"
+
         return None

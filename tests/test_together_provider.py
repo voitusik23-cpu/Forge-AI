@@ -443,7 +443,11 @@ class TogetherArchitectureInvariantTests(unittest.TestCase):
                         mentions[key] = mentions.get(key, 0) + 1
         self.assertEqual(
             sorted(mentions),
-            ["app/agents/providers/capabilities.py", "app/agents/providers/factory.py"],
+            [
+                "app/agents/providers/capabilities.py",
+                "app/agents/providers/factory.py",
+                "app/agents/providers/model_registry.py",
+            ],
             f"unexpected integration points: {mentions}",
         )
 

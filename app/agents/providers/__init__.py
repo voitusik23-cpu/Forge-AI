@@ -9,6 +9,22 @@ from app.agents.providers.base import (
 )
 from app.agents.providers.config import ProviderConfig
 from app.agents.providers.deepseek import DeepSeekProvider
+from app.agents.providers.model_registry import (
+    DuplicateRegistrationError,
+    ModelNotFoundError,
+    ModelRegistry,
+    ModelRegistryError,
+    ProviderNotFoundError,
+    create_default_registry,
+)
+from app.agents.providers.models import (
+    CostTier,
+    ModelCapability,
+    ProviderAccount,
+    ProviderInfo,
+    ProviderModelInfo,
+    ProviderProtocol,
+)
 from app.agents.providers.openrouter import OpenRouterProvider
 
 __all__ = [
@@ -20,4 +36,16 @@ __all__ = [
     "ProviderResponse",
     "DeepSeekProvider",
     "OpenRouterProvider",
+    "CostTier",
+    "ModelCapability",
+    "ProviderProtocol",
+    "ProviderInfo",
+    "ProviderModelInfo",
+    "ProviderAccount",
+    "ModelRegistry",
+    "ModelRegistryError",
+    "ProviderNotFoundError",
+    "ModelNotFoundError",
+    "DuplicateRegistrationError",
+    "create_default_registry",
 ]
