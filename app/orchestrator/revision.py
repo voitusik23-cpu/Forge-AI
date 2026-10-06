@@ -119,6 +119,8 @@ class RevisionLoopExecutor:
         workspace: Workspace | None = None,
         snapshot_paths: Iterable[str] | None = None,
         max_revision_attempts: int | None = None,
+        run_id: str = "",
+        run_scope: object | None = None,
     ) -> RevisionResult:
         """Execute once, then revise only after a safe, observed Acceptance FAIL."""
         criteria = tuple(criteria)
@@ -131,7 +133,7 @@ class RevisionLoopExecutor:
         max_attempts = self.max_revision_attempts if max_revision_attempts is None else max_revision_attempts
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 0:
             raise ValueError("max_revision_attempts must be a non-negative integer")
-        run = Run(task=task)
+        run = Run(task=task, **({"id": run_id} if run_id else {}))
         initial_before = None
         if requested_snapshot_paths is not None:
             initial_before = self._snapshotter.create(
@@ -147,6 +149,7 @@ class RevisionLoopExecutor:
             explicit_inputs=explicit_inputs,
             allowed_tool_ids=allowed_tool_ids,
             workspace=workspace,
+            run_scope=run_scope,
             _run=run,
             _attempt_number=0,
         )
@@ -206,6 +209,7 @@ class RevisionLoopExecutor:
                 explicit_inputs=explicit_inputs,
                 allowed_tool_ids=allowed_tool_ids,
                 workspace=workspace,
+                run_scope=run_scope,
                 _run=run,
                 _attempt_number=attempt,
             )

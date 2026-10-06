@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import dataclasses
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 from uuid import uuid4
@@ -42,6 +43,7 @@ from app.execution.request import (
     ExecutionRequest,
 )
 from app.orchestrator.models import EventType
+from app.runtime.run_scope import RunScope
 from app.orchestrator.trace import RunEvent, RunTrace
 from app.projects.state import ProjectState, ProjectStateStatus, derive_project_state
 from app.tasks.specification import (
@@ -149,6 +151,8 @@ class TestAgentHarness(unittest.TestCase):
         pass
 
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.temp_dir = tempfile.mkdtemp(prefix="forge_harness_test_")
         self.workspace_root = pathlib.Path(self.temp_dir)
         self.workspace = Workspace(root=self.workspace_root)
@@ -157,6 +161,77 @@ class TestAgentHarness(unittest.TestCase):
             allowed_commands=(sys.executable,),
         )
         self.harness = AgentHarness()
+        # A Run that declares acceptance work without criteria still needs a
+        # non-empty canonical identity for its perimeter.
+        self._placeholder_criterion = AcceptanceCriterion(
+            criterion_id="harness-placeholder", description="no acceptance work declared"
+        )
+
+    def _scope_request(
+        self,
+        request: HarnessRequest,
+        declared_commands: tuple[object, ...] = (),
+        criteria: tuple[AcceptanceCriterion, ...] = (),
+        tools: tuple[str, ...] = (),
+    ) -> HarnessRequest:
+        """Freeze this Run's single scope and bind the request to it.
+
+        The run identity and every declared authority come from the test, never
+        from the request. A run that declares no dispatch authority needs no
+        perimeter, so the request is returned unchanged.
+        """
+        if not (getattr(request, "execution_requests", ()) or declared_commands):
+            return request
+
+        # The scope's profile must permit everything this Run may execute: the
+        # declared entries plus the identities its execution profiles pin. It is
+        # cloned from the request profile so environment and limits carry over.
+        entries: list[object] = [sys.executable, "python", "python.exe"]
+        entries.extend(declared_commands)
+        base = self.profile
+        for exec_req in getattr(request, "execution_requests", ()):
+            profile = getattr(exec_req, "profile", None)
+            if profile is None:
+                continue
+            base = profile
+            entries.extend(profile.allowed_commands)
+        unique: list[object] = []
+        for entry in entries:
+            if entry not in unique:
+                unique.append(entry)
+
+        scope_profile = ProjectExecutionProfile(
+            profile_id=base.profile_id,
+            environment_type=base.environment_type,
+            runtime_name=base.runtime_name,
+            runtime_version=base.runtime_version,
+            target_os=base.target_os,
+            working_directory=base.working_directory,
+            environment_variables=dict(base.environment_variables),
+            timeout_seconds=base.timeout_seconds,
+            max_output_bytes=base.max_output_bytes,
+            network_access=base.network_access,
+            capabilities=base.capabilities,
+            allowed_commands=tuple(unique),
+        )
+        scope = RunScope(
+            run_id=request.run_id,
+            workspace=self.workspace,
+            execution_profile=scope_profile,
+            allowed_tool_ids=frozenset(tools),
+            allowed_execution_commands=frozenset(declared_commands),
+            acceptance_criteria=tuple(criteria) or (self._placeholder_criterion,),
+        )
+        scope.freeze()
+        return HarnessRequest(
+            **{
+                **{
+                    field.name: getattr(request, field.name)
+                    for field in dataclasses.fields(request)
+                },
+                "run_scope": scope,
+            }
+        )
 
     def _make_exec_request(self, command: tuple[str, ...]) -> tuple[ExecutionRequest, object]:
         from app.execution.identity import CommandIdentity
@@ -168,6 +243,7 @@ class TestAgentHarness(unittest.TestCase):
         return ExecutionRequest(command=command, profile=profile), cid
 
     def tearDown(self) -> None:
+        RunScope.release_all()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # =========================================================================
@@ -182,7 +258,8 @@ class TestAgentHarness(unittest.TestCase):
             f"import pathlib; pathlib.Path(r'{target_file}').write_text('hello')",
         )
         exec_req, cid = self._make_exec_request(cmd)
-        req = HarnessRequest(
+        req = self._scope_request(
+            HarnessRequest(
             run_id="run-a",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -192,6 +269,9 @@ class TestAgentHarness(unittest.TestCase):
                 attempt_number=0,
                 status=ProjectStateStatus.INITIAL,
             ),
+        ),
+            (sys.executable, cid,),
+            (),
         )
 
         # Use policy with max_actions=1
@@ -230,7 +310,8 @@ class TestAgentHarness(unittest.TestCase):
             acceptance_criteria=(crit,),
             execution_profile=exec_req.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-b",
             task_specification=spec,
             workspace=self.workspace,
@@ -246,6 +327,9 @@ class TestAgentHarness(unittest.TestCase):
                 attempt_number=0,
                 status=ProjectStateStatus.INITIAL,
             ),
+        ),
+            (sys.executable, cid,),
+            (crit,),
         )
 
         result = self.harness.run(h_req)
@@ -272,7 +356,8 @@ class TestAgentHarness(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-c",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -280,6 +365,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-c", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = self.harness.run(h_req)
@@ -304,7 +392,8 @@ class TestAgentHarness(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingApprovalResolver(decision=ApprovalState.REQUIRED)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-d",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -314,6 +403,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-d", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (sys.executable,),
+            (),
         )
 
         result = self.harness.run(h_req)
@@ -338,7 +430,8 @@ class TestAgentHarness(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingApprovalResolver(decision=ApprovalState.REJECTED)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-e",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -348,6 +441,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-e", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (sys.executable,),
+            (),
         )
 
         result = self.harness.run(h_req)
@@ -364,7 +460,8 @@ class TestAgentHarness(unittest.TestCase):
         """Prove that a non-zero exit code produces execution failure and halts progress."""
         cmd = (sys.executable, "-c", "import sys; sys.exit(7)")
         exec_req, cid = self._make_exec_request(cmd)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-f",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -372,6 +469,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-f", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (sys.executable, cid,),
+            (),
         )
 
         result = self.harness.run(h_req)
@@ -391,7 +491,8 @@ class TestAgentHarness(unittest.TestCase):
         crit = AcceptanceCriterion(
             criterion_id="crit-g", requirement_id="req-g", description="missing.txt exists"
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-g",
             workspace=self.workspace,
             verification_expectations={
@@ -402,6 +503,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-g", attempt_number=0, status=ProjectStateStatus.CHANGED
             ),
+        ),
+            (),
+            (crit,),
         )
 
         result = self.harness.run(h_req)
@@ -421,7 +525,8 @@ class TestAgentHarness(unittest.TestCase):
         crit = AcceptanceCriterion(
             criterion_id="crit-h", requirement_id="req-h", description="file exists"
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-h",
             workspace=self.workspace,
             verification_expectations={
@@ -432,6 +537,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-h", attempt_number=0, status=ProjectStateStatus.CHANGED
             ),
+        ),
+            (),
+            (crit,),
         )
 
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=2))
@@ -454,7 +562,8 @@ class TestAgentHarness(unittest.TestCase):
         crit = AcceptanceCriterion(
             criterion_id="crit-i", requirement_id="req-i", description="valid exists"
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-i",
             workspace=self.workspace,
             verification_expectations={
@@ -465,6 +574,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-i", attempt_number=0, status=ProjectStateStatus.CHANGED
             ),
+        ),
+            (),
+            (crit,),
         )
 
         result = self.harness.run(h_req)
@@ -481,7 +593,8 @@ class TestAgentHarness(unittest.TestCase):
         crit = AcceptanceCriterion(
             criterion_id="crit-j", requirement_id="req-j", description="never exists"
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-j",
             workspace=self.workspace,
             verification_expectations={
@@ -492,6 +605,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-j", attempt_number=0, status=ProjectStateStatus.CHANGED
             ),
+        ),
+            (),
+            (crit,),
         )
 
         result = self.harness.run(h_req)
@@ -509,12 +625,16 @@ class TestAgentHarness(unittest.TestCase):
             decision_provider=fake_provider,
             policy=AgentHarnessPolicy(fail_on_unknown_decision=True),
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-k",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-k", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = harness.run(h_req)
@@ -530,12 +650,16 @@ class TestAgentHarness(unittest.TestCase):
             decision_provider=_InfiniteLoopProvider(),
             policy=AgentHarnessPolicy(max_iterations=4, max_actions=10),
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-l",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-l", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = harness.run(h_req)
@@ -552,12 +676,16 @@ class TestAgentHarness(unittest.TestCase):
             decision_provider=_InfiniteLoopProvider(),
             policy=AgentHarnessPolicy(max_iterations=10, max_actions=3),
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-m",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-m", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = harness.run(h_req)
@@ -573,12 +701,16 @@ class TestAgentHarness(unittest.TestCase):
             decision_provider=_InfiniteLoopProvider(),
             policy=AgentHarnessPolicy(max_iterations=5, max_actions=5),
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-n",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-n", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = harness.run(h_req)
@@ -599,7 +731,8 @@ class TestAgentHarness(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-o",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -607,6 +740,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-o", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (sys.executable,),
+            (),
         )
 
         result = self.harness.run(h_req)
@@ -633,7 +769,8 @@ class TestAgentHarness(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-p",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -641,6 +778,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-p", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = harness.run(h_req)
@@ -665,7 +805,8 @@ class TestAgentHarness(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingApprovalResolver(decision=ApprovalState.REQUIRED)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-q",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -675,6 +816,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-q", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (sys.executable,),
+            (),
         )
 
         result = harness.run(h_req)
@@ -693,7 +837,8 @@ class TestAgentHarness(unittest.TestCase):
             command=("forbidden_binary_xyz", "-c", "echo 1"),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-r",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -701,6 +846,9 @@ class TestAgentHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-r", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            ("allowed_tool",),
+            (),
         )
 
         result = harness.run(h_req)
@@ -714,12 +862,16 @@ class TestAgentHarness(unittest.TestCase):
         provider = _MaliciousCompleteProvider()
         harness = AgentHarness(decision_provider=provider)
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-s",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-s", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
 
         result = harness.run(h_req)
@@ -731,12 +883,16 @@ class TestAgentHarness(unittest.TestCase):
     # =========================================================================
     def test_scenario_t_project_state_authoritative(self) -> None:
         """Prove that ProjectState derivation is authoritative and not fabricated by harness."""
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-t",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-t", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
         result = self.harness.run(h_req)
         self.assertIsInstance(result.final_project_state, ProjectState)
@@ -747,12 +903,16 @@ class TestAgentHarness(unittest.TestCase):
     # =========================================================================
     def test_scenario_u_context_fingerprint_deterministic(self) -> None:
         """Prove that repeated runs with identical state produce identical fingerprints."""
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-u",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-u", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
         res1 = self.harness.run(h_req)
         res2 = self.harness.run(h_req)
@@ -780,12 +940,16 @@ class TestAgentHarness(unittest.TestCase):
     # =========================================================================
     def test_scenario_w_trace_lifecycle_ordering(self) -> None:
         """Prove strict sequence monotonicity and event ordering in RunTrace."""
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-w",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-w", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        ),
+            (),
+            (),
         )
         result = self.harness.run(h_req)
         seqs = [e.sequence_number for e in result.events]
@@ -801,10 +965,14 @@ class TestAgentHarness(unittest.TestCase):
             attempt_number=0,
             status=ProjectStateStatus.INITIAL,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-x",
             workspace=self.workspace,
             initial_project_state=foreign_state,
+        ),
+            (),
+            (),
         )
         result = self.harness.run(h_req)
         self.assertEqual(result.final_state.status, HarnessStatus.FAILED)
@@ -839,13 +1007,17 @@ class TestAgentHarness(unittest.TestCase):
     def test_scenario_z_purity_and_side_effect_freedom(self) -> None:
         """Prove that harness control logic does not access socket or execute uncontrolled processes."""
         with patch.object(socket, "socket", side_effect=RuntimeError("Network forbidden")):
-            h_req = HarnessRequest(
+            h_req = self._scope_request(
+            HarnessRequest(
                 run_id="run-z",
                 workspace=self.workspace,
                 initial_project_state=ProjectState(
                     run_id="run-z", attempt_number=0, status=ProjectStateStatus.INITIAL
                 ),
-            )
+            ),
+            (),
+            (),
+        )
             result = self.harness.run(h_req)
             self.assertIsNotNone(result)
 

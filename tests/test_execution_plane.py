@@ -57,7 +57,9 @@ from app.tools.verification import (
     VerificationStatus,
     WorkspaceVerifier,
 )
+from app.runtime.run_scope import RunScope
 from app.tools.workspace import Workspace
+from run_scope_support import freeze_scope
 
 
 class _MockApprovalResolver:
@@ -74,6 +76,8 @@ class TestExecutionPlane(unittest.TestCase):
     """Test suite for Forge Execution Plane v0.1."""
 
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.source_dir = tempfile.TemporaryDirectory()
         self.source_root = Path(self.source_dir.name).resolve()
 
@@ -168,6 +172,40 @@ class TestExecutionPlane(unittest.TestCase):
             max_output_bytes=1048576,
             network_access=False,
         )
+        # Git is a declared capability of this Run; the existing ExecutionPolicy
+        # remains the authority that rejects the forbidden flags.
+        self.git_commands = (
+            "git",
+            CommandIdentity("git", ("status",)),
+            CommandIdentity("git", ("--git-dir=/primary/repo/.git", "status")),
+            CommandIdentity("git", ("--git-dir", "/primary/repo/.git", "status")),
+            CommandIdentity("git", ("--work-tree=/primary/repo", "status")),
+            CommandIdentity("git", ("--work-tree", "/primary/repo", "status")),
+        )
+        # A binary the policy is expected to reject. Declaring it in the perimeter
+        # is what lets the permission check, rather than the scope, decide.
+        self.forbidden_binary = "forbidden_binary_xyz"
+        scope_commands = tuple(allowed) + self.git_commands + (self.forbidden_binary,)
+
+        # DECISION 1/2: this Run's identity is established here, its full perimeter
+        # is declared once, and the scope is frozen before any dispatch. No later
+        # declaration may widen it.
+        self.run_id = "exec-plane-run"
+        scope_profile = ProjectExecutionProfile(
+            profile_id="test-exec-profile",
+            environment_type=ExecutionEnvironmentType.HOST,
+            runtime_name="python",
+            allowed_commands=scope_commands,
+            timeout_seconds=10.0,
+            max_output_bytes=1048576,
+            network_access=False,
+        )
+        self.scope = freeze_scope(
+            self.run_id,
+            workspace=Workspace(self.source_root),
+            commands=scope_commands,
+            profile=scope_profile,
+        )
 
         self.policy = ExecutionPolicy()
         self.redactor = DefaultSecretRedactor()
@@ -185,20 +223,24 @@ class TestExecutionPlane(unittest.TestCase):
 
         def _compat_execute(target):
             if isinstance(target, ExecutionRequest):
-                allowed = frozenset(
-                    cmd.executable if hasattr(cmd, "executable") else str(cmd)
-                    for cmd in (target.profile.allowed_commands if target.profile else ())
+                # The declared permission set keeps full command identities, so a
+                # pinned argv is not silently collapsed to a bare executable.
+                allowed = (
+                    tuple(target.profile.allowed_commands) if target.profile else ()
                 )
                 return self.coordinator.execute(
                     target,
                     workspace_root=self.source_root,
+                    run_id=self.run_id,
                     allowed_commands=allowed,
+                    run_scope=self.scope,
                 )
             return orig_execute(target)
 
         self.adapter.execute = _compat_execute
 
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.source_dir.cleanup()
 
     # A. Ephemeral workspace creation
@@ -274,11 +316,13 @@ class TestExecutionPlane(unittest.TestCase):
             profile=self.profile,
         )
         coord = ExecutionCoordinator(adapter=adapter, policy=self.policy, redactor=self.redactor)
-        allowed = frozenset(
-            cmd.executable if hasattr(cmd, "executable") else str(cmd)
-            for cmd in self.profile.allowed_commands
+        result = coord.execute(
+            req,
+            workspace_root=self.source_root,
+            run_id=self.run_id,
+            allowed_commands=self.scope.allowed_execution_commands,
+            run_scope=self.scope,
         )
-        result = coord.execute(req, workspace_root=self.source_root, allowed_commands=allowed)
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(len(captured_scratch), 1)
         self.assertFalse(captured_scratch[0].exists())
@@ -305,11 +349,13 @@ class TestExecutionPlane(unittest.TestCase):
             profile=self.profile,
         )
         coord = ExecutionCoordinator(adapter=adapter, policy=self.policy, redactor=self.redactor)
-        allowed = frozenset(
-            cmd.executable if hasattr(cmd, "executable") else str(cmd)
-            for cmd in self.profile.allowed_commands
+        result = coord.execute(
+            req,
+            workspace_root=self.source_root,
+            run_id=self.run_id,
+            allowed_commands=self.scope.allowed_execution_commands,
+            run_scope=self.scope,
         )
-        result = coord.execute(req, workspace_root=self.source_root, allowed_commands=allowed)
         self.assertEqual(result.status, ExecutionStatus.FAILURE)
         self.assertEqual(len(captured_scratch), 1)
         self.assertFalse(captured_scratch[0].exists())
@@ -386,6 +432,14 @@ class TestExecutionPlane(unittest.TestCase):
 
     # I. Artifact run_id/provenance
     def test_artifact_run_id_provenance(self) -> None:
+        # A different Run identity: new run id, its own perimeter.
+        provenance_run_id = "run-42-test"
+        provenance_scope = freeze_scope(
+            provenance_run_id,
+            workspace=Workspace(self.source_root),
+            commands=self.scope.allowed_execution_commands,
+            profile=self.scope.execution_profile,
+        )
         req = ExecutionRequest(
             command=(
                 sys.executable,
@@ -393,15 +447,21 @@ class TestExecutionPlane(unittest.TestCase):
                 "import pathlib; pathlib.Path('prov.txt').write_text('provenance test')",
             ),
             artifact_targets=("prov.txt",),
-            metadata={"run_id": "run-42-test"},
+            metadata={"run_id": provenance_run_id},
             profile=self.profile,
         )
-        result = self.adapter.execute(req)
+        result = self.coordinator.execute(
+            req,
+            workspace_root=self.source_root,
+            run_id=provenance_run_id,
+            allowed_commands=self.scope.allowed_execution_commands,
+            run_scope=provenance_scope,
+        )
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(len(result.artifacts), 1)
 
         art = result.artifacts[0]
-        self.assertEqual(art.run_id, "run-42-test")
+        self.assertEqual(art.run_id, provenance_run_id)
         self.assertEqual(art.provenance_source, sys.executable)
         self.assertIn("text/plain", art.media_type)
         self.assertTrue(art.created_at)
@@ -483,10 +543,12 @@ class TestExecutionPlane(unittest.TestCase):
         )
         result = coordinator.execute(
             req,
-            run_id="run-blocked",
+            workspace_root=self.source_root,
+            run_id=self.run_id,
             allowed_commands=frozenset([sys.executable]),
             approval_policy=approval_policy,
             approval_resolver=resolver,
+            run_scope=self.scope,
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(len(captured_scratch), 0)  # Zero scratch workspace created!
@@ -595,8 +657,10 @@ class TestExecutionPlane(unittest.TestCase):
         )
         result = coordinator.execute(
             req,
-            run_id="run-perm",
+            workspace_root=self.source_root,
+            run_id=self.run_id,
             allowed_commands=frozenset([sys.executable]),
+            run_scope=self.scope,
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
 
@@ -612,10 +676,12 @@ class TestExecutionPlane(unittest.TestCase):
         )
         result = coordinator.execute(
             req,
-            run_id="run-appr-rej",
+            workspace_root=self.source_root,
+            run_id=self.run_id,
             allowed_commands=frozenset([sys.executable]),
             approval_policy=approval_policy,
             approval_resolver=resolver,
+            run_scope=self.scope,
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_REJECTED)
 
@@ -678,9 +744,12 @@ class TestExecutionPlane(unittest.TestCase):
 
     # X. Git forbidden flag --git-dir is rejected
     def test_git_forbidden_flag_git_dir(self) -> None:
+        coord = ExecutionCoordinator(adapter=self.adapter, policy=self.policy)
         git_profile = ProjectExecutionProfile(
             profile_id="git-profile",
-            allowed_commands=("git",),
+            allowed_commands=self.git_commands,
+            timeout_seconds=self.scope.execution_profile.timeout_seconds,
+            max_output_bytes=self.scope.execution_profile.max_output_bytes,
         )
         for cmd in (
             ("git", "--git-dir=/primary/repo/.git", "status"),
@@ -691,15 +760,24 @@ class TestExecutionPlane(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertEqual(decision.reason, "forbidden_flag:--git-dir")
 
-            res = self.adapter.execute(req)
+            res = coord.execute(
+                req,
+                workspace_root=self.source_root,
+                run_id=self.run_id,
+                allowed_commands=self.git_commands,
+                run_scope=self.scope,
+            )
             self.assertEqual(res.status, ExecutionStatus.DENIED)
             self.assertIn("forbidden_flag:--git-dir", res.stderr)
 
     # Y. Git forbidden flag --work-tree is rejected
     def test_git_forbidden_flag_work_tree(self) -> None:
+        coord = ExecutionCoordinator(adapter=self.adapter, policy=self.policy)
         git_profile = ProjectExecutionProfile(
             profile_id="git-profile",
-            allowed_commands=("git",),
+            allowed_commands=self.git_commands,
+            timeout_seconds=self.scope.execution_profile.timeout_seconds,
+            max_output_bytes=self.scope.execution_profile.max_output_bytes,
         )
         for cmd in (
             ("git", "--work-tree=/primary/repo", "status"),
@@ -710,7 +788,13 @@ class TestExecutionPlane(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertEqual(decision.reason, "forbidden_flag:--work-tree")
 
-            res = self.adapter.execute(req)
+            res = coord.execute(
+                req,
+                workspace_root=self.source_root,
+                run_id=self.run_id,
+                allowed_commands=self.git_commands,
+                run_scope=self.scope,
+            )
             self.assertEqual(res.status, ExecutionStatus.DENIED)
             self.assertIn("forbidden_flag:--work-tree", res.stderr)
 
@@ -718,7 +802,9 @@ class TestExecutionPlane(unittest.TestCase):
     def test_git_allowed_command_without_forbidden_flags(self) -> None:
         git_profile = ProjectExecutionProfile(
             profile_id="git-profile",
-            allowed_commands=("git",),
+            allowed_commands=self.git_commands,
+            timeout_seconds=self.scope.execution_profile.timeout_seconds,
+            max_output_bytes=self.scope.execution_profile.max_output_bytes,
         )
         req = ExecutionRequest(
             command=("git", "status"),

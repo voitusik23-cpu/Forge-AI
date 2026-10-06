@@ -1,6 +1,8 @@
 """Focused Block 1 tests for fail-closed, unified execution authorization."""
 
+import pathlib
 import sys
+import tempfile
 import unittest
 
 from app.execution.authorizer import ExecutionCoordinator
@@ -8,7 +10,15 @@ from app.execution.identity import CommandIdentity, command_identity
 from app.execution.policy import ExecutionPolicy
 from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import ExecutionOutcomeStatus, ExecutionRequest
+from app.runtime.run_scope import RunScope
+from app.tools.acceptance import AcceptanceCriterion
 from app.tools.approval import ApprovalPolicy, ApprovalState
+from app.tools.workspace import Workspace
+
+
+_PLACEHOLDER_CRITERION = AcceptanceCriterion(
+    criterion_id="hardening-placeholder", description="run declares no acceptance work"
+)
 
 
 class _Backend:
@@ -43,6 +53,62 @@ class _Resolver:
 
 
 class ExecutionAuthorizationHardeningTests(unittest.TestCase):
+    def setUp(self):
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
+
+    def tearDown(self):
+        RunScope.release_all()
+
+    def _scope_for(self, run_id, commands, profile=None, request=None, extra_commands=()):
+        """Freeze this Run's single scope.
+
+        The run identity comes from the test. The perimeter covers the commands
+        this Run declares plus, when a request is supplied, the request's own
+        profile and command: those must be inside the perimeter so the
+        authorization chain - not the scope - produces the denial under test.
+        """
+        entries = list(commands)
+        entries.extend(extra_commands)
+        if request is not None:
+            request_profile = getattr(request, "profile", None)
+            if request_profile is not None:
+                profile = profile or request_profile
+                entries.extend(request_profile.allowed_commands)
+            command = getattr(request, "command", ()) or ()
+            if command:
+                # The attempted invocation must be a real perimeter entry, so the
+                # authorization chain - not the scope - produces the denial. An
+                # executable the identity contract rejects (for example a relative
+                # path) has no representable entry: the perimeter then denies the
+                # request fail-closed, which is the intended v0.2 behaviour.
+                try:
+                    entries.append(CommandIdentity(command[0], tuple(command[1:])))
+                except ValueError:
+                    pass
+        profile = profile or self.profile(tuple(commands))
+        # Scope entries are executables or pinned identities; raw command tuples
+        # are not entries and are dropped. Identities stay pinned in the profile.
+        unique = []
+        for entry in entries:
+            if isinstance(entry, (tuple, list)):
+                continue
+            if isinstance(entry, str):
+                if entry.strip() and entry not in unique:
+                    unique.append(entry)
+            elif isinstance(getattr(entry, "executable", None), str):
+                if entry not in unique:
+                    unique.append(entry)
+        scope = RunScope(
+            run_id=run_id,
+            workspace=Workspace(pathlib.Path(tempfile.gettempdir())),
+            execution_profile=profile,
+            allowed_execution_commands=frozenset(unique),
+            acceptance_criteria=(_PLACEHOLDER_CRITERION,),
+        )
+        scope.freeze()
+        return scope
+
     def profile(self, allowed):
         return ProjectExecutionProfile("hardening", allowed_commands=allowed)
 
@@ -83,7 +149,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             req,
             allowed_commands=frozenset({sys.executable}),
             approval_policy=policy,
-        )
+            run_id="test_approval_requires_resolver_and_carries_intent_fingerprint-run1",
+            run_scope=self._scope_for("test_approval_requires_resolver_and_carries_intent_fingerprint-run1", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(waiting.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
         resolver = _Resolver()
@@ -92,7 +159,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             approval_policy=policy,
             approval_resolver=resolver,
-        )
+            run_id="test_approval_requires_resolver_and_carries_intent_fingerprint-run2",
+            run_scope=self._scope_for("test_approval_requires_resolver_and_carries_intent_fingerprint-run2", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(approved.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(len(resolver.requests), 1)
         self.assertEqual(len(resolver.requests[0].intent_fingerprint), 64)
@@ -102,13 +170,24 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             (sys.executable,), profile=self.profile((sys.executable,)), approval_required=True
         )
         result = ExecutionCoordinator(adapter=_Backend()).execute(
-            req, allowed_commands=frozenset({sys.executable})
-        )
+            req, allowed_commands=frozenset({sys.executable}),
+            run_id="test_missing_required_approval_policy_is_denied-run1",
+            run_scope=self._scope_for("test_missing_required_approval_policy_is_denied-run1", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
     def test_approval_intent_changes_when_argv_changes(self):
         policy = ApprovalPolicy(approval_required_tools=(sys.executable,))
         resolver = _Resolver()
+        # One Run models both attempted invocations, so its single perimeter is
+        # declared once and reused for each iteration.
+        argv_scope = self._scope_for(
+            "test_approval_intent_changes_when_argv_changes-run1",
+            (sys.executable,),
+            request=self.request((sys.executable, "--version"), (sys.executable,)),
+            extra_commands=(
+                CommandIdentity(sys.executable, ("--help",)),
+            ),
+        )
         for argv in (("--version",), ("--help",)):
             req = self.request((sys.executable, *argv), (sys.executable,))
             ExecutionCoordinator(adapter=_Backend()).execute(
@@ -116,6 +195,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                 allowed_commands=frozenset({sys.executable}),
                 approval_policy=policy,
                 approval_resolver=resolver,
+                run_id="test_approval_intent_changes_when_argv_changes-run1",
+                run_scope=argv_scope,
             )
     def test_in_memory_resolver_exact_approved_intent_allows(self):
         from app.tools.approval import InMemoryApprovalResolver
@@ -135,7 +216,7 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             approval_policy=policy,
             approval_resolver=resolver,
-        )
+            run_scope=self._scope_for("run-1", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
 
     def test_in_memory_resolver_modified_argv_is_waiting_denied(self):
@@ -162,7 +243,7 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             approval_policy=policy,
             approval_resolver=resolver,
-        )
+            run_scope=self._scope_for("run-1", tuple(req_modified.profile.allowed_commands), request=req_modified),)
         self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
     def test_in_memory_resolver_modified_executable_is_waiting_denied(self):
@@ -189,7 +270,7 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable, "python"}),
             approval_policy=policy,
             approval_resolver=resolver,
-        )
+            run_scope=self._scope_for("run-1", tuple(req_modified.profile.allowed_commands), request=req_modified),)
         self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
     def test_absolute_interpreter_path_dangerous_argv_without_exact_authorization_denied(self):
@@ -224,7 +305,10 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             approval_policy=policy,
             approval_resolver=resolver,
             initial_project_state=ProjectState(run_id="run-h-1", attempt_number=0, status=ProjectStateStatus.INITIAL),
-        )
+            run_scope=self._scope_for(
+                "run-h-1",
+                (sys.executable,),
+            ),)
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=1), execution_coordinator=coord)
         res = harness.run(h_req)
 
@@ -251,7 +335,10 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             approval_policy=policy,
             approval_resolver=resolver,
             initial_project_state=ProjectState(run_id="run-h-2", attempt_number=0, status=ProjectStateStatus.INITIAL),
-        )
+            run_scope=self._scope_for(
+                "run-h-2",
+                (sys.executable,),
+            ),)
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=1), execution_coordinator=coord)
         res = harness.run(h_req)
 
@@ -279,7 +366,10 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             approval_policy=policy,
             approval_resolver=resolver,
             initial_project_state=ProjectState(run_id="run-h-3", attempt_number=0, status=ProjectStateStatus.INITIAL),
-        )
+            run_scope=self._scope_for(
+                "run-h-3",
+                (sys.executable,),
+            ),)
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=1), execution_coordinator=coord)
         res = harness.run(h_req)
 
@@ -347,8 +437,16 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         backend = _Backend()
         coord = ExecutionCoordinator(adapter=backend)
         req_rel = ExecutionRequest(("./x",), profile=ProjectExecutionProfile("p", allowed_commands=(sys.executable,)))
-        res = coord.execute(req_rel, allowed_commands=frozenset([sys.executable]))
-        self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
+        res = coord.execute(req_rel, allowed_commands=frozenset([sys.executable]),
+            run_id="test_relative_executable_paths_rejected-run1",
+            run_scope=self._scope_for("test_relative_executable_paths_rejected-run1", tuple(req_rel.profile.allowed_commands), request=req_rel),)
+        # RunScope v0.2: an executable the identity contract cannot represent has
+        # no perimeter entry, so the frozen scope denies the request fail-closed
+        # before the permission layer is consulted. The security requirement is
+        # unchanged: the relative executable is still rejected, and the backend is
+        # still never reached.
+        self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
+        self.assertEqual(res.metadata.get("denial_reason"), "run_scope_violation")
         self.assertEqual(backend.call_count, 0)
 
     def test_approval_required_true_fail_closed_regression(self):
@@ -362,19 +460,25 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
 
         # Case A: approval_policy is empty and does not list the tool, resolver is None
         empty_policy = ApprovalPolicy(approval_required_tools=())
-        res_a = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=empty_policy, approval_resolver=None)
+        res_a = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=empty_policy, approval_resolver=None,
+            run_id="test_approval_required_true_fail_closed_regression-run1",
+            run_scope=self._scope_for("test_approval_required_true_fail_closed_regression-run1", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(res_a.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
         # Case B: approval_policy is None, resolver is None
-        res_b = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=None, approval_resolver=None)
+        res_b = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=None, approval_resolver=None,
+            run_id="test_approval_required_true_fail_closed_regression-run2",
+            run_scope=self._scope_for("test_approval_required_true_fail_closed_regression-run2", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(res_b.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
         # Case C: resolver is present but has no approval for this intent
         from app.tools.approval import InMemoryApprovalResolver
         resolver = InMemoryApprovalResolver()
-        res_c = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=empty_policy, approval_resolver=resolver)
+        res_c = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=empty_policy, approval_resolver=resolver,
+            run_id="test_approval_required_true_fail_closed_regression-run3",
+            run_scope=self._scope_for("test_approval_required_true_fail_closed_regression-run3", tuple(req.profile.allowed_commands), request=req),)
         self.assertEqual(res_c.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
@@ -415,7 +519,7 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             allowed_commands=frozenset([cmd_a, cmd_b]),
             approval_policy=ApprovalPolicy(approval_required_tools=(cmd_b,)),
             approval_resolver=resolver,
-        )
+            run_scope=self._scope_for("run-1", tuple(req_b.profile.allowed_commands), request=req_b),)
         self.assertEqual(res.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
@@ -448,6 +552,12 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         spy_resolver = _CountingResolver(inner)
 
         policy = ApprovalPolicy(approval_required_tools=(sys.executable,))
+        # One logical Run: one immutable scope, reused by both executions.
+        single_use_scope = self._scope_for(
+            "run-single-use",
+            (sys.executable,),
+            request=req,
+        )
         h_req = HarnessRequest(
             run_id="run-single-use",
             execution_requests=(req,),
@@ -455,7 +565,7 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             approval_policy=policy,
             approval_resolver=spy_resolver,
             initial_project_state=ProjectState(run_id="run-single-use", attempt_number=0, status=ProjectStateStatus.INITIAL),
-        )
+            run_scope=single_use_scope,)
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=1), execution_coordinator=coord)
         res1 = harness.run(h_req)
 
@@ -464,7 +574,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         self.assertEqual(backend.call_count, 1)
 
         # Invariant 2: Approval was consumed once. Second execution with same resolver cannot reuse it
-        res2 = coord.execute(req, run_id="run-single-use", allowed_commands=frozenset([sys.executable]), approval_policy=policy, approval_resolver=spy_resolver)
+        res2 = coord.execute(req, run_id="run-single-use", allowed_commands=frozenset([sys.executable]), approval_policy=policy, approval_resolver=spy_resolver,
+            run_scope=single_use_scope,)
         self.assertEqual(spy_resolver.call_count, 2)
         self.assertEqual(res2.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 1)
@@ -488,7 +599,10 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             approval_policy=ApprovalPolicy(approval_required_tools=(cmd_b,)),
             approval_resolver=spy_resolver3,
             initial_project_state=ProjectState(run_id="run-h-mod", attempt_number=0, status=ProjectStateStatus.INITIAL),
-        )
+            run_scope=self._scope_for(
+                "run-h-mod",
+                (cmd_a, cmd_b,),
+            ),)
         harness3 = AgentHarness(policy=AgentHarnessPolicy(max_actions=1), execution_coordinator=coord3)
         res_mod = harness3.run(h_req3)
         self.assertEqual(res_mod.final_state.status, HarnessStatus.WAITING_FOR_APPROVAL)
@@ -549,7 +663,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                 req_c = ExecutionRequest((sys.executable, "--version"), profile=ProjectExecutionProfile("p", allowed_commands=(sys.executable,)), approval_required=app_req)
                 if resolver is not None and fp_mod is not None:
                     resolver.submit("run-fc", req_c.request_id, ApprovalState.APPROVED, intent_fingerprint="other_fp")
-                res_c = coord.execute(req_c, run_id="run-fc", allowed_commands=frozenset([sys.executable]), approval_policy=policy, approval_resolver=resolver)
+                res_c = coord.execute(req_c, run_id="run-fc", allowed_commands=frozenset([sys.executable]), approval_policy=policy, approval_resolver=resolver,
+            run_scope=self._scope_for("run-fc", tuple(req_c.profile.allowed_commands), request=req_c),)
                 self.assertEqual(res_c.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
                 self.assertEqual(backend_c.call_count, 0)
 
@@ -567,7 +682,10 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                     approval_policy=policy,
                     approval_resolver=res_res_h,
                     initial_project_state=ProjectState(run_id="run-h-fc", attempt_number=0, status=ProjectStateStatus.INITIAL),
-                )
+            run_scope=self._scope_for(
+                "run-h-fc",
+                (sys.executable,),
+            ),)
                 res_h = harness.run(h_req)
                 self.assertEqual(res_h.final_state.status, HarnessStatus.WAITING_FOR_APPROVAL)
                 self.assertEqual(backend_h.call_count, 0)
@@ -592,6 +710,11 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                     approval_policy=policy,
                     approval_resolver=res_res_e,
                     workspace=ws,
+                    run_scope=self._scope_for(
+                        "run-e-fc",
+                        (sys.executable,),
+                        request=req_e,
+                    ),
                 )
                 res_e = eng_exec.execute(eng_req)
                 self.assertEqual(res_e.final_status, EngineeringRunStatus.WAITING_FOR_APPROVAL)
@@ -617,49 +740,63 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         # 1. allowed=("python",), python -cCODE => DENIED
         p1 = ProjectExecutionProfile("p1", allowed_commands=("python",))
         r1 = ExecutionRequest(("python", "-cprint(1)"), profile=p1)
-        res1 = coord.execute(r1, allowed_commands=("python",))
+        res1 = coord.execute(r1, allowed_commands=("python",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run1",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run1", tuple(r1.profile.allowed_commands), request=r1),)
         self.assertEqual(res1.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
         # 2. allowed=("python",), python -Ic CODE => DENIED
         p2 = ProjectExecutionProfile("p2", allowed_commands=("python",))
         r2 = ExecutionRequest(("python", "-Ic", "print(1)"), profile=p2)
-        res2 = coord.execute(r2, allowed_commands=("python",))
+        res2 = coord.execute(r2, allowed_commands=("python",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run2",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run2", tuple(r2.profile.allowed_commands), request=r2),)
         self.assertEqual(res2.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
         # 3. allowed=("python",), python -mtimeit => DENIED
         p3 = ProjectExecutionProfile("p3", allowed_commands=("python",))
         r3 = ExecutionRequest(("python", "-mtimeit"), profile=p3)
-        res3 = coord.execute(r3, allowed_commands=("python",))
+        res3 = coord.execute(r3, allowed_commands=("python",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run3",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run3", tuple(r3.profile.allowed_commands), request=r3),)
         self.assertEqual(res3.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
         # 4. allowed=("python",), python --eval=CODE => DENIED
         p4 = ProjectExecutionProfile("p4", allowed_commands=("python",))
         r4 = ExecutionRequest(("python", "--eval=print(1)"), profile=p4)
-        res4 = coord.execute(r4, allowed_commands=("python",))
+        res4 = coord.execute(r4, allowed_commands=("python",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run4",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run4", tuple(r4.profile.allowed_commands), request=r4),)
         self.assertEqual(res4.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
         # 5. allowed=("bash",), bash -c CODE => DENIED
         p5 = ProjectExecutionProfile("p5", allowed_commands=("bash",))
         r5 = ExecutionRequest(("bash", "-c", "echo 1"), profile=p5)
-        res5 = coord.execute(r5, allowed_commands=("bash",))
+        res5 = coord.execute(r5, allowed_commands=("bash",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run5",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run5", tuple(r5.profile.allowed_commands), request=r5),)
         self.assertEqual(res5.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
         # 6. allowed=("powershell",), powershell -Command CODE => DENIED
         p6 = ProjectExecutionProfile("p6", allowed_commands=("powershell",))
         r6 = ExecutionRequest(("powershell", "-Command", "Write-Output 1"), profile=p6)
-        res6 = coord.execute(r6, allowed_commands=("powershell",))
+        res6 = coord.execute(r6, allowed_commands=("powershell",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run6",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run6", tuple(r6.profile.allowed_commands), request=r6),)
         self.assertEqual(res6.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
         # 7. allowed=("cmd",), cmd /c CODE => DENIED
         p7 = ProjectExecutionProfile("p7", allowed_commands=("cmd",))
         r7 = ExecutionRequest(("cmd", "/c", "echo 1"), profile=p7)
-        res7 = coord.execute(r7, allowed_commands=("cmd",))
+        res7 = coord.execute(r7, allowed_commands=("cmd",),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run7",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run7", tuple(r7.profile.allowed_commands), request=r7),)
         self.assertEqual(res7.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(backend.call_count, 0)
 
@@ -667,13 +804,19 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         approved_cmd = CommandIdentity("python", ("-c", "print(1)"))
         p8 = ProjectExecutionProfile("p8", allowed_commands=(approved_cmd,))
         r8 = ExecutionRequest(("python", "-c", "print(1)"), profile=p8)
-        res8 = coord.execute(r8, allowed_commands=(approved_cmd,))
+        res8 = coord.execute(r8, allowed_commands=(approved_cmd,),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run8",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run8", tuple(r8.profile.allowed_commands), request=r8),)
         self.assertEqual(res8.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(backend.call_count, 1)
 
         # 9. Same exact executable + modified argv => DENIED
+        attempted_cmd = CommandIdentity("python", ("-c", "print(2)"))
+        p8 = ProjectExecutionProfile("p8", allowed_commands=(approved_cmd, attempted_cmd))
         r9 = ExecutionRequest(("python", "-c", "print(2)"), profile=p8)
-        res9 = coord.execute(r9, allowed_commands=(approved_cmd,))
+        res9 = coord.execute(r9, allowed_commands=(approved_cmd,),
+            run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run9",
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run9", tuple(r9.profile.allowed_commands), request=r9),)
         self.assertEqual(res9.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
         self.assertEqual(backend.call_count, 1)  # unchanged from case 8
 

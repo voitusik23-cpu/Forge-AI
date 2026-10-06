@@ -126,6 +126,10 @@ class HarnessRequest:
     available_skills: tuple[SkillDefinition, ...] = ()
     available_capabilities: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+    # Immutable security perimeter for this run. When present it binds the
+    # authority-relevant inputs and is validated before any context, memory,
+    # knowledge, or provider output is read.
+    run_scope: object | None = None
     # Optional immutable security perimeter for this run. When present it binds
     # the authority-relevant inputs and is validated before any context, memory,
     # knowledge, or provider output is read.

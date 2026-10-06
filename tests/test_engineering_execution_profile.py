@@ -10,6 +10,7 @@ from app.execution.profile import (
     ProjectExecutionProfile,
     TargetOS,
 )
+from app.runtime.run_scope import RunScope
 from app.tools.workspace import Workspace
 from app.orchestrator.engineering import (
     EngineeringRunExecutor,
@@ -42,6 +43,9 @@ class _StubAgent:
 
 class TestEngineeringExecutionProfile(unittest.TestCase):
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
+        self._run_seq = 0
         self.agent = _StubAgent()
         self.agent_registry = AgentRegistry()
         self.agent_registry.register(self.agent)
@@ -80,7 +84,27 @@ class TestEngineeringExecutionProfile(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.temp.cleanup()
+
+    def _scope_for(self, profile):
+        """Freeze this Run's single scope from an explicit execution profile.
+
+        The run identity is established here, before the scope exists, and the
+        scope carries no execution-command authority because these Runs exercise
+        the profile/revision path rather than the command path.
+        """
+        self._run_seq += 1
+        scope = RunScope(
+            run_id=f"eng-profile-run-{self._run_seq}",
+            workspace=self.workspace,
+            execution_profile=profile,
+            allowed_tool_ids=frozenset(),
+            allowed_execution_commands=frozenset(),
+            acceptance_criteria=(self.crit,),
+        )
+        scope.freeze()
+        return scope
 
     def test_task_specification_with_valid_execution_profile(self) -> None:
         spec = TaskSpecification(
@@ -129,6 +153,7 @@ class TestEngineeringExecutionProfile(unittest.TestCase):
             agent_name=self.agent.name,
             workspace=self.workspace,
             verification_expectations=self.expectations,
+            run_scope=self._scope_for(spec.execution_profile),
         )
         result = self.engineering_executor.execute(request)
         self.assertEqual(result.final_status, EngineeringRunStatus.SUCCESS)
@@ -148,6 +173,7 @@ class TestEngineeringExecutionProfile(unittest.TestCase):
             agent_name=self.agent.name,
             workspace=self.workspace,
             verification_expectations=self.expectations,
+            run_scope=self._scope_for(self.profile),
         )
         result = self.engineering_executor.execute(request)
         self.assertEqual(result.final_status, EngineeringRunStatus.SUCCESS)
@@ -169,6 +195,7 @@ class TestEngineeringExecutionProfile(unittest.TestCase):
         request = EngineeringRunRequest(
             task_specification=spec,
             execution_profile=profile_b,
+            run_scope=self._scope_for(self.profile),
         )
         with self.assertRaises(ValueError) as ctx:
             self.engineering_executor.execute(request)
@@ -181,6 +208,7 @@ class TestEngineeringExecutionProfile(unittest.TestCase):
             task=task,
             acceptance_criteria=(self.crit,),
             execution_profile=bad_profile,
+            run_scope=self._scope_for(self.profile),
         )
         with self.assertRaises(ValueError) as ctx:
             self.engineering_executor.execute(request)

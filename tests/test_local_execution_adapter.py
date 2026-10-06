@@ -19,10 +19,15 @@ from app.execution.request import (
     ExecutionResult,
     ExecutionStatus,
 )
+from app.runtime.run_scope import RunScope
+from app.tools.workspace import Workspace
+from run_scope_support import freeze_scope
 
 
 class TestLocalExecutionAdapter(unittest.TestCase):
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.workspace_root = Path(self.temp_dir.name)
         self.redactor = DefaultSecretRedactor(registered_secrets=["sensitive_token_999"])
@@ -58,18 +63,44 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             max_output_bytes=1048576,
         )
 
+        # A binary the policy is expected to reject. Declaring it as a capability
+        # of this Run is what lets the permission check, rather than the scope,
+        # decide. It is never executed.
+        self.allowed_only_bin = "allowed_only_bin"
+        scope_commands = tuple(self.profile.allowed_commands) + (self.allowed_only_bin,)
+        scope_profile = ProjectExecutionProfile(
+            profile_id=self.profile.profile_id,
+            environment_type=self.profile.environment_type,
+            runtime_name=self.profile.runtime_name,
+            allowed_commands=scope_commands,
+            timeout_seconds=self.profile.timeout_seconds,
+            max_output_bytes=self.profile.max_output_bytes,
+        )
+        # DECISION 1/2: the run identity is established here and the full perimeter
+        # is declared once, then frozen before any dispatch. A different perimeter
+        # would require a new run id, never a widened scope.
+        self.run_id = "local-adapter-run"
+        self.scope = freeze_scope(
+            self.run_id,
+            workspace=Workspace(self.workspace_root),
+            commands=scope_commands,
+            profile=scope_profile,
+        )
+
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def _execute(self, req: ExecutionRequest) -> ExecutionResult:
-        allowed = frozenset(
-            cmd.executable if hasattr(cmd, "executable") else str(cmd)
-            for cmd in (req.profile.allowed_commands if req.profile else ())
-        )
+        # The declared permission set keeps full command identities, so a pinned
+        # argv is not collapsed to a bare executable. It may only narrow the scope.
+        declared = tuple(req.profile.allowed_commands) if req.profile else ()
         return self.coordinator.execute(
             req,
             workspace_root=self.workspace_root,
-            allowed_commands=allowed,
+            run_id=self.run_id,
+            allowed_commands=declared,
+            run_scope=self.scope,
         )
 
     def test_direct_call_without_authorized_execution_rejected(self) -> None:
@@ -153,9 +184,15 @@ class TestLocalExecutionAdapter(unittest.TestCase):
         self.assertLessEqual(len(result.stdout.encode("utf-8")), 25)
 
     def test_policy_denial_prevents_process_execution(self) -> None:
+        # The profile stays inside the Run's declared envelope so that the
+        # *policy* is what denies the command, not the scope. The command itself
+        # is declared in the perimeter: the permission check, not the scope,
+        # decides whether it may run.
         restricted_profile = ProjectExecutionProfile(
             profile_id="restricted",
             allowed_commands=("allowed_only_bin",),
+            timeout_seconds=self.scope.execution_profile.timeout_seconds,
+            max_output_bytes=self.scope.execution_profile.max_output_bytes,
         )
         req = ExecutionRequest(
             command=(sys.executable, "-c", "print('should not run')"),
@@ -164,7 +201,9 @@ class TestLocalExecutionAdapter(unittest.TestCase):
         result = self.coordinator.execute(
             req,
             workspace_root=self.workspace_root,
-            allowed_commands=frozenset({sys.executable, "allowed_only_bin"}),
+            run_id=self.run_id,
+            allowed_commands=frozenset({sys.executable}),
+            run_scope=self.scope,
         )
         self.assertEqual(result.status, ExecutionStatus.DENIED)
         self.assertIsNone(result.exit_code)

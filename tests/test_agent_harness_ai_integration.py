@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import dataclasses
 import pathlib
 import shutil
 import sys
@@ -85,6 +86,8 @@ from app.tools.verification import (
     VerificationStatus,
     WorkspaceVerifier,
 )
+from app.runtime.run_scope import RunScope
+from app.tools.acceptance import AcceptanceCriterion
 from app.tools.workspace import Workspace
 
 
@@ -152,6 +155,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
     """Stage 14: End-to-end integration of AIDecisionProvider with AgentHarness."""
 
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.temp_dir = tempfile.mkdtemp(prefix="forge_stage14_test_")
         self.workspace_root = pathlib.Path(self.temp_dir)
         self.workspace = Workspace(root=self.workspace_root)
@@ -169,7 +174,75 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         )
         return ExecutionRequest(command=command, profile=profile), cid
 
+    def _scope_request(self, request):
+        """Freeze this Run's single scope and bind the request to it.
+
+        The run identity comes from the test. The perimeter covers what the
+        request declares plus the command identities its execution profiles pin,
+        so the request can only be an equal or narrower declaration of it. A run
+        that declares no dispatch authority needs no perimeter.
+        """
+        if not (
+            getattr(request, "execution_requests", ())
+            or getattr(request, "allowed_execution_commands", None)
+        ):
+            return request
+        entries: list = [sys.executable, "python", "python.exe"]
+        base = self.profile
+        for exec_req in getattr(request, "execution_requests", ()):
+            profile = getattr(exec_req, "profile", None)
+            if profile is None:
+                continue
+            base = profile
+            entries.extend(profile.allowed_commands)
+        entries.extend(getattr(request, "allowed_execution_commands", ()) or ())
+        unique: list = []
+        for entry in entries:
+            if entry not in unique:
+                unique.append(entry)
+        scope_profile = ProjectExecutionProfile(
+            profile_id=base.profile_id,
+            environment_type=base.environment_type,
+            runtime_name=base.runtime_name,
+            runtime_version=base.runtime_version,
+            target_os=base.target_os,
+            working_directory=base.working_directory,
+            environment_variables=dict(base.environment_variables),
+            timeout_seconds=base.timeout_seconds,
+            max_output_bytes=base.max_output_bytes,
+            network_access=base.network_access,
+            capabilities=base.capabilities,
+            allowed_commands=tuple(unique),
+        )
+        criteria = tuple(getattr(request, "acceptance_criteria", ()) or ()) or (
+            AcceptanceCriterion(
+                criterion_id="stage14-placeholder",
+                description="run declares no acceptance criteria",
+            ),
+        )
+        scope = RunScope(
+            run_id=request.run_id,
+            workspace=self.workspace,
+            execution_profile=scope_profile,
+            allowed_tool_ids=frozenset(getattr(request, "allowed_tool_ids", ()) or ()),
+            allowed_execution_commands=frozenset(
+                getattr(request, "allowed_execution_commands", ()) or ()
+            ),
+            acceptance_criteria=criteria,
+        )
+        scope.freeze()
+        return HarnessRequest(
+            **{
+                **{
+                    field.name: getattr(request, field.name)
+                    for field in dataclasses.fields(request)
+                },
+                "run_scope": scope,
+            }
+        )
+
     def tearDown(self) -> None:
+        RunScope.release_all()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # =========================================================================
@@ -199,7 +272,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             f"import pathlib; pathlib.Path(r'{exec_file}').write_text('scenario_a')",
         )
         exec_req, cid = self._make_exec_request(cmd)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-a",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -207,6 +281,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-a", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -252,7 +327,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             f"import pathlib; pathlib.Path(r'{exec_file}').write_text('scenario_b')",
         )
         exec_req, cid = self._make_exec_request(cmd)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-b",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -260,6 +336,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-b", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -299,7 +376,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-c",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -307,6 +385,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-c", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -340,7 +419,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingApprovalResolver(decision=ApprovalState.REQUIRED)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-d",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -350,6 +430,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-d", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -375,7 +456,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
 
         cmd = (sys.executable, "-c", "print('hello_stdout')")
         exec_req, cid = self._make_exec_request(cmd)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-e",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -383,6 +465,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-e", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -418,7 +501,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         crit = AcceptanceCriterion(
             criterion_id="crit-f", requirement_id="req-f", description="verified file exists"
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-f",
             workspace=self.workspace,
             verification_expectations={
@@ -429,6 +513,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-f", attempt_number=0, status=ProjectStateStatus.CHANGED
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -482,7 +567,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             f"import pathlib; pathlib.Path(r'{target_file}').write_text('artifact')",
         )
         exec_req, cid = self._make_exec_request(cmd)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-g",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -495,6 +581,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-g", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -535,12 +622,14 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         ai_provider = AIDecisionProvider(provider=scripted_model)
         harness = AgentHarness(decision_provider=ai_provider)
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-h",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-14-h", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -566,12 +655,14 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         ai_provider = AIDecisionProvider(provider=scripted_model)
         harness = AgentHarness(decision_provider=ai_provider)
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-i",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-14-i", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -589,12 +680,14 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
         ai_provider = AIDecisionProvider(provider=failing_provider)
         harness = AgentHarness(decision_provider=ai_provider)
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-j",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-14-j", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -625,12 +718,14 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             policy=AgentHarnessPolicy(max_iterations=4, max_actions=10, max_revision_attempts=10),
         )
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-k",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-14-k", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -655,10 +750,12 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             attempt_number=0,
             status=ProjectStateStatus.INITIAL,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-l",
             workspace=self.workspace,
             initial_project_state=foreign_state,
+        )
         )
 
         result = harness.run(h_req)
@@ -686,7 +783,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             profile=self.profile,
             metadata={"api_key": secret_key, "password": "pass"},
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-m",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -695,6 +793,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
                 run_id="run-14-m", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
             metadata={"secret_token": secret_key},
+        )
         )
 
         result = harness.run(h_req)
@@ -737,7 +836,8 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             f"import pathlib; pathlib.Path(r'{target_file}').write_text('deterministic')",
         )
         exec_req, cid = self._make_exec_request(cmd)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-14-o",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -745,6 +845,7 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-14-o", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)

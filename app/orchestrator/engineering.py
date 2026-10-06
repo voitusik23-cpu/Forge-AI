@@ -13,6 +13,7 @@ from app.context import (
     DecisionContextEnvelope,
 )
 from app.orchestrator.models import Event, EventType, Run, RunState, Task
+from app.runtime.run_scope import RunScope, RunScopeError, require_active_scope
 from app.orchestrator.revision import (
     RevisionAttemptResult,
     RevisionLoopExecutor,
@@ -82,6 +83,8 @@ class EngineeringRunRequest:
     approval_resolver: ApprovalResolver | None = None
     decision_provider: DecisionProvider | None = None
     context_assembler: DecisionContextAssembler | None = None
+    # Immutable security perimeter for this run.
+    run_scope: object | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.execution_requests, list):
@@ -149,6 +152,38 @@ class EngineeringRunExecutor:
         self._context_assembler = context_assembler or DecisionContextAssembler()
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
+        # DECISION 1: the run identity is established before the scope is used and
+        # is never taken from the scope. DECISION 2: the scope is frozen once and
+        # only narrowed downstream.
+        scope = getattr(request, "run_scope", None)
+        if scope is None:
+            # NO DISPATCH AUTHORITY -> NO RUNSCOPE REQUIRED. A run that declares
+            # no dispatch authority cannot reach the command or tool paths, so it
+            # needs no perimeter. No scope is created, substituted, or inferred.
+            #
+            # Note: EngineeringRunRequest carries no run identity, so there is no
+            # key here for the "frozen scope exists but was not provided" check
+            # that the Agent Harness entry point performs; that check applies
+            # wherever a run id is available.
+            declares_dispatch_authority = bool(
+                getattr(request, "execution_requests", ())
+                or getattr(request, "allowed_execution_commands", None)
+                or getattr(request, "allowed_tool_ids", ())
+            )
+            if declares_dispatch_authority:
+                raise RunScopeError(
+                    "engineering run declares dispatch authority and requires an "
+                    "explicit RunScope before it may dispatch"
+                )
+            scope_run_id = ""
+        else:
+            # A supplied scope is still validated exactly as before: type-checked,
+            # frozen, and bound to the run identity it carries.
+            if not isinstance(scope, RunScope):
+                raise RunScopeError("run_scope must be a RunScope")
+            scope_run_id = scope.run_id
+            require_active_scope(scope_run_id, scope)
+
         task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
         revision_result = self._revision_executor.execute(
             task,
@@ -162,6 +197,8 @@ class EngineeringRunExecutor:
             criteria=criteria,
             requirements=requirements,
             max_revision_attempts=request.max_revision_attempts,
+            run_id=scope_run_id,
+            run_scope=scope,
         )
         run = revision_result.run
 
@@ -190,6 +227,7 @@ class EngineeringRunExecutor:
                     allowed_commands=allowed_cmds,
                     approval_policy=request.approval_policy,
                     approval_resolver=request.approval_resolver,
+                    run_scope=scope,
                     observer=lambda event_type, data: run.events.append(
                         Event(run_id=run.id, type=event_type, data=data)
                     ),

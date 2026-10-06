@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import dataclasses
 import sys
 import tempfile
 import unittest
@@ -49,6 +50,7 @@ from app.tasks.specification import AcceptanceCriterion, Requirement, TaskSpecif
 from app.tools.approval import ApprovalPolicy, ApprovalRequest, ApprovalState, InMemoryApprovalResolver
 from app.tools.permissions import PermissionDecision, PermissionPolicy
 from app.tools.verification import VerificationExpectation
+from app.runtime.run_scope import RunScope
 from app.tools.workspace import Workspace
 
 
@@ -87,6 +89,8 @@ class TestMultiSkillHarness(unittest.TestCase):
     """Stage 16B: Verification of Multi-Skill Agent Runs."""
 
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.workspace_path = Path(self.temp_dir.name).resolve()
         self.workspace = Workspace(root=self.workspace_path)
@@ -96,7 +100,69 @@ class TestMultiSkillHarness(unittest.TestCase):
         )
         self.evaluator = SkillEvaluator()
 
+    def _scope_request(self, request):
+        """Freeze this Run's single scope and bind the request to it.
+
+        The run identity comes from the test. The perimeter covers what the
+        request declares plus the command identities its execution profiles pin,
+        so the request can only be an equal or narrower declaration of it.
+        """
+        entries: list = [sys.executable, "python", "python.exe"]
+        base = self.profile
+        for exec_req in getattr(request, "execution_requests", ()):
+            profile = getattr(exec_req, "profile", None)
+            if profile is None:
+                continue
+            base = profile
+            entries.extend(profile.allowed_commands)
+        entries.extend(getattr(request, "allowed_execution_commands", ()) or ())
+        unique: list = []
+        for entry in entries:
+            if entry not in unique:
+                unique.append(entry)
+        scope_profile = ProjectExecutionProfile(
+            profile_id=base.profile_id,
+            environment_type=base.environment_type,
+            runtime_name=base.runtime_name,
+            runtime_version=base.runtime_version,
+            target_os=base.target_os,
+            working_directory=base.working_directory,
+            environment_variables=dict(base.environment_variables),
+            timeout_seconds=base.timeout_seconds,
+            max_output_bytes=base.max_output_bytes,
+            network_access=base.network_access,
+            capabilities=base.capabilities,
+            allowed_commands=tuple(unique),
+        )
+        criteria = tuple(getattr(request, "acceptance_criteria", ()) or ()) or (
+            AcceptanceCriterion(
+                criterion_id="multi-skill-placeholder",
+                description="run declares no acceptance criteria",
+            ),
+        )
+        scope = RunScope(
+            run_id=request.run_id,
+            workspace=self.workspace,
+            execution_profile=scope_profile,
+            allowed_tool_ids=frozenset(getattr(request, "allowed_tool_ids", ()) or ()),
+            allowed_execution_commands=frozenset(
+                getattr(request, "allowed_execution_commands", ()) or ()
+            ),
+            acceptance_criteria=criteria,
+        )
+        scope.freeze()
+        return HarnessRequest(
+            **{
+                **{
+                    field.name: getattr(request, field.name)
+                    for field in dataclasses.fields(request)
+                },
+                "run_scope": scope,
+            }
+        )
+
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     # =========================================================================
@@ -331,7 +397,8 @@ class TestMultiSkillHarness(unittest.TestCase):
             exists=True,
         )
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-ms3",
             workspace=self.workspace,
             available_skills=(skill_a, skill_b),
@@ -344,6 +411,7 @@ class TestMultiSkillHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-ms3", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -424,7 +492,8 @@ class TestMultiSkillHarness(unittest.TestCase):
             command=(sys.executable, str(test_file)),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-ms4",
             workspace=self.workspace,
             available_skills=(skill_fast, skill_thorough),
@@ -434,6 +503,7 @@ class TestMultiSkillHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-ms4", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -484,7 +554,8 @@ class TestMultiSkillHarness(unittest.TestCase):
             command=("custom_native_tool", "--all"),
             profile=ProjectExecutionProfile("p", allowed_commands=()),
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-ms5",
             workspace=self.workspace,
             available_skills=(skill_1, skill_2),
@@ -494,6 +565,7 @@ class TestMultiSkillHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-ms5", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)
@@ -541,7 +613,8 @@ class TestMultiSkillHarness(unittest.TestCase):
         approval_policy = ApprovalPolicy(approval_required_tools=(sys.executable,))
         approval_resolver = InMemoryApprovalResolver()  # Empty: unapproved
 
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-ms6",
             workspace=self.workspace,
             available_skills=(skill_1, skill_2),
@@ -553,6 +626,7 @@ class TestMultiSkillHarness(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-ms6", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         result = harness.run(h_req)

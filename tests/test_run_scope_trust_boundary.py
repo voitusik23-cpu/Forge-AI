@@ -241,12 +241,13 @@ class AuthorityExpansionIsRejectedTests(ScopeTestCase):
         network_on = ProjectExecutionProfile(
             "scope-profile", allowed_commands=("python", "pytest"), network_access=True
         )
-        with self.assertRaisesRegex(RunScopeError, "execution profile"):
+        # The directional rule reports the specific widening it detected.
+        with self.assertRaisesRegex(RunScopeError, "network access"):
             self.scope.validate_execution_profile(network_on)
         longer = ProjectExecutionProfile(
             "scope-profile", allowed_commands=("python", "pytest"), timeout_seconds=99999.0
         )
-        with self.assertRaisesRegex(RunScopeError, "execution profile"):
+        with self.assertRaisesRegex(RunScopeError, "timeout"):
             self.scope.validate_execution_profile(longer)
 
     def test_acceptance_criteria_cannot_be_changed(self) -> None:
@@ -484,20 +485,25 @@ class LegitimateFlowsStillWorkTests(ScopeTestCase):
         self.assertEqual(scope_for_run("run-scope-1"), fingerprint)
         self.assertEqual(fingerprint, self.scope.fingerprint)
 
-    def test_run_without_a_scope_is_unchanged(self) -> None:
-        """Backward compatibility: an ordinary run needs no scope."""
+    def test_run_declaring_authority_without_a_scope_fails_closed(self) -> None:
+        """A run that declares dispatch authority requires an explicit RunScope."""
+        harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=1))
+        with self.assertRaisesRegex(RunScopeError, "declares dispatch authority"):
+            harness.run(
+                HarnessRequest(
+                    run_id="run-without-scope",
+                    workspace=self.workspace,
+                    allowed_execution_commands=("python",),
+                )
+            )
+
+    def test_run_without_authority_needs_no_scope(self) -> None:
+        """A run that declares no dispatch authority cannot dispatch, so it runs."""
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=1))
         result = harness.run(
-            HarnessRequest(
-                run_id="run-without-scope",
-                workspace=self.workspace,
-                allowed_execution_commands=("python",),
-            )
+            HarnessRequest(run_id="run-no-authority", workspace=self.workspace)
         )
-        self.assertIn(
-            result.final_state.status,
-            {HarnessStatus.LIMIT_REACHED, HarnessStatus.COMPLETED, HarnessStatus.FAILED},
-        )
+        self.assertEqual(tuple(result.execution_results), ())
 
     def test_freeze_then_repeat_identical_scope_is_idempotent(self) -> None:
         freeze_run_scope(self.scope)

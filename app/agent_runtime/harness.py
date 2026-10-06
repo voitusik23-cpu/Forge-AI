@@ -24,7 +24,7 @@ from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
 from app.execution.identity import command_is_allowed
 from app.execution.request import ExecutionOutcomeStatus, ExecutionResult
-from app.runtime.run_scope import RunScope, RunScopeError
+from app.runtime.run_scope import RunScope, RunScopeError, require_active_scope
 from app.orchestrator.models import EventType
 from app.orchestrator.trace import RunEvent, RunEventCollector, RunTrace
 from app.projects.state import ProjectState, ProjectStateStatus, derive_project_state
@@ -87,10 +87,18 @@ class AgentHarness:
         """
         scope = getattr(request, "run_scope", None)
         if scope is None:
-            # A frozen scope must not be silently abandoned once one exists.
-            if RunScope.frozen_fingerprint(request.run_id) is not None:
+            # A frozen scope must not be silently abandoned, and a run that
+            # declares dispatch authority must carry an explicit scope.
+            if RunScope.frozen_scope(request.run_id) is not None:
                 raise RunScopeError(
                     f"run '{request.run_id}' has a frozen scope and cannot run without it"
+                )
+            if getattr(request, "execution_requests", ()) or getattr(
+                request, "allowed_execution_commands", None
+            ):
+                raise RunScopeError(
+                    f"run '{request.run_id}' declares dispatch authority and requires "
+                    "an explicit RunScope before it may dispatch"
                 )
             return
         if not isinstance(scope, RunScope):
@@ -101,9 +109,10 @@ class AgentHarness:
         scope.validate_workspace(request.workspace)
         scope.validate_command_set(request.allowed_execution_commands)
         scope.validate_acceptance_criteria(request.acceptance_criteria)
+        scope.validate_tool_set(getattr(request, "allowed_tool_ids", None))
 
         scope.freeze()
-        scope.assert_current()
+        require_active_scope(request.run_id, scope)
 
     def run(self, request: HarnessRequest) -> HarnessResult:
         """Execute the controlled, bounded Run Loop according to configured policy."""
@@ -546,6 +555,7 @@ class AgentHarness:
                         allowed_commands=allowed_cmds,
                         approval_policy=request.approval_policy,
                         approval_resolver=request.approval_resolver,
+                        run_scope=request.run_scope,
                         observer=lambda event_type, data: emit(event_type, data),
                     )
                     latest_exec_id = exec_res.request_id

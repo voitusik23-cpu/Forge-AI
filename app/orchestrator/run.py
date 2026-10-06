@@ -51,11 +51,13 @@ class RunExecutor:
         explicit_inputs: Iterable[str | ContextItem] = (),
         allowed_tool_ids: Iterable[str] = (),
         workspace: Optional[Workspace] = None,
+        run_id: str = "",
+        run_scope: object | None = None,
         _run: Run | None = None,
         _attempt_number: int = 0,
     ) -> Run:
         """Execute through Orchestrator and retain a safe in-memory event trace."""
-        run = _run or Run(task=task)
+        run = _run or Run(task=task, **({"id": run_id} if run_id else {}))
         started = time.perf_counter()
         self._record(run, EventType.RUN_STARTED, task_id=getattr(task, "id", None))
         run.state = RunState.RUNNING if _attempt_number == 0 else RunState.REVISING
@@ -81,6 +83,7 @@ class RunExecutor:
                     allowed_tool_ids=frozenset(allowed_tool_ids),
                     attempt_number=_attempt_number,
                     workspace=workspace,
+                    run_scope=run_scope,
                 )
                 initial_invocations = list(result.tool_invocations)
                 tool_results = [
@@ -120,6 +123,7 @@ class RunExecutor:
                     round_number=1,
                     attempt_number=_attempt_number,
                     workspace=workspace,
+                    run_scope=run_scope,
                 )
                 tool_results.extend(
                     self._tool_executor.execute(

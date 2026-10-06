@@ -13,6 +13,7 @@ Covers:
 import dataclasses
 import os
 import sys
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +37,9 @@ from app.execution.paths import (
 )
 from app.execution.policy import ExecutionPolicy
 from app.execution.profile import ProjectExecutionProfile
+from app.runtime.run_scope import RunScope
+from app.tools.acceptance import AcceptanceCriterion
+from app.tools.workspace import Workspace
 from app.execution.request import (
     ExecutionOutcomeStatus,
     ExecutionRequest,
@@ -70,6 +74,58 @@ class _MockBackend:
         )
 
 
+
+def _scope_for(req, run_id, declared, command, *, source_root):
+    """Freeze one Run's scope from the request's own declaration.
+
+    Everything here is derived from what the test itself declares: the run id,
+    the declared commands, and the request profile. The scope profile permits
+    the executables of the request profile, of the declared commands, and of the
+    request command, so the coordinator's own command validation reaches the
+    authorization layer the test targets instead of stopping at the perimeter.
+    """
+    anchor = source_root
+    try:
+        anchor = pathlib.Path(anchor)
+        if not anchor.is_absolute() or not anchor.exists() or not anchor.is_dir():
+            anchor = pathlib.Path(tempfile.gettempdir())
+    except Exception:
+        anchor = pathlib.Path(tempfile.gettempdir())
+
+    executables = list(req.profile.allowed_commands)
+    executables.extend(declared)
+    entries = set(declared)
+    if command:
+        executables.append(command[0])
+        entries.add(command[0])
+
+    profile = req.profile
+    scope = RunScope(
+        run_id=run_id,
+        workspace=Workspace(anchor),
+        execution_profile=ProjectExecutionProfile(
+            profile.profile_id or "v02-scope-profile",
+            environment_type=profile.environment_type,
+            runtime_name=profile.runtime_name,
+            runtime_version=profile.runtime_version,
+            target_os=profile.target_os,
+            working_directory=profile.working_directory,
+            environment_variables=dict(profile.environment_variables),
+            timeout_seconds=profile.timeout_seconds,
+            max_output_bytes=profile.max_output_bytes,
+            network_access=profile.network_access,
+            capabilities=profile.capabilities,
+            allowed_commands=tuple(executables),
+        ),
+        allowed_execution_commands=frozenset(entries),
+        acceptance_criteria=(
+            AcceptanceCriterion(criterion_id="v02-scope-anchor", description="run scope anchor"),
+        ),
+    )
+    scope.freeze()
+    return scope
+
+
 class Category1IntentImmutabilityTests(unittest.TestCase):
     """Category 1: Intent Immutability & Canonical Fingerprint."""
 
@@ -78,6 +134,7 @@ class Category1IntentImmutabilityTests(unittest.TestCase):
         self.workspace = Path(self.temp_dir.name).resolve()
 
     def tearDown(self):
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def test_intent_fields_are_frozen(self):
@@ -204,7 +261,9 @@ class Category1IntentImmutabilityTests(unittest.TestCase):
             allowed_commands=("python",),
             approval_resolver=resolver,
             workspace_root=self.workspace,
-        )
+            run_scope=_scope_for(
+                req_b, "run-1", ("python",), req_b.command, source_root=self.workspace
+            ),)
         self.assertEqual(result_b.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
 
@@ -216,6 +275,7 @@ class Category2CanonicalPathsTests(unittest.TestCase):
         self.workspace = Path(self.temp_dir.name).resolve()
 
     def tearDown(self):
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def test_windows_drive_absolute_path_rejected_outside_workspace(self):
@@ -321,7 +381,10 @@ class Category3CapabilityModelTests(unittest.TestCase):
                 req,
                 allowed_commands=("python",),
                 workspace_root=Path(temp_dir.name).resolve(),
-            )
+            run_id="v02-run-2",
+            run_scope=_scope_for(
+                req, "v02-run-2", ("python",), req.command, source_root=Path(temp_dir.name).resolve()
+            ),)
             self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
             self.assertIn(result.failure_reason, ("argv_not_authorized", "capability_denied"))
         finally:
@@ -346,7 +409,10 @@ class Category3CapabilityModelTests(unittest.TestCase):
                 req,
                 allowed_commands=(cmd_id,),
                 workspace_root=Path(temp_dir.name).resolve(),
-            )
+            run_id="v02-run-3",
+            run_scope=_scope_for(
+                req, "v02-run-3", (cmd_id,), req.command, source_root=Path(temp_dir.name).resolve()
+            ),)
             self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         finally:
             temp_dir.cleanup()
@@ -360,6 +426,7 @@ class Category4ApprovalContractTests(unittest.TestCase):
         self.workspace = Path(self.temp_dir.name).resolve()
 
     def tearDown(self):
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def test_approval_resolution_contains_fingerprint_and_id(self):
@@ -449,7 +516,9 @@ class Category4ApprovalContractTests(unittest.TestCase):
             allowed_commands=("python",),
             approval_resolver=resolver,
             workspace_root=self.workspace,
-        )
+            run_scope=_scope_for(
+                req, "run-reuse", ("python",), req.command, source_root=self.workspace
+            ),)
         self.assertEqual(r1.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(backend.call_count, 1)
 
@@ -460,7 +529,9 @@ class Category4ApprovalContractTests(unittest.TestCase):
             allowed_commands=("python",),
             approval_resolver=resolver,
             workspace_root=self.workspace,
-        )
+            run_scope=_scope_for(
+                req, "run-reuse", ("python",), req.command, source_root=self.workspace
+            ),)
         self.assertEqual(r2.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 1)
 
@@ -477,7 +548,10 @@ class Category5WorkspaceRootEnforcementTests(unittest.TestCase):
             req,
             allowed_commands=("python",),
             workspace_root=None,
-        )
+            run_id="v02-run-6",
+            run_scope=_scope_for(
+                req, "v02-run-6", ("python",), req.command, source_root=None
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertIn("workspace_root", result.failure_reason)
 
@@ -490,7 +564,10 @@ class Category5WorkspaceRootEnforcementTests(unittest.TestCase):
             req,
             allowed_commands=("python",),
             workspace_root=Path("relative/path"),
-        )
+            run_id="v02-run-7",
+            run_scope=_scope_for(
+                req, "v02-run-7", ("python",), req.command, source_root=Path("relative/path")
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertIn("workspace_root", result.failure_reason)
 
@@ -503,7 +580,10 @@ class Category5WorkspaceRootEnforcementTests(unittest.TestCase):
             req,
             allowed_commands=("python",),
             workspace_root=Path("."),
-        )
+            run_id="v02-run-8",
+            run_scope=_scope_for(
+                req, "v02-run-8", ("python",), req.command, source_root=Path(".")
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertIn("workspace_root", result.failure_reason)
 
@@ -520,7 +600,10 @@ class Category5WorkspaceRootEnforcementTests(unittest.TestCase):
             req,
             allowed_commands=("python",),
             workspace_root=non_existent,
-        )
+            run_id="v02-run-9",
+            run_scope=_scope_for(
+                req, "v02-run-9", ("python",), req.command, source_root=non_existent
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertIn("workspace_root", result.failure_reason)
 
@@ -533,6 +616,7 @@ class Category6BackendAuthorityTests(unittest.TestCase):
         self.workspace = Path(self.temp_dir.name).resolve()
 
     def tearDown(self):
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def test_direct_call_without_token_raises_error(self):
@@ -576,7 +660,10 @@ class Category6BackendAuthorityTests(unittest.TestCase):
             req,
             allowed_commands=("python",),
             workspace_root=self.workspace,
-        )
+            run_id="v02-run-10",
+            run_scope=_scope_for(
+                req, "v02-run-10", ("python",), req.command, source_root=self.workspace
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(result.exit_code, 0)
 
@@ -589,6 +676,7 @@ class Category7PipelineInvariantsTests(unittest.TestCase):
         self.workspace = Path(self.temp_dir.name).resolve()
 
     def tearDown(self):
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def test_permission_denial_short_circuits_before_approval_and_backend(self):
@@ -608,7 +696,10 @@ class Category7PipelineInvariantsTests(unittest.TestCase):
             allowed_commands=("pytest",),
             approval_resolver=resolver,
             workspace_root=self.workspace,
-        )
+            run_id="v02-run-11",
+            run_scope=_scope_for(
+                req, "v02-run-11", ("pytest",), req.command, source_root=self.workspace
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
         # Approval resolver never queried
         self.assertEqual(len(resolver._entries), 0)
@@ -632,7 +723,10 @@ class Category7PipelineInvariantsTests(unittest.TestCase):
             allowed_commands=("python",),
             approval_resolver=resolver,
             workspace_root=self.workspace,
-        )
+            run_id="v02-run-12",
+            run_scope=_scope_for(
+                req, "v02-run-12", ("python",), req.command, source_root=self.workspace
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
@@ -661,7 +755,9 @@ class Category7PipelineInvariantsTests(unittest.TestCase):
             allowed_commands=("python",),
             approval_resolver=resolver,
             workspace_root=self.workspace,
-        )
+            run_scope=_scope_for(
+                req, "run-1", ("python",), req.command, source_root=self.workspace
+            ),)
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_REJECTED)
         self.assertEqual(backend.call_count, 0)
 

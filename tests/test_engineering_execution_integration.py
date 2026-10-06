@@ -43,6 +43,7 @@ from app.tools.verification import (
     create_execution_verification_evidence,
 )
 from app.tools.workspace import Workspace
+from run_scope_support import engineering_request, freeze_scope
 
 
 class _StubAgent:
@@ -127,6 +128,47 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
         self.expectations = {
             "crit-1": VerificationExpectation(relative_path="result.txt", exists=True)
         }
+        # DECISION 1/2: establish this Run's identity, declare its full perimeter
+        # once, and freeze it. Later declarations may only be subsets.
+        # A fresh Run per test: new identity, never a widened or reused scope.
+        # A binary the policy is expected to reject. Declaring it as a capability
+        # of this Run is what lets the permission check decide, not the scope.
+        # It is never executed.
+        self.disallowed_binary = "some_disallowed_command"
+        # A second binary the policy is expected to reject. Declared for the same
+        # reason: the permission/policy layer decides, the scope does not.
+        self.policy_rejected_binary = "some_other_binary"
+        scope_commands = (
+            sys.executable,
+            "python",
+            "python.exe",
+            self.cmd_ok,
+            self.cmd_exit0,
+            self.cmd_nonzero,
+            self.cmd_verif,
+            self.cmd_unmapped,
+            self.cmd_leak,
+            self.cmd_secret,
+            self.cmd_timeout,
+            self.disallowed_binary,
+            self.policy_rejected_binary,
+        )
+        scope_profile = ProjectExecutionProfile(
+            profile_id=self.profile.profile_id,
+            environment_type=self.profile.environment_type,
+            runtime_name=self.profile.runtime_name,
+            allowed_commands=scope_commands,
+            timeout_seconds=self.profile.timeout_seconds,
+            max_output_bytes=self.profile.max_output_bytes,
+        )
+        self.run_id = f"eng-integration-{self._testMethodName}"
+        self.scope = freeze_scope(
+            self.run_id,
+            workspace=self.workspace,
+            commands=scope_commands,
+            profile=scope_profile,
+            criteria=(self.crit,),
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -140,14 +182,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_ok),
+            allowed_execution_commands=(sys.executable, self.cmd_ok),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-exec-1", description="Run with execution request"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_ok),
         )
 
         result = self.engineering_executor.execute(request)
@@ -175,14 +216,15 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(
+            self.scope,
+            command=(self.disallowed_binary,),
+            allowed_execution_commands=(self.disallowed_binary,),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-exec-denied", description="Permission denied run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=("some_disallowed_command",),
         )
         result = self.engineering_executor.execute(request)
 
@@ -207,14 +249,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingResolver(decision=ApprovalState.REQUIRED)
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_exit0),
+            allowed_execution_commands=(sys.executable, self.cmd_exit0),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-exec-waiting", description="Approval waiting run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_exit0),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
         )
@@ -237,14 +278,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingResolver(decision=ApprovalState.REJECTED)
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_exit0),
+            allowed_execution_commands=(sys.executable, self.cmd_exit0),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-exec-rejected", description="Approval rejected run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_exit0),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
         )
@@ -265,25 +305,28 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
         self.assertEqual(denied_event.data.get("reason"), "approval_rejected")
 
     def test_policy_denied_prevents_subprocess(self) -> None:
-        # Profile does not allow sys.executable -> ExecutionPolicy denies
+        # Profile does not allow sys.executable -> ExecutionPolicy denies.
+        # Limits stay inside the Run's declared envelope so that the policy, not
+        # the scope, is what denies the command.
         restricted_profile = ProjectExecutionProfile(
             profile_id="restricted-env",
             environment_type=ExecutionEnvironmentType.HOST,
             runtime_name="python",
-            allowed_commands=("some_other_binary",),
+            allowed_commands=(self.policy_rejected_binary,),
+            timeout_seconds=self.scope.execution_profile.timeout_seconds,
+            max_output_bytes=self.scope.execution_profile.max_output_bytes,
         )
         exec_req = ExecutionRequest(
             command=(sys.executable, "-c", "import sys; sys.exit(0)"),
             profile=restricted_profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable,),
+            allowed_execution_commands=(sys.executable,),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-exec-policy-denied", description="Policy denied run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable,),
         )
         result = self.engineering_executor.execute(request)
 
@@ -311,14 +354,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_leak),
+            allowed_execution_commands=(sys.executable, self.cmd_leak),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-leak-check", description="Leak check"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_leak),
         )
         result = self.engineering_executor.execute(request)
 
@@ -345,14 +387,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_secret),
+            allowed_execution_commands=(sys.executable, self.cmd_secret),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-redaction", description="Redaction run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_secret),
         )
         result = engineering_executor.execute(request)
 
@@ -376,14 +417,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=timeout_profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_timeout),
+            allowed_execution_commands=(sys.executable, self.cmd_timeout),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-timeout", description="Timeout run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_timeout),
         )
         result = self.engineering_executor.execute(request)
 
@@ -400,14 +440,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_nonzero),
+            allowed_execution_commands=(sys.executable, self.cmd_nonzero),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-fail-code", description="Fail exit code run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_nonzero),
         )
         result = self.engineering_executor.execute(request)
 
@@ -417,12 +456,11 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
         self.assertEqual(exec_res.exit_code, 42)
 
     def test_legacy_engineering_run_unaffected(self) -> None:
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope,
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-legacy", description="Legacy run without execution"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
         )
         result = self.engineering_executor.execute(request)
 
@@ -442,11 +480,15 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             ),
             profile=self.profile,
         )
+        # A direct coordinator call is still a dispatch: it needs this Run's
+        # identity and the frozen scope the command was granted under.
         coordinator = ExecutionCoordinator()
         exec_res = coordinator.execute_request(
             request=exec_req,
             workspace_root=self.workspace_root,
+            run_id=self.run_id,
             allowed_commands=(sys.executable, self.cmd_verif),
+            run_scope=self.scope,
         )
 
         evidence = create_execution_verification_evidence("crit-exec", exec_res)
@@ -474,14 +516,13 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             profile=self.profile,
         )
         # The acceptance criteria here only care about result.txt existing, not execution
-        request = EngineeringRunRequest(
+        request = engineering_request(self.scope, command=(sys.executable, self.cmd_unmapped),
+            allowed_execution_commands=(sys.executable, self.cmd_unmapped),
+            acceptance_criteria=(self.crit,),
             task=Task(id="run-unmapped-fail", description="Unmapped fail run"),
             agent_name=self.agent.name,
-            workspace=self.workspace,
             verification_expectations=self.expectations,
-            acceptance_criteria=(self.crit,),
             execution_requests=(exec_req,),
-            allowed_execution_commands=(sys.executable, self.cmd_unmapped),
         )
         result = self.engineering_executor.execute(request)
 

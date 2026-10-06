@@ -62,6 +62,8 @@ from app.execution.profile import (
     ProjectExecutionProfile,
     TargetOS,
 )
+from app.runtime.run_scope import RunScope
+from app.tools.acceptance import AcceptanceCriterion
 from app.execution.request import (
     ExecutionOutcomeStatus,
     ExecutionRequest,
@@ -189,7 +191,64 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             timeout_seconds=10.0,
         )
 
+
+    def _run_scope_for(self, spec, run_id, *, declared=(), execution_requests=()):
+        """Freeze this Run's single scope from what the test itself declares.
+
+        Command authority is the declared set plus the executable of every
+        execution request: a scope must admit the command it dispatches, or the
+        perimeter would deny before the authorization layer under test. Nothing
+        beyond that is added.
+        """
+        entries = list(declared)
+        profile = getattr(spec, "execution_profile", None) or self.profile
+        for exec_req in execution_requests:
+            if exec_req.command:
+                entries.append(exec_req.command[0])
+            candidate = getattr(exec_req, "profile", None)
+            if candidate is not None and candidate.profile_id == profile.profile_id:
+                profile = candidate
+        # RunScope requires allowed_execution_commands to be within the profile's
+        # permitted executables. The scope is the outer container of authority,
+        # so its profile carries the union while the narrower request/profile
+        # declaration stays exactly as the test authored it. Scenario B is the
+        # case that needs this: it declares a command the profile does not permit
+        # so that PermissionPolicy, not the perimeter, denies it.
+        merged = list(profile.allowed_commands)
+        for entry in entries:
+            if entry not in merged:
+                merged.append(entry)
+        profile = ProjectExecutionProfile(
+            profile_id=profile.profile_id,
+            environment_type=profile.environment_type,
+            runtime_name=profile.runtime_name,
+            runtime_version=profile.runtime_version,
+            target_os=profile.target_os,
+            working_directory=profile.working_directory,
+            environment_variables=dict(profile.environment_variables),
+            timeout_seconds=profile.timeout_seconds,
+            max_output_bytes=profile.max_output_bytes,
+            network_access=profile.network_access,
+            capabilities=profile.capabilities,
+            allowed_commands=tuple(merged),
+        )
+        scope = RunScope(
+            run_id=run_id,
+            workspace=self.workspace,
+            execution_profile=profile,
+            allowed_execution_commands=frozenset(entries),
+            acceptance_criteria=tuple(getattr(spec, "acceptance_criteria", ()) or ())
+            or (
+                AcceptanceCriterion(
+                    criterion_id="ifm-scope-anchor", description="run scope anchor"
+                ),
+            ),
+        )
+        scope.freeze()
+        return scope
+
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.temp.cleanup()
 
     # =========================================================================
@@ -231,6 +290,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             },
             execution_requests=(exec_req,),
             allowed_execution_commands=(sys.executable, self.cmd_happy),
+            run_scope=self._run_scope_for(
+                spec, "run-a",
+                declared=(sys.executable, self.cmd_happy,),
+                execution_requests=(exec_req,),
+            ),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -318,6 +382,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             },
             execution_requests=(exec_req,),
             allowed_execution_commands=("some_disallowed_command",),
+            run_scope=self._run_scope_for(
+                spec, "run-b",
+                declared=("some_disallowed_command",),
+                execution_requests=(exec_req,),
+            ),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -392,6 +461,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             },
             execution_requests=(exec_req,),
             allowed_execution_commands=(sys.executable,),
+            run_scope=self._run_scope_for(
+                spec, "run-c",
+                declared=(sys.executable,),
+                execution_requests=(exec_req,),
+            ),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
         )
@@ -462,6 +536,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             },
             execution_requests=(exec_req,),
             allowed_execution_commands=(sys.executable,),
+            run_scope=self._run_scope_for(
+                spec, "run-d",
+                declared=(sys.executable,),
+                execution_requests=(exec_req,),
+            ),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
         )
@@ -522,6 +601,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             },
             execution_requests=(exec_req,),
             allowed_execution_commands=(sys.executable, self.cmd_fail),
+            run_scope=self._run_scope_for(
+                spec, "run-e",
+                declared=(sys.executable, self.cmd_fail,),
+                execution_requests=(exec_req,),
+            ),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -583,6 +667,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
             },
             execution_requests=(exec_req,),
             allowed_execution_commands=(sys.executable, self.cmd_exit0),
+            run_scope=self._run_scope_for(
+                spec, "run-f",
+                declared=(sys.executable, self.cmd_exit0,),
+                execution_requests=(exec_req,),
+            ),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -1078,12 +1167,26 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
 
         # 2. Decision cannot approve approval
         resolver = _TrackingResolver(decision=ApprovalState.REQUIRED)
+        n_scope = RunScope(
+            run_id="run-n",
+            workspace=self.workspace,
+            execution_profile=self.profile,
+            allowed_execution_commands=frozenset({sys.executable}),
+            acceptance_criteria=(
+                AcceptanceCriterion(
+                    criterion_id="ifm-n-scope-anchor",
+                    description="scenario N approval boundary",
+                ),
+            ),
+        )
+        n_scope.freeze()
         res_appr = coord.execute(
             ExecutionRequest(command=(sys.executable, "-c", "pass"), profile=self.profile),
             run_id="run-n",
             allowed_commands=(sys.executable,),
             approval_policy=ApprovalPolicy(approval_required_tools=("execute", sys.executable)),
             approval_resolver=resolver,
+            run_scope=n_scope,
         )
         self.assertEqual(res_appr.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 

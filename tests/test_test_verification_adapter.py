@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.execution.capabilities import ExecutionCapability
 from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
 from app.execution.policy import ExecutionPolicy
@@ -13,6 +14,8 @@ from app.execution.profile import (
     ProjectExecutionProfile,
     TargetOS,
 )
+from app.runtime.run_scope import RunScope
+from app.tools.workspace import Workspace
 from app.execution.request import (
     ExecutionOutcomeStatus,
     ExecutionRequest,
@@ -48,6 +51,53 @@ class _TrackingApprovalResolver:
         return self.decision
 
 
+def _scope_for(req, run_id, declared, *, workspace):
+    """Freeze this Run's single scope from what the test declares.
+
+    Command authority is the declared allowed_commands plus the request's own
+    command executable, because a scope must admit the command it dispatches or
+    the perimeter would deny before the authorization, execution and
+    verification layers under test. The scope profile permits those executables
+    so the scope satisfies its own invariant; the request keeps its own profile
+    and command untouched, so any narrower restriction stays where the test put
+    it.
+    """
+    entries = list(declared)
+    if req.command:
+        entries.append(req.command[0])
+    merged = list(req.profile.allowed_commands)
+    for entry in entries:
+        if entry not in merged:
+            merged.append(entry)
+    profile = req.profile
+    scope = RunScope(
+        run_id=run_id,
+        workspace=Workspace(workspace),
+        execution_profile=ProjectExecutionProfile(
+            profile_id=profile.profile_id or "tva-scope-profile",
+            environment_type=profile.environment_type,
+            runtime_name=profile.runtime_name,
+            runtime_version=profile.runtime_version,
+            target_os=profile.target_os,
+            working_directory=profile.working_directory,
+            environment_variables=dict(profile.environment_variables),
+            timeout_seconds=profile.timeout_seconds,
+            max_output_bytes=profile.max_output_bytes,
+            network_access=profile.network_access,
+            capabilities=profile.capabilities,
+            allowed_commands=tuple(merged),
+        ),
+        allowed_execution_commands=frozenset(entries),
+        acceptance_criteria=(
+            AcceptanceCriterion(
+                criterion_id="tva-scope-anchor", description="run scope anchor"
+            ),
+        ),
+    )
+    scope.freeze()
+    return scope
+
+
 class TestTestVerificationAdapter(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -67,6 +117,11 @@ class TestTestVerificationAdapter(unittest.TestCase):
             runtime_name="python",
             target_os=TargetOS.WINDOWS if sys.platform == "win32" else TargetOS.LINUX,
             allowed_commands=(sys.executable, "python", "python.exe", "pytest", self.ok_cmd, self.fail_cmd),
+            # This fixture runs `python -c ...`, which the capability classifier
+            # treats as inline text interpretation. Declaring it here makes the
+            # fixture accurately describe the command it already executes; it
+            # grants no command or tool authority.
+            capabilities=frozenset({ExecutionCapability.INTERPRET_TEXT}),
             timeout_seconds=10.0,
         )
 
@@ -78,6 +133,7 @@ class TestTestVerificationAdapter(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     def test_creation_of_test_verification_request(self) -> None:
@@ -217,7 +273,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             exec_req,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({"disallowed_cmd"}),
-        )
+            run_id="tva-run-1",
+            run_scope=_scope_for(
+                exec_req, "tva-run-1", ("disallowed_cmd",), workspace=self.workspace_root
+            ),)
         self.assertEqual(exec_res.status, ExecutionStatus.DENIED)
         self.assertEqual(exec_res.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
 
@@ -240,7 +299,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             approval_policy=policy,
             approval_resolver=resolver,
-        )
+            run_id="tva-run-2",
+            run_scope=_scope_for(
+                exec_req, "tva-run-2", (sys.executable,), workspace=self.workspace_root
+            ),)
         self.assertEqual(exec_res.status, ExecutionStatus.DENIED)
         self.assertEqual(exec_res.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
@@ -264,7 +326,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             exec_req,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
-        )
+            run_id="tva-run-3",
+            run_scope=_scope_for(
+                exec_req, "tva-run-3", (sys.executable,), workspace=self.workspace_root
+            ),)
         self.assertEqual(exec_res.status, ExecutionStatus.DENIED)
         self.assertEqual(exec_res.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
 
@@ -285,7 +350,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             exec_req,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable, self.ok_cmd}),
-        )
+            run_id="tva-run-4",
+            run_scope=_scope_for(
+                exec_req, "tva-run-4", (sys.executable, self.ok_cmd,), workspace=self.workspace_root
+            ),)
         self.assertEqual(exec_res.status, ExecutionStatus.SUCCESS)
         self.assertEqual(exec_res.exit_code, 0)
         self.assertEqual(exec_res.stdout, "test_ok")
@@ -309,7 +377,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             exec_req,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable, self.fail_cmd}),
-        )
+            run_id="tva-run-5",
+            run_scope=_scope_for(
+                exec_req, "tva-run-5", (sys.executable, self.fail_cmd,), workspace=self.workspace_root
+            ),)
         self.assertEqual(exec_res.status, ExecutionStatus.FAILURE)
         self.assertEqual(exec_res.exit_code, 1)
 
@@ -331,7 +402,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             exec_req,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
-        )
+            run_id="tva-run-6",
+            run_scope=_scope_for(
+                exec_req, "tva-run-6", (sys.executable,), workspace=self.workspace_root
+            ),)
         v_res = self.adapter.evaluate_result(intent, exec_res)
 
         trace = validate_verification_traceability(
@@ -379,7 +453,10 @@ class TestTestVerificationAdapter(unittest.TestCase):
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
             observer=observer,
-        )
+            run_id="tva-run-7",
+            run_scope=_scope_for(
+                exec_req, "tva-run-7", (sys.executable,), workspace=self.workspace_root
+            ),)
         v_res = self.adapter.evaluate_result(
             intent,
             exec_res,

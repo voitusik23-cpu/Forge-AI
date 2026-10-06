@@ -67,12 +67,95 @@ class ExecutionCoordinator:
         allowed_commands: Optional[frozenset[str]] = None,
         approval_policy: Optional[ApprovalPolicy] = None,
         approval_resolver: Optional[ApprovalResolver] = None,
+        run_scope: Optional[object] = None,
         observer: Optional[Callable[[EventType, dict[str, object]], None]] = None,
     ) -> ExecutionResult:
         """Run through the strict authorization chain before dispatching to adapter."""
+        # Imported lazily: run_scope imports the execution identity module and the
+        # execution package imports this coordinator, so a module-level import is
+        # circular.
+        from app.runtime.run_scope import RunScope, RunScopeError, require_active_scope
+
         profile = request.profile if request else None
         profile_id = profile.profile_id if profile else None
-        run_id = run_id or str(getattr(request, "metadata", {}).get("run_id") or "")
+
+        # DECISION 1 (Block 3.1): the run identity is established before the scope
+        # is created and is never recovered from the scope.
+        if run_scope is None:
+            candidate = run_id or str(getattr(request, "metadata", {}).get("run_id") or "")
+            frozen = RunScope.frozen_scope(candidate) if candidate else None
+            if frozen is not None or allowed_commands is not None:
+                return self._deny(
+                    request=request,
+                    run_id=candidate,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="run_scope_required",
+                    message=(
+                        "Execution denied: this run requires an active frozen "
+                        "RunScope before it may dispatch"
+                    ),
+                    observer=observer,
+                )
+        else:
+            resolved = run_id or str(getattr(request, "metadata", {}).get("run_id") or "")
+            scope_run_id = str(getattr(run_scope, "run_id", "") or "")
+            if not resolved.strip():
+                return self._deny(
+                    request=request,
+                    run_id=resolved,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="run_scope_violation",
+                    message=(
+                        "Execution denied: an active run id is required and is never "
+                        "taken from the run scope"
+                    ),
+                    observer=observer,
+                )
+            if resolved != scope_run_id:
+                return self._deny(
+                    request=request,
+                    run_id=resolved,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="run_scope_violation",
+                    message="Execution denied: run scope does not belong to this run",
+                    observer=observer,
+                )
+            try:
+                scope = require_active_scope(resolved, run_scope)
+                # An adapter that runs inside an ephemeral, adapter-managed
+                # workspace executes in a private scratch directory, so the
+                # execution root is not a scope-checkable property there. That
+                # isolation is enforced by EphemeralWorkspaceManager plus the
+                # Workspace boundary on the scratch root, independently.
+                if not bool(getattr(self._adapter, "_isolate_workspace", False)):
+                    scope.validate_workspace_root(workspace_root)
+                # validate_execution_request checks the command as a full identity,
+                # which preserves a pinned argv. Re-checking only the bare
+                # executable here would drop that pinning and reject a legitimate
+                # identity-pinned invocation.
+                scope.validate_execution_request(request)
+                # The request's own command must be inside the perimeter as a full
+                # identity, so a pinned argv cannot be swapped for a different
+                # invocation of the same executable.
+                if request.command:
+                    scope.validate_command_set((tuple(request.command),))
+                # The caller's declared permission set may only narrow the scope.
+                if allowed_commands is not None:
+                    scope.validate_command_set(allowed_commands)
+            except RunScopeError as exc:
+                return self._deny(
+                    request=request,
+                    run_id=resolved,
+                    profile_id=profile_id,
+                    outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                    reason="run_scope_violation",
+                    message=f"Execution denied by run scope: {exc}",
+                    observer=observer,
+                )
+            run_id = resolved
 
         # 1. Notify execution requested
         self._emit(

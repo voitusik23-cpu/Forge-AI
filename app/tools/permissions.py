@@ -19,6 +19,7 @@ class PermissionReason(str, Enum):
     INVALID_INVOCATION = "INVALID_INVOCATION"
     MISSING_CONTEXT = "MISSING_CONTEXT"
     TOOL_LOOP_LIMIT = "TOOL_LOOP_LIMIT"
+    SCOPE_VIOLATION = "SCOPE_VIOLATION"
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,9 @@ class ToolExecutionContext:
     round_number: int = 0
     attempt_number: int = 0
     workspace: Workspace | None = None
+    # Immutable security perimeter. When present, the tool set declared for this
+    # execution must stay inside the frozen run scope.
+    run_scope: object | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,19 @@ class PermissionPolicy:
                 context.run_id, tool_id, invocation_id,
                 PermissionDecision.DENY, PermissionReason.UNKNOWN_TOOL,
             )
+        # RunScope binding: the declared tool set may only narrow the perimeter,
+        # and the scope must be the frozen one for this run.
+        if context.run_scope is not None:
+            from app.runtime.run_scope import RunScopeError, require_active_scope
+
+            try:
+                scope = require_active_scope(context.run_id, context.run_scope)
+                scope.validate_tool_set(context.allowed_tool_ids)
+            except RunScopeError:
+                return self._decision(
+                    context.run_id, tool_id, invocation_id,
+                    PermissionDecision.DENY, PermissionReason.SCOPE_VIOLATION,
+                )
         if tool_id not in context.allowed_tool_ids:
             return self._decision(
                 context.run_id, tool_id, invocation_id,

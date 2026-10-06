@@ -24,6 +24,9 @@ from app.execution.redaction import (
     looks_like_credential,
 )
 from app.execution.request import ExecutionRequest, ExecutionResult, ExecutionStatus
+from app.runtime.run_scope import RunScope
+from app.tools.acceptance import AcceptanceCriterion
+from app.tools.workspace import Workspace
 
 # Realistic credential fixtures. No fixed length is assumed anywhere: the App
 # installation token is deliberately ~520 characters because GitHub made
@@ -282,10 +285,13 @@ class TestExecutionCredentialBoundary(unittest.TestCase):
     """End-to-end: a credential reaches the child process but never the artefacts."""
 
     def setUp(self) -> None:
+        RunScope.release_all()
         self._tmp = tempfile.TemporaryDirectory()
         self.workspace = Path(self._tmp.name)
+        self._run_seq = 0
 
     def tearDown(self) -> None:
+        RunScope.release_all()
         self._tmp.cleanup()
 
     def _execute_with_env(self, key: str, value: str):
@@ -301,11 +307,33 @@ class TestExecutionCredentialBoundary(unittest.TestCase):
         coordinator = ExecutionCoordinator(
             adapter=LocalExecutionAdapter(workspace_root=self.workspace, isolate_workspace=False)
         )
+        # This run declares dispatch authority (allowed_commands), so it needs an
+        # explicit run id and its single frozen RunScope. The perimeter carries
+        # only the executable the profile already permits; no authority is added.
+        # The command text differs per call, so each call is a different
+        # perimeter and therefore a different run id.
+        self._run_seq += 1
+        run_id = f"credential-boundary-run-{self._run_seq}"
+        scope = RunScope(
+            run_id=run_id,
+            workspace=Workspace(self.workspace),
+            execution_profile=profile,
+            allowed_execution_commands=frozenset({sys.executable}),
+            acceptance_criteria=(
+                AcceptanceCriterion(
+                    criterion_id="credential-boundary-anchor",
+                    description="credential redaction boundary",
+                ),
+            ),
+        )
+        scope.freeze()
         result = coordinator.execute(
             request,
             workspace_root=self.workspace,
             allowed_commands=frozenset({sys.executable}),
             observer=lambda event_type, data: events.append((str(event_type), data)),
+            run_id=run_id,
+            run_scope=scope,
         )
         return result, events
 

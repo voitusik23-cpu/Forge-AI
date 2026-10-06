@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -32,6 +33,7 @@ from app.execution.policy import ExecutionPolicy
 from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import ExecutionOutcomeStatus, ExecutionRequest
 from app.projects.state import ProjectState, ProjectStateStatus
+from app.runtime.run_scope import RunScope
 from app.skills.builtin import get_builtin_python_test_runner
 from app.skills.evaluator import SkillEvaluator
 from app.skills.models import (
@@ -80,6 +82,58 @@ class _ScriptedAIModelProvider(Provider):
         )
 
 
+def _scoped_request(request: HarnessRequest) -> HarnessRequest:
+    """Bind a HarnessRequest to its single frozen RunScope.
+
+    The run identity comes from the request the test authored. The scope's
+    command authority is the request's declared allowed_execution_commands plus
+    the executable of every execution request, because the scope must admit the
+    command it dispatches or `_enforce_run_scope` would deny before the harness
+    permission and approval layers run. The request's own narrower declaration is
+    preserved untouched.
+    """
+    entries = list(request.allowed_execution_commands or ())
+    profiles = []
+    for exec_req in request.execution_requests or ():
+        if exec_req.command:
+            entries.append(exec_req.command[0])
+        if getattr(exec_req, "profile", None) is not None:
+            profiles.append(exec_req.profile)
+    base = profiles[0] if profiles else ProjectExecutionProfile("skill-scope-profile")
+    merged = list(base.allowed_commands)
+    for entry in entries:
+        if entry not in merged:
+            merged.append(entry)
+    scope = RunScope(
+        run_id=request.run_id,
+        workspace=request.workspace,
+        execution_profile=ProjectExecutionProfile(
+            profile_id=base.profile_id or "skill-scope-profile",
+            environment_type=base.environment_type,
+            runtime_name=base.runtime_name,
+            runtime_version=base.runtime_version,
+            target_os=base.target_os,
+            working_directory=base.working_directory,
+            environment_variables=dict(base.environment_variables),
+            timeout_seconds=base.timeout_seconds,
+            max_output_bytes=base.max_output_bytes,
+            network_access=base.network_access,
+            capabilities=base.capabilities,
+            allowed_commands=tuple(merged),
+        ),
+        allowed_tool_ids=frozenset(getattr(request, "allowed_tool_ids", ()) or ()),
+        allowed_execution_commands=frozenset(entries),
+        acceptance_criteria=tuple(request.acceptance_criteria or ())
+        or (
+            AcceptanceCriterion(
+                criterion_id="skill-scope-anchor", description="run scope anchor"
+            ),
+        ),
+    )
+    scope.freeze()
+    return dataclasses.replace(request, run_scope=scope)
+
+
 class TestAgentSkillSystem(unittest.TestCase):
     """Comprehensive test suite verifying Stage 15 Agent Skill contracts and invariants."""
 
@@ -104,6 +158,7 @@ class TestAgentSkillSystem(unittest.TestCase):
         return ExecutionRequest(command=command, profile=profile, metadata=metadata or {}), cid
 
     def tearDown(self) -> None:
+        RunScope.release_all()
         self.temp_dir.cleanup()
 
     # =========================================================================
@@ -313,6 +368,7 @@ class TestAgentSkillSystem(unittest.TestCase):
                 run_id="run-15-e", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
         )
+        h_req = _scoped_request(h_req)
 
         result = harness.run(h_req)
         # Authoritative permission denial occurs without invoking execution coordinator
@@ -359,6 +415,7 @@ class TestAgentSkillSystem(unittest.TestCase):
                 run_id="run-15-f", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
         )
+        h_req = _scoped_request(h_req)
 
         result = harness.run(h_req)
         self.assertEqual(result.final_state.status, HarnessStatus.WAITING_FOR_APPROVAL)
@@ -487,6 +544,7 @@ class TestAgentSkillSystem(unittest.TestCase):
                 run_id="run-15-untrusted-perm", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
         )
+        h_req = _scoped_request(h_req)
 
         result = harness.run(h_req)
         # PermissionPolicy authoritatively denies execution despite skill being applicable
@@ -603,6 +661,7 @@ class TestAgentSkillSystem(unittest.TestCase):
                 run_id="run-15-k", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
         )
+        h_req = _scoped_request(h_req)
 
         result = harness.run(h_req)
 
@@ -658,6 +717,7 @@ class TestAgentSkillSystem(unittest.TestCase):
                 run_id="run-15-l", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
         )
+        h_req = _scoped_request(h_req)
 
         result = harness.run(h_req)
         # Deterministic provider executes cleanly and completes through verification and acceptance

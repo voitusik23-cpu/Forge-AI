@@ -7,6 +7,7 @@ AI recommendation != authorization != execution.
 from __future__ import annotations
 
 import json
+import dataclasses
 import pathlib
 import shutil
 import sys
@@ -54,6 +55,8 @@ from app.tools.approval import (
     ApprovalRequest,
     ApprovalState,
 )
+from app.runtime.run_scope import RunScope
+from app.tools.acceptance import AcceptanceCriterion
 from app.tools.workspace import Workspace
 
 
@@ -103,6 +106,8 @@ class TestAIDecisionProvider(unittest.TestCase):
     """Stage 13 verification suite for Real AI Decision Provider."""
 
     def setUp(self) -> None:
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.temp_dir = tempfile.mkdtemp(prefix="forge_stage13_test_")
         self.workspace_root = pathlib.Path(self.temp_dir)
         self.workspace = Workspace(root=self.workspace_root)
@@ -111,7 +116,73 @@ class TestAIDecisionProvider(unittest.TestCase):
             allowed_commands=(sys.executable,),
         )
 
+    def _scope_request(self, request):
+        """Freeze this Run's single scope and bind the request to it.
+
+        The run identity comes from the test. A run that declares no dispatch
+        authority needs no perimeter and is returned unchanged.
+        """
+        if not (
+            getattr(request, "execution_requests", ())
+            or getattr(request, "allowed_execution_commands", None)
+        ):
+            return request
+        entries: list = [sys.executable, "python", "python.exe"]
+        base = self.profile
+        for exec_req in getattr(request, "execution_requests", ()):
+            profile = getattr(exec_req, "profile", None)
+            if profile is None:
+                continue
+            base = profile
+            entries.extend(profile.allowed_commands)
+        entries.extend(getattr(request, "allowed_execution_commands", ()) or ())
+        unique: list = []
+        for entry in entries:
+            if entry not in unique:
+                unique.append(entry)
+        scope_profile = ProjectExecutionProfile(
+            profile_id=base.profile_id,
+            environment_type=base.environment_type,
+            runtime_name=base.runtime_name,
+            runtime_version=base.runtime_version,
+            target_os=base.target_os,
+            working_directory=base.working_directory,
+            environment_variables=dict(base.environment_variables),
+            timeout_seconds=base.timeout_seconds,
+            max_output_bytes=base.max_output_bytes,
+            network_access=base.network_access,
+            capabilities=base.capabilities,
+            allowed_commands=tuple(unique),
+        )
+        criteria = tuple(getattr(request, "acceptance_criteria", ()) or ()) or (
+            AcceptanceCriterion(
+                criterion_id="ai-decision-placeholder",
+                description="run declares no acceptance criteria",
+            ),
+        )
+        scope = RunScope(
+            run_id=request.run_id,
+            workspace=self.workspace,
+            execution_profile=scope_profile,
+            allowed_tool_ids=frozenset(getattr(request, "allowed_tool_ids", ()) or ()),
+            allowed_execution_commands=frozenset(
+                getattr(request, "allowed_execution_commands", ()) or ()
+            ),
+            acceptance_criteria=criteria,
+        )
+        scope.freeze()
+        return HarnessRequest(
+            **{
+                **{
+                    field.name: getattr(request, field.name)
+                    for field in dataclasses.fields(request)
+                },
+                "run_scope": scope,
+            }
+        )
+
     def tearDown(self) -> None:
+        RunScope.release_all()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # =========================================================================
@@ -146,7 +217,8 @@ class TestAIDecisionProvider(unittest.TestCase):
             command=cmd,
             profile=exec_profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-a-ai",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -154,6 +226,7 @@ class TestAIDecisionProvider(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-a-ai", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         harness = AgentHarness(
@@ -188,12 +261,14 @@ class TestAIDecisionProvider(unittest.TestCase):
         self.assertTrue(decision.references.get("fail_closed"))
 
         # In harness, it must transition safely to FAILED
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-b-malformed",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-b-malformed", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
         harness = AgentHarness(decision_provider=ai_decision_provider)
         result = harness.run(h_req)
@@ -253,12 +328,14 @@ class TestAIDecisionProvider(unittest.TestCase):
         self.assertIn("premature_completion:acceptance_not_passed", report.errors)
 
         # Inside harness, the harness validator rejects it and halts in FAILED
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-d-premature",
             workspace=self.workspace,
             initial_project_state=ProjectState(
                 run_id="run-d-premature", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
         harness = AgentHarness(decision_provider=ai_decision_provider)
         result = harness.run(h_req)
@@ -288,7 +365,8 @@ class TestAIDecisionProvider(unittest.TestCase):
             ),
             profile=self.profile,
         )
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-e-deny",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -296,6 +374,7 @@ class TestAIDecisionProvider(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-e-deny", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         harness = AgentHarness(decision_provider=ai_decision_provider)
@@ -328,7 +407,8 @@ class TestAIDecisionProvider(unittest.TestCase):
             profile=self.profile,
         )
         resolver = _TrackingApprovalResolver(decision=ApprovalState.REQUIRED)
-        h_req = HarnessRequest(
+        h_req = self._scope_request(
+            HarnessRequest(
             run_id="run-f-approval",
             workspace=self.workspace,
             execution_requests=(exec_req,),
@@ -338,6 +418,7 @@ class TestAIDecisionProvider(unittest.TestCase):
             initial_project_state=ProjectState(
                 run_id="run-f-approval", attempt_number=0, status=ProjectStateStatus.INITIAL
             ),
+        )
         )
 
         harness = AgentHarness(decision_provider=ai_decision_provider)

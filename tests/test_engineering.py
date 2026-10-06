@@ -22,6 +22,8 @@ from app.tools.contracts import ToolInvocation
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
 from app.tools.verification import VerificationExpectation, VerificationStatus
+from app.execution.profile import ProjectExecutionProfile
+from app.runtime.run_scope import RunScope
 from app.tools.workspace import Workspace
 from app.tools.write_project_file import WriteProjectFile
 from app.tasks import Requirement, TaskSpecification
@@ -80,6 +82,8 @@ class _Resolver:
 
 class EngineeringRunTests(unittest.TestCase):
     def setUp(self):
+        # Each test is its own Run with its own perimeter.
+        RunScope.release_all()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.workspace = Workspace(self.root)
@@ -95,7 +99,27 @@ class EngineeringRunTests(unittest.TestCase):
         }
 
     def tearDown(self):
+        RunScope.release_all()
         self.temp.cleanup()
+
+    def _scope_for(self, run_id, *, allowed, profile=None, criteria=None):
+        """Freeze this Run's single scope.
+
+        The run identity and the declared tool authority come from the test. The
+        scope carries exactly the declared tools and no execution commands, so the
+        engineering path can only ever use a subset of this perimeter.
+        """
+        scope = RunScope(
+            run_id=run_id,
+            workspace=self.workspace,
+            execution_profile=profile
+            or ProjectExecutionProfile("engineering-test-profile", allowed_commands=("python",)),
+            allowed_tool_ids=frozenset(allowed),
+            allowed_execution_commands=frozenset(),
+            acceptance_criteria=tuple(criteria or ()) or (self.criterion,),
+        )
+        scope.freeze()
+        return scope
 
     def make_executor(self, contents, *, approval=ApprovalState.APPROVED, path="result.txt"):
         agent = _SequenceAgent(contents, path=path)
@@ -112,7 +136,7 @@ class EngineeringRunTests(unittest.TestCase):
         )
         return EngineeringRunExecutor(RevisionLoopExecutor(run_executor)), agent, resolver
 
-    def request(self, *, max_attempts=1, allowed=(WriteProjectFile.TOOL_ID,)):
+    def request(self, *, max_attempts=1, allowed=(WriteProjectFile.TOOL_ID,), run_id="engineering-test-run"):
         return EngineeringRunRequest(
             task=Task(id="engineering-test", description="write expected file"),
             workspace=self.workspace,
@@ -121,6 +145,7 @@ class EngineeringRunTests(unittest.TestCase):
             acceptance_criteria=(self.criterion,),
             max_revision_attempts=max_attempts,
             allowed_tool_ids=allowed,
+            run_scope=self._scope_for(run_id, allowed=allowed),
         )
 
     def specification(self, **overrides):
@@ -135,7 +160,12 @@ class EngineeringRunTests(unittest.TestCase):
         return TaskSpecification(**values)
 
     def specification_request(
-        self, specification, *, max_attempts=1, allowed=(WriteProjectFile.TOOL_ID,)
+        self,
+        specification,
+        *,
+        max_attempts=1,
+        allowed=(WriteProjectFile.TOOL_ID,),
+        run_id="engineering-spec-run",
     ):
         return EngineeringRunRequest(
             workspace=self.workspace,
@@ -144,6 +174,7 @@ class EngineeringRunTests(unittest.TestCase):
             max_revision_attempts=max_attempts,
             allowed_tool_ids=allowed,
             task_specification=specification,
+            run_scope=self._scope_for(run_id, allowed=allowed),
         )
 
     def test_success_collects_complete_attempt_and_lifecycle_history(self):
@@ -208,12 +239,13 @@ class EngineeringRunTests(unittest.TestCase):
 
     def test_permission_denial_and_workspace_traversal_fail_safely(self):
         executor, _, _ = self.make_executor([self.good])
-        denied = executor.execute(self.request(allowed=()))
+        # Two independent Runs: different perimeters, so different run ids.
+        denied = executor.execute(self.request(allowed=(), run_id="engineering-denied-run"))
         self.assertEqual(denied.final_status, EngineeringRunStatus.FAILED)
         self.assertEqual(denied.changesets, ())
 
         traversal_executor, _, _ = self.make_executor([self.good], path="../outside.txt")
-        traversal = traversal_executor.execute(self.request())
+        traversal = traversal_executor.execute(self.request(run_id="engineering-traversal-run"))
         self.assertEqual(traversal.final_status, EngineeringRunStatus.FAILED)
         self.assertFalse((self.root.parent / "outside.txt").exists())
 

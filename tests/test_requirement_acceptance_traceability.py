@@ -49,6 +49,8 @@ from app.tools.verification import (
     VerificationStatus,
     WorkspaceVerifier,
 )
+from app.execution.profile import ProjectExecutionProfile
+from app.runtime.run_scope import RunScope
 from app.tools.workspace import Workspace
 from app.tools.write_project_file import WriteProjectFile
 
@@ -324,6 +326,19 @@ class RequirementAcceptanceTraceabilityTests(unittest.TestCase):
                 RevisionLoopExecutor(run_executor, max_revision_attempts=1)
             )
 
+            # This Run declares dispatch authority (a tool), so its single frozen
+            # perimeter is declared here. No command authority is granted.
+            run_scope = RunScope(
+                run_id="traceability-run",
+                workspace=workspace,
+                execution_profile=ProjectExecutionProfile(
+                    "traceability-profile", allowed_commands=("python",)
+                ),
+                allowed_tool_ids=frozenset({WriteProjectFile.TOOL_ID}),
+                allowed_execution_commands=frozenset(),
+                acceptance_criteria=(crit,),
+            )
+            run_scope.freeze()
             request = EngineeringRunRequest(
                 workspace=workspace,
                 snapshot_paths=("result.txt",),
@@ -331,6 +346,7 @@ class RequirementAcceptanceTraceabilityTests(unittest.TestCase):
                 max_revision_attempts=1,
                 allowed_tool_ids=(WriteProjectFile.TOOL_ID,),
                 task_specification=spec,
+                run_scope=run_scope,
             )
             result = engineering_executor.execute(request)
 
