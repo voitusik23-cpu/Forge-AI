@@ -918,3 +918,194 @@ code in `app/api/service.py` and `tests/test_api_declared_execution.py`.
    `run_task` остаётся неиспользуемым, а host execution там — выключенным.
 3. **GAP-A, GAP-B и идемпотентность этим блоком не изменены.** GAP-C был закрыт
    до него, в `RunScope.validate_execution_profile()`.
+
+## Production Agent Loop Vertical Slice v0.1
+
+Implemented in the production agent loop block. Verified against the code in
+`app/agent_runtime/harness.py`, `app/runtime/bootstrap.py`,
+`app/runtime/context.py`, `app/api/service.py`, and
+`tests/test_agent_loop_production.py`.
+
+### Accepted decisions
+
+- **`AgentHarness` is the canonical production orchestrator.** The bootstrap
+  supplies it in `RuntimeContext.harness`, so the production runtime contains one
+  orchestration loop, constructed by one composition factory
+  (`create_agent_harness`). No second loop and no orchestration singleton inside
+  the API service were created.
+- **`RunExecutor` remains the execution primitive.** The production flow is
+  `AgentHarness -> ExecutionCoordinator`, not `RunExecutor -> decision`. The
+  decision layer was not bolted onto the execution primitive.
+- **The first slice is `ForgeApiService.run_agent_loop(declaration_id, *,
+  purpose_run_id=None)`**, a trusted in-process entry point, not an HTTP route.
+  `TaskRunRequest` and the HTTP routes are unchanged.
+- **`run_task` does not route through the loop.** Routing the existing HTTP task
+  path through the harness would have changed the response contract, the provider
+  routing path, and `test_api`/`test_desktop` behaviour, and would have required a
+  `TaskSpecification`-shaped response that the contract cannot express. The loop
+  therefore has its own trusted entry point, and the ordinary task path keeps its
+  previous semantics. Wiring `POST /api/tasks/run` into the loop is left as a
+  separate change with its own compatibility decision.
+- **Decision is not authority.** A decision answers *what to do next*; authority
+  answers *what this run may do at all*. The decision provider receives a
+  `DecisionRequest` that carries no command, workspace, tool grant, environment,
+  timeout, approval policy, or run scope.
+- **The decision selects among pre-authorized actions, never authors one.** The
+  harness selects `execution_requests[i]`, which the server-side composition built
+  once from an operator declaration, and re-checks the selected command against
+  `allowed_execution_commands`. The `ExecutionCoordinator` then re-validates
+  independently and remains the only creator of `AuthorizedExecution`.
+- **Tool authority is operator-configured.** `ForgeApiService.allowed_tool_ids`
+  is set at composition time, intersected with registered tools, and bound into
+  the frozen `RunScope`. `TaskRunRequest` gained no field, and `category`,
+  `context`, `description`, `task_id`, `provider_name`, or LLM output cannot grant
+  a tool. The empty default stays fail-closed.
+- **The slice is bounded to one action.** `max_actions=1` and
+  `max_execution_attempts=1` narrow the existing policy; they add no authority.
+  `max_revision_attempts` stays positive because `DeterministicDecisionProvider`
+  treats a zero revision budget as already exhausted and would fail the run
+  before it acts.
+- **Acceptance is deferred, not fabricated.** The slice reports execution success,
+  not task acceptance. Criterion identity is GAP-F and was not invented, so no
+  placeholder criterion is presented as real and no acceptance event is emitted.
+- **`RUN_VERIFICATION` reads only server-side expectations.** The harness takes
+  verification expectations from the request, which the composition supplies. A
+  decision has no channel to select a declaration, and the declared-execution
+  entry point is not reachable from the decision. With no expectations configured
+  the acceptance gate fails closed with `verification_missing`.
+- **`EngineeringRunExecutor`, `RevisionLoopExecutor`, `MultiAgentExecutor`, and
+  `ProviderReviewer` are not production machinery.** They stay test/smoke
+  machinery until a separate decision.
+- **Observability reuses the existing store.** The harness gained an optional
+  observer that receives exactly the events it already collects - a second
+  consumer, never a second event stream - and `ForgeApiService` persists those
+  events and a terminal snapshot through the existing `RunStore` writer. No new
+  event store was created and the finite run loop's control flow is unchanged.
+
+### Rejected alternatives (with rationale)
+
+- **Routing `POST /api/tasks/run` through the harness in this block.** Rejected:
+  it would break the desktop/API response contract and the ordinary task path, and
+  the brief requires both to keep working.
+- **Building the decision layer into `RunExecutor`.** Rejected by the accepted
+  architecture: `RunExecutor` is the execution primitive.
+- **Adding `allowed_tool_ids` to `TaskRunRequest`.** Rejected: it would be
+  client-controlled tool authority.
+- **Deriving tools from `category`, `context`, or the description.** Rejected:
+  all are client-supplied, so any of them would let a client grant itself tools.
+- **Mapping `RUN_VERIFICATION` onto a declared execution.** Rejected: the decision
+  would then select which operator-declared command runs. That would be
+  LLM-controlled command selection.
+- **Passing a hand-built `execution_requests` list from the loop entry point.**
+  Rejected: it would be a second, caller-supplied authority source. The list is
+  built once from the operator declaration.
+
+### Consequences and open items
+
+1. **`run_task` is unchanged and still execution-disabled for host processes**
+   beyond what the operator declared; the loop is a separate trusted entry point.
+   Unifying the two paths is a future decision with its own compatibility impact.
+2. **GAP-F (criterion identity) remains open** and is the next architectural
+   block; the loop's acceptance stage is deliberately deferred behind it.
+3. **GAP-A, GAP-B, and idempotency are unchanged** by this block.
+4. **Pre-existing cosmetic defect noticed, not fixed:** `HarnessRequest` declares
+   the `run_scope` field annotation twice (`app/agent_runtime/models.py`). The
+   duplicate is inert for `dataclasses` (`dataclasses.fields` reports one field)
+   and was left untouched as unrelated to this block.
+
+## Production Agent Loop Vertical Slice v0.1 — русская версия
+
+Реализовано в блоке production agent loop. Проверено по коду в
+`app/agent_runtime/harness.py`, `app/runtime/bootstrap.py`,
+`app/runtime/context.py`, `app/api/service.py` и
+`tests/test_agent_loop_production.py`.
+
+### Принятые решения
+
+- **`AgentHarness` — канонический production-оркестратор.** Bootstrap поставляет
+  его в `RuntimeContext.harness`, поэтому production-runtime содержит один
+  orchestration loop, построенный одной композиционной фабрикой
+  (`create_agent_harness`). Второй loop и orchestration-singleton внутри API-сервиса
+  не создавались.
+- **`RunExecutor` остаётся execution-примитивом.** Production-поток —
+  `AgentHarness -> ExecutionCoordinator`, а не `RunExecutor -> decision`. Слой
+  решений не приделывался к execution-примитиву.
+- **Первый срез — `ForgeApiService.run_agent_loop(declaration_id, *,
+  purpose_run_id=None)`**, доверенный in-process вход, а не HTTP-маршрут.
+  `TaskRunRequest` и HTTP-маршруты не изменены.
+- **`run_task` не идёт через loop.** Маршрутизация существующего HTTP-пути задачи
+  через harness изменила бы контракт ответа, путь провайдерской маршрутизации и
+  поведение `test_api`/`test_desktop`, а также потребовала бы ответ формы
+  `TaskSpecification`, которую контракт выразить не может. Поэтому у loop есть
+  собственный доверенный вход, а обычный путь задачи сохраняет прежнюю семантику.
+  Подключение `POST /api/tasks/run` к loop оставлено отдельным изменением с
+  собственным решением о совместимости.
+- **Decision не является authority.** Decision отвечает на вопрос *что делать
+  дальше*; authority — на вопрос *что этому run вообще разрешено*. Decision
+  provider получает `DecisionRequest`, который не несёт ни команды, ни workspace,
+  ни выдачи tools, ни окружения, ни timeout, ни approval-политики, ни run scope.
+- **Decision выбирает среди уже авторизованных действий, но не создаёт их.**
+  Harness выбирает `execution_requests[i]`, которые server-side композиция
+  построила один раз из объявления оператора, и повторно проверяет выбранную
+  команду против `allowed_execution_commands`. Затем `ExecutionCoordinator`
+  перепроверяет независимо и остаётся единственным создателем
+  `AuthorizedExecution`.
+- **Tool authority конфигурируется оператором.** `ForgeApiService.allowed_tool_ids`
+  задаётся на композиции, пересекается с зарегистрированными tools и связывается в
+  замороженный `RunScope`. `TaskRunRequest` не получил новых полей, а `category`,
+  `context`, `description`, `task_id`, `provider_name` или вывод LLM не могут
+  выдать tool. Пустой default остаётся fail-closed.
+- **Срез ограничен одним действием.** `max_actions=1` и
+  `max_execution_attempts=1` сужают существующую политику; они не добавляют
+  authority. `max_revision_attempts` остаётся положительным, поскольку
+  `DeterministicDecisionProvider` читает нулевой бюджет ревизий как уже
+  исчерпанный и завалил бы run до совершения действия.
+- **Acceptance отложен, а не подделан.** Срез сообщает execution success, а не task
+  acceptance. Criterion identity — это GAP-F, и она не выдумывалась, поэтому
+  placeholder-критерий не выдаётся за настоящий и acceptance-событие не эмитится.
+- **`RUN_VERIFICATION` читает только server-side expectations.** Harness берёт
+  verification expectations из запроса, который поставляет композиция. У decision
+  нет канала для выбора объявления, и вход объявленного выполнения из decision
+  недостижим. Без сконфигурированных expectations acceptance-гейт падает
+  fail-closed с `verification_missing`.
+- **`EngineeringRunExecutor`, `RevisionLoopExecutor`, `MultiAgentExecutor` и
+  `ProviderReviewer` не являются production-машинерией.** Они остаются
+  test/smoke-машинерией до отдельного решения.
+- **Наблюдаемость переиспользует существующее хранилище.** Harness получил
+  опциональный observer, который получает ровно те события, которые harness и так
+  собирает — второй потребитель, а не второй поток событий — а `ForgeApiService`
+  записывает эти события и терминальный snapshot через существующий writer
+  `RunStore`. Новое event-хранилище не создавалось, управляющий поток loop не
+  изменён.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Маршрутизировать `POST /api/tasks/run` через harness в этом блоке.**
+  Отклонено: это сломало бы контракт ответа desktop/API и обычный путь задачи, а
+  задание требует, чтобы оба продолжали работать.
+- **Встроить слой решений в `RunExecutor`.** Отклонено принятой архитектурой:
+  `RunExecutor` — execution-примитив.
+- **Добавить `allowed_tool_ids` в `TaskRunRequest`.** Отклонено: это была бы
+  клиентски управляемая tool authority.
+- **Выводить tools из `category`, `context` или description.** Отклонено: все они
+  клиентские, поэтому любой из них позволил бы клиенту выдать себе tools.
+- **Отобразить `RUN_VERIFICATION` на объявленное выполнение.** Отклонено: тогда
+  decision выбирал бы, какая объявленная оператором команда выполнится. Это было
+  бы LLM-управляемым выбором команды.
+- **Передавать вручную собранный список `execution_requests` из входа loop.**
+  Отклонено: это был бы второй, задаваемый вызывающим источник authority. Список
+  строится один раз из объявления оператора.
+
+### Следствия и открытые пункты
+
+1. **`run_task` не изменён** и по-прежнему execution-disabled для host-процессов
+  сверх объявленного оператором; loop — отдельный доверенный вход. Объединение
+  двух путей — будущее решение с собственным влиянием на совместимость.
+2. **GAP-F (criterion identity) остаётся открытым** и является следующим
+  архитектурным блоком; стадия acceptance в loop намеренно отложена за ним.
+3. **GAP-A, GAP-B и идемпотентность этим блоком не изменены.**
+4. **Замечен существующий косметический дефект, не исправлен:** `HarnessRequest`
+   объявляет аннотацию поля `run_scope` дважды
+   (`app/agent_runtime/models.py`). Дубль инертен для `dataclasses`
+   (`dataclasses.fields` сообщает одно поле) и оставлен нетронутым как не
+   относящийся к этому блоку.

@@ -87,4 +87,40 @@ def create_runtime(
                 ToolExecutor(tool_registry) if tool_registry is not None else None
             ),
         ),
+        harness=create_agent_harness(),
     )
+
+
+def create_agent_harness(
+    *,
+    decision_provider: object | None = None,
+    coordinator: object | None = None,
+    policy: object | None = None,
+) -> "AgentHarness":
+    """Build the canonical production orchestration loop.
+
+    The harness is stateless per run: everything authority-bearing arrives
+    through ``HarnessRequest``, and ``AgentHarness._enforce_run_scope`` refuses a
+    request that declares dispatch authority without a frozen ``RunScope``. No
+    authority is supplied here, so a harness built by composition cannot execute
+    anything on its own.
+
+    Defaults are the deterministic decision provider and a coordinator over a
+    local adapter, matching the historical behaviour; callers may inject a bounded
+    policy (for example the one-action policy of the first vertical slice).
+    """
+    from app.agent_runtime.harness import AgentHarness
+    from app.agent_runtime.policy import AgentHarnessPolicy
+    from app.decision.provider import DeterministicDecisionProvider
+    from app.execution.adapter import LocalExecutionAdapter
+    from app.execution.authorizer import ExecutionCoordinator
+
+    kwargs = {
+        "decision_provider": decision_provider or DeterministicDecisionProvider(),
+        "policy": policy or AgentHarnessPolicy(),
+    }
+    resolved_coordinator = coordinator
+    if resolved_coordinator is None:
+        resolved_coordinator = ExecutionCoordinator(LocalExecutionAdapter())
+    kwargs["execution_coordinator"] = resolved_coordinator
+    return AgentHarness(**kwargs)

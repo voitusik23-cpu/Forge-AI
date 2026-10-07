@@ -66,6 +66,7 @@ class AgentHarness:
         policy: AgentHarnessPolicy | None = None,
         skill_evaluator: SkillEvaluator | None = None,
         memory_store: Any | None = None,
+        observer: Callable[[EventType, Mapping[str, object]], None] | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -77,6 +78,11 @@ class AgentHarness:
         self.policy = policy or AgentHarnessPolicy()
         self._skill_evaluator = skill_evaluator or SkillEvaluator()
         self._memory_store = memory_store
+        # Optional sink for the same events the harness collects. It receives
+        # exactly the events the harness already emits - it is a second consumer,
+        # never a second event stream - so a production caller can persist the
+        # loop's observable stages without changing the run loop.
+        self._observer = observer
 
     def _enforce_run_scope(self, request: HarnessRequest) -> None:
         """Freeze and enforce the run's security perimeter before any read.
@@ -128,12 +134,20 @@ class AgentHarness:
         )
 
         def emit(event_type: EventType, data: Mapping[str, object] | None = None) -> None:
+            payload = data or {}
             collector.emit(
                 event_type,
                 attempt_number=current_state.attempt_number,
                 task_id=request.task_specification.task_id if request.task_specification else None,
-                metadata=data or {},
+                metadata=payload,
             )
+            if self._observer is not None:
+                # A failing observer must never abort or alter the run loop: the
+                # harness owns control flow, the observer only records.
+                try:
+                    self._observer(event_type, payload)
+                except Exception:  # noqa: BLE001 - observation must not break a run
+                    pass
 
         emit(EventType.HARNESS_STARTED, {"policy": repr(self.policy)})
         iterations_history: list[HarnessState] = []

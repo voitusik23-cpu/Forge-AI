@@ -19,6 +19,8 @@ from app.api.models import (
 from app.dashboard.models import DashboardReport, ProviderStatus
 from app.dashboard.provider_health import ProviderHealthMonitor
 from app.dashboard.service import CostDashboardService
+from app.agent_runtime.models import HarnessRequest
+from app.agent_runtime.policy import AgentHarnessPolicy
 from app.execution.capabilities import ExecutionCapability
 from app.execution.declaration import (
     ExecutionDeclaration,
@@ -32,10 +34,10 @@ from app.execution.request import ExecutionOutcomeStatus
 from app.fabric.fabric import CapabilityFabric
 from app.orchestrator.models import RunState, Task, TaskCategory
 from app.orchestrator.run import RunExecutor
-from app.runtime.bootstrap import create_runtime
+from app.runtime.bootstrap import create_agent_harness, create_runtime
 from app.runtime.context import RuntimeContext
 from app.runtime.run_scope import RunScope, require_active_scope
-from app.runtime.run_store import RunStore
+from app.runtime.run_store import RunStateSnapshot, RunStore
 from app.tools.approval import ApprovalPolicy, ApprovalResolver
 from app.tools.acceptance import AcceptanceCriterion
 from app.tools.executor import ToolExecutor
@@ -87,6 +89,19 @@ API_RUN_CRITERION = AcceptanceCriterion(
     requirement_id="api-run",
 )
 
+# Bounds for the first production vertical slice of the agent loop: exactly one
+# action and one execution attempt. `max_revision_attempts` must stay positive:
+# the decision provider treats a zero revision budget as an already-exhausted
+# budget and would fail the run before it acts. The single action is enforced by
+# `max_actions`, not by starving the revision budget. These bounds add no
+# authority; they only narrow what the existing policy already permits.
+SINGLE_ACTION_LOOP_POLICY = AgentHarnessPolicy(
+    max_iterations=2,
+    max_actions=1,
+    max_execution_attempts=1,
+    max_revision_attempts=1,
+)
+
 
 from pathlib import Path
 
@@ -114,6 +129,7 @@ class ForgeApiService:
         verification_resolver: Optional[
             Callable[[Task, ProjectExecutionProfile], str | None]
         ] = None,
+        harness_factory: Callable[..., object] | None = None,
     ) -> None:
         self._workspace = workspace or Workspace(Path.cwd())
 
@@ -135,6 +151,11 @@ class ForgeApiService:
         # authorise anything, and it is never populated from client input. It is
         # deliberately not exposed on the HTTP contract.
         self._execution_request_factory = execution_request_factory
+        # Composition-time factory for the canonical orchestration loop. It is the
+        # same factory the runtime uses, so there is exactly one loop
+        # implementation; the service only asks it for a harness with the narrowed
+        # bounds of the first vertical slice.
+        self._harness_factory = harness_factory or create_agent_harness
 
         # Operator-declared execution intents. Declarations are data, never a
         # gate: an unmatched declaration simply cannot run.
@@ -499,6 +520,215 @@ class ForgeApiService:
                     )
                 )
         return agents
+
+    def _build_harness_request(
+        self,
+        run_id: str,
+        declaration: ExecutionDeclaration,
+        scope: RunScope,
+    ) -> HarnessRequest:
+        """Assemble the per-run input for the canonical orchestration loop.
+
+        Everything authority-bearing is derived from the operator's declaration
+        and the frozen scope, never from a request, a context, or a decision:
+
+        * ``execution_requests`` is the operator's declared command, already
+          translated once. The loop selects among pre-authorized actions by index;
+          a decision can never author one.
+        * ``allowed_execution_commands`` is the scope's derived command set, so the
+          loop's own authorization step and the coordinator both re-check the
+          same operator-granted set.
+
+        ``verification_expectations`` is left empty: criterion identity is GAP-F
+        and is deliberately not invented here, so the acceptance stage stays
+        deferred rather than pretending a successful process is task acceptance.
+        """
+        return HarnessRequest(
+            run_id=run_id,
+            workspace=self._workspace,
+            execution_requests=(
+                to_execution_request(
+                    declaration,
+                    profile=self._execution_profile,
+                    run_id=run_id,
+                ),
+            ),
+            allowed_execution_commands=tuple(scope.allowed_execution_commands),
+            acceptance_criteria=(API_RUN_CRITERION,),
+            approval_policy=self._approval_policy,
+            approval_resolver=self._approval_resolver,
+            run_scope=scope,
+            metadata={"declaration_id": declaration.declaration_id},
+        )
+
+    def run_agent_loop(
+        self,
+        declaration_id: str,
+        *,
+        purpose_run_id: Optional[str] = None,
+    ) -> TaskRunResponse:
+        """Run the canonical agent loop once through the production harness.
+
+        This is a trusted server-side entry point, like
+        ``run_declared_verification``: it is called by operator-controlled code
+        inside the process and is not reachable from the HTTP contract.
+
+        The loop is intentionally a single-action vertical slice: one context
+        assembly, one decision, one operator-authorized action, one execution
+        result, recorded in the durable run history. ``decision`` never grants
+        authority - the decision provider returns a recommendation, and both the
+        harness's authorization step and the ``ExecutionCoordinator`` validate it
+        against the frozen ``RunScope``.
+
+        ``run_task`` is unchanged and does not route through this method, so the
+        existing API task path keeps its previous semantics.
+        """
+        if self._runtime.harness is None:
+            raise ExecutionDeclarationError(
+                "no agent harness is configured in this runtime"
+            )
+        if not self._declarations:
+            raise ExecutionDeclarationError(
+                "no execution declarations are configured, so the agent loop has "
+                "no pre-authorized action to select"
+            )
+        if not isinstance(declaration_id, str) or not declaration_id.strip():
+            raise ExecutionDeclarationError("declaration_id must be a non-empty string")
+        declaration = self._declarations.get(declaration_id.strip())
+        if declaration is None:
+            raise UnknownExecutionDeclarationError(
+                f"undeclared execution: {declaration_id.strip()!r}"
+            )
+        if purpose_run_id is not None and (
+            not isinstance(purpose_run_id, str) or not purpose_run_id.strip()
+        ):
+            raise ExecutionDeclarationError(
+                "purpose_run_id must be a non-empty string when provided"
+            )
+
+        run_id = f"run-loop-{uuid.uuid4().hex[:8]}"
+        scope = self._build_declared_verification_scope(run_id, declaration)
+        task_id = f"task-loop-{declaration.declaration_id}"
+
+        loop_store: Optional[RunStore] = None
+        try:
+            loop_store = self._run_store.bind_run(run_id, task_id=task_id)
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            loop_store = None
+
+        if loop_store is not None:
+            try:
+                loop_store(
+                    "RUN_STARTED",
+                    {"run_id": run_id, "task_id": task_id, "entry_point": "run_agent_loop"},
+                )
+            except Exception:  # noqa: BLE001 - persistence must not block a run
+                pass
+
+        request = self._build_harness_request(run_id, declaration, scope)
+        # Built by the same composition factory that supplies the runtime's
+        # canonical harness, differing only in the narrowed bounds of this slice.
+        # No second loop implementation and no second authority object exist.
+        harness = self._harness_factory(policy=SINGLE_ACTION_LOOP_POLICY)
+        t0 = time.perf_counter()
+        result = harness.run(request)
+        duration = time.perf_counter() - t0
+
+        if loop_store is not None:
+            self._persist_harness_events(loop_store, result)
+            self._persist_loop_state(loop_store, run_id, task_id, result)
+
+        execution_result = (
+            result.execution_results[0] if result.execution_results else None
+        )
+        output = (execution_result.stdout if execution_result else "") or ""
+        error: Optional[str] = None
+        if execution_result is None:
+            error = result.final_state.status.value
+        elif execution_result.outcome_status != ExecutionOutcomeStatus.EXECUTION_SUCCESS:
+            error = str(
+                execution_result.metadata.get("denial_reason")
+                or getattr(
+                    execution_result.outcome_status,
+                    "value",
+                    execution_result.outcome_status,
+                )
+            )
+        if not result.decisions and error is None:
+            error = "no_decision_produced"
+
+        succeeded = (
+            execution_result is not None
+            and execution_result.outcome_status == ExecutionOutcomeStatus.EXECUTION_SUCCESS
+        )
+        return TaskRunResponse(
+            run_id=run_id,
+            task_id=task_id,
+            project_id=self._active_project_id,
+            state=result.final_state.status.value,
+            # Execution success, not task acceptance: the acceptance stage is
+            # deferred until criterion identity exists (GAP-F).
+            success=succeeded,
+            output=output or "(Agent loop produced no process output)",
+            error=error,
+            tokens=0,
+            cost=0.0,
+            duration_seconds=round(duration, 3),
+            provider_used="",
+            model_used="",
+        )
+
+    def _persist_harness_events(self, store: RunStore, result: object) -> None:
+        """Record the loop's collected events into the existing durable history.
+
+        Reuses the run store's existing append path; no second event store is
+        created and the run loop itself is not modified.
+        """
+        run_id = store.bound_run_id
+        if not run_id:
+            return
+        for event in getattr(result, "events", ()) or ():
+            event_type = getattr(event, "event_type", None)
+            if event_type is None:
+                continue
+            try:
+                store.append_event(
+                    event_type,
+                    dict(getattr(event, "metadata", {}) or {}),
+                    run_id=run_id,
+                    attempt_number=getattr(event, "attempt_number", 0) or 0,
+                    task_id=getattr(event, "task_id", None),
+                )
+            except Exception:  # noqa: BLE001 - persistence must not block a run
+                continue
+
+    def _persist_loop_state(
+        self, store: RunStore, run_id: str, task_id: str, result: object
+    ) -> None:
+        """Persist the loop's terminal snapshot with the existing state writer.
+
+        The harness produces its own result object rather than an orchestrator
+        ``Run``, so the snapshot is derived from that result directly instead of
+        from ``record_run_state``. It uses the same ``RunStateSnapshot`` type and
+        the same atomic writer, so the durable history keeps one shape and the
+        ``task_id`` matches the events exactly.
+        """
+        try:
+            events = tuple(getattr(result, "events", ()) or ())
+            state = getattr(getattr(result, "final_state", None), "status", None)
+            store.write_state(
+                RunStateSnapshot(
+                    run_id=run_id,
+                    task_id=task_id,
+                    state=state.value if hasattr(state, "value") else str(state or ""),
+                    status=state.value if hasattr(state, "value") else str(state or ""),
+                    attempt_number=0,
+                    event_count=len(events),
+                    updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                )
+            )
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            pass
 
     def run_declared_verification(
         self,

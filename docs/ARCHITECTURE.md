@@ -818,12 +818,69 @@ disabled with no default or implicit command; an unknown declaration id raises
 built, or any process starts. `run_task` never invokes declared verification, so
 the ordinary API task path stays execution-disabled.
 
+**Canonical production orchestration loop.** `AgentHarness`
+(`app/agent_runtime/harness.py`) is the canonical production orchestrator and the
+bootstrap supplies it in `RuntimeContext.harness`. `RunExecutor` remains the
+execution primitive; the loop is not built on top of it.
+
+`ForgeApiService.run_agent_loop(declaration_id, *, purpose_run_id=None)` is the
+trusted server-side entry point for the first vertical slice:
+
+```text
+trusted caller
+  -> AgentHarness
+  -> DecisionContextAssembler
+  -> DecisionProvider            (recommendation only)
+  -> harness AUTHORIZE           (frozen RunScope)
+  -> ExecutionCoordinator        (mandatory, authoritative)
+  -> AuthorizedExecution
+  -> LocalExecutionAdapter
+  -> RunStore
+```
+
+The slice is deliberately narrow: one context assembly, one decision, one
+operator-authorized action, one execution result, recorded in the durable run
+history. The bounds are `max_actions=1` and `max_execution_attempts=1`; these
+narrow an existing policy and add no authority. `max_revision_attempts` stays
+positive because the decision provider reads a zero revision budget as an
+already-exhausted budget.
+
+**Decision is not authority.** A decision answers *what to do next*; authority
+answers *what this run may do at all*. The harness selects among
+`execution_requests` that the server-side composition already built from an
+operator declaration, and it re-checks the selected command against
+`allowed_execution_commands` before dispatch. The `ExecutionCoordinator` then
+re-validates independently. A decision provider cannot add a tool, add a command,
+change the workspace, profile, environment, timeout, or approval, and cannot
+construct an `AuthorizedExecution`.
+
+**Tools are operator-authorized.** Tool authority comes from the operator-set
+`allowed_tool_ids` on `ForgeApiService`, intersected with the registered tools and
+bound into the frozen `RunScope`. `TaskRunRequest` carries no authority field, so
+a request, its context, its description, its category, or a task id cannot grant a
+tool. The empty default remains fail-closed.
+
+**Acceptance stays deferred.** The slice records execution success, not task
+acceptance. Criterion identity is GAP-F and is not invented here, so the
+acceptance stage is not fabricated: a successful process is reported as execution
+success only.
+
+**`RUN_VERIFICATION` in the slice.** The action reads verification expectations
+from the server-side request and has no channel to select a declaration, so a
+decision cannot choose an arbitrary declared execution. With no expectations
+configured the acceptance gate fails closed with `verification_missing` rather
+than reporting a pass.
+
+`EngineeringRunExecutor`, `RevisionLoopExecutor`, `MultiAgentExecutor`, and
+`ProviderReviewer` are **not** production machinery; they remain test/smoke
+machinery until a separate decision.
+
 **What is still missing.** The entry point runs and records a declared
-verification, but there is no trusted criterion identity to attach the result to,
-so it is deliberately not linked to a client task's acceptance criteria and no
-placeholder criterion is presented as a real one (GAP-F). Task-driven
-verification binding likewise still needs its own decision: no production
-`VerificationExpectation` or `TestVerificationIntent` exists, and
+verification, and the loop runs one authorized action, but there is no trusted
+criterion identity to attach a result to, so neither is linked to a client task's
+acceptance criteria and no placeholder criterion is presented as a real one
+(GAP-F). Task-driven verification binding likewise still needs its own decision:
+no production `VerificationExpectation` or `TestVerificationIntent` exists, and
 `TaskRunRequest` carries no verification field. Network restriction is
 best-effort only (`network_access=False` sets proxy environment variables; it is
 not a kernel-level block), and the ephemeral workspace boundary is a
@@ -912,17 +969,74 @@ scope, построен запрос или запущен процесс. `run_
 объявленную verification, поэтому обычный API-путь задачи остаётся
 execution-disabled.
 
-**Чего ещё нет.** Вход выполняет и записывает объявленную verification, но
-доверенной criterion-идентичности, к которой можно привязать результат, нет,
-поэтому он намеренно не связывается с acceptance criteria клиентской задачи, а
-placeholder-критерий не выдаётся за настоящий (GAP-F). Привязка verification к
-задаче также всё ещё требует отдельного решения: production
-`VerificationExpectation` или `TestVerificationIntent` не существует, а
-`TaskRunRequest` не несёт verification-поля. Ограничение сети — только
-best-effort (`network_access=False` выставляет прокси-переменные окружения; это
-не kernel-level блокировка), а граница эфемерного workspace — это граница рабочей
-директории и COPY-разворачивания, а не файловая песочница. Идемпотентное
-исполнение side effects и automatic resume остаются вне области работ.
+**Канонический production orchestration loop.** `AgentHarness`
+(`app/agent_runtime/harness.py`) — канонический production-оркестратор, и
+bootstrap поставляет его в `RuntimeContext.harness`. `RunExecutor` остаётся
+execution-примитивом; loop не строится поверх него.
+
+`ForgeApiService.run_agent_loop(declaration_id, *, purpose_run_id=None)` — доверенный
+server-side вход для первого вертикального среза:
+
+```text
+доверенный вызывающий
+  -> AgentHarness
+  -> DecisionContextAssembler
+  -> DecisionProvider            (только рекомендация)
+  -> AUTHORIZE в harness         (замороженный RunScope)
+  -> ExecutionCoordinator        (обязателен, авторитетен)
+  -> AuthorizedExecution
+  -> LocalExecutionAdapter
+  -> RunStore
+```
+
+Срез намеренно узкий: одна сборка контекста, одно решение, одно авторизованное
+оператором действие, один результат исполнения, записанный в durable history.
+Границы — `max_actions=1` и `max_execution_attempts=1`; они сужают существующую
+политику и не добавляют authority. `max_revision_attempts` остаётся положительным,
+поскольку decision provider читает нулевой бюджет ревизий как уже исчерпанный.
+
+**Decision не является authority.** Decision отвечает на вопрос *что делать
+дальше*; authority — на вопрос *что этому run вообще разрешено*. Harness выбирает
+среди `execution_requests`, которые server-side композиция уже построила из
+объявления оператора, и повторно проверяет выбранную команду против
+`allowed_execution_commands` перед dispatch. Затем `ExecutionCoordinator`
+перепроверяет независимо. Decision provider не может добавить tool, добавить
+команду, изменить workspace, профиль, окружение, timeout или approval, а также
+создать `AuthorizedExecution`.
+
+**Tools авторизуются оператором.** Tool authority приходит из заданного оператором
+`allowed_tool_ids` в `ForgeApiService`, пересекается с зарегистрированными tools и
+связывается в замороженный `RunScope`. `TaskRunRequest` не несёт authority-полей,
+поэтому запрос, его context, description, category или task id не могут выдать
+tool. Пустой default остаётся fail-closed.
+
+**Acceptance остаётся отложенным.** Срез записывает execution success, а не task
+acceptance. Criterion identity — это GAP-F, и здесь она не выдумывается, поэтому
+стадия acceptance не подделывается: успешный процесс сообщается только как
+execution success.
+
+**`RUN_VERIFICATION` в срезе.** Действие читает verification expectations из
+server-side запроса и не имеет канала для выбора объявления, поэтому decision не
+может выбрать произвольное объявленное выполнение. Без сконфигурированных
+expectations acceptance-гейт падает fail-closed с `verification_missing`, а не
+сообщает о прохождении.
+
+`EngineeringRunExecutor`, `RevisionLoopExecutor`, `MultiAgentExecutor` и
+`ProviderReviewer` **не** являются production-машинерией; они остаются
+test/smoke-машинерией до отдельного решения.
+
+**Чего ещё нет.** Вход выполняет и записывает объявленную verification, а loop
+выполняет одно авторизованное действие, но доверенной criterion-идентичности, к
+которой можно привязать результат, нет, поэтому ни то, ни другое не связывается с
+acceptance criteria клиентской задачи, а placeholder-критерий не выдаётся за
+настоящий (GAP-F). Привязка verification к задаче также всё ещё требует отдельного
+решения: production `VerificationExpectation` или `TestVerificationIntent` не
+существует, а `TaskRunRequest` не несёт verification-поля. Ограничение сети —
+только best-effort (`network_access=False` выставляет прокси-переменные
+окружения; это не kernel-level блокировка), а граница эфемерного workspace — это
+граница рабочей директории и COPY-разворачивания, а не файловая песочница.
+Идемпотентное исполнение side effects и automatic resume остаются вне области
+работ.
 
 ## Capability and Tool Discovery v0.1 — русская версия
 
