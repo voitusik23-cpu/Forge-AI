@@ -91,6 +91,22 @@ def create_runtime(
     )
 
 
+def create_loop_coordinator(isolate_workspace: bool = True) -> "ExecutionCoordinator":
+    """Build the coordinator a production loop should dispatch through.
+
+    Composition decides the workspace staging mode; the API layer only asks for
+    a coordinator, so it never imports the adapter itself. Authority is
+    unaffected: ``RunScope``, ``ExecutionPolicy``, approval, and the
+    coordinator's sentinel are unchanged.
+    """
+    from app.execution.adapter import LocalExecutionAdapter
+    from app.execution.authorizer import ExecutionCoordinator
+
+    return ExecutionCoordinator(
+        LocalExecutionAdapter(isolate_workspace=isolate_workspace)
+    )
+
+
 def create_agent_harness(
     *,
     decision_provider: object | None = None,

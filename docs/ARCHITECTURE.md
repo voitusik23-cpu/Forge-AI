@@ -860,12 +860,55 @@ bound into the frozen `RunScope`. `TaskRunRequest` carries no authority field, s
 a request, its context, its description, its category, or a task id cannot grant a
 tool. The empty default remains fail-closed.
 
-**Acceptance stays deferred.** The slice records execution success, not task
-acceptance. Criterion identity is GAP-F and is not invented here, so the
-acceptance stage is not fabricated: a successful process is reported as execution
-success only.
+**Acceptance slice: criterion, verification, and verdict.**
+`ForgeApiService.run_accepted_task(declaration_id)` is the production acceptance
+entry point. It is trusted in-process code whose only input is a declaration id.
 
-**`RUN_VERIFICATION` in the slice.** The action reads verification expectations
+```text
+operator composition
+  -> ExecutionDeclaration          (what may run)
+  -> AcceptanceSpec                (criterion + deterministic expectation)
+  -> run_id / task_id              (server-generated identity)
+  -> RunAcceptanceCriteria         (frozen per-run criteria)
+  -> AgentHarness
+  -> one authorized action
+  -> WorkspaceVerifier             (file existence / SHA-256)
+  -> AcceptanceGate                (PASS / FAIL)
+  -> RunStore                      (criterion, verification, acceptance events)
+```
+
+* **Criterion identity** is created server-side. `AcceptanceSpec`
+  (`app/agent_runtime/acceptance_spec.py`) is the operator's definition, declared
+  next to the execution declaration; `AcceptanceSpec.bind(run_id, task_id)`
+  freezes it into `RunAcceptanceCriteria`, which asserts it belongs to exactly
+  that run and task. Nothing can bind a spec to a run it was not composed for, and
+  criteria cannot be swapped after a run starts.
+* **Every criterion must be checkable.** A criterion without an expectation, an
+  expectation for an unknown criterion, a duplicate criterion id, an empty
+  criterion set, and a malformed digest are all rejected at construction, so a
+  criterion can never exist whose acceptance could only ever be
+  `verification_missing`.
+* **Verification is deterministic and non-authoritative.**
+  `FrozenCriteriaVerifier` (`app/agent_runtime/frozen_verifier.py`) evaluates
+  workspace facts through the existing `WorkspaceVerifier`. Its input is a plain
+  mapping of expectations, so it also serves the harness's own verification stage,
+  and there is still one verification implementation. It has no executable, argv,
+  environment, timeout, profile, or scope, and it cannot choose a command. A
+  verifier that cannot complete its work reports `ERROR`, never `PASS`.
+* **The verdict is the existing gate's.** `AcceptanceGate` decides PASS/FAIL; the
+  entry point only consumes the result. A missing verdict is recorded as
+  `not_evaluated` and is never treated as a pass.
+* **The slice is one execution plus its verification.** `ACCEPTANCE_LOOP_POLICY`
+  allows `max_execution_attempts=1`, and the action budget admits the verification
+  stage that must follow it.
+
+**`EXECUTION_SUCCESS` is not task acceptance.** The response's `success` means the
+action ran successfully *and* its verification passed; the acceptance verdict
+itself is recorded as `acceptance_status` in the durable run record. A successful
+process whose criterion fails is rejected with `required_criteria_failed`.
+Redefining the public `success` field is a separate contract decision.
+
+**`RUN_VERIFICATION` in the loop.** The action reads verification expectations
 from the server-side request and has no channel to select a declaration, so a
 decision cannot choose an arbitrary declared execution. With no expectations
 configured the acceptance gate fails closed with `verification_missing` rather
@@ -1010,10 +1053,37 @@ server-side вход для первого вертикального среза
 поэтому запрос, его context, description, category или task id не могут выдать
 tool. Пустой default остаётся fail-closed.
 
-**Acceptance остаётся отложенным.** Срез записывает execution success, а не task
-acceptance. Criterion identity — это GAP-F, и здесь она не выдумывается, поэтому
-стадия acceptance не подделывается: успешный процесс сообщается только как
-execution success.
+**Срез acceptance: criterion, verification и вердикт.**
+`ForgeApiService.run_accepted_task(declaration_id)` — production-вход acceptance.
+Это доверенный in-process код, единственный вход которого — declaration id.
+
+* **Criterion identity создаётся server-side.** `AcceptanceSpec`
+  (`app/agent_runtime/acceptance_spec.py`) — определение оператора, объявляемое
+  рядом с execution-объявлением; `AcceptanceSpec.bind(run_id, task_id)`
+  замораживает его в `RunAcceptanceCriteria`, который проверяет принадлежность
+  ровно этому run и task. Никто не может связать spec с run, для которого он не
+  объявлялся, а критерии нельзя подменить после старта run.
+* **Каждый критерий обязан быть проверяемым.** Критерий без expectation,
+  expectation для неизвестного критерия, дубликат criterion id, пустой набор
+  критериев и некорректный digest отвергаются при создании.
+* **Verification детерминирован и не несёт authority.**
+  `FrozenCriteriaVerifier` (`app/agent_runtime/frozen_verifier.py`) проверяет
+  факты workspace через существующий `WorkspaceVerifier`. У него нет executable,
+  argv, окружения, timeout, профиля или scope, и он не может выбрать команду.
+  Verifier, который не может выполнить работу, сообщает `ERROR`, но никогда
+  `PASS`.
+* **Вердикт выдаёт существующий гейт.** PASS/FAIL решает `AcceptanceGate`; вход
+  лишь потребляет результат. Отсутствующий вердикт записывается как
+  `not_evaluated` и никогда не трактуется как прохождение.
+* **Срез — одно исполнение плюс его verification.** `ACCEPTANCE_LOOP_POLICY`
+  допускает `max_execution_attempts=1`, а бюджет действий вмещает обязательную
+  следующую за ним стадию verification.
+
+**`EXECUTION_SUCCESS` — не task acceptance.** `success` в ответе означает, что
+действие выполнилось успешно *и* его verification прошёл; сам вердикт acceptance
+записывается как `acceptance_status` в durable run record. Успешный процесс, чей
+критерий не проходит, отвергается с `required_criteria_failed`. Переопределение
+публичного поля `success` — отдельное решение о контракте.
 
 **`RUN_VERIFICATION` в срезе.** Действие читает verification expectations из
 server-side запроса и не имеет канала для выбора объявления, поэтому decision не

@@ -127,6 +127,7 @@ class EventType(str, Enum):
     APPROVAL_RESOLVED = "approval_resolved"
     VERIFICATION_REQUESTED = "verification_requested"
     VERIFICATION_COMPLETED = "verification_completed"
+    CRITERION_DEFINED = "criterion_defined"
     ACCEPTANCE_COMPLETED = "acceptance_completed"
     REVISION_STARTED = "revision_started"
     REVISION_COMPLETED = "revision_completed"

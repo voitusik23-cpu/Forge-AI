@@ -120,6 +120,49 @@ class AgentHarness:
         scope.freeze()
         require_active_scope(request.run_id, scope)
 
+    def run_verification(
+        self,
+        request: HarnessRequest,
+        emit: Callable[[EventType, Mapping[str, object]], None],
+    ) -> tuple[tuple[VerificationResult, ...], AcceptanceResult | None]:
+        """Verify the request's frozen expectations and evaluate acceptance.
+
+        This is the single verification/acceptance implementation: the run loop's
+        ``RUN_VERIFICATION`` action calls it, and a trusted production caller may
+        call it directly. It uses only expectations and criteria carried by the
+        request, so neither a decision nor a caller of this method can choose what
+        is verified or declare the verdict itself.
+        """
+        verified: list[VerificationResult] = []
+        for crit_id, exp in request.verification_expectations.items():
+            v_res = self._verifier.verify(
+                exp,
+                workspace=request.workspace,
+                run_id=request.run_id,
+                observer=emit,
+                criterion_id=crit_id,
+            )
+            verified.append(v_res)
+
+        if not verified:
+            # Nothing was verified, so there is nothing to accept. Returning no
+            # acceptance result keeps missing verification distinguishable from a
+            # pass - a caller must not read this as acceptance.
+            return (), None
+
+        v_dict = {
+            (v.criterion_id or f"crit-{idx}"): v
+            for idx, v in enumerate(verified)
+        }
+        acceptance = self._acceptance_gate.evaluate(
+            criteria=request.acceptance_criteria,
+            verifications=v_dict,
+            run_id=request.run_id,
+            observer=emit,
+            requirements=request.requirements if request.requirements else None,
+        )
+        return tuple(verified), acceptance
+
     def run(self, request: HarnessRequest) -> HarnessResult:
         """Execute the controlled, bounded Run Loop according to configured policy."""
         self._enforce_run_scope(request)
@@ -642,31 +685,18 @@ class AgentHarness:
                         {"phase": HarnessPhase.VERIFY.value, "iteration": current_state.iteration},
                     )
 
-                    verifs_for_this_round: list[VerificationResult] = []
-                    for crit_id, exp in request.verification_expectations.items():
-                        v_res = self._verifier.verify(
-                            exp,
-                            workspace=request.workspace,
-                            run_id=request.run_id,
-                            observer=lambda event_type, data: emit(event_type, data),
-                            criterion_id=crit_id,
-                        )
-                        verifs_for_this_round.append(v_res)
-                        verification_results.append(v_res)
-                        latest_verif_id = v_res.verification_id
-
-                    v_dict = {
-                        (v.criterion_id or f"crit-{idx}"): v
-                        for idx, v in enumerate(verifs_for_this_round)
-                    }
-                    acceptance_result = self._acceptance_gate.evaluate(
-                        criteria=request.acceptance_criteria,
-                        verifications=v_dict,
-                        run_id=request.run_id,
-                        observer=lambda event_type, data: emit(event_type, data),
-                        requirements=request.requirements if request.requirements else None,
+                    verifs_for_this_round, acceptance_result = self.run_verification(
+                        request,
+                        emit,
                     )
-                    action_outcome = acceptance_result.status.value
+                    verification_results.extend(verifs_for_this_round)
+                    if verifs_for_this_round:
+                        latest_verif_id = verifs_for_this_round[-1].verification_id
+                    action_outcome = (
+                        acceptance_result.status.value
+                        if acceptance_result is not None
+                        else "not_evaluated"
+                    )
 
             # PHASE 7: OBSERVE_RESULT
             obs = StructuredObservation(

@@ -1109,3 +1109,193 @@ Implemented in the production agent loop block. Verified against the code in
    (`app/agent_runtime/models.py`). Дубль инертен для `dataclasses`
    (`dataclasses.fields` сообщает одно поле) и оставлен нетронутым как не
    относящийся к этому блоку.
+
+## Production Criterion, Verification, and Acceptance v0.1
+
+Implemented in the acceptance slice block. Verified against the code in
+`app/agent_runtime/acceptance_spec.py`, `app/agent_runtime/frozen_verifier.py`,
+`app/agent_runtime/harness.py`, `app/api/service.py`, `app/runtime/bootstrap.py`,
+and `tests/test_acceptance_production.py`.
+
+### Accepted decisions
+
+- **`EXECUTION_SUCCESS` is not task acceptance.** A process that exits zero is
+  reported as execution success. Task acceptance exists only when the existing
+  `AcceptanceGate` returns PASS over verification results produced from frozen
+  server-side expectations.
+- **Criterion identity is created server-side, in two steps.** `AcceptanceSpec`
+  is the operator's definition, declared next to the execution declaration.
+  `AcceptanceSpec.bind(run_id, task_id)` freezes it into `RunAcceptanceCriteria`,
+  which asserts it belongs to exactly that run and task. Criteria cannot be bound
+  to a run they were not composed for and cannot be swapped after the run starts.
+- **Criteria come only from operator composition.** `ForgeApiService` takes an
+  `acceptance_specs` mapping at construction time, next to `declarations`. There
+  is no HTTP field, no task context, no description, no category, no task id, and
+  no decision input that can add, remove, or replace a criterion.
+- **Absent criteria mean no acceptance.** A declaration without an
+  `AcceptanceSpec` is refused; missing criteria are never a permissive default.
+- **Every criterion must be checkable.** A criterion without an expectation, an
+  expectation for an unknown criterion, a duplicate criterion id, an empty
+  criterion set, and a malformed digest are rejected when the spec is built, so a
+  criterion whose acceptance could only ever be `verification_missing` cannot
+  exist.
+- **Verification is deterministic and non-authoritative.** `FrozenCriteriaVerifier`
+  evaluates workspace facts through the existing `WorkspaceVerifier`: a relative
+  path must exist or be absent, optionally matching a SHA-256. It has no
+  executable, argv, environment, timeout, profile, or scope, so a criterion can
+  never become command authority.
+- **Errors are never passes.** A verifier that cannot complete its work reports
+  `ERROR`; the gate then rejects it as `verification_failed`. An empty expectation
+  set yields no results and no acceptance verdict, which is recorded as
+  `not_evaluated` rather than PASS.
+- **The verdict belongs to the existing gate.** `AcceptanceGate` decides
+  PASS/FAIL from criteria and verification results. The entry point consumes
+  `final_acceptance` and does not evaluate acceptance itself.
+- **One verification implementation.** The harness's verification stage was
+  extracted into `AgentHarness.run_verification`, which the loop action and the
+  production entry point both call. No second `AcceptanceGate` or second
+  `VerificationEvaluator` was created.
+- **Verification runs only after an execution result exists.** An execution
+  failure produces no verification and no acceptance verdict, so a failure can
+  never be masked by a verdict.
+- **The slice is one execution plus its verification.** `ACCEPTANCE_LOOP_POLICY`
+  keeps `max_execution_attempts=1`; the action budget admits the mandatory
+  verification stage.
+- **The acceptance slice runs without workspace COPY-staging.** The criterion
+  asserts a fact about the workspace the action was told to work in, and a scratch
+  copy would make that fact unverifiable. Only the staging mode changes:
+  `RunScope`, `ExecutionPolicy`, approval, and the coordinator sentinel are
+  untouched.
+- **The public `success` field is not redefined.** `success` means the action ran
+  and its verification passed; the acceptance verdict is recorded as
+  `acceptance_status` in the durable run record. Changing the public contract is a
+  separate decision.
+
+### Rejected alternatives (with rationale)
+
+- **Letting a decision select the criterion or the verifier.** Rejected: the
+  decision would then control what counts as done, which is acceptance authority
+  flowing from a replaceable component.
+- **Deriving a criterion from the command.** Rejected: a criterion created from
+  what ran can only restate that it ran, which is exactly the confusion this block
+  removes.
+- **Accepting on `EXECUTION_SUCCESS` when no expectation is configured.**
+  Rejected: that is the artificial PASS the brief forbids.
+- **Adding `criterion_id` or criteria to `TaskRunRequest`.** Rejected: it would let
+  a client choose what counts as done.
+- **The file-based `TestVerificationAdapter` path as the production verifier.**
+  Kept test-only; production verification already has a safe deterministic
+  mechanism in `WorkspaceVerifier`, and the adapter's intent types are not needed
+  to express a workspace fact.
+
+### Consequences and open items
+
+1. **GAP-F is only half closed.** Criterion identity now works for
+   operator-declared criteria end to end, including a real PASS/FAIL verdict in the
+   durable history. Deriving criteria from a `TaskSpecification` or a task request
+   still has no trusted server-side source and remains an open architectural
+   decision; it is not closed here.
+2. **Acceptance is not exposed on the public contract.** Consumers read
+   `acceptance_status` from the run record. Redefining `TaskRunRequest` or
+   `TaskRunResponse` is a separate decision.
+3. **One criterion shape in this slice.** Only `exists` / `sha256` expectations are
+   used. Richer criteria (test-suite outcomes, build artifacts) would need their
+   own deterministic verifier and their own decision.
+4. **GAP-A, GAP-B, and idempotency are unchanged** by this block.
+
+## Production Criterion, Verification, and Acceptance v0.1 — русская версия
+
+Реализовано в блоке acceptance slice. Проверено по коду в
+`app/agent_runtime/acceptance_spec.py`, `app/agent_runtime/frozen_verifier.py`,
+`app/agent_runtime/harness.py`, `app/api/service.py`, `app/runtime/bootstrap.py`
+и `tests/test_acceptance_production.py`.
+
+### Принятые решения
+
+- **`EXECUTION_SUCCESS` — не task acceptance.** Процесс с нулевым кодом
+  сообщается как execution success. Task acceptance существует только тогда,
+  когда существующий `AcceptanceGate` вернул PASS по результатам verification,
+  полученным из замороженных server-side expectations.
+- **Criterion identity создаётся server-side, в два шага.** `AcceptanceSpec` —
+  определение оператора, объявляемое рядом с execution-объявлением.
+  `AcceptanceSpec.bind(run_id, task_id)` замораживает его в
+  `RunAcceptanceCriteria`, который проверяет принадлежность ровно этому run и
+  task. Критерии нельзя связать с run, для которого они не объявлялись, и нельзя
+  подменить после старта run.
+- **Критерии приходят только из композиции оператора.** `ForgeApiService`
+  принимает mapping `acceptance_specs` на композиции, рядом с `declarations`. Нет
+  ни HTTP-поля, ни task context, ни description, ни category, ни task id, ни
+  входа decision, которые могли бы добавить, удалить или заменить критерий.
+- **Нет критериев — нет acceptance.** Объявление без `AcceptanceSpec`
+  отвергается; отсутствие критериев никогда не является разрешающим значением по
+  умолчанию.
+- **Каждый критерий обязан быть проверяемым.** Критерий без expectation,
+  expectation для неизвестного критерия, дубликат criterion id, пустой набор
+  критериев и некорректный digest отвергаются при построении spec, поэтому
+  критерий, у которого acceptance могло быть только `verification_missing`,
+  существовать не может.
+- **Verification детерминирован и не несёт authority.**
+  `FrozenCriteriaVerifier` проверяет факты workspace через существующий
+  `WorkspaceVerifier`: относительный путь должен существовать или отсутствовать,
+  опционально совпадая с SHA-256. У него нет executable, argv, окружения,
+  timeout, профиля или scope, поэтому критерий никогда не может стать command
+  authority.
+- **Ошибки никогда не становятся прохождением.** Verifier, который не может
+  выполнить работу, сообщает `ERROR`; гейт затем отвергает это как
+  `verification_failed`. Пустой набор expectations даёт ноль результатов и
+  отсутствие вердикта acceptance, что записывается как `not_evaluated`, а не PASS.
+- **Вердикт принадлежит существующему гейту.** PASS/FAIL решает `AcceptanceGate`
+  по критериям и результатам verification. Вход потребляет `final_acceptance` и не
+  оценивает acceptance сам.
+- **Одна реализация verification.** Стадия verification в harness вынесена в
+  `AgentHarness.run_verification`, которую вызывают и действие loop, и
+  production-вход. Второй `AcceptanceGate` или второй `VerificationEvaluator` не
+  создавались.
+- **Verification выполняется только при наличии результата исполнения.** Сбой
+  исполнения не даёт ни verification, ни вердикта acceptance, поэтому сбой никогда
+  не маскируется вердиктом.
+- **Срез — одно исполнение плюс его verification.** `ACCEPTANCE_LOOP_POLICY`
+  сохраняет `max_execution_attempts=1`; бюджет действий вмещает обязательную
+  стадию verification.
+- **Срез acceptance работает без COPY-разворачивания workspace.** Критерий
+  утверждает факт о workspace, в котором действию было сказано работать, и
+  scratch-копия сделала бы этот факт непроверяемым. Меняется только режим
+  разворачивания: `RunScope`, `ExecutionPolicy`, approval и sentinel координатора
+  не тронуты.
+- **Публичное поле `success` не переопределяется.** `success` означает, что
+  действие выполнилось и его verification прошёл; вердикт acceptance записывается
+  как `acceptance_status` в durable run record. Изменение публичного контракта —
+  отдельное решение.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Позволить decision выбирать критерий или verifier.** Отклонено: тогда decision
+  управлял бы тем, что считается выполненным, то есть acceptance authority
+  текла бы из заменяемого компонента.
+- **Выводить критерий из команды.** Отклонено: критерий, созданный из того, что
+  выполнялось, может лишь повторить, что оно выполнялось, — а это ровно та
+  путаница, которую устраняет этот блок.
+- **Принимать по `EXECUTION_SUCCESS`, когда expectation не сконфигурирован.**
+  Отклонено: это и есть искусственный PASS, запрещённый заданием.
+- **Добавить `criterion_id` или критерии в `TaskRunRequest`.** Отклонено: это
+  позволило бы клиенту выбирать, что считается выполненным.
+- **Путь файлового `TestVerificationAdapter` как production-verifier.** Оставлен
+  test-only; у production verification уже есть безопасный детерминированный
+  механизм в `WorkspaceVerifier`, а intent-типы адаптера не нужны для выражения
+  факта о workspace.
+
+### Следствия и открытые пункты
+
+1. **GAP-F закрыт лишь наполовину.** Criterion identity теперь работает для
+   объявленных оператором критериев end-to-end, включая реальный вердикт PASS/FAIL
+   в durable history. Вывод критериев из `TaskSpecification` или запроса задачи
+   по-прежнему не имеет доверенного server-side источника и остаётся открытым
+   архитектурным решением; здесь он не закрывается.
+2. **Acceptance не экспортируется в публичный контракт.** Потребители читают
+   `acceptance_status` из run record. Переопределение `TaskRunRequest` или
+   `TaskRunResponse` — отдельное решение.
+3. **Одна форма критерия в этом срезе.** Используются только expectations
+   `exists` / `sha256`. Более богатые критерии (результаты тестовых наборов,
+   артефакты сборки) потребовали бы собственного детерминированного verifier и
+   собственного решения.
+4. **GAP-A, GAP-B и идемпотентность этим блоком не изменены.**

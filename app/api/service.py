@@ -19,6 +19,11 @@ from app.api.models import (
 from app.dashboard.models import DashboardReport, ProviderStatus
 from app.dashboard.provider_health import ProviderHealthMonitor
 from app.dashboard.service import CostDashboardService
+from app.agent_runtime.acceptance_spec import (
+    AcceptanceSpec,
+    AcceptanceSpecError,
+    RunAcceptanceCriteria,
+)
 from app.agent_runtime.models import HarnessRequest
 from app.agent_runtime.policy import AgentHarnessPolicy
 from app.execution.capabilities import ExecutionCapability
@@ -34,12 +39,16 @@ from app.execution.request import ExecutionOutcomeStatus
 from app.fabric.fabric import CapabilityFabric
 from app.orchestrator.models import RunState, Task, TaskCategory
 from app.orchestrator.run import RunExecutor
-from app.runtime.bootstrap import create_agent_harness, create_runtime
+from app.runtime.bootstrap import (
+    create_agent_harness,
+    create_loop_coordinator,
+    create_runtime,
+)
 from app.runtime.context import RuntimeContext
 from app.runtime.run_scope import RunScope, require_active_scope
 from app.runtime.run_store import RunStateSnapshot, RunStore
 from app.tools.approval import ApprovalPolicy, ApprovalResolver
-from app.tools.acceptance import AcceptanceCriterion
+from app.tools.acceptance import AcceptanceCriterion, AcceptanceStatus
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry, build_default_tool_registry
 from app.tools.workspace import Workspace
@@ -102,6 +111,19 @@ SINGLE_ACTION_LOOP_POLICY = AgentHarnessPolicy(
     max_revision_attempts=1,
 )
 
+# Bounds for the acceptance slice. Exactly one execution attempt is allowed, and
+# the budget must admit the verification stage that follows it, so the slice is
+# "one execution plus its verification" rather than "one action then stop".
+# Verification is not a decision here: the criteria and expectations it uses are
+# frozen by the operator composition, and the decision provider cannot add,
+# remove, or replace them.
+ACCEPTANCE_LOOP_POLICY = AgentHarnessPolicy(
+    max_iterations=3,
+    max_actions=2,
+    max_execution_attempts=1,
+    max_revision_attempts=1,
+)
+
 
 from pathlib import Path
 
@@ -126,6 +148,8 @@ class ForgeApiService:
             Callable[..., Sequence["ExecutionRequest"]] | None
         ) = None,
         declarations: Optional[Mapping[str, ExecutionDeclaration]] = None,
+        acceptance_specs: Optional[Mapping[str, AcceptanceSpec]] = None,
+        loop_coordinator_factory: Optional[Callable[..., object]] = None,
         verification_resolver: Optional[
             Callable[[Task, ProjectExecutionProfile], str | None]
         ] = None,
@@ -167,6 +191,15 @@ class ForgeApiService:
         # context, or any other client-controlled text, because that would turn
         # natural language into command selection. No resolver means no host
         # execution, which is the fail-closed default.
+        self._acceptance_specs: Mapping[str, AcceptanceSpec] = dict(
+            acceptance_specs or {}
+        )
+        # Composition-time factory for the coordinator the acceptance slice
+        # dispatches through. The API asks for a coordinator; it never imports the
+        # adapter or spawns anything itself.
+        self._loop_coordinator_factory = (
+            loop_coordinator_factory or create_loop_coordinator
+        )
         self._verification_resolver = verification_resolver
 
         # One registry serves both execution and discovery, so capability
@@ -727,6 +760,282 @@ class ForgeApiService:
                     updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 )
             )
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            pass
+
+    def run_accepted_task(self, declaration_id: str) -> TaskRunResponse:
+        """Run one authorized action and decide real task acceptance.
+
+        This is the production acceptance entry point. It is trusted in-process
+        code, not an HTTP route, and its only input is a declaration id. Criteria,
+        expectations, command, workspace, profile, environment, timeout, tools, and
+        approval all come from the operator composition - never from the caller.
+
+        The flow is fixed by this composition, not by a decision provider:
+
+            one operator-authorized action
+              -> deterministic verification against the frozen expectations
+              -> AcceptanceGate PASS/FAIL
+              -> durable history
+
+        Verification and acceptance are produced by the existing harness stages
+        (``RUN_VERIFICATION`` -> ``VerificationEvaluator``/``WorkspaceVerifier`` ->
+        ``AcceptanceGate``). This method deliberately does not evaluate acceptance
+        itself: it consumes ``final_acceptance`` and refuses to treat a missing
+        verdict as a pass.
+
+        ``EXECUTION_SUCCESS`` is deliberately **not** task acceptance. The
+        response's ``success`` means the action ran successfully *and* its
+        verification passed; the acceptance verdict is recorded as
+        ``acceptance_status`` in the durable run record. Redefining the public
+        ``success`` field is a separate contract decision.
+        """
+        if self._runtime.harness is None:
+            raise ExecutionDeclarationError(
+                "no agent harness is configured in this runtime"
+            )
+        if not isinstance(declaration_id, str) or not declaration_id.strip():
+            raise ExecutionDeclarationError("declaration_id must be a non-empty string")
+        declaration_key = declaration_id.strip()
+        declaration = self._declarations.get(declaration_key)
+        if declaration is None:
+            raise UnknownExecutionDeclarationError(
+                f"undeclared execution: {declaration_key!r}"
+            )
+        spec = self._acceptance_specs.get(declaration_key)
+        if spec is None:
+            # No trusted criteria means no acceptance. This is not a permissive
+            # default: without criteria nothing can legitimately be accepted.
+            raise AcceptanceSpecError(
+                f"no acceptance criteria are declared for {declaration_key!r}, so "
+                "task acceptance cannot be evaluated"
+            )
+
+        run_id = f"run-accept-{uuid.uuid4().hex[:8]}"
+        task_id = f"task-accept-{declaration.declaration_id}"
+        criteria = spec.bind(run_id=run_id, task_id=task_id)
+        criteria.assert_belongs_to(run_id, task_id)
+
+        scope = RunScope(
+            run_id=run_id,
+            workspace=self._workspace,
+            execution_profile=self._execution_profile,
+            # The acceptance slice is a host-process slice, not a tool slice.
+            allowed_tool_ids=frozenset(),
+            allowed_execution_commands=frozenset({declaration.executable}),
+            acceptance_criteria=criteria.criteria,
+        )
+        scope.freeze()
+        require_active_scope(run_id, scope)
+
+        record_store: Optional[RunStore] = None
+        try:
+            record_store = self._run_store.bind_run(run_id, task_id=task_id)
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            record_store = None
+
+        # Identity and criteria are recorded before anything executes, so the
+        # frozen criteria are part of the run's durable history rather than a
+        # later claim.
+        self._emit_acceptance_event(
+            record_store,
+            run_id,
+            task_id,
+            "RUN_STARTED",
+            {"run_id": run_id, "task_id": task_id, "entry_point": "run_accepted_task"},
+        )
+        self._emit_acceptance_event(
+            record_store,
+            run_id,
+            task_id,
+            "CRITERION_DEFINED",
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "declaration_id": declaration.declaration_id,
+                "criterion_ids": list(criteria.criterion_ids),
+                "criteria_source": criteria.source,
+                "expectation_count": len(criteria.expectations),
+            },
+        )
+
+        request = HarnessRequest(
+            run_id=run_id,
+            workspace=self._workspace,
+            execution_requests=(
+                to_execution_request(
+                    declaration,
+                    profile=self._execution_profile,
+                    run_id=run_id,
+                ),
+            ),
+            allowed_execution_commands=tuple(scope.allowed_execution_commands),
+            # Frozen server-side criteria and their expectations. A decision
+            # cannot add, drop, or replace any of them.
+            acceptance_criteria=criteria.criteria,
+            verification_expectations=criteria.expectations,
+            approval_policy=self._approval_policy,
+            approval_resolver=self._approval_resolver,
+            run_scope=scope,
+            metadata={
+                "declaration_id": declaration.declaration_id,
+                "criterion_ids": list(criteria.criterion_ids),
+            },
+        )
+
+        harness = self._harness_factory(
+            policy=ACCEPTANCE_LOOP_POLICY,
+            coordinator=self._acceptance_coordinator(),
+        )
+        t0 = time.perf_counter()
+        result = harness.run(request)
+        duration = time.perf_counter() - t0
+
+        # The loop's own stages land in the same durable history through the
+        # existing writer.
+        if record_store is not None:
+            self._persist_harness_events(record_store, result)
+
+        execution_result = (
+            result.execution_results[0] if result.execution_results else None
+        )
+        execution_outcome = (
+            execution_result.outcome_status.value
+            if execution_result is not None
+            else "NOT_RUN"
+        )
+        acceptance = result.final_acceptance
+
+        # The acceptance verdict is written with the run's own identity, using the
+        # same store and snapshot writer as every other run. A missing verdict is
+        # recorded as not evaluated, never as a pass.
+        acceptance_status = "not_evaluated"
+        acceptance_code = "verification_not_evaluated"
+        if acceptance is not None:
+            acceptance_status = acceptance.status.value
+            acceptance_code = acceptance.code or ""
+        self._emit_acceptance_event(
+            record_store,
+            run_id,
+            task_id,
+            "ACCEPTANCE_COMPLETED",
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "status": acceptance_status,
+                "code": acceptance_code,
+                "criterion_ids": list(criteria.criterion_ids),
+                "criteria_source": criteria.source,
+                "criterion_results": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "status": item.status.value,
+                        "code": item.code,
+                    }
+                    for item in (getattr(acceptance, "results", ()) or ())
+                ],
+            },
+        )
+        if record_store is not None:
+            try:
+                record_store.write_state(
+                    RunStateSnapshot(
+                        run_id=run_id,
+                        task_id=task_id,
+                        state=result.final_state.status.value,
+                        status=result.final_state.status.value,
+                        attempt_number=0,
+                        event_count=len(result.events),
+                        updated_at=datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                        project_state={"acceptance_status": acceptance_status},
+                    )
+                )
+            except Exception:  # noqa: BLE001 - persistence must not block a run
+                pass
+
+        output = (execution_result.stdout if execution_result else "") or ""
+        error: Optional[str] = None
+        if execution_result is None:
+            error = result.final_state.status.value
+        elif execution_result.outcome_status != ExecutionOutcomeStatus.EXECUTION_SUCCESS:
+            error = str(
+                execution_result.metadata.get("denial_reason") or execution_outcome
+            )
+        elif acceptance is None:
+            error = "verification_not_evaluated"
+        elif acceptance.status is not AcceptanceStatus.PASS:
+            error = acceptance.code or "acceptance_rejected"
+
+        accepted = acceptance is not None and acceptance.status is AcceptanceStatus.PASS
+        return TaskRunResponse(
+            run_id=run_id,
+            task_id=task_id,
+            project_id=self._active_project_id,
+            state=result.final_state.status.value,
+            # The action ran successfully *and* its verification passed. Task
+            # acceptance is reported separately as `acceptance_status` in the
+            # durable run record, because redefining this field is a public
+            # contract decision.
+            success=(
+                execution_result is not None
+                and execution_result.outcome_status
+                == ExecutionOutcomeStatus.EXECUTION_SUCCESS
+                and accepted
+            ),
+            output=output or "(Accepted task produced no process output)",
+            error=error,
+            tokens=0,
+            cost=0.0,
+            duration_seconds=round(duration, 3),
+            provider_used="",
+            model_used="",
+        )
+
+    def _acceptance_coordinator(self) -> object:
+        """Coordinator for the acceptance slice, built by composition.
+
+        It runs with workspace COPY-staging disabled on purpose: the criterion
+        asserts a fact about the workspace the action was told to work in, and a
+        scratch copy would make that fact unverifiable. This does not widen
+        authority - ``RunScope``, ``ExecutionPolicy``, approval, and the
+        coordinator's sentinel are unchanged - it only keeps the process and the
+        verification pointed at the same directory. The API layer never imports
+        the adapter; it asks the composition for a coordinator.
+        """
+        return self._loop_coordinator_factory(isolate_workspace=False)
+
+    def _make_store_observer(self, store: Optional[RunStore]) -> Callable[..., None]:
+        """Return an observer that mirrors events into the durable history."""
+        run_id = store.bound_run_id if store is not None else None
+
+        def observe(event_type: object, data: object) -> None:
+            if store is None or not run_id:
+                return
+            try:
+                store.append_event(
+                    event_type,
+                    dict(data) if isinstance(data, dict) else {},
+                    run_id=run_id,
+                )
+            except Exception:  # noqa: BLE001 - persistence must not block a run
+                pass
+
+        return observe
+
+    def _emit_acceptance_event(
+        self,
+        store: Optional[RunStore],
+        run_id: str,
+        task_id: str,
+        event_type: object,
+        data: Mapping[str, object],
+    ) -> None:
+        if store is None:
+            return
+        try:
+            store.append_event(event_type, dict(data), run_id=run_id, task_id=task_id)
         except Exception:  # noqa: BLE001 - persistence must not block a run
             pass
 
