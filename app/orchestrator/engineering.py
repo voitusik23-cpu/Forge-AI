@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+import logging
 
 from app.context import (
     ContextItem,
@@ -52,7 +53,12 @@ from app.decision import (
     validate_decision,
 )
 from app.projects.state import ProjectState, derive_project_state
-from app.orchestrator.trace import RunEvent, RunTrace, build_trace_from_run
+from app.orchestrator.trace import (
+    RunEvent,
+    RunTrace,
+    build_trace_from_run,
+    sanitize_event_metadata,
+)
 from app.understanding.models import UnderstandingSnapshot
 from app.understanding.snapshotter import UnderstandingSnapshotter
 
@@ -88,6 +94,13 @@ class EngineeringRunRequest:
     # Immutable security perimeter for this run.
     run_scope: object | None = None
     understanding_snapshot: UnderstandingSnapshot | None = None
+    # Optional read-only observation hook. The callable receives the canonical
+    # event type and a SANITIZED projection of the event metadata, after the event
+    # has already been stored in run.events. It is a passive observer: it holds no
+    # execution authority, cannot alter the perimeter, and a failure inside it is
+    # contained and never changes the outcome of the Run. It must be lightweight
+    # and must not perform I/O, because it is invoked inline on the execution path.
+    observer: Callable[[EventType, dict], None] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.execution_requests, list):
@@ -154,6 +167,38 @@ class EngineeringRunExecutor:
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
         self._context_assembler = context_assembler or DecisionContextAssembler()
 
+    @staticmethod
+    def _emit(
+        run: Run,
+        event_type: EventType,
+        data: dict[str, object] | None = None,
+        observer: Callable[[EventType, dict], None] | None = None,
+    ) -> None:
+        """Store one canonical Run event, then optionally notify an observer.
+
+        Ordering is deliberate: the event is committed to ``run.events`` first, so
+        the canonical record exists even if the observer fails. The observer
+        receives only a sanitized projection produced by the canonical
+        ``sanitize_event_metadata`` policy that ``RunEvent`` itself uses - never the
+        raw payload. An observer exception is contained: it is logged and
+        swallowed, because external observation must never change a Run's outcome
+        or abort execution.
+        """
+        run.events.append(
+            Event(run_id=run.id, type=event_type, data=data if data is not None else {})
+        )
+        if observer is None:
+            return
+        try:
+            observer(event_type, sanitize_event_metadata(data))
+        except Exception:  # noqa: BLE001 - observational failures must not abort a Run
+            logging.getLogger("forge_ai").warning(
+                "run observer failed for event %s of run %s",
+                getattr(event_type, "value", event_type),
+                run.id,
+                exc_info=True,
+            )
+
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
         # DECISION 1: the run identity is established before the scope is used and
         # is never taken from the scope. DECISION 2: the scope is frozen once and
@@ -214,6 +259,7 @@ class EngineeringRunExecutor:
             max_revision_attempts=request.max_revision_attempts,
             run_id=scope_run_id,
             run_scope=scope,
+            observer=request.observer,
         )
         run = revision_result.run
 
@@ -243,8 +289,8 @@ class EngineeringRunExecutor:
                     approval_policy=request.approval_policy,
                     approval_resolver=request.approval_resolver,
                     run_scope=scope,
-                    observer=lambda event_type, data: run.events.append(
-                        Event(run_id=run.id, type=event_type, data=data)
+                    observer=lambda event_type, data: self._emit(
+                        run, event_type, data, request.observer
                     ),
                 )
                 execution_results.append(res)
@@ -266,16 +312,33 @@ class EngineeringRunExecutor:
         if effective_understanding_snapshot is not None:
             start_data["workspace_fingerprint"] = effective_understanding_snapshot.workspace_fingerprint
         start_ts = run.events[0].timestamp if run.events else datetime.now(timezone.utc)
+        # ENGINEERING_RUN_STARTED is intentionally placed at the head of the
+        # canonical list so the recorded sequence begins with it. It is still
+        # stored before the observer is notified, preserving the store-then-notify
+        # contract.
         run.events.insert(0, Event(
             run_id=run.id,
             type=EventType.ENGINEERING_RUN_STARTED,
             data=start_data,
             timestamp=start_ts,
         ))
-        run.events.append(Event(
-            run_id=run.id,
-            type=EventType.ENGINEERING_RUN_COMPLETED,
-            data={
+        if request.observer is not None:
+            try:
+                request.observer(
+                    EventType.ENGINEERING_RUN_STARTED,
+                    sanitize_event_metadata(start_data),
+                )
+            except Exception:  # noqa: BLE001 - observational failures must not abort a Run
+                logging.getLogger("forge_ai").warning(
+                    "run observer failed for event %s of run %s",
+                    EventType.ENGINEERING_RUN_STARTED.value,
+                    run.id,
+                    exc_info=True,
+                )
+        self._emit(
+            run,
+            EventType.ENGINEERING_RUN_COMPLETED,
+            {
                 "run_id": run.id,
                 "status": final_status.value,
                 "attempt_count": len(revision_result.attempts),
@@ -291,7 +354,8 @@ class EngineeringRunExecutor:
                 "execution_count": len(execution_results),
                 "reason": self._reason_code(final_status, final_acceptance, run),
             },
-        ))
+            request.observer,
+        )
 
         attempts = revision_result.attempts
         project_states: list[ProjectState] = []
@@ -325,20 +389,19 @@ class EngineeringRunExecutor:
             project_states.append(st)
 
         for st in project_states:
-            run.events.append(
-                Event(
-                    run_id=run.id,
-                    type=EventType.PROJECT_STATE_UPDATED,
-                    data={
-                        "run_id": run.id,
-                        "attempt_number": st.attempt_number,
-                        "status": st.status.value,
-                        "project_state_status": st.status.value,
-                        "snapshot_id": st.snapshot_id,
-                        "changeset_id": st.changeset_id,
-                        "acceptance_status": st.acceptance_status,
-                    },
-                )
+            self._emit(
+                run,
+                EventType.PROJECT_STATE_UPDATED,
+                {
+                    "run_id": run.id,
+                    "attempt_number": st.attempt_number,
+                    "status": st.status.value,
+                    "project_state_status": st.status.value,
+                    "snapshot_id": st.snapshot_id,
+                    "changeset_id": st.changeset_id,
+                    "acceptance_status": st.acceptance_status,
+                },
+                request.observer,
             )
 
         provider = request.decision_provider or self._decision_provider
@@ -384,18 +447,17 @@ class EngineeringRunExecutor:
             )
             context_envelopes.append(envelope)
 
-            run.events.append(
-                Event(
-                    run_id=run.id,
-                    type=EventType.CONTEXT_DECISION_READY,
-                    data={
-                        "context_id": envelope.context_id,
-                        "context_fingerprint": envelope.context_fingerprint,
-                        "run_id": run.id,
-                        "attempt_number": envelope.attempt_number,
-                        "item_count": envelope.item_count,
-                    },
-                )
+            self._emit(
+                run,
+                EventType.CONTEXT_DECISION_READY,
+                {
+                    "context_id": envelope.context_id,
+                    "context_fingerprint": envelope.context_fingerprint,
+                    "run_id": run.id,
+                    "attempt_number": envelope.attempt_number,
+                    "item_count": envelope.item_count,
+                },
+                request.observer,
             )
 
             dec_req = DecisionRequest(
@@ -408,65 +470,61 @@ class EngineeringRunExecutor:
                 context_fingerprint=envelope.context_fingerprint,
                 context_envelope=envelope,
             )
-            run.events.append(
-                Event(
-                    run_id=run.id,
-                    type=EventType.DECISION_REQUESTED,
-                    data={
-                        "decision_id": dec_req.decision_id,
-                        "run_id": run.id,
-                        "attempt_number": dec_req.attempt_number,
-                        "project_state_status": st.status.value,
-                        "context_id": dec_req.context_id,
-                        "context_fingerprint": dec_req.context_fingerprint,
-                    },
-                )
+            self._emit(
+                run,
+                EventType.DECISION_REQUESTED,
+                {
+                    "decision_id": dec_req.decision_id,
+                    "run_id": run.id,
+                    "attempt_number": dec_req.attempt_number,
+                    "project_state_status": st.status.value,
+                    "context_id": dec_req.context_id,
+                    "context_fingerprint": dec_req.context_fingerprint,
+                },
+                request.observer,
             )
             decision = provider.decide(dec_req)
             val = validate_decision(decision, dec_req, st)
             if val.valid:
-                run.events.append(
-                    Event(
-                        run_id=run.id,
-                        type=EventType.DECISION_MADE,
-                        data={
-                            "decision_id": decision.decision_id,
-                            "run_id": run.id,
-                            "attempt_number": decision.attempt_number,
-                            "decision_type": decision.decision_type.value,
-                            "action": decision.action.value,
-                            "rationale": decision.rationale,
-                            "metadata": dict(decision.metadata),
-                            "context_id": decision.references.get("context_id") if decision.references else None,
-                            "context_fingerprint": decision.references.get("context_fingerprint") if decision.references else None,
-                        },
-                    )
+                self._emit(
+                    run,
+                    EventType.DECISION_MADE,
+                    {
+                        "decision_id": decision.decision_id,
+                        "run_id": run.id,
+                        "attempt_number": decision.attempt_number,
+                        "decision_type": decision.decision_type.value,
+                        "action": decision.action.value,
+                        "rationale": decision.rationale,
+                        "metadata": dict(decision.metadata),
+                        "context_id": decision.references.get("context_id") if decision.references else None,
+                        "context_fingerprint": decision.references.get("context_fingerprint") if decision.references else None,
+                    },
+                    request.observer,
                 )
                 decisions.append(decision)
             else:
-                run.events.append(
-                    Event(
-                        run_id=run.id,
-                        type=EventType.DECISION_REJECTED,
-                        data={
-                            "decision_id": decision.decision_id,
-                            "run_id": run.id,
-                            "attempt_number": decision.attempt_number,
-                            "errors": list(val.errors),
-                        },
-                    )
+                self._emit(
+                    run,
+                    EventType.DECISION_REJECTED,
+                    {
+                        "decision_id": decision.decision_id,
+                        "run_id": run.id,
+                        "attempt_number": decision.attempt_number,
+                        "errors": list(val.errors),
+                    },
+                    request.observer,
                 )
 
-        run.events.append(
-            Event(
-                run_id=run.id,
-                type=EventType.RUN_COMPLETED,
-                data={
-                    "run_id": run.id,
-                    "status": final_status.value,
-                    "task_id": task_id,
-                },
-            )
+        self._emit(
+            run,
+            EventType.RUN_COMPLETED,
+            {
+                "run_id": run.id,
+                "status": final_status.value,
+                "task_id": task_id,
+            },
+            request.observer,
         )
 
         trace = build_trace_from_run(run, project_states=tuple(project_states))

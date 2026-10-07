@@ -1,6 +1,8 @@
 """In-memory Run wrapper around the existing Orchestrator dispatch flow."""
 
+import logging
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Iterable, Optional
 
@@ -24,6 +26,7 @@ from app.orchestrator.models import (
     TaskResult,
 )
 from app.orchestrator.orchestrator import Orchestrator
+from app.orchestrator.trace import sanitize_event_metadata
 from app.tools.executor import ToolExecutor
 from app.tools.contracts import ToolResult, ToolStatus
 from app.tools.permissions import ToolExecutionContext
@@ -111,6 +114,7 @@ class RunExecutor:
         workspace: Optional[Workspace] = None,
         run_id: str = "",
         run_scope: object | None = None,
+        observer: Optional[Callable[[EventType, dict], None]] = None,
         _run: Run | None = None,
         _attempt_number: int = 0,
     ) -> Run:
@@ -144,7 +148,7 @@ class RunExecutor:
                 agent_name=agent_name,
                 provider_name=provider_name,
                 observer=lambda event_type, data: self._record(
-                    run, event_type, **data
+                    run, event_type, observer, **data
                 ),
             )
             if result.success and result.tool_invocations:
@@ -162,7 +166,7 @@ class RunExecutor:
                         invocation,
                         context=permission_context,
                         observer=lambda event_type, data: self._record(
-                            run, event_type, **data
+                            run, event_type, observer, **data
                         ),
                     )
                     for invocation in initial_invocations
@@ -183,7 +187,7 @@ class RunExecutor:
                     agent_name=agent_name,
                     provider_name=provider_name,
                     observer=lambda event_type, data: self._record(
-                        run, event_type, **data
+                        run, event_type, observer, **data
                     ),
                 )
                 followup_invocations = list(result.tool_invocations)
@@ -201,7 +205,7 @@ class RunExecutor:
                         invocation,
                         context=followup_context,
                         observer=lambda event_type, data: self._record(
-                            run, event_type, **data
+                            run, event_type, observer, **data
                         ),
                     )
                     for invocation in followup_invocations
@@ -253,8 +257,30 @@ class RunExecutor:
         return run
 
     @staticmethod
-    def _record(run: Run, event_type: EventType, **data: object) -> None:
+    def _record(
+        run: Run,
+        event_type: EventType,
+        observer: Optional[Callable[[EventType, dict], None]] = None,
+        **data: object,
+    ) -> None:
+        """Store one canonical Run event, then optionally notify an observer.
+
+        The canonical record is written first so it survives an observer failure.
+        The observer receives a sanitized projection only, and any exception it
+        raises is contained rather than propagated.
+        """
         run.events.append(Event(run_id=run.id, type=event_type, data=data))
+        if observer is None:
+            return
+        try:
+            observer(event_type, sanitize_event_metadata(data))
+        except Exception:  # noqa: BLE001 - observational failures must not abort a Run
+            logging.getLogger("forge_ai").warning(
+                "run observer failed for event %s of run %s",
+                getattr(event_type, "value", event_type),
+                run.id,
+                exc_info=True,
+            )
 
     def attach_attempt_outcomes(
         self,
