@@ -24,6 +24,7 @@ from app.orchestrator.run import RunExecutor
 from app.runtime.bootstrap import create_runtime
 from app.runtime.context import RuntimeContext
 from app.runtime.run_store import RunStore
+from app.tools.registry import ToolRegistry, build_default_tool_registry
 from app.tools.workspace import Workspace
 
 
@@ -40,11 +41,18 @@ class ForgeApiService:
         dashboard_service: Optional[CostDashboardService] = None,
         workspace: Optional[Workspace] = None,
         run_store: Optional[RunStore] = None,
+        tool_registry: Optional[ToolRegistry] = None,
     ) -> None:
         self._runtime = runtime or create_runtime()
         self._workspace = workspace or Workspace(Path.cwd())
+        # One registry serves both execution and discovery, so capability
+        # enumeration can never report a tool that execution cannot reach.
+        self._tool_registry = tool_registry or build_default_tool_registry(
+            self._workspace.root
+        )
         self._fabric = fabric or CapabilityFabric(
             workspace=self._workspace,
+            tool_registry=self._tool_registry,
         )
         self._run_store = run_store or RunStore()
         self._health_monitor = ProviderHealthMonitor()
@@ -65,6 +73,32 @@ class ForgeApiService:
     @property
     def dashboard_service(self) -> CostDashboardService:
         return self._dashboard_service
+
+    @property
+    def tool_registry(self) -> ToolRegistry:
+        return self._tool_registry
+
+    def list_capabilities(self) -> List[Dict[str, object]]:
+        """Return the capabilities currently available, as plain dictionaries.
+
+        Read-only enumeration over the registries this service actually holds. It
+        reports what is registered right now, performs no probing or scanning, and
+        exposes only descriptor fields - never credentials, approval state, or a
+        frozen execution scope. Host environment discovery is deliberately not
+        part of this: it is a separate architectural stage.
+        """
+        return [descriptor.to_dict() for descriptor in self._fabric.list_capabilities()]
+
+    def list_tools(self) -> List[Dict[str, object]]:
+        """Return the tools registered for execution, as plain dictionaries.
+
+        Uses the same registry instance the service configures capabilities from,
+        so this listing cannot report a tool that execution cannot reach.
+        """
+        return [
+            {"id": definition.id, "name": definition.name, "description": definition.description}
+            for definition in self._tool_registry.list_tools()
+        ]
 
     @property
     def run_store(self) -> RunStore:

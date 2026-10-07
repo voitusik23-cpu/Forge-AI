@@ -624,6 +624,73 @@ count and kind/source/trust/freshness summaries, never item content. This is a
 small explicit-input boundary, not RAG, project memory, repository discovery,
 or a secret scanner. Context metadata does not grant tool permissions.
 
+## Capability and Tool Discovery v0.1
+
+Capability and tool discovery is wired into the production API path. The
+composing service builds one `ToolRegistry` through
+`app/tools/registry.py::build_default_tool_registry`, which registers Forge's
+built-in tools explicitly and by name - `write_project_file`, and
+`read_project_file` when a project root is known. Nothing is discovered by
+scanning Python classes, so a tool becomes visible only when it is registered on
+purpose.
+
+That single registry instance backs both execution configuration and discovery,
+so enumeration cannot report a tool that execution cannot reach.
+`CapabilityFabric.list_capabilities()` and
+`CapabilityFabric.list_tool_capabilities()` are passive, read-only projections
+over the existing `ToolRegistryAdapter`, `ModelRegistryAdapter`, and
+`WorkspaceResourceAdapter`. They perform no I/O, start no scan, probe no host,
+and cache nothing; enumeration returns the current state of the registries, and
+registries that were not supplied contribute nothing rather than a guess.
+`CapabilityDescriptor.to_dict()` serialises a descriptor without exposing
+credentials, approval state, or a frozen execution scope.
+
+Two read-only endpoints expose this: `GET /api/capabilities` lists the
+capability descriptors (domains: tool, model, task), and `GET /api/tools` lists
+the registered tools. Both are deterministic and side-effect free.
+
+**Host environment discovery is not implemented.** No endpoint here inspects
+executables, runtimes, `git`, Docker, the shell, or filesystem capabilities;
+that remains a separate, deliberately deferred architectural stage with its own
+trust boundary. `CapabilityFabric.resolve()` is still not invoked on the
+production request path, and the legacy `RunExecutor`-based API task endpoint
+does not yet dispatch tools; wiring execution onto the shared registry is
+tracked separately.
+
+## Capability and Tool Discovery v0.1 — русская версия
+
+Capability- и tool-discovery подключены к production-пути API. Композирующий
+сервис создаёт один `ToolRegistry` через
+`app/tools/registry.py::build_default_tool_registry`, который регистрирует
+встроенные инструменты Forge явно и по имени - `write_project_file` и
+`read_project_file`, когда известен корень проекта. Ничего не обнаруживается
+сканированием Python-классов, поэтому инструмент становится видимым только при
+осознанной регистрации.
+
+Этот единственный экземпляр реестра обслуживает и конфигурацию выполнения, и
+discovery, поэтому перечисление не может показать инструмент, недостижимый для
+выполнения. `CapabilityFabric.list_capabilities()` и
+`CapabilityFabric.list_tool_capabilities()` - пассивные read-only проекции поверх
+существующих `ToolRegistryAdapter`, `ModelRegistryAdapter` и
+`WorkspaceResourceAdapter`. Они не выполняют I/O, не запускают сканирование, не
+опрашивают хост и ничего не кэшируют; перечисление возвращает текущее состояние
+реестров, а непереданные реестры не дают ничего вместо догадки.
+`CapabilityDescriptor.to_dict()` сериализует descriptor, не раскрывая
+credentials, состояние approval или замороженный scope выполнения.
+
+Два read-only endpoint'а предоставляют это: `GET /api/capabilities` перечисляет
+capability descriptors (домены: tool, model, task), а `GET /api/tools`
+перечисляет зарегистрированные инструменты. Оба детерминированы и не имеют
+побочных эффектов.
+
+**Host environment discovery не реализован.** Ни один endpoint здесь не
+исследует исполняемые файлы, runtime'ы, `git`, Docker, shell или возможности
+файловой системы; это отдельный, намеренно отложенный архитектурный этап со своей
+границей доверия. `CapabilityFabric.resolve()` по-прежнему не вызывается на
+production-пути запроса, а legacy API-endpoint выполнения задач на базе
+`RunExecutor` пока не диспетчеризует инструменты; подключение выполнения к общему
+реестру отслеживается отдельно.
+
 
 ## Context Assembly v0.1 — русская версия
 

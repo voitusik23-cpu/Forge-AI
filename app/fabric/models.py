@@ -138,6 +138,23 @@ class CapabilityDescriptor:
         """Backward compatibility alias for domain."""
         return self.domain
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable projection of this descriptor.
+
+        Only describing fields are exposed. Descriptors carry no credentials,
+        approval state, or frozen scope, so a discovery response built from these
+        fields cannot leak authority.
+        """
+        return {
+            "capability_id": self.capability_id,
+            "domain": (
+                self.domain.value if hasattr(self.domain, "value") else str(self.domain)
+            ),
+            "name": self.name,
+            "description": self.description,
+            "metadata": dict(self.metadata),
+        }
+
 
 @dataclass(frozen=True)
 class ResourceDescriptor:

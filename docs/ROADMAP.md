@@ -192,6 +192,8 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Candidate Forge Knowledge -> evaluation -> Approved Forge Knowledge promotion workflow
 - [ ] Forge API, desktop and web clients, setup wizard
 - [x] Durable run history / checkpoint persistence (append-only event log + state snapshot, `GET /api/runs/{run_id}`)
+- [x] Capability / tool discovery (`GET /api/capabilities`, `GET /api/tools`; one shared `ToolRegistry` for execution and discovery)
+- [ ] Host environment discovery (executables, runtimes, git, Docker, shell, filesystem capabilities) — separate architectural stage with its own trust boundary
 - [ ] Automatic resume of interrupted runs (deferred pending side-effect idempotency design)
 - [ ] Durable, resumable task queues
 
@@ -398,6 +400,8 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Workflow продвижения Candidate Forge Knowledge -> evaluation -> Approved Forge Knowledge
 - [ ] Forge API, desktop- и web-клиенты, setup wizard
 - [x] Durable run history / checkpoint persistence (append-only event log + state snapshot, `GET /api/runs/{run_id}`)
+- [x] Capability / tool discovery (`GET /api/capabilities`, `GET /api/tools`; единый `ToolRegistry` для выполнения и discovery)
+- [ ] Host environment discovery (исполняемые файлы, runtime'ы, git, Docker, shell, возможности файловой системы) — отдельный архитектурный этап со своей границей доверия
 - [ ] Автоматическое возобновление прерванных запусков (отложено до проектирования идемпотентности side effects)
 - [ ] Долговременные возобновляемые очереди задач
 

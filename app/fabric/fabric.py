@@ -254,6 +254,63 @@ class CapabilityFabric:
             raise ValueError("run_id must be a non-empty string")
         self._run_usage[run_id].append(usage_record)
 
+    # ------------------------------------------------------------------
+    # Passive discovery
+    # ------------------------------------------------------------------
+    def list_capabilities(self) -> tuple[CapabilityDescriptor, ...]:
+        """Enumerate the capabilities currently registered with this Fabric.
+
+        This is read-only introspection over the existing registries: it consults
+        the same adapters ``resolve`` uses, performs no I/O, starts no scan, and
+        caches nothing. Registries that were not supplied simply contribute
+        nothing, so the result is empty rather than guessed.
+
+        The output is deterministic: descriptors are ordered by
+        ``(domain, capability_id)`` and de-duplicated by ``capability_id``.
+        """
+        descriptors: list[CapabilityDescriptor] = []
+        if self._tool_adapter is not None:
+            descriptors.extend(self._tool_adapter.list_tool_capabilities())
+        if self._model_adapter is not None and self._model_registry is not None:
+            for model in self._model_registry.list_models():
+                descriptors.extend(self._model_adapter.get_capabilities_for_model(model))
+        if self._workspace_adapter is not None:
+            workspace = self._workspace_adapter.to_resource_descriptor()
+            descriptors.append(
+                CapabilityDescriptor(
+                    capability_id=f"cap:{workspace.resource_type.value.lower()}:workspace",
+                    domain=CapabilityDomain.TASK,
+                    name=workspace.resource_type.value,
+                    description="Workspace resource available to a Run",
+                    metadata={"resource_id": workspace.resource_id},
+                )
+            )
+
+        unique: dict[str, CapabilityDescriptor] = {}
+        for descriptor in descriptors:
+            unique.setdefault(descriptor.capability_id, descriptor)
+        return tuple(
+            sorted(
+                unique.values(),
+                key=lambda item: (item.domain.value, item.capability_id),
+            )
+        )
+
+    def list_tool_capabilities(self) -> tuple[CapabilityDescriptor, ...]:
+        """Enumerate only the registered tools, as Fabric tool capabilities.
+
+        Reuses ``ToolRegistryAdapter.list_tool_capabilities`` so discovery cannot
+        drift from execution: an empty result means no tool is registered.
+        """
+        if self._tool_adapter is None:
+            return ()
+        return tuple(
+            sorted(
+                self._tool_adapter.list_tool_capabilities(),
+                key=lambda item: item.capability_id,
+            )
+        )
+
     def get_run_accounting(
         self,
         run_id: str,

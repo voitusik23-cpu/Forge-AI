@@ -48,6 +48,21 @@ def create_api_app(service: Optional[ForgeApiService] = None) -> Any:
     def refresh_dashboard() -> Dict[str, Any]:
         return api_service.refresh_dashboard()
 
+    @app.get("/api/capabilities")
+    def list_capabilities() -> list[Dict[str, Any]]:
+        """List the capabilities currently available to Forge.
+
+        Read-only enumeration of the registered model, tool, and workspace
+        capabilities. It reports only descriptors and performs no probing or
+        scanning. Host environment discovery is not part of this endpoint.
+        """
+        return api_service.list_capabilities()
+
+    @app.get("/api/tools")
+    def list_tools() -> list[Dict[str, Any]]:
+        """List the tools currently registered for execution."""
+        return api_service.list_tools()
+
     @app.post("/api/tasks/run")
     def run_task(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not payload.get("description"):
