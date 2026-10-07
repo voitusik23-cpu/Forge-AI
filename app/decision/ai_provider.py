@@ -123,7 +123,7 @@ class AIDecisionProvider:
                 safe_items.append({
                     "item_id": getattr(item, "item_id", ""),
                     "item_type": getattr(item, "item_type", ""),
-                    "content": val[:500],
+                    "content": val[:2000],
                 })
 
         safe_items.sort(key=lambda x: x["item_id"])

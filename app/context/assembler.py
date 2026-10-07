@@ -20,6 +20,14 @@ from app.context.models import (
     ExecutionContext,
     TraceSummary,
 )
+from app.context.selector import (
+    ContextAssemblyError,
+    ContextBudgetPolicy,
+    ContextSelector,
+    CriticalContextUnfitError,
+    InsufficientContextBudgetError,
+    SelectionReport,
+)
 from app.context.validation import (
     MAX_CONTEXT_ITEMS,
     MAX_METADATA_ITEMS,
@@ -29,10 +37,6 @@ from app.context.validation import (
 )
 from app.orchestrator.models import Task
 from app.skills.models import SkillDefinition
-
-
-class ContextAssemblyError(ValueError):
-    """Raised when explicit context or a decision context envelope cannot be assembled safely."""
 
 
 class ContextBudgetExceededError(ContextAssemblyError):
@@ -159,10 +163,15 @@ class DecisionContextAssembler:
         max_context_items: int = MAX_CONTEXT_ITEMS,
         max_metadata_items: int = MAX_METADATA_ITEMS,
         max_string_length: int = MAX_STRING_LENGTH,
+        *,
+        selector: ContextSelector | None = None,
+        budget_policy: ContextBudgetPolicy | None = None,
     ) -> None:
         self.max_context_items = max_context_items
         self.max_metadata_items = max_metadata_items
         self.max_string_length = max_string_length
+        self._selector = selector
+        self._budget_policy = budget_policy
 
     def assemble(
         self,
@@ -186,6 +195,10 @@ class DecisionContextAssembler:
         skills: Iterable[SkillDefinition] = (),
         project_memory: Iterable[Any] = (),
         knowledge: Iterable[Any] = (),
+        understanding_snapshot: Any | None = None,
+        selector: ContextSelector | None = None,
+        budget_policy: ContextBudgetPolicy | None = None,
+        model_info: Any | None = None,
     ) -> DecisionContextEnvelope:
         if not run_id or not isinstance(run_id, str):
             raise ContextAssemblyError("run_id must be a non-empty string")
@@ -483,14 +496,75 @@ class DecisionContextAssembler:
                 )
             )
 
-        # Budget verification
-        if len(items) > self.max_context_items:
-            raise ContextBudgetExceededError(
-                item_count=len(items),
-                character_count=sum(len(it.value) for it in items),
-                max_items=self.max_context_items,
-                max_characters=self.max_context_items * self.max_string_length,
+        # 13. Project Understanding (compact architectural summary)
+        if understanding_snapshot is not None:
+            u_id = getattr(understanding_snapshot, "snapshot_id", str(uuid4()))
+            if hasattr(understanding_snapshot, "facts") and hasattr(understanding_snapshot, "topology"):
+                try:
+                    from app.understanding.summary import summarize_snapshot
+
+                    u_summary = summarize_snapshot(understanding_snapshot)
+                    u_payload = json.dumps(u_summary, ensure_ascii=False, sort_keys=True)
+                except Exception:
+                    u_payload = json.dumps(
+                        {"snapshot_id": u_id, "summary": str(understanding_snapshot)[:1000]},
+                        ensure_ascii=False,
+                    )
+            elif isinstance(understanding_snapshot, dict):
+                u_payload = json.dumps(understanding_snapshot, ensure_ascii=False, sort_keys=True)
+            else:
+                u_payload = str(understanding_snapshot)[:1000]
+
+            items.append(
+                ContextItem(
+                    item_id=f"understanding:{u_id}",
+                    item_type="project_understanding",
+                    source_type=ContextSourceType.PROJECT_UNDERSTANDING,
+                    value=u_payload,
+                    trust_level=ContextTrustLevel.VERIFIED,
+                    source_id=f"understanding:{u_id}",
+                    sensitivity=ContextSensitivity.INTERNAL,
+                )
             )
+
+        # Selection & Budget Packing
+        has_selector = (
+            selector is not None
+            or self._selector is not None
+            or budget_policy is not None
+            or self._budget_policy is not None
+            or model_info is not None
+        )
+
+        if has_selector:
+            eff_policy = budget_policy or (
+                ContextBudgetPolicy.from_model_info(model_info)
+                if model_info is not None
+                else (
+                    self._budget_policy
+                    or ContextBudgetPolicy(
+                        max_items=self.max_context_items,
+                        max_item_characters=self.max_string_length,
+                    )
+                )
+            )
+            eff_selector = selector or self._selector or ContextSelector(policy=eff_policy)
+            selected_items, selection_report = eff_selector.select(items, budget_policy=eff_policy)
+        else:
+            if len(items) > self.max_context_items:
+                raise ContextBudgetExceededError(
+                    item_count=len(items),
+                    character_count=sum(len(it.value) for it in items),
+                    max_items=self.max_context_items,
+                    max_characters=self.max_context_items * self.max_string_length,
+                )
+            selected_items = items
+            eff_policy = ContextBudgetPolicy(
+                max_items=self.max_context_items,
+                max_item_characters=self.max_string_length,
+            )
+            eff_selector = ContextSelector(policy=eff_policy)
+            _, selection_report = eff_selector.select(items, budget_policy=eff_policy)
 
         envelope = DecisionContextEnvelope(
             context_id=cid,
@@ -505,9 +579,10 @@ class DecisionContextAssembler:
             blocking_conditions=cond_tuple,
             available_actions=acts_tuple,
             trace_summary=trace_summary_obj,
-            context_items=tuple(items),
+            context_items=tuple(selected_items),
             metadata=sanitized_meta,
             project_state=project_state,
+            selection_report=selection_report,
         )
 
         report = validate_decision_context(envelope)

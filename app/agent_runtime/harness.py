@@ -260,6 +260,18 @@ class AgentHarness:
                     project_memory = tuple(self._memory_store.query(MemoryQuery(project_id=str(proj_id))))
 
             try:
+                model_info = None
+                dp_model = getattr(self._decision_provider, "model_name", None)
+                dp_provider = getattr(self._decision_provider, "provider_name", None)
+                if dp_model:
+                    try:
+                        from app.agents.providers.model_registry import create_default_registry
+
+                        mreg = getattr(request, "model_registry", None) or create_default_registry()
+                        model_info = mreg.get_model(dp_model, provider_id=dp_provider)
+                    except Exception:
+                        model_info = None
+
                 context_envelope = self._context_assembler.assemble(
                     run_id=request.run_id,
                     attempt_number=current_state.attempt_number,
@@ -273,6 +285,9 @@ class AgentHarness:
                     acceptance_criteria=request.acceptance_criteria,
                     skills=applicable_skills,
                     project_memory=project_memory,
+                    understanding_snapshot=getattr(request, "understanding_snapshot", None),
+                    model_info=model_info,
+                    budget_policy=getattr(request, "budget_policy", None),
                 )
             except Exception as exc:
                 current_state = replace(

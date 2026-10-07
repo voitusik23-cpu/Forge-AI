@@ -30,6 +30,7 @@ class ContextSourceType(str, Enum):
     SKILL = "SKILL"
     PROJECT_MEMORY = "PROJECT_MEMORY"
     FORGE_KNOWLEDGE = "FORGE_KNOWLEDGE"
+    PROJECT_UNDERSTANDING = "PROJECT_UNDERSTANDING"
     # Legacy backward-compatible types
     USER_TASK = "USER_TASK"
     EXPLICIT_INPUT = "EXPLICIT_INPUT"
@@ -282,6 +283,7 @@ class DecisionContextEnvelope:
     context_items: tuple[ContextItem, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
     project_state: Any | None = None
+    selection_report: Any | None = None
 
     def __post_init__(self) -> None:
         if not self.context_id or not isinstance(self.context_id, str):
@@ -365,4 +367,9 @@ class DecisionContextEnvelope:
             "context_items": [item.to_dict() for item in self.context_items],
             "metadata": dict(self.metadata),
             "context_fingerprint": self.context_fingerprint,
+            "selection_report": (
+                self.selection_report.to_dict()
+                if hasattr(self.selection_report, "to_dict")
+                else self.selection_report
+            ),
         }

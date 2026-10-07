@@ -257,11 +257,16 @@ class ManifestDescriptor:
         if isinstance(self.metadata, dict):
             object.__setattr__(self, "metadata", dict(self.metadata))
 
+    @property
+    def dependencies(self) -> tuple[DeclaredDependency, ...]:
+        return self.declared_dependencies
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "relative_path": self.relative_path,
             "manifest_type": self.manifest_type,
             "declared_dependencies": [d.to_dict() for d in self.declared_dependencies],
+            "dependencies": [d.to_dict() for d in self.declared_dependencies],
             "metadata": dict(self.metadata),
         }
 
