@@ -689,10 +689,12 @@ approval when allowed, `write_project_file` still requires it, and with no
 resolver the result is `WAITING_FOR_APPROVAL`. Unknown tools remain
 `UNKNOWN_TOOL` / DENY, and workspace escapes remain denied.
 
-**Host process execution is not wired.** `ExecutionCoordinator`,
-`LocalExecutionAdapter`, `AgentHarness`, `EngineeringRunExecutor`, and
-`execution_requests` remain outside the API path; the API never builds execution
-requests, so no shell or process command can run through an API task.
+**Host process execution is wired but disabled by default.** `ExecutionCoordinator`
+and `LocalExecutionAdapter` are reachable from the API path through the
+`RunExecutor` execution branch (see the section below), but the operator command
+allowlist defaults to the empty set and no production `ExecutionRequest` source
+is wired, so no process runs through an API task today. `AgentHarness` and
+`EngineeringRunExecutor` remain outside the API path.
 
 ## Production Tool Execution and RunScope v0.1 — русская версия
 
@@ -729,11 +731,198 @@ Approval не изменён и не является authorization: `read_proje
 resolver результат — `WAITING_FOR_APPROVAL`. Неизвестные tools остаются
 `UNKNOWN_TOOL` / DENY, выход за пределы workspace остаётся запрещённым.
 
-**Host process execution не подключён.** `ExecutionCoordinator`,
-`LocalExecutionAdapter`, `AgentHarness`, `EngineeringRunExecutor` и
-`execution_requests` остаются вне API-пути; API никогда не формирует execution
-requests, поэтому ни одна shell- или process-команда не может выполниться через
-API-задачу.
+**Host process execution подключён, но выключен по умолчанию.**
+`ExecutionCoordinator` и `LocalExecutionAdapter` достижимы из API-пути через
+ветку execution в `RunExecutor` (см. раздел ниже), однако allowlist команд
+оператора по умолчанию пуст, а production-источник `ExecutionRequest` не
+подключён, поэтому сегодня ни один процесс не выполняется через API-задачу.
+`AgentHarness` и `EngineeringRunExecutor` остаются вне API-пути.
+
+## Production Host Process Execution v0.1
+
+Host process execution runs through a separate branch beside the tool path in
+`RunExecutor`. It is reachable from the API path, and it is disabled by default.
+
+`ForgeApiService` takes `allowed_execution_commands`, declared at composition
+time. That declaration is the only source of authority to run a host process: it
+is never derived from the request, its context, a skill, the fabric, the tool
+registry, or `execution_profile.allowed_commands`. The default is
+`frozenset()`, which means no process is reachable. The value is written into the
+run's frozen `RunScope` as `allowed_execution_commands`.
+
+The execution branch runs only when all of the following hold, and each missing
+piece is a fail-closed refusal rather than a silent skip:
+
+1. the operator command allowlist is non-empty;
+2. the run has a frozen `RunScope` (the coordinator re-validates every request
+   against it and denies an unscoped dispatch with `run_scope_required`);
+3. a server-side `ApprovalPolicy` was supplied, so approval never depends on the
+   request's own `approval_required` flag alone;
+4. the run has a `Workspace`, which is the explicit execution root.
+
+A server-side request factory may then produce `ExecutionRequest` values. The
+factory is a server-side injection point: it can only *ask* for a command, never
+authorize one. `RunExecutor` calls `ExecutionCoordinator.execute` with the
+request, the scoped workspace root, the run id, the operator allowlist, the
+approval policy and resolver, and the frozen scope. The coordinator performs the
+permission check, builds the `ExecutionIntent`, evaluates the approval and the
+`ExecutionPolicy`, validates the workspace root, and only then mints an
+`AuthorizedExecution`. `LocalExecutionAdapter` refuses anything that is not a
+valid token and spawns the process inside an ephemeral scratch workspace.
+
+Denied, waiting, and failed outcomes are recorded as sanitized events carrying
+only a request id, status, reason, and exit code. Stdout, stderr, raw environment
+values, and the execution token are never written, so a durable record can never
+act as execution authority later. Recorded host execution results are available
+as `Run.execution_results` for reading only, and a pending approval is reported
+as `WAITING_FOR_APPROVAL` rather than as a failure.
+
+**Declared executions.** Command authority comes from operator-owned
+`ExecutionDeclaration` values (`app/execution/declaration.py`), declared at
+composition time on `ForgeApiService` as a `declarations` mapping plus a
+server-side `verification_resolver`. A declaration is frozen, may carry only the
+`verification` purpose in v0.1, and is rejected at composition time if the active
+execution profile cannot admit it (executable, working directory, environment
+values, timeout, profile id). `to_execution_request` is a pure translator: it
+reads no request, no task description, and no context, and it takes the profile
+from the caller so a request always carries the scope's profile.
+
+The command set a run may use is derived from the declaration the resolver
+selects, never from an independently configured allowlist. With no declarations,
+no resolver, or an unresolvable selection, the derived set is empty, which is what
+the executor's command-authority gate consumes, so host execution stays disabled.
+
+**Trusted server-side verification entry point.**
+`ForgeApiService.run_declared_verification(declaration_id, *, purpose_run_id=None)`
+runs one operator-declared verification execution. It is server-side code called
+in-process, never an HTTP route, because the HTTP layer has no caller-trust
+model.
+
+Its only selection input is the declaration id, resolved exclusively against the
+operator-configured registry. It accepts no command, workspace, profile,
+environment, timeout, allowlist, or approval flag, so a caller can choose *which*
+declared verification runs, never *what* runs. `purpose_run_id` is correlation
+metadata attached to the request, never authority.
+
+The service generates its own run id, builds a frozen `RunScope` from its own
+trusted values (its `Workspace`, its execution profile, the declared executable
+as the command set, and the system acceptance criterion), and then reuses the
+existing chain unchanged: `RunExecutor` → `ExecutionCoordinator` →
+`AuthorizedExecution` → `LocalExecutionAdapter`. It never bypasses the
+coordinator, never constructs a token, and never spawns a process itself.
+Approval remains the sole decision of the server-side `ApprovalPolicy`.
+
+Fail-closed: no declarations configured means declared verification execution is
+disabled with no default or implicit command; an unknown declaration id raises
+`UnknownExecutionDeclarationError` before any scope is frozen, any request is
+built, or any process starts. `run_task` never invokes declared verification, so
+the ordinary API task path stays execution-disabled.
+
+**What is still missing.** The entry point runs and records a declared
+verification, but there is no trusted criterion identity to attach the result to,
+so it is deliberately not linked to a client task's acceptance criteria and no
+placeholder criterion is presented as a real one (GAP-F). Task-driven
+verification binding likewise still needs its own decision: no production
+`VerificationExpectation` or `TestVerificationIntent` exists, and
+`TaskRunRequest` carries no verification field. Network restriction is
+best-effort only (`network_access=False` sets proxy environment variables; it is
+not a kernel-level block), and the ephemeral workspace boundary is a
+working-directory and COPY-staging boundary, not a filesystem sandbox. Idempotent
+side-effect execution and automatic resume remain out of scope.
+
+## Production Host Process Execution v0.1 — русская версия
+
+Host process execution выполняется через отдельную ветку рядом с tool-путём в
+`RunExecutor`. Он достижим из API-пути и выключен по умолчанию.
+
+`ForgeApiService` принимает `allowed_execution_commands`, объявляемый на уровне
+композиции. Это объявление — единственный источник права запустить host-процесс:
+оно никогда не выводится из запроса, его контекста, скилла, fabric, реестра tools
+или `execution_profile.allowed_commands`. Значение по умолчанию — `frozenset()`,
+то есть ни один процесс недостижим. Это значение записывается в замороженный
+`RunScope` запуска как `allowed_execution_commands`.
+
+Ветка execution выполняется только при выполнении всех условий, и каждый
+недостающий элемент — это fail-closed отказ, а не молчаливый пропуск:
+
+1. allowlist команд оператора непуст;
+2. у запуска есть замороженный `RunScope` (координатор перепроверяет каждый
+   запрос против него и отвергает dispatch без scope с `run_scope_required`);
+3. передана server-side `ApprovalPolicy`, поэтому approval никогда не зависит
+   только от флага `approval_required` самого запроса;
+4. у запуска есть `Workspace` — явный execution root.
+
+После этого server-side фабрика запросов может породить значения
+`ExecutionRequest`. Фабрика — это server-side точка инъекции: она может только
+*запросить* команду, но не авторизовать её. `RunExecutor` вызывает
+`ExecutionCoordinator.execute` с запросом, корнем workspace из scope, run id,
+allowlist оператора, approval policy и resolver'ом, а также замороженным scope.
+Координатор выполняет permission-проверку, строит `ExecutionIntent`, оценивает
+approval и `ExecutionPolicy`, валидирует корень workspace и только затем выпускает
+`AuthorizedExecution`. `LocalExecutionAdapter` отвергает всё, что не является
+валидным токеном, и запускает процесс внутри эфемерного scratch-workspace.
+
+Отказы, ожидание и ошибки записываются как санитизированные события, несущие
+только request id, статус, причину и exit code. Stdout, stderr, сырые значения
+окружения и execution-токен никогда не записываются, поэтому durable-запись
+никогда не сможет стать execution-authority. Записанные результаты host execution
+доступны как `Run.execution_results` только для чтения, а ожидание approval
+сообщается как `WAITING_FOR_APPROVAL`, а не как ошибка.
+
+**Объявленные выполнения.** Command-authority приходит от принадлежащих
+оператору значений `ExecutionDeclaration` (`app/execution/declaration.py`),
+объявляемых на уровне композиции в `ForgeApiService` как mapping `declarations`
+плюс server-side `verification_resolver`. Объявление заморожено, в v0.1 может
+нести только purpose `verification` и отвергается на этапе композиции, если
+активный профиль выполнения не может его admit'нуть (executable, working
+directory, значения environment, timeout, profile id). `to_execution_request` —
+чистый транслятор: он не читает ни запрос, ни description задачи, ни context, а
+профиль берёт у вызывающего, поэтому запрос всегда несёт профиль scope.
+
+Набор команд, доступных запуску, выводится из объявления, выбранного resolver'ом,
+а не из независимо сконфигурированного allowlist. Без объявлений, без resolver'а
+или при неразрешимом выборе производный набор пуст — именно его потребляет гейт
+command-authority в executor'е, поэтому host execution остаётся выключенным.
+
+**Доверенный server-side вход для verification.**
+`ForgeApiService.run_declared_verification(declaration_id, *, purpose_run_id=None)`
+выполняет одно объявленное оператором verification-выполнение. Это server-side
+код, вызываемый внутри процесса, а не HTTP-маршрут, поскольку у HTTP-слоя нет
+модели доверия вызывающего.
+
+Единственный вход выбора — declaration id, разрешаемый исключительно через
+операторский реестр. Метод не принимает ни команду, ни workspace, ни профиль, ни
+окружение, ни timeout, ни allowlist, ни approval-флаг, поэтому вызывающий может
+выбрать *какая* объявленная verification выполнится, но никогда — *что*
+выполнится. `purpose_run_id` — correlation-метаданные, прикрепляемые к запросу, а
+не authority.
+
+Сервис сам генерирует run id, строит замороженный `RunScope` из собственных
+доверенных значений (`Workspace`, профиль выполнения, объявленный executable как
+набор команд и системный acceptance-критерий) и затем переиспользует существующую
+цепочку без изменений: `RunExecutor` → `ExecutionCoordinator` →
+`AuthorizedExecution` → `LocalExecutionAdapter`. Он никогда не обходит
+координатор, не конструирует токен и не запускает процесс сам. Approval остаётся
+исключительным решением server-side `ApprovalPolicy`.
+
+Fail-closed: если объявления не сконфигурированы, объявленное verification-
+выполнение выключено, без default- или implicit-команды; неизвестный declaration
+id поднимает `UnknownExecutionDeclarationError` до того, как будет заморожен
+scope, построен запрос или запущен процесс. `run_task` никогда не вызывает
+объявленную verification, поэтому обычный API-путь задачи остаётся
+execution-disabled.
+
+**Чего ещё нет.** Вход выполняет и записывает объявленную verification, но
+доверенной criterion-идентичности, к которой можно привязать результат, нет,
+поэтому он намеренно не связывается с acceptance criteria клиентской задачи, а
+placeholder-критерий не выдаётся за настоящий (GAP-F). Привязка verification к
+задаче также всё ещё требует отдельного решения: production
+`VerificationExpectation` или `TestVerificationIntent` не существует, а
+`TaskRunRequest` не несёт verification-поля. Ограничение сети — только
+best-effort (`network_access=False` выставляет прокси-переменные окружения; это
+не kernel-level блокировка), а граница эфемерного workspace — это граница рабочей
+директории и COPY-разворачивания, а не файловая песочница. Идемпотентное
+исполнение side effects и automatic resume остаются вне области работ.
 
 ## Capability and Tool Discovery v0.1 — русская версия
 

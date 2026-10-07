@@ -2,9 +2,9 @@
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 from app.agents.base import AgentExecutionError
 from app.context import (
@@ -32,6 +32,31 @@ from app.tools.contracts import ToolResult, ToolStatus
 from app.tools.permissions import ToolExecutionContext
 from app.tools.registry import ToolRegistry
 from app.tools.workspace import Workspace
+
+# Maps a host execution outcome onto the lifecycle event that records it. A
+# denied outcome is reported with the same terminal event shape as any other
+# unsuccessful execution so a Run never looks successful after a denial.
+_EXECUTION_OUTCOME_EVENTS: dict[str, EventType] = {
+    "EXECUTION_SUCCESS": EventType.EXECUTION_COMPLETED,
+    "EXECUTION_FAILURE": EventType.EXECUTION_COMPLETED,
+    "EXECUTION_TIMEOUT": EventType.EXECUTION_COMPLETED,
+    "EXECUTION_ERROR": EventType.EXECUTION_COMPLETED,
+    "PERMISSION_DENIED": EventType.EXECUTION_DENIED,
+    "POLICY_DENIED": EventType.EXECUTION_DENIED,
+    "APPROVAL_WAITING": EventType.EXECUTION_DENIED,
+    "APPROVAL_REJECTED": EventType.EXECUTION_DENIED,
+}
+
+# Outcomes that mean the run must not be reported as completed. Approval waiting
+# is distinct: it is a terminal wait state, not a failure.
+_SUCCESSFUL_EXECUTION_OUTCOMES = frozenset({"EXECUTION_SUCCESS"})
+_APPROVAL_WAITING_OUTCOMES = frozenset({"APPROVAL_WAITING"})
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from app.execution.authorizer import ExecutionCoordinator
+    from app.execution.profile import ProjectExecutionProfile
+    from app.execution.request import ExecutionRequest, ExecutionResult
+    from app.tools.approval import ApprovalPolicy, ApprovalResolver
 
 
 class RunExecutor:
@@ -116,6 +141,13 @@ class RunExecutor:
         run_scope: object | None = None,
         observer: Optional[Callable[[EventType, dict], None]] = None,
         run_store: object | None = None,
+        execution_request_factory: (
+            Callable[[Task, "ProjectExecutionProfile"], Sequence["ExecutionRequest"]] | None
+        ) = None,
+        allowed_execution_commands: "frozenset[str] | None" = None,
+        execution_coordinator: "ExecutionCoordinator | None" = None,
+        approval_policy: "ApprovalPolicy | None" = None,
+        approval_resolver: "ApprovalResolver | None" = None,
         _run: Run | None = None,
         _attempt_number: int = 0,
     ) -> Run:
@@ -214,9 +246,53 @@ class RunExecutor:
                 result.tool_invocations = initial_invocations + followup_invocations
                 result.tool_results = tool_results
             run.result = result
+
+            # Host process execution. This is a separate branch beside the tool
+            # path, not part of it. It runs only when the server injected an
+            # execution request factory AND the run declares command authority;
+            # both defaults are inert, so an ordinary Run never reaches the
+            # execution plane. The coordinator remains the only component that
+            # may mint an AuthorizedExecution, and it re-validates every request
+            # against this Run's frozen scope before doing so.
+            if execution_request_factory is not None and result.success:
+                self._execute_host_requests(
+                    run,
+                    result=result,
+                    execution_request_factory=execution_request_factory,
+                    allowed_execution_commands=allowed_execution_commands,
+                    execution_coordinator=execution_coordinator,
+                    approval_policy=approval_policy,
+                    approval_resolver=approval_resolver,
+                    workspace=workspace,
+                    run_scope=run_scope,
+                    observer=observer,
+                    run_store=run_store,
+                )
+
             if result.success:
                 run.state = RunState.COMPLETED
                 run.error = None
+            else:
+                message = result.error or "Task execution failed"
+                if self._host_approval_pending(run):
+                    # Host execution is waiting for approval. This is a terminal
+                    # wait state, not a failure, and it must not be reported as a
+                    # failed workaround for a completed dispatch.
+                    run.state = RunState.WAITING_FOR_APPROVAL
+                    run.error = None
+                else:
+                    run.state = RunState.FAILED
+                    run.error = RunError("TaskExecutionError", message)
+
+            if run.state == RunState.WAITING_FOR_APPROVAL:
+                self._record(
+                    run,
+                    EventType.APPROVAL_REQUESTED,
+                    run_id=run.id,
+                    state=RunState.WAITING_FOR_APPROVAL.value,
+                    reason="host_execution_approval_pending",
+                )
+            elif run.state == RunState.COMPLETED:
                 self._record(
                     run,
                     EventType.RUN_COMPLETED,
@@ -226,14 +302,11 @@ class RunExecutor:
                     usage=self._usage_data(result),
                 )
             else:
-                message = result.error or "Task execution failed"
-                run.state = RunState.FAILED
-                run.error = RunError("TaskExecutionError", message)
                 self._record(
                     run,
                     EventType.RUN_FAILED,
-                    error_type=run.error.error_type,
-                    error=run.error.message,
+                    error_type=run.error.error_type if run.error else "TaskExecutionError",
+                    error=run.error.message if run.error else "Task execution failed",
                     duration_seconds=max(0.0, time.perf_counter() - started),
                 )
         except Exception as exc:
@@ -293,6 +366,163 @@ class RunExecutor:
                 run.id,
                 exc_info=True,
             )
+
+    def _execute_host_requests(
+        self,
+        run: Run,
+        *,
+        result: TaskResult,
+        execution_request_factory: Callable[..., Sequence["ExecutionRequest"]],
+        allowed_execution_commands: "frozenset[str] | None",
+        execution_coordinator: "ExecutionCoordinator | None",
+        approval_policy: "ApprovalPolicy | None",
+        approval_resolver: "ApprovalResolver | None",
+        workspace: Workspace | None,
+        run_scope: object | None,
+        observer: Optional[Callable[[EventType, dict], None]],
+        run_store: object | None,
+    ) -> None:
+        """Run host process execution requests through the execution coordinator.
+
+        Trust model: the factory is server-side. It may only *ask* for a command;
+        it cannot authorise one. Every request is re-validated by the coordinator
+        against this Run's frozen scope, and a request whose command is outside
+        the operator's allowlist is denied before any token is minted.
+
+        Fail-closed rules applied here, before the coordinator is reached:
+
+        1. no declared command authority -> nothing is requested at all;
+        2. a run scope is mandatory, because the coordinator is the only
+           perimeter that can reject an out-of-perimeter request;
+        3. an ``ApprovalPolicy`` is mandatory, so approval never depends solely
+           on the request's own ``approval_required`` flag;
+        4. a missing workspace root means no execution root, so no execution.
+        """
+        command_authority = allowed_execution_commands or frozenset()
+        if not command_authority:
+            return
+        if run_scope is None:
+            self._record(
+                run,
+                EventType.EXECUTION_DENIED,
+                run_id=run.id,
+                status="DENIED",
+                reason="run_scope_required",
+            )
+            result.success = False
+            return
+        if approval_policy is None:
+            self._record(
+                run,
+                EventType.EXECUTION_DENIED,
+                run_id=run.id,
+                status="DENIED",
+                reason="approval_policy_required",
+            )
+            result.success = False
+            return
+        if workspace is None:
+            self._record(
+                run,
+                EventType.EXECUTION_DENIED,
+                run_id=run.id,
+                status="DENIED",
+                reason="workspace_root_required",
+            )
+            result.success = False
+            return
+
+        profile = getattr(run_scope, "execution_profile", None)
+        try:
+            requests = tuple(execution_request_factory(run.task, profile))
+        except Exception as exc:  # noqa: BLE001 - a failed request must not execute
+            self._record(
+                run,
+                EventType.EXECUTION_DENIED,
+                run_id=run.id,
+                status="DENIED",
+                reason=f"execution_request_failed:{type(exc).__name__}",
+            )
+            result.success = False
+            return
+
+        if not requests:
+            return
+
+        coordinator = execution_coordinator
+        if coordinator is None:
+            from app.execution.adapter import LocalExecutionAdapter
+            from app.execution.authorizer import ExecutionCoordinator as _Coordinator
+
+            coordinator = _Coordinator(
+                LocalExecutionAdapter(workspace_root=workspace.root)
+            )
+
+        execution_results: list["ExecutionResult"] = []
+        for request in requests:
+            execution_result = coordinator.execute(
+                request,
+                workspace_root=workspace.root,
+                run_id=run.id,
+                allowed_commands=command_authority,
+                approval_policy=approval_policy,
+                approval_resolver=approval_resolver,
+                run_scope=run_scope,
+                observer=lambda event_type, data: self._record(
+                    run, event_type, observer, run_store, **data
+                ),
+            )
+            execution_results.append(execution_result)
+            self._record_execution_outcome(run, execution_result)
+
+        run.execution_results = list(execution_results)
+        outcomes = {
+            str(item.outcome_status.value)
+            for item in execution_results
+            if item.outcome_status is not None
+        }
+        if outcomes & _APPROVAL_WAITING_OUTCOMES:
+            # Approval waiting is a terminal wait state, not a failure. The
+            # state is applied after the caller's success/failure branch so a
+            # completed dispatch cannot mask the pending approval.
+            result.success = False
+        elif not outcomes <= _SUCCESSFUL_EXECUTION_OUTCOMES:
+            result.success = False
+
+    @staticmethod
+    def _host_approval_pending(run: Run) -> bool:
+        """Report whether any recorded host execution is waiting for approval."""
+        return any(
+            item.outcome_status is not None
+            and str(item.outcome_status.value) in _APPROVAL_WAITING_OUTCOMES
+            for item in getattr(run, "execution_results", ())
+        )
+
+    def _record_execution_outcome(
+        self, run: Run, execution_result: "ExecutionResult"
+    ) -> None:
+        """Record one host execution outcome with sanitized, non-secret metadata.
+
+        Only identifiers, status, and a reason are recorded. Stdout, stderr, raw
+        environment values, and the AuthorizedExecution token are never written,
+        so a durable record can never act as execution authority later.
+        """
+        outcome = (
+            execution_result.outcome_status.value
+            if execution_result.outcome_status is not None
+            else str(execution_result.status.value)
+        )
+        event_type = _EXECUTION_OUTCOME_EVENTS.get(outcome, EventType.EXECUTION_DENIED)
+        metadata = dict(execution_result.metadata or {})
+        self._record(
+            run,
+            event_type,
+            run_id=run.id,
+            request_id=execution_result.request_id,
+            status=outcome,
+            reason=metadata.get("denial_reason") or outcome,
+            exit_code=execution_result.exit_code,
+        )
 
     def attach_attempt_outcomes(
         self,

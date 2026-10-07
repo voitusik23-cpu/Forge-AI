@@ -3,13 +3,16 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from uuid import uuid4
 
 from app.artifacts import Artifact, ChangeSet
 from app.snapshots import ProjectSnapshot
 from app.usage import Usage
 from app.tools.contracts import ToolInvocation, ToolResult
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from app.execution.request import ExecutionResult
 
 
 class TaskPriority(Enum):
@@ -197,3 +200,7 @@ class Run:
     change_sets: list[ChangeSet] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
     project_snapshots: list[ProjectSnapshot] = field(default_factory=list)
+    # Host process execution outcomes for this Run. Empty for a Run that never
+    # requested execution, which is the default production path. These are
+    # results to read, never authority to act on.
+    execution_results: list["ExecutionResult"] = field(default_factory=list)

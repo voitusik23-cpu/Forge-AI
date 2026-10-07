@@ -380,3 +380,541 @@ production tool execution wiring. Проверено по коду в `app/api/s
    исполняемых файлов после проектирования host process execution.
 4. Дать API способ выражать легитимный сужающий запрос tools, когда появится
    server-side allowlist, относительно которого можно сужать.
+
+## Production Host Process Execution Authority v0.1
+
+Implemented in the host process execution wiring block. Verified against the code
+in `app/orchestrator/run.py`, `app/api/service.py`, `app/execution/`, and
+`app/runtime/run_scope.py`.
+
+### Accepted decisions
+
+- **Operator command authority is the only source of authority to run a host
+  process.** `ForgeApiService` takes `allowed_execution_commands`, declared once
+  at composition time. It is never derived from `TaskRunRequest`, the request
+  context, a skill manifest, `SkillEvaluator`, `CapabilityFabric`, the tool
+  registry, `registry.list_tools()`, or `execution_profile.allowed_commands`.
+- **The default command allowlist is empty**, which means host process execution
+  is disabled. `RunScope.allows_command` rejects every command when the set is
+  empty, so no process is reachable until an operator declares one.
+- **`RunScope` is the frozen perimeter.** Each API run builds a scope with the
+  service's own `Workspace`, the service execution profile, the effective tool
+  allowlist, and the operator command allowlist, then calls `freeze()` and
+  `require_active_scope()` before the executor runs.
+- **The execution profile is a ceiling, not a grant.** `allowed_commands`,
+  `capabilities`, `network_access`, `environment_variables`, `timeout_seconds`,
+  `max_output_bytes`, and `working_directory` bound what a request may ask for.
+  A profile never authorizes anything by itself.
+- **`ExecutionRequest` is a request, never authority.** It cannot widen the
+  scope, the workspace, the profile, the environment, the network, the timeout,
+  or the output limit; every field is re-validated against the frozen scope.
+- **`ExecutionCoordinator` is the authorization boundary.** It is the only
+  component that evaluates permission, approval, and policy, and the only one
+  that may mint an execution token.
+- **`AuthorizedExecution` is the execution token.** It is created solely by the
+  coordinator with the internal sentinel, is never constructed manually, never
+  travels over HTTP, and is never written to the durable run store.
+- **`LocalExecutionAdapter` is the only component that spawns a process**, and it
+  refuses anything that is not a valid `AuthorizedExecution`.
+- **`TaskRunRequest` carries no authority fields.** It gained no command,
+  workspace, profile, environment, network, timeout, or output parameter.
+- **Approval is server-side.** Host execution requires an explicit server-side
+  `ApprovalPolicy`; without one the executor refuses rather than falling back to
+  the request's own `approval_required` flag, so that flag can never be the only
+  approval mechanism. A missing resolver is fail-closed and reported as an
+  approval wait.
+- **The production entry point is the existing `RunExecutor`**, extended with an
+  execution branch beside the tool path. No new executor was created, and
+  `AgentHarness` / `EngineeringRunExecutor` were not repurposed as API entry
+  points.
+- **No automatic resume and no idempotency.** A recorded `EXECUTION_STARTED` is
+  never treated as permission to re-run, and a crash between process start and
+  result recording produces no retry.
+- **Network restriction is currently best-effort.** `network_access=False` sets
+  proxy environment variables for the child process. It is not a kernel-level
+  block, and nothing in the documentation claims otherwise.
+
+### Rejected or deferred alternatives (with rationale)
+
+- **A new executor for host execution.** Rejected: `RunExecutor` already carries
+  the run id, workspace, frozen scope, and run store, so a fourth executor would
+  duplicate authority.
+- **Using `AgentHarness` as the API entry point.** Rejected: it does not dispatch
+  tools at all, so adopting it would mean adding a tool path, not wiring one.
+- **Using `EngineeringRunExecutor` as the API entry point.** Deferred: it
+  requires acceptance criteria and verification expectations the API cannot
+  supply.
+- **Turning `TestVerificationAdapter` into a registered Tool.** Rejected for this
+  block: it would create an artificial tool/permission surface purely to generate
+  a request.
+- **Deriving the command allowlist from the profile.** Rejected: the profile is a
+  ceiling, and treating it as a grant would make every profile entry executable.
+- **Relying on `request.approval_required`.** Rejected: approval must not depend
+  on a field a request can set to `False`.
+- **Kernel-level network enforcement, namespaces, seccomp, or proxy-bypass
+  protection.** Deferred as a separate security block.
+- **Idempotent side-effect execution.** Deferred as its own block; it is a
+  prerequisite for durable/resumable host execution, not for wiring.
+
+### Consequences and open items
+
+1. **The production `ExecutionRequest` source is not wired and requires a
+   separate architectural decision.** The executor accepts a server-side
+   request factory, but `ForgeApiService` supplies none, because no existing
+   server-side use case can legitimately produce an execution request from the
+   API contract. Until that decision is made, host process execution stays
+   disabled by default and the operator command allowlist stays empty.
+2. The working-directory isolation provided by `EphemeralWorkspaceManager` uses
+   COPY semantics: it stages the source workspace into a scratch directory and
+   runs the process there, but it is not a filesystem sandbox. A process given an
+   absolute path can still write outside the scratch tree. OS-level isolation
+   remains deferred.
+3. Idempotent side-effect execution must land before host execution is allowed
+   into any durable or resumable flow.
+
+## Production Host Process Execution Authority v0.1 — русская версия
+
+Реализовано в блоке host process execution wiring. Проверено по коду в
+`app/orchestrator/run.py`, `app/api/service.py`, `app/execution/` и
+`app/runtime/run_scope.py`.
+
+### Принятые решения
+
+- **Authority оператора на команды — единственный источник права запустить
+  host-процесс.** `ForgeApiService` принимает `allowed_execution_commands`,
+  объявляемый один раз на уровне композиции. Он никогда не выводится из
+  `TaskRunRequest`, контекста запроса, манифеста скилла, `SkillEvaluator`,
+  `CapabilityFabric`, реестра tools, `registry.list_tools()` или
+  `execution_profile.allowed_commands`.
+- **Default-allowlist команд пуст**, то есть host process execution выключен.
+  `RunScope.allows_command` отвергает любую команду при пустом множестве,
+  поэтому ни один процесс недостижим, пока оператор не объявит команду.
+- **`RunScope` — замороженный периметр.** Каждый API-run создаёт scope с
+  собственным `Workspace` сервиса, профилем выполнения, effective tool allowlist
+  и allowlist команд оператора, затем вызывает `freeze()` и
+  `require_active_scope()` до запуска executor'а.
+- **Профиль выполнения — потолок, а не разрешение.** `allowed_commands`,
+  `capabilities`, `network_access`, `environment_variables`, `timeout_seconds`,
+  `max_output_bytes` и `working_directory` ограничивают то, что может запросить
+  request. Сам профиль ничего не авторизует.
+- **`ExecutionRequest` — запрос, а не authority.** Он не может расширить scope,
+  workspace, профиль, окружение, сеть, timeout или лимит вывода; каждое поле
+  повторно проверяется против замороженного scope.
+- **`ExecutionCoordinator` — граница авторизации.** Только он оценивает
+  permission, approval и policy и только он может выпустить execution-токен.
+- **`AuthorizedExecution` — execution-токен.** Создаётся исключительно
+  координатором через внутренний sentinel, никогда не конструируется вручную,
+  никогда не передаётся по HTTP и никогда не записывается в durable run store.
+- **`LocalExecutionAdapter` — единственный, кто запускает процесс**, и он
+  отвергает всё, что не является валидным `AuthorizedExecution`.
+- **`TaskRunRequest` не несёт authority-полей.** В него не добавлены ни команда,
+  ни workspace, ни профиль, ни окружение, ни сеть, ни timeout, ни лимит вывода.
+- **Approval — server-side.** Host execution требует явной server-side
+  `ApprovalPolicy`; без неё executor отказывается, а не откатывается к флагу
+  `approval_required` самого запроса, поэтому этот флаг никогда не может быть
+  единственным механизмом approval. Отсутствие resolver'а — fail-closed и
+  сообщается как ожидание approval.
+- **Production entry point — существующий `RunExecutor`**, расширенный веткой
+  execution рядом с tool-путём. Новый executor не создавался, а `AgentHarness` /
+  `EngineeringRunExecutor` не превращались в API entry point.
+- **Никакого automatic resume и никакой идемпотентности.** Записанный
+  `EXECUTION_STARTED` никогда не считается разрешением на повторный запуск, а
+  краш между запуском процесса и записью результата не приводит к повтору.
+- **Ограничение сети сейчас best-effort.** `network_access=False` выставляет
+  прокси-переменные окружения для дочернего процесса. Это не kernel-level
+  блокировка, и никакая документация не утверждает обратного.
+
+### Отклонённые или отложенные альтернативы (с обоснованием)
+
+- **Новый executor для host execution.** Отклонено: `RunExecutor` уже несёт run
+  id, workspace, замороженный scope и run store, поэтому четвёртый executor
+  дублировал бы authority.
+- **Использовать `AgentHarness` как API entry point.** Отклонено: он вообще не
+  диспетчеризует tools, поэтому его принятие означало бы добавление tool-пути, а
+  не подключение существующего.
+- **Использовать `EngineeringRunExecutor` как API entry point.** Отложено: он
+  требует acceptance criteria и verification expectations, которых API не может
+  предоставить.
+- **Превратить `TestVerificationAdapter` в зарегистрированный Tool.** Отклонено
+  для этого блока: это создало бы искусственную tool/permission-поверхность
+  исключительно ради генерации запроса.
+- **Выводить allowlist команд из профиля.** Отклонено: профиль — потолок, и
+  трактовка его как разрешения сделала бы исполняемой каждую его запись.
+- **Полагаться на `request.approval_required`.** Отклонено: approval не должен
+  зависеть от поля, которое запрос может выставить в `False`.
+- **Kernel-level network enforcement, namespaces, seccomp, защита от обхода
+  прокси.** Отложено как отдельный security-блок.
+- **Идемпотентное исполнение side effects.** Отложено как отдельный блок; это
+  предпосылка для durable/resumable host execution, а не для wiring.
+
+### Следствия и открытые пункты
+
+1. **Production-источник `ExecutionRequest` не подключён и требует отдельного
+   архитектурного решения.** Executor принимает server-side фабрику запросов, но
+   `ForgeApiService` её не предоставляет, потому что ни один существующий
+   server-side сценарий не может легитимно породить execution request из
+   API-контракта. Пока это решение не принято, host process execution остаётся
+   выключенным по умолчанию, а allowlist команд оператора — пустым.
+2. Изоляция рабочей директории, предоставляемая `EphemeralWorkspaceManager`,
+   использует COPY-семантику: она разворачивает исходный workspace в scratch-каталог
+   и запускает процесс там, но это не файловая песочница. Процесс, получивший
+   абсолютный путь, всё ещё может писать за пределами scratch-дерева. OS-level
+   изоляция остаётся отложенной.
+3. Идемпотентное исполнение side effects должно появиться до того, как host
+   execution будет допущен в любой durable- или resumable-flow.
+
+## Server-Side Declared Execution Intent v0.1
+
+Implemented in the declared verification execution block. Verified against the
+code in `app/execution/declaration.py`, `app/api/service.py`,
+`app/orchestrator/run.py`, and `app/runtime/run_scope.py`.
+
+### Accepted decisions
+
+- **Host command authority belongs to the operator.** It is declared at
+  composition time as `ExecutionDeclaration` values on `ForgeApiService`, next to
+  the tool allowlist, the execution profile, and the approval policy.
+- **A declaration is data, never a gate.** It can only add limits; it cannot
+  authorize anything on its own and it introduces no new permission layer.
+- **`command` is the only authority-bearing field.** Every other field
+  identifies the declaration or narrows it further, and each is re-validated
+  against the frozen `RunScope` and the execution profile.
+- **Declarations are frozen and fail closed at composition time.** A declaration
+  the active profile cannot admit - wrong executable, different working
+  directory, unauthorized environment variable, timeout above the ceiling, or a
+  mismatched profile id - is rejected when the service is constructed.
+- **v0.1 is verification-only.** `purpose` accepts exactly `verification`;
+  anything else is rejected, so the type does not imply that wider purposes are
+  merely unconfigured.
+- **`TaskRunRequest` is unchanged.** It gained no command, declaration id,
+  workspace, profile, environment, timeout, or allowlist field.
+- **No client input can select or alter a command.** The resolver receives only
+  the task and the active profile. `context`, the task description, `category`,
+  the skill layer, the fabric, the tool registry, `Decision`, and the execution
+  profile are all non-authoritative for command selection.
+- **`category` does not select a declaration.** Mapping a client-supplied
+  category onto an arbitrary declaration would let a client choose which
+  operator-declared command runs, so that channel is rejected.
+- **`allowed_execution_commands` is derived, not configured.** It is the
+  executable of the declaration the server-side resolver actually selected. An
+  unresolved, unknown, or absent selection yields the empty set, which disables
+  host execution for the run.
+- **The legacy `allowed_execution_commands` constructor parameter grants
+  nothing.** Two independent command sources could disagree, and one of them
+  would silently widen the perimeter. The parameter is retained for
+  compatibility only.
+- **`RunScope` remains the gate.** Its semantics were not changed: it receives
+  the already-derived command set, then freezes, then the coordinator
+  re-validates every request against it.
+- **`ExecutionCoordinator` remains the sole creator of `AuthorizedExecution`.**
+  No new executor, token, or authority layer was introduced.
+- **Approval stays server-side policy.** A declaration has no
+  `approval_required` field, so it cannot weaken approval; a missing
+  `ApprovalPolicy` refuses, and a missing resolver is reported as an approval
+  wait.
+- **No automatic resume and no idempotency.** A recorded `EXECUTION_STARTED` is
+  never permission to re-run.
+
+### Rejected alternatives (with rationale)
+
+- **Reusing `TestVerificationIntent` as the general authority container.**
+  Rejected: it requires `criterion_id` and `verification_id`, so a non-verification
+  purpose would have to invent them, and the type would imply a verification
+  contract that does not exist.
+- **Turning `TestVerificationAdapter` into a Tool.** Rejected: it would create a
+  tool and permission surface purely to generate a request.
+- **`TaskSpecification` as the declaration carrier.** Rejected: no production
+  code constructs a `TaskSpecification` at all, so a field there would either be
+  operator-supplied (equivalent to a declaration, but heavier) or a renamed
+  `context` channel.
+- **`Decision` as the authority reference.** Rejected: `Decision` deliberately
+  carries no authority, and `RunExecutor` does not reach the decision machinery.
+- **Declaring `approval_required` on a declaration.** Rejected: it would let a
+  declaration remove an approval requirement.
+- **Deriving authority from `execution_profile.allowed_commands`.** Rejected:
+  the profile is a ceiling, and treating it as a grant would make every declared
+  executable runnable.
+- **A client-supplied `declaration_id` on the HTTP contract.** Rejected for
+  v0.1: it would let a client pick which operator-declared command runs.
+
+### Consequences and open items
+
+1. **The verification binding requires a separate architectural decision.** The
+   declaration mechanism is complete and tested end-to-end, but the API path has
+   no trusted server-side verification identity: no production code constructs a
+   `VerificationExpectation` or a `TestVerificationIntent`, and `TaskRunRequest`
+   carries no verification field. No server-side resolver can therefore select a
+   declaration from production data, and a client-controlled selector is
+   rejected by design. Production host process execution consequently remains
+   disabled by default, and the roadmap item for the binding stays open.
+2. **GAP-A (workspace isolation).** `EphemeralWorkspaceManager` uses COPY
+   staging into a scratch directory; it is a working-directory boundary, not a
+   filesystem sandbox. A process given an absolute path can still write outside
+   the scratch tree.
+3. **GAP-B (network).** `network_access=False` sets proxy environment variables.
+   It is best-effort and not a kernel-level block.
+4. **GAP-C — CLOSED.** `RunScope.validate_execution_profile()` enforces the
+   frozen capability ceiling and rejects attempts to widen capabilities, so a
+   request profile can no longer declare capabilities the scope never approved.
+   This protection already existed in `RunScope` before this block (closed in
+   `1220398 security: close execution authority hardening block`); this entry
+   corrects an earlier statement that described it as open.
+5. **Policy capabilities matter for declarations.** `ExecutionPolicy` requires
+   every capability the argv implies to be declared in the profile, so `python -c`
+   requires `INTERPRET_TEXT` in the ceiling. The `api-default` profile now
+   declares it; this widens what a declaration *could* ask for but grants
+   nothing, since only a declaration can produce a request.
+
+## Server-Side Declared Execution Intent v0.1 — русская версия
+
+Реализовано в блоке declared verification execution. Проверено по коду в
+`app/execution/declaration.py`, `app/api/service.py`, `app/orchestrator/run.py` и
+`app/runtime/run_scope.py`.
+
+### Принятые решения
+
+- **Authority на host-команды принадлежит оператору.** Она объявляется на уровне
+  композиции значениями `ExecutionDeclaration` в `ForgeApiService`, рядом с
+  allowlist tools, профилем выполнения и approval-политикой.
+- **Объявление — это данные, а не гейт.** Оно может только добавлять ограничения;
+  само по себе оно ничего не авторизует и не вводит новый permission-слой.
+- **`command` — единственное поле, несущее authority.** Остальные поля
+  идентифицируют объявление или сужают его, и каждое повторно проверяется против
+  замороженного `RunScope` и профиля выполнения.
+- **Объявления заморожены и падают fail-closed на композиции.** Объявление,
+  которое активный профиль не может admit'нуть — неверный executable, другой
+  working directory, неразрешённая переменная окружения, timeout выше потолка или
+  несовпадающий profile id — отвергается при создании сервиса.
+- **v0.1 — только verification.** `purpose` принимает ровно `verification`; всё
+  остальное отвергается, поэтому тип не подразумевает, что более широкие purpose'ы
+  просто не сконфигурированы.
+- **`TaskRunRequest` не изменён.** В него не добавлены ни команда, ни
+  declaration id, ни workspace, ни профиль, ни окружение, ни timeout, ни allowlist.
+- **Никакой клиентский ввод не может выбрать или изменить команду.** Resolver
+  получает только задачу и активный профиль. `context`, description задачи,
+  `category`, слой скиллов, fabric, реестр tools, `Decision` и профиль выполнения
+  не являются authority для выбора команды.
+- **`category` не выбирает объявление.** Отображение клиентского `category` на
+  произвольное объявление позволило бы клиенту выбирать, какая объявленная
+  оператором команда выполнится, поэтому этот канал отвергнут.
+- **`allowed_execution_commands` выводится, а не конфигурируется.** Это executable
+  того объявления, которое фактически выбрал server-side resolver. Неразрешённый,
+  неизвестный или отсутствующий выбор даёт пустое множество, что выключает host
+  execution для запуска.
+- **Legacy-параметр `allowed_execution_commands` ничего не даёт.** Два независимых
+  источника команд могли бы расходиться, и один из них молча расширил бы периметр.
+  Параметр сохранён только для совместимости.
+- **`RunScope` остаётся гейтом.** Его семантика не менялась: он получает уже
+  производный набор команд, затем замораживается, затем координатор перепроверяет
+  каждый запрос против него.
+- **`ExecutionCoordinator` остаётся единственным создателем `AuthorizedExecution`.**
+  Новый executor, токен или authority-слой не вводились.
+- **Approval остаётся server-side политикой.** У объявления нет поля
+  `approval_required`, поэтому оно не может ослабить approval; отсутствие
+  `ApprovalPolicy` отказывает, а отсутствие resolver'а сообщается как ожидание
+  approval.
+- **Никакого automatic resume и идемпотентности.** Записанный `EXECUTION_STARTED`
+  никогда не является разрешением на повторный запуск.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Переиспользовать `TestVerificationIntent` как общий authority-контейнер.**
+  Отклонено: он требует `criterion_id` и `verification_id`, поэтому для
+  не-verification purpose их пришлось бы выдумывать, а тип подразумевал бы
+  несуществующий verification-контракт.
+- **Превратить `TestVerificationAdapter` в Tool.** Отклонено: это создало бы
+  tool- и permission-поверхность исключительно ради генерации запроса.
+- **`TaskSpecification` как носитель объявления.** Отклонено: ни один production-код
+  не создаёт `TaskSpecification` вовсе, поэтому поле там было бы либо
+  операторским (эквивалент объявления, но тяжелее), либо переименованным каналом
+  `context`.
+- **`Decision` как authority-ссылка.** Отклонено: `Decision` намеренно не несёт
+  authority, а `RunExecutor` не достигает decision-машинерии.
+- **Объявлять `approval_required` в объявлении.** Отклонено: это позволило бы
+  объявлению снять требование approval.
+- **Выводить authority из `execution_profile.allowed_commands`.** Отклонено:
+  профиль — потолок, и трактовка его как разрешения сделала бы исполняемым каждый
+  объявленный executable.
+- **Клиентский `declaration_id` в HTTP-контракте.** Отклонено для v0.1: это
+  позволило бы клиенту выбирать, какая объявленная оператором команда выполнится.
+
+### Следствия и открытые пункты
+
+1. **Привязка verification требует отдельного архитектурного решения.** Механизм
+   объявлений полон и протестирован end-to-end, но в API-пути нет доверенной
+   server-side verification-идентичности: ни один production-код не создаёт
+   `VerificationExpectation` или `TestVerificationIntent`, а `TaskRunRequest` не
+   несёт verification-поля. Поэтому ни один server-side resolver не может выбрать
+   объявление из production-данных, а управляемый клиентом селектор отвергнут by
+   design. Как следствие production host process execution остаётся выключенным по
+   умолчанию, и пункт roadmap по привязке остаётся открытым.
+2. **GAP-A (изоляция workspace).** `EphemeralWorkspaceManager` использует
+   COPY-разворачивание в scratch-каталог; это граница рабочей директории, а не
+   файловая песочница. Процесс, получивший абсолютный путь, всё ещё может писать
+   за пределами scratch-дерева.
+3. **GAP-B (сеть).** `network_access=False` выставляет прокси-переменные
+   окружения. Это best-effort и не kernel-level блокировка.
+4. **GAP-C — CLOSED.** `RunScope.validate_execution_profile()` обеспечивает
+   соблюдение замороженного потолка capabilities и отвергает попытки расширить
+   capabilities, поэтому профиль запроса больше не может объявить capabilities,
+   которые scope не одобрял. Эта защита уже существовала в `RunScope` до этого
+   блока (закрыта в `1220398 security: close execution authority hardening
+   block`); данная запись исправляет более раннее утверждение, описывавшее её как
+   открытую.
+5. **Capabilities политики важны для объявлений.** `ExecutionPolicy` требует, чтобы
+   каждая capability, которую подразумевает argv, была объявлена в профиле, поэтому
+   `python -c` требует `INTERPRET_TEXT` в потолке. Профиль `api-default` теперь его
+   объявляет; это расширяет то, что объявление *могло бы* запросить, но ничего не
+   выдаёт, поскольку только объявление может породить запрос.
+
+## Trusted Server-Side Verification Entry Point v0.1
+
+Implemented in the declared verification execution block. Verified against the
+code in `app/api/service.py` and `tests/test_api_declared_execution.py`.
+
+### Accepted decisions
+
+- **The entry point is server-side in-process code, not an HTTP route.**
+  `ForgeApiService.run_declared_verification(declaration_id, *,
+  purpose_run_id=None)` is called by operator-controlled code. No HTTP endpoint
+  was added, because the HTTP layer has no caller-trust model at all.
+- **The declaration id is the only selection input.** It resolves exclusively
+  against the operator-configured registry. This makes the selection a
+  composition fact rather than a lookup over production data, which is why no
+  verification identity is needed for it.
+- **No authority parameter is accepted.** No command, workspace, execution
+  profile, environment, timeout, allowlist, or approval flag. A caller can choose
+  *which* declared verification runs, never *what* runs.
+- **`TaskRunRequest` is unchanged** and the existing HTTP routes are unchanged.
+  The desktop contract is unchanged.
+- **`run_task` never invokes declared verification.** The ordinary API task path
+  stays execution-disabled even when declarations are configured, so the
+  client-reachable surface gains nothing.
+- **Unknown declaration fails closed** with the existing
+  `UnknownExecutionDeclarationError`, before any scope is frozen, any request is
+  built, or any process starts.
+- **No declarations means disabled.** There is no default command, no implicit
+  first declaration, and no category-based selection.
+- **The service generates the run id** and builds the `RunScope` from its own
+  trusted values: its `Workspace`, its execution profile, the declared
+  executable as the command set, and the system acceptance criterion. No second
+  scope mechanism was introduced and `RunScope` semantics were not changed.
+- **The existing execution chain is reused unchanged:** `RunExecutor` →
+  `ExecutionCoordinator` → `AuthorizedExecution` → `LocalExecutionAdapter`. The
+  entry point never bypasses the coordinator, never constructs a token, and never
+  spawns a process itself.
+- **`purpose_run_id` is correlation only.** It is attached to the translated
+  request as sanitized metadata and cannot change what executes.
+- **Approval remains server-side policy.** A declaration still has no
+  `approval_required` field, a missing `ApprovalPolicy` refuses with
+  `approval_policy_required`, a missing resolver waits, and an approval whose
+  fingerprint does not match the intent is rejected with
+  `intent_fingerprint_mismatch`.
+
+### Rejected alternatives (with rationale)
+
+- **A new HTTP endpoint.** Rejected for now: the HTTP layer has no caller
+  authentication or trust model, so exposing this would require a separate
+  decision about caller trust before it could be safe.
+- **A client-supplied `declaration_id` on `TaskRunRequest`.** Rejected: it would
+  let a client pick which operator-declared command runs, and it would make the
+  ordinary task path an execution path.
+- **A `category` or task-based resolver for production.** Rejected: `category`,
+  `description`, `context`, and `task_id` are all client-supplied, so any of them
+  as a selector gives the client command selection.
+- **A placeholder acceptance criterion presented as a real link.** Rejected: the
+  system criterion is used only because `RunScope` requires a non-empty
+  declaration, and it is documented as carrying no verification meaning.
+- **Renaming `ExecutionDeclaration` to `VerificationExecutionDeclaration`.**
+  Deferred as cosmetic; `purpose` is already restricted to `verification`, so the
+  rename would change readability but not authority or security.
+
+### Consequences and open items
+
+1. **GAP-F: no criterion binding.** The entry point runs a declared verification
+   and records a sanitized result, but there is no trusted criterion identity to
+   attach that result to. It is deliberately not linked to a client task's
+   acceptance criteria, and no placeholder criterion is presented as real. This
+   requires its own decision.
+2. **Task-driven verification binding still needs a decision.** There is still no
+   production `VerificationExpectation` or `TestVerificationIntent`, and
+   `TaskRunRequest` carries no verification field, so the resolver-based path in
+   `run_task` remains unused and host execution there stays disabled.
+3. **GAP-A, GAP-B and idempotency are unchanged** by this block. GAP-C was
+   already closed before it, in `RunScope.validate_execution_profile()`.
+
+## Trusted Server-Side Verification Entry Point v0.1 — русская версия
+
+Реализовано в блоке declared verification execution. Проверено по коду в
+`app/api/service.py` и `tests/test_api_declared_execution.py`.
+
+### Принятые решения
+
+- **Точка входа — server-side код внутри процесса, а не HTTP-маршрут.**
+  `ForgeApiService.run_declared_verification(declaration_id, *,
+  purpose_run_id=None)` вызывается операторским кодом. HTTP-endpoint не добавлен,
+  поскольку у HTTP-слоя вообще нет модели доверия вызывающего.
+- **Declaration id — единственный вход выбора.** Он разрешается исключительно
+  через операторский реестр. Это делает выбор фактом композиции, а не поиском по
+  production-данным, поэтому verification-идентичность для него не нужна.
+- **Ни один authority-параметр не принимается.** Ни команда, ни workspace, ни
+  профиль выполнения, ни окружение, ни timeout, ни allowlist, ни approval-флаг.
+  Вызывающий может выбрать *какая* объявленная verification выполнится, но
+  никогда — *что* выполнится.
+- **`TaskRunRequest` не изменён**, существующие HTTP-маршруты не изменены,
+  контракт desktop не изменён.
+- **`run_task` никогда не вызывает объявленную verification.** Обычный API-путь
+  задачи остаётся execution-disabled даже при сконфигурированных объявлениях,
+  поэтому клиентски достижимая поверхность ничего не приобретает.
+- **Неизвестное объявление падает fail-closed** существующей ошибкой
+  `UnknownExecutionDeclarationError` — до заморозки scope, до построения запроса,
+  до запуска процесса.
+- **Нет объявлений — выключено.** Нет ни default-команды, ни implicit первого
+  объявления, ни выбора по category.
+- **Run id генерирует сервис**, а `RunScope` строится из его собственных
+  доверенных значений: `Workspace`, профиль выполнения, объявленный executable
+  как набор команд и системный acceptance-критерий. Второй механизм scope не
+  вводился, семантика `RunScope` не менялась.
+- **Существующая цепочка исполнения переиспользована без изменений:**
+  `RunExecutor` → `ExecutionCoordinator` → `AuthorizedExecution` →
+  `LocalExecutionAdapter`. Точка входа не обходит координатор, не конструирует
+  токен и не запускает процесс сама.
+- **`purpose_run_id` — только correlation.** Он прикрепляется к
+  транслированному запросу как санитизированные метаданные и не может изменить то,
+  что выполняется.
+- **Approval остаётся server-side политикой.** У объявления по-прежнему нет поля
+  `approval_required`; отсутствие `ApprovalPolicy` отказывает с
+  `approval_policy_required`, отсутствие resolver'а даёт ожидание, а approval с
+  несовпадающим fingerprint отвергается с `intent_fingerprint_mismatch`.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Новый HTTP-endpoint.** Отклонено сейчас: у HTTP-слоя нет аутентификации
+  вызывающего и модели доверия, поэтому его появление потребовало бы отдельного
+  решения о доверии до того, как это станет безопасным.
+- **Клиентский `declaration_id` в `TaskRunRequest`.** Отклонено: это позволило бы
+  клиенту выбирать, какая объявленная оператором команда выполнится, и превратило
+  бы обычный путь задачи в путь исполнения.
+- **Resolver по `category` или по задаче для production.** Отклонено: `category`,
+  `description`, `context` и `task_id` все клиентские, поэтому любой из них как
+  селектор даёт клиенту выбор команды.
+- **Placeholder-критерий, выдаваемый за реальную связь.** Отклонено: системный
+  критерий используется только потому, что `RunScope` требует непустое
+  объявление, и документирован как не несущий verification-смысла.
+- **Переименование `ExecutionDeclaration` в `VerificationExecutionDeclaration`.**
+  Отложено как косметика; `purpose` уже ограничен `verification`, поэтому
+  переименование изменило бы читаемость, но не authority и не безопасность.
+
+### Следствия и открытые пункты
+
+1. **GAP-F: привязки к критерию нет.** Точка входа выполняет объявленную
+   verification и записывает санитизированный результат, но доверенной
+   criterion-идентичности, к которой этот результат можно привязать, нет. Он
+   намеренно не связывается с acceptance criteria клиентской задачи, и
+   placeholder-критерий не выдаётся за настоящий. Это требует отдельного решения.
+2. **Привязка verification к задаче всё ещё требует решения.** Production
+   `VerificationExpectation` или `TestVerificationIntent` по-прежнему нет, а
+   `TaskRunRequest` не несёт verification-поля, поэтому путь через resolver в
+   `run_task` остаётся неиспользуемым, а host execution там — выключенным.
+3. **GAP-A, GAP-B и идемпотентность этим блоком не изменены.** GAP-C был закрыт
+   до него, в `RunScope.validate_execution_profile()`.
