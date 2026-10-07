@@ -15,6 +15,7 @@ from app.context import (
 )
 from app.orchestrator.models import Event, EventType, Run, RunState, Task
 from app.runtime.run_scope import RunScope, RunScopeError, require_active_scope
+from app.runtime.run_store import RunStore, default_store_enabled as _default_store_enabled
 from app.orchestrator.revision import (
     RevisionAttemptResult,
     RevisionLoopExecutor,
@@ -101,6 +102,12 @@ class EngineeringRunRequest:
     # contained and never changes the outcome of the Run. It must be lightweight
     # and must not perform I/O, because it is invoked inline on the execution path.
     observer: Callable[[EventType, dict], None] | None = None
+    # Optional durable Run history sink. When supplied (or when a workspace is
+    # present, in which case the default local store is used) the Run's canonical
+    # events and a state snapshot are written to disk so the history survives a
+    # process restart. This is storage only: it never resumes, retries, or grants
+    # authority. Pass ``False`` to disable persistence explicitly.
+    run_store: object | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.execution_requests, list):
@@ -173,20 +180,36 @@ class EngineeringRunExecutor:
         event_type: EventType,
         data: dict[str, object] | None = None,
         observer: Callable[[EventType, dict], None] | None = None,
+        run_store: object | None = None,
     ) -> None:
-        """Store one canonical Run event, then optionally notify an observer.
+        """Store one canonical Run event, persist it, then optionally notify.
 
-        Ordering is deliberate: the event is committed to ``run.events`` first, so
-        the canonical record exists even if the observer fails. The observer
-        receives only a sanitized projection produced by the canonical
-        ``sanitize_event_metadata`` policy that ``RunEvent`` itself uses - never the
-        raw payload. An observer exception is contained: it is logged and
-        swallowed, because external observation must never change a Run's outcome
-        or abort execution.
+        Ordering is deliberate and has three stages:
+
+        1. the event is committed to ``run.events``, so the canonical in-memory
+           record exists even if everything after it fails;
+        2. it is appended to the durable Run history, so the record survives a
+           process restart;
+        3. the external observer is notified with a sanitized projection.
+
+        Stages 2 and 3 are both best-effort: a failure in either is logged and
+        swallowed, because persistence or observation must never change a Run's
+        outcome or abort execution. Durability is therefore at-least-once and
+        explicitly not an execution-authority mechanism.
         """
         run.events.append(
             Event(run_id=run.id, type=event_type, data=data if data is not None else {})
         )
+        if run_store is not None:
+            try:
+                run_store(event_type, sanitize_event_metadata(data))
+            except Exception:  # noqa: BLE001 - persistence must not abort a Run
+                logging.getLogger("forge_ai").warning(
+                    "run history persistence failed for event %s of run %s",
+                    getattr(event_type, "value", event_type),
+                    run.id,
+                    exc_info=True,
+                )
         if observer is None:
             return
         try:
@@ -197,6 +220,43 @@ class EngineeringRunExecutor:
                 getattr(event_type, "value", event_type),
                 run.id,
                 exc_info=True,
+            )
+
+    @staticmethod
+    def _persist_snapshot(
+        run_store: object | None,
+        run: Run,
+        *,
+        status: str,
+        attempt_number: int,
+        completed_attempt_indexes: "tuple[int, ...]" = (),
+        project_state: object | None = None,
+        interrupted: bool = False,
+    ) -> None:
+        """Best-effort durable state snapshot; never aborts a Run."""
+        if run_store is None:
+            return
+        try:
+            state_payload = None
+            if project_state is not None:
+                to_dict = getattr(project_state, "to_dict", None)
+                state_payload = to_dict() if callable(to_dict) else None
+            accounting = None
+            get_accounting = getattr(run_store, "accounting_summary", None)
+            if callable(get_accounting):
+                accounting = get_accounting(run.id)
+            run_store.record_run_state(
+                run,
+                status=status,
+                attempt_number=attempt_number,
+                completed_attempt_indexes=completed_attempt_indexes,
+                project_state=state_payload,
+                accounting=accounting,
+                interrupted=interrupted,
+            )
+        except Exception:  # noqa: BLE001 - persistence must not abort a Run
+            logging.getLogger("forge_ai").warning(
+                "run state persistence failed for run %s", run.id, exc_info=True
             )
 
     def execute(self, request: EngineeringRunRequest) -> EngineeringRunResult:
@@ -234,6 +294,28 @@ class EngineeringRunExecutor:
 
         task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
 
+        # Durable Run history. Storage only: it never resumes, retries, or grants
+        # authority. A store instance may be injected explicitly, and the API
+        # service always injects one. The default store is used only when
+        # FORGE_RUN_STORE_ENABLED is set, so library/test invocation of this
+        # executor never writes runtime state as a side effect.
+        run_store: object | None = getattr(request, "run_store", None)
+        store_run_id = scope_run_id or (task_id or "")
+        if run_store is None and _default_store_enabled() and request.workspace is not None:
+            run_store = RunStore()
+        if run_store is not None and run_store is not False:
+            try:
+                run_store.bind_run(store_run_id, task_id=task_id)
+            except Exception:  # noqa: BLE001 - persistence must not abort a Run
+                logging.getLogger("forge_ai").warning(
+                    "run history store could not be bound for run %s",
+                    store_run_id,
+                    exc_info=True,
+                )
+                run_store = None
+        else:
+            run_store = None
+
         # Resolve Project Understanding Snapshot (informational context)
         effective_understanding_snapshot: UnderstandingSnapshot | None = None
         if request.understanding_snapshot is not None:
@@ -260,6 +342,7 @@ class EngineeringRunExecutor:
             run_id=scope_run_id,
             run_scope=scope,
             observer=request.observer,
+            run_store=run_store,
         )
         run = revision_result.run
 
@@ -290,7 +373,7 @@ class EngineeringRunExecutor:
                     approval_resolver=request.approval_resolver,
                     run_scope=scope,
                     observer=lambda event_type, data: self._emit(
-                        run, event_type, data, request.observer
+                        run, event_type, data, request.observer, run_store
                     ),
                 )
                 execution_results.append(res)
@@ -322,6 +405,19 @@ class EngineeringRunExecutor:
             data=start_data,
             timestamp=start_ts,
         ))
+        if run_store is not None:
+            try:
+                run_store(
+                    EventType.ENGINEERING_RUN_STARTED,
+                    sanitize_event_metadata(start_data),
+                )
+            except Exception:  # noqa: BLE001 - persistence must not abort a Run
+                logging.getLogger("forge_ai").warning(
+                    "run history persistence failed for event %s of run %s",
+                    EventType.ENGINEERING_RUN_STARTED.value,
+                    run.id,
+                    exc_info=True,
+                )
         if request.observer is not None:
             try:
                 request.observer(
@@ -355,6 +451,7 @@ class EngineeringRunExecutor:
                 "reason": self._reason_code(final_status, final_acceptance, run),
             },
             request.observer,
+            run_store,
         )
 
         attempts = revision_result.attempts
@@ -402,6 +499,7 @@ class EngineeringRunExecutor:
                     "acceptance_status": st.acceptance_status,
                 },
                 request.observer,
+                run_store,
             )
 
         provider = request.decision_provider or self._decision_provider
@@ -458,6 +556,7 @@ class EngineeringRunExecutor:
                     "item_count": envelope.item_count,
                 },
                 request.observer,
+                run_store,
             )
 
             dec_req = DecisionRequest(
@@ -482,6 +581,7 @@ class EngineeringRunExecutor:
                     "context_fingerprint": dec_req.context_fingerprint,
                 },
                 request.observer,
+                run_store,
             )
             decision = provider.decide(dec_req)
             val = validate_decision(decision, dec_req, st)
@@ -501,6 +601,7 @@ class EngineeringRunExecutor:
                         "context_fingerprint": decision.references.get("context_fingerprint") if decision.references else None,
                     },
                     request.observer,
+                    run_store,
                 )
                 decisions.append(decision)
             else:
@@ -514,6 +615,7 @@ class EngineeringRunExecutor:
                         "errors": list(val.errors),
                     },
                     request.observer,
+                    run_store,
                 )
 
         self._emit(
@@ -525,6 +627,20 @@ class EngineeringRunExecutor:
                 "task_id": task_id,
             },
             request.observer,
+            run_store,
+        )
+
+        # Final durable state snapshot. Written after every event so the stored
+        # snapshot and the stored history agree. A Run that raised before this
+        # point leaves its events on disk and no final snapshot, which is exactly
+        # how an interrupted Run remains readable without being continued.
+        self._persist_snapshot(
+            run_store,
+            run,
+            status=final_status.value,
+            attempt_number=(attempts[-1].attempt_number if attempts else 0),
+            completed_attempt_indexes=tuple(a.attempt_number for a in attempts),
+            project_state=(project_states[-1] if project_states else None),
         )
 
         trace = build_trace_from_run(run, project_states=tuple(project_states))

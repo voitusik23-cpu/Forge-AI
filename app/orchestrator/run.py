@@ -115,6 +115,7 @@ class RunExecutor:
         run_id: str = "",
         run_scope: object | None = None,
         observer: Optional[Callable[[EventType, dict], None]] = None,
+        run_store: object | None = None,
         _run: Run | None = None,
         _attempt_number: int = 0,
     ) -> Run:
@@ -148,7 +149,7 @@ class RunExecutor:
                 agent_name=agent_name,
                 provider_name=provider_name,
                 observer=lambda event_type, data: self._record(
-                    run, event_type, observer, **data
+                    run, event_type, observer, run_store, **data
                 ),
             )
             if result.success and result.tool_invocations:
@@ -166,7 +167,7 @@ class RunExecutor:
                         invocation,
                         context=permission_context,
                         observer=lambda event_type, data: self._record(
-                            run, event_type, observer, **data
+                            run, event_type, observer, run_store, **data
                         ),
                     )
                     for invocation in initial_invocations
@@ -187,7 +188,7 @@ class RunExecutor:
                     agent_name=agent_name,
                     provider_name=provider_name,
                     observer=lambda event_type, data: self._record(
-                        run, event_type, observer, **data
+                        run, event_type, observer, run_store, **data
                     ),
                 )
                 followup_invocations = list(result.tool_invocations)
@@ -205,7 +206,7 @@ class RunExecutor:
                         invocation,
                         context=followup_context,
                         observer=lambda event_type, data: self._record(
-                            run, event_type, observer, **data
+                            run, event_type, observer, run_store, **data
                         ),
                     )
                     for invocation in followup_invocations
@@ -261,15 +262,26 @@ class RunExecutor:
         run: Run,
         event_type: EventType,
         observer: Optional[Callable[[EventType, dict], None]] = None,
+        run_store: object | None = None,
         **data: object,
     ) -> None:
-        """Store one canonical Run event, then optionally notify an observer.
+        """Store one canonical Run event, persist it, then optionally notify.
 
-        The canonical record is written first so it survives an observer failure.
-        The observer receives a sanitized projection only, and any exception it
-        raises is contained rather than propagated.
+        The canonical record is written first so it survives any later failure.
+        Persistence and observation each receive a sanitized projection only, and
+        an exception from either is contained rather than propagated.
         """
         run.events.append(Event(run_id=run.id, type=event_type, data=data))
+        if run_store is not None:
+            try:
+                run_store(event_type, sanitize_event_metadata(data))
+            except Exception:  # noqa: BLE001 - persistence must not abort a Run
+                logging.getLogger("forge_ai").warning(
+                    "run history persistence failed for event %s of run %s",
+                    getattr(event_type, "value", event_type),
+                    run.id,
+                    exc_info=True,
+                )
         if observer is None:
             return
         try:

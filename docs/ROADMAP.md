@@ -191,7 +191,9 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Ready-to-run project generation
 - [ ] Candidate Forge Knowledge -> evaluation -> Approved Forge Knowledge promotion workflow
 - [ ] Forge API, desktop and web clients, setup wizard
-- [ ] Durable, resumable runs and task queues
+- [x] Durable run history / checkpoint persistence (append-only event log + state snapshot, `GET /api/runs/{run_id}`)
+- [ ] Automatic resume of interrupted runs (deferred pending side-effect idempotency design)
+- [ ] Durable, resumable task queues
 
 Technology candidates under evaluation are tracked in
 [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md). Nothing there is approved.
@@ -395,7 +397,9 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Генерация готового к запуску проекта
 - [ ] Workflow продвижения Candidate Forge Knowledge -> evaluation -> Approved Forge Knowledge
 - [ ] Forge API, desktop- и web-клиенты, setup wizard
-- [ ] Долговременные возобновляемые запуски и очереди задач
+- [x] Durable run history / checkpoint persistence (append-only event log + state snapshot, `GET /api/runs/{run_id}`)
+- [ ] Автоматическое возобновление прерванных запусков (отложено до проектирования идемпотентности side effects)
+- [ ] Долговременные возобновляемые очереди задач
 
 Технологические кандидаты на рассмотрении отслеживаются в
 [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md). Ничто там не одобрено.

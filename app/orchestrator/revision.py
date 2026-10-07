@@ -124,6 +124,7 @@ class RevisionLoopExecutor:
         run_id: str = "",
         run_scope: object | None = None,
         observer: Callable[[EventType, dict], None] | None = None,
+        run_store: object | None = None,
     ) -> RevisionResult:
         """Execute once, then revise only after a safe, observed Acceptance FAIL."""
         criteria = tuple(criteria)
@@ -154,6 +155,7 @@ class RevisionLoopExecutor:
             workspace=workspace,
             run_scope=run_scope,
             observer=observer,
+            run_store=run_store,
             _run=run,
             _attempt_number=0,
         )
@@ -166,7 +168,7 @@ class RevisionLoopExecutor:
                 workspace=workspace,
             )
         acceptance, can_revise, verification_results = self._verify_and_accept(
-            run, criteria, expectations, workspace, requirements=requirements, attempt_number=0, observer=observer
+            run, criteria, expectations, workspace, requirements=requirements, attempt_number=0, observer=observer, run_store=run_store
         )
         attempts = [self._attempt_result(
             run, 0, (initial_before, initial_after), verification_results, acceptance
@@ -215,6 +217,7 @@ class RevisionLoopExecutor:
                 workspace=workspace,
                 run_scope=run_scope,
                 observer=observer,
+                run_store=run_store,
                 _run=run,
                 _attempt_number=attempt,
             )
@@ -227,7 +230,7 @@ class RevisionLoopExecutor:
                     workspace=workspace,
                 )
             next_acceptance, can_revise, verification_results = self._verify_and_accept(
-                run, criteria, expectations, workspace, requirements=requirements, attempt_number=attempt, observer=observer
+                run, criteria, expectations, workspace, requirements=requirements, attempt_number=attempt, observer=observer, run_store=run_store
             )
             attempts.append(self._attempt_result(
                 run, attempt, (revision_before, revision_after),
@@ -235,19 +238,19 @@ class RevisionLoopExecutor:
             ))
             if next_acceptance is None or not can_revise:
                 self._emit_revision_completed(
-                    run, request, RevisionStatus.FAILED, next_acceptance, observer
+                    run, request, RevisionStatus.FAILED, next_acceptance, observer, run_store
                 )
                 return RevisionResult(RevisionStatus.FAILED, attempt, next_acceptance, run, tuple(attempts))
             acceptance = next_acceptance
             if acceptance.status == AcceptanceStatus.PASS:
                 self._emit_revision_completed(
-                    run, request, RevisionStatus.COMPLETED, acceptance, observer
+                    run, request, RevisionStatus.COMPLETED, acceptance, observer, run_store
                 )
                 return RevisionResult(RevisionStatus.COMPLETED, attempt, acceptance, run, tuple(attempts))
             failed = self._failed_criteria(acceptance)
             if attempt == max_attempts:
                 self._emit_revision_completed(
-                    run, request, RevisionStatus.LIMIT_REACHED, acceptance, observer
+                    run, request, RevisionStatus.LIMIT_REACHED, acceptance, observer, run_store
                 )
                 return RevisionResult(RevisionStatus.LIMIT_REACHED, attempt, acceptance, run, tuple(attempts))
 
@@ -263,6 +266,7 @@ class RevisionLoopExecutor:
         requirements=None,
         attempt_number,
         observer=None,
+        run_store=None,
     ):
         # Hard execution/policy failures and unresolved approvals stop before acceptance.
         if run.state != RunState.COMPLETED or run.result is None:
@@ -281,7 +285,7 @@ class RevisionLoopExecutor:
                 expectation,
                 workspace=workspace,
                 run_id=run.id,
-                observer=lambda event_type, data: self._emit(run, event_type, data, observer),
+                observer=lambda event_type, data: self._emit(run, event_type, data, observer, run_store),
             )
             verification_results[criterion.criterion_id] = verification
             denied = denied or verification.status == VerificationStatus.DENIED
@@ -290,7 +294,7 @@ class RevisionLoopExecutor:
             verification_results,
             requirements=requirements,
             run_id=run.id,
-            observer=lambda event_type, data: self._emit(run, event_type, data, observer),
+            observer=lambda event_type, data: self._emit(run, event_type, data, observer, run_store),
         )
         verification_status = (
             "denied" if denied else
@@ -409,14 +413,25 @@ class RevisionLoopExecutor:
         event_type: EventType,
         data: dict[str, object],
         observer: Callable[[EventType, dict], None] | None = None,
+        run_store: object | None = None,
     ) -> None:
-        """Store one canonical Run event, then optionally notify an observer.
+        """Store one canonical Run event, persist it, then optionally notify.
 
-        The canonical record is written first so it survives an observer failure.
-        The observer receives a sanitized projection only, and any exception it
-        raises is contained rather than propagated.
+        The canonical record is written first so it survives any later failure.
+        Persistence and observation each receive a sanitized projection only, and
+        an exception from either is contained rather than propagated.
         """
         run.events.append(Event(run_id=run.id, type=event_type, data=data))
+        if run_store is not None:
+            try:
+                run_store(event_type, sanitize_event_metadata(data))
+            except Exception:  # noqa: BLE001 - persistence must not abort a Run
+                logging.getLogger("forge_ai").warning(
+                    "run history persistence failed for event %s of run %s",
+                    getattr(event_type, "value", event_type),
+                    run.id,
+                    exc_info=True,
+                )
         if observer is None:
             return
         try:
@@ -430,7 +445,7 @@ class RevisionLoopExecutor:
             )
 
     @classmethod
-    def _emit_revision_completed(cls, run, request, status, acceptance, observer=None):
+    def _emit_revision_completed(cls, run, request, status, acceptance, observer=None, run_store=None):
         cls._emit(
             run,
             EventType.REVISION_COMPLETED,
@@ -442,4 +457,5 @@ class RevisionLoopExecutor:
                 "acceptance_status": acceptance.status.value if acceptance else "unavailable",
             },
             observer,
+            run_store,
         )

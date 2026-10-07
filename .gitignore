@@ -34,3 +34,6 @@ log/
 *.swo
 *~
 .DS_Store
+
+# Local Forge runtime state (never commit run history or caches)
+.forge/

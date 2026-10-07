@@ -822,9 +822,37 @@ The Dispatcher can notify the Run observer about `run_started`,
 `run_completed`, and `run_failed` events. Events record only available
 execution metadata such as provider/model, attempt number, duration, usage, and
 failure reason; they do not record task prompts, model output, chain-of-thought,
-or credentials. Runs and events currently exist only in process memory. There
-is no durable event store, checkpoint/resume, distributed tracing, or telemetry
-service.
+or credentials. Runs and events are held in process memory for the duration of
+the Run and are additionally persisted to a local Run store
+(`app/runtime/run_store.py`) as an append-only sanitized event log
+(`events.jsonl`) plus a state snapshot (`state.json`), keyed by `run_id`. The
+persisted record is readable after the originating process has exited, through
+`GET /api/runs/{run_id}`. There is still no distributed tracing or telemetry
+service. Durable run history/checkpoint persistence is implemented; automatic
+execution resume remains intentionally deferred pending side-effect idempotency
+design, because replaying an interrupted tool or process would duplicate an
+irreversible action. The store is a sink only: it grants no authority and never
+resumes, retries, or re-executes anything.
+
+Persistence is configured by two environment variables:
+`FORGE_RUN_STORE_ENABLED` (default `false`; ordinary library use and test
+execution therefore never write runtime state as a side effect) and
+`FORGE_RUN_STORE_ROOT` (overrides the per-user storage location). The API
+service injects a store explicitly and does not depend on the enable flag.
+
+## Durable Run history v0.1 — русская версия
+
+Run и события по-прежнему живут в памяти процесса на время выполнения Run, но
+дополнительно сохраняются в локальное Run-хранилище (`app/runtime/run_store.py`)
+в виде append-only журнала событий (`events.jsonl`) и снимка состояния
+(`state.json`), с ключом `run_id`. Сохранённая история доступна после завершения
+исходного процесса через `GET /api/runs/{run_id}`. Распределённого трейсинга и
+телеметрийного сервиса по-прежнему нет. Durable run history/checkpoint
+persistence реализован; automatic execution resume намеренно отложен до
+проектирования идемпотентности side effects, поскольку повторное выполнение
+прерванного инструмента или процесса продублировало бы необратимое действие.
+Хранилище — только приёмник: оно не выдаёт полномочий и никогда не возобновляет,
+не повторяет и не перезапускает ничего.
 
 ## Run + Events v0.1 — русская версия
 

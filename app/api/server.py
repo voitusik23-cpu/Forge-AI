@@ -62,4 +62,16 @@ def create_api_app(service: Optional[ForgeApiService] = None) -> Any:
         )
         return api_service.run_task(req).to_dict()
 
+    @app.get("/api/runs/{run_id}")
+    def get_run(run_id: str) -> Dict[str, Any]:
+        """Return the durable history of a Run, including after a restart.
+
+        Read-only: this reports persisted state and never resumes, retries, or
+        re-executes anything.
+        """
+        record = api_service.get_run_record(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Unknown run_id '{run_id}'")
+        return record
+
     return app

@@ -23,6 +23,7 @@ from app.orchestrator.models import RunState, Task, TaskCategory
 from app.orchestrator.run import RunExecutor
 from app.runtime.bootstrap import create_runtime
 from app.runtime.context import RuntimeContext
+from app.runtime.run_store import RunStore
 from app.tools.workspace import Workspace
 
 
@@ -38,12 +39,14 @@ class ForgeApiService:
         fabric: Optional[CapabilityFabric] = None,
         dashboard_service: Optional[CostDashboardService] = None,
         workspace: Optional[Workspace] = None,
+        run_store: Optional[RunStore] = None,
     ) -> None:
         self._runtime = runtime or create_runtime()
         self._workspace = workspace or Workspace(Path.cwd())
         self._fabric = fabric or CapabilityFabric(
             workspace=self._workspace,
         )
+        self._run_store = run_store or RunStore()
         self._health_monitor = ProviderHealthMonitor()
         self._dashboard_service = dashboard_service or CostDashboardService(
             fabric=self._fabric,
@@ -62,6 +65,29 @@ class ForgeApiService:
     @property
     def dashboard_service(self) -> CostDashboardService:
         return self._dashboard_service
+
+    @property
+    def run_store(self) -> RunStore:
+        return self._run_store
+
+    def get_run_record(self, run_id: str) -> Optional[Dict[str, object]]:
+        """Return the durable history of a Run, or None when unknown.
+
+        Strictly read-only. It reports what was persisted and never resumes,
+        retries, or re-executes an interrupted Run, and never returns secrets or
+        raw payloads: the stored history is already sanitized by the canonical
+        event-metadata policy.
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            return None
+        try:
+            record = self._run_store.load(run_id.strip())
+        except ValueError:
+            # Unsafe run id for the storage layout: treat as unknown.
+            return None
+        if record is None:
+            return None
+        return record.summary()
 
     def get_health(self) -> HealthResponse:
         """Return basic liveness and Core connection status."""
@@ -178,13 +204,31 @@ class ForgeApiService:
         )
 
         t0 = time.perf_counter()
+        # Durable history: bind the store to this run so its events persist and
+        # remain queryable through GET /api/runs/{run_id} after a restart. The
+        # store is a sink only and never resumes or re-executes anything.
+        api_run_store: Optional[RunStore] = None
+        try:
+            api_run_store = self._run_store.bind_run(run_id, task_id=task_id)
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            api_run_store = None
         run = self._runtime.run_executor.execute(
             task=task,
             provider_name=req.provider_name,
             workspace=self._workspace,
             run_id=run_id,
+            run_store=api_run_store,
         )
         duration = time.perf_counter() - t0
+        if api_run_store is not None:
+            try:
+                api_run_store.record_run_state(
+                    run,
+                    status=run.state.value if hasattr(run.state, "value") else str(run.state),
+                    attempt_number=0,
+                )
+            except Exception:  # noqa: BLE001 - persistence must not block a run
+                pass
 
         # Retrieve run accounting
         run_acc = self._fabric.get_run_accounting(
