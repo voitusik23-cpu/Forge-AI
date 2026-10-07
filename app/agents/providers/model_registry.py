@@ -444,6 +444,27 @@ def create_default_registry() -> ModelRegistry:
                 ModelCapability.STREAMING,
             }),
             cost_tier=CostTier.CHEAP,
+            input_cost_per_1m=0.14,
+            output_cost_per_1m=0.28,
+        )
+    )
+    registry.register_model(
+        ProviderModelInfo(
+            provider_id="deepseek",
+            model_id="deepseek-flash",
+            display_name="DeepSeek Flash",
+            context_window=131072,
+            max_output_tokens=8192,
+            capabilities=frozenset({
+                ModelCapability.CODE,
+                ModelCapability.ANALYSIS,
+                ModelCapability.FAST,
+                ModelCapability.STRUCTURED_OUTPUT,
+                ModelCapability.STREAMING,
+            }),
+            cost_tier=CostTier.CHEAP,
+            input_cost_per_1m=0.14,
+            output_cost_per_1m=0.28,
         )
     )
     registry.register_model(
@@ -460,6 +481,8 @@ def create_default_registry() -> ModelRegistry:
                 ModelCapability.STREAMING,
             }),
             cost_tier=CostTier.CHEAP,
+            input_cost_per_1m=0.55,
+            output_cost_per_1m=2.19,
         )
     )
 
@@ -476,7 +499,47 @@ def create_default_registry() -> ModelRegistry:
                 "cohere/north-mini-code:free",
                 "openrouter/free",
                 "meta-llama/llama-3.3-70b-instruct",
+                "anthropic/claude-haiku-4.5",
+                "anthropic/claude-sonnet-5.5",
             ),
+        )
+    )
+    registry.register_model(
+        ProviderModelInfo(
+            provider_id="openrouter",
+            model_id="anthropic/claude-haiku-4.5",
+            display_name="Anthropic Claude Haiku 4.5 (via OpenRouter)",
+            context_window=200000,
+            max_output_tokens=8192,
+            capabilities=frozenset({
+                ModelCapability.CODE,
+                ModelCapability.ANALYSIS,
+                ModelCapability.REVIEW,
+                ModelCapability.FAST,
+                ModelCapability.STREAMING,
+            }),
+            cost_tier=CostTier.CHEAP,
+            input_cost_per_1m=1.00,
+            output_cost_per_1m=5.00,
+        )
+    )
+    registry.register_model(
+        ProviderModelInfo(
+            provider_id="openrouter",
+            model_id="anthropic/claude-sonnet-5.5",
+            display_name="Anthropic Claude Sonnet 5.5 (via OpenRouter)",
+            context_window=200000,
+            max_output_tokens=8192,
+            capabilities=frozenset({
+                ModelCapability.CODE,
+                ModelCapability.ANALYSIS,
+                ModelCapability.REVIEW,
+                ModelCapability.REASONING,
+                ModelCapability.STREAMING,
+            }),
+            cost_tier=CostTier.PAID,
+            input_cost_per_1m=3.00,
+            output_cost_per_1m=15.00,
         )
     )
     registry.register_model(

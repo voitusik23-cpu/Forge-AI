@@ -276,3 +276,11 @@ class CapabilityFabric:
             associated_artifact_ids=associated_artifact_ids,
             total_duration_seconds=total_duration_seconds,
         )
+
+    def list_run_ids(self) -> List[str]:
+        """Return all tracked run_ids."""
+        return list(self._run_usage.keys())
+
+    def get_all_run_accounting(self) -> List[RunAccountingRecord]:
+        """Return RunAccountingRecords for all tracked runs."""
+        return [self.get_run_accounting(run_id) for run_id in self._run_usage]

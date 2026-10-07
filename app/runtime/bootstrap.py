@@ -7,17 +7,23 @@ from app.agents.provider_agent import ProviderAgent
 from app.agents.providers.factory import ProviderFactory
 from app.agents.providers.registry import ProviderRegistry
 from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
+from app.agents.providers.model_registry import ModelRegistry
 from app.agents.registry import AgentRegistry
 from app.config.settings import RuntimeSettings, load_settings
 from app.config.provider_accounts import load_provider_account_config
 from app.config.secrets import SecretStore
+from app.fabric.fabric import CapabilityFabric
 from app.orchestrator.orchestrator import Orchestrator
 from app.orchestrator.run import RunExecutor
 from app.runtime.context import RuntimeContext
 from app.runtime.logging import configure_logging
 
 
-def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext:
+def create_runtime(
+    settings: Optional[RuntimeSettings] = None,
+    fabric: Optional[CapabilityFabric] = None,
+    model_registry: Optional[ModelRegistry] = None,
+) -> RuntimeContext:
     """Build registries and orchestrator without making external API calls."""
     resolved_settings = settings if settings is not None else load_settings()
     configure_logging(resolved_settings)
@@ -58,6 +64,8 @@ def create_runtime(settings: Optional[RuntimeSettings] = None) -> RuntimeContext
         fallback_chain=resolved_settings.provider_fallback_chain,
         provider_registry=provider_registry,
         capabilities_registry=capabilities_registry,
+        model_registry=model_registry,
+        fabric=fabric,
         allow_paid_providers=resolved_settings.allow_paid_providers,
     )
     return RuntimeContext(

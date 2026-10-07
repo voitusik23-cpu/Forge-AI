@@ -108,6 +108,12 @@ class OpenAICompatibleProvider(Provider):
         raw_usage = getattr(response, "usage", None)
         input_tokens = getattr(raw_usage, "prompt_tokens", 0) if raw_usage else 0
         output_tokens = getattr(raw_usage, "completion_tokens", 0) if raw_usage else 0
+        cost = getattr(raw_usage, "cost", None)
+        cached_tokens = 0
+        details = getattr(raw_usage, "prompt_tokens_details", None)
+        if details:
+            cached_tokens = getattr(details, "cached_tokens", 0) or 0
+
         if not self._valid_token_count(input_tokens) or not self._valid_token_count(
             output_tokens
         ):
@@ -122,7 +128,8 @@ class OpenAICompatibleProvider(Provider):
             usage=Usage(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                estimated_cost=None,
+                cached_tokens=cached_tokens,
+                estimated_cost=cost,
             ),
         )
 
