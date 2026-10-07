@@ -13,6 +13,9 @@ from app.agents.providers.capabilities import (
 from app.agents.providers.model_registry import ModelRegistry
 from app.agents.providers.registry import ProviderNotFoundError, ProviderRegistry
 from app.agents.registry import AgentNotFoundError, AgentRegistry
+from app.fabric.adapters import UsageAccountingAdapter
+from app.fabric.fabric import CapabilityFabric
+from app.fabric.models import CapabilityRequirement, FabricRequest
 from app.orchestrator.classification import classify_task
 from app.orchestrator.executor import TaskExecutor
 from app.orchestrator.models import EventType, Task, TaskCategory, TaskResult
@@ -58,6 +61,7 @@ class DispatchPolicy:
         *,
         capabilities: Optional[ProviderCapabilitiesRegistry] = None,
         model_registry: Optional[ModelRegistry] = None,
+        fabric: Optional[CapabilityFabric] = None,
         registered_provider_names: Optional[Sequence[str]] = None,
         registered_agent_names: Optional[Sequence[str]] = None,
         allow_paid_providers: bool = False,
@@ -66,10 +70,60 @@ class DispatchPolicy:
         provider_names = set(registered_provider_names or ())
         agent_names = set(registered_agent_names or ())
 
+        requested_model = task.parameters.get("model") or task.parameters.get("model_override")
+        min_ctx = task.parameters.get("min_context")
+        min_ctx_val = int(min_ctx) if isinstance(min_ctx, (int, float)) and min_ctx > 0 else None
+        raw_req_caps = task.parameters.get("required_capabilities")
+
+        # 0. CapabilityFabric-based resolution (v0.3 unified coordinator path)
+        if fabric is not None:
+            req_caps = ()
+            if isinstance(raw_req_caps, (list, tuple, set, frozenset)):
+                req_caps = tuple(CapabilityRequirement.parse(c) for c in raw_req_caps)
+            elif isinstance(raw_req_caps, (str, CapabilityRequirement)):
+                req_caps = (CapabilityRequirement.parse(raw_req_caps),)
+
+            fabric_req = FabricRequest(
+                subject_agent="dispatcher",
+                intent_description=task.description or "Task execution",
+                required_capabilities=req_caps,
+                task_category=task.category.value if task.category else None,
+                explicit_model=str(requested_model) if requested_model and isinstance(requested_model, str) else None,
+                explicit_provider=str(task.parameters.get("provider")) if task.parameters.get("provider") else None,
+                context_tokens=min_ctx_val or 0,
+                allow_paid_providers=allow_paid_providers,
+            )
+            resolution = fabric.resolve(fabric_req)
+
+            if resolution.can_proceed and resolution.candidate_providers:
+                ordered_providers = [
+                    p for p in resolution.candidate_providers
+                    if (not provider_names or p in provider_names)
+                    and (not agent_names or p in agent_names)
+                ]
+                if ordered_providers:
+                    return DispatchDecision(
+                        category=task.category,
+                        candidates=tuple(ordered_providers),
+                        selected_provider=ordered_providers[0],
+                        reason=(
+                            f"Resolved {len(ordered_providers)} candidate providers "
+                            f"via CapabilityFabric ({resolution.reason})"
+                        ),
+                    )
+
+            if not resolution.is_capable or not resolution.is_authorized or resolution.rejection_reasons:
+                if req_caps or requested_model or not resolution.is_authorized or not resolution.is_capable:
+                    return DispatchDecision(
+                        category=task.category,
+                        candidates=(),
+                        selected_provider=None,
+                        reason=f"CapabilityFabric rejected request: {'; '.join(resolution.rejection_reasons) if resolution.rejection_reasons else resolution.reason}",
+                    )
+
         # 1. ModelRegistry-based routing (v0.2 preferred path)
         if model_registry is not None:
             # Check for model override in task parameters
-            requested_model = task.parameters.get("model") or task.parameters.get("model_override")
             if requested_model and isinstance(requested_model, str):
                 try:
                     model_info = model_registry.get_model(requested_model)
@@ -88,13 +142,9 @@ class DispatchPolicy:
                     pass
 
             # Search by task category and capabilities
-            min_ctx = task.parameters.get("min_context")
-            min_ctx_val = int(min_ctx) if isinstance(min_ctx, (int, float)) and min_ctx > 0 else None
-            req_caps = task.parameters.get("required_capabilities")
-
             eligible_models = model_registry.find_models(
                 task_category=task.category.value if task.category in self._SPECIALIZED_CATEGORIES else None,
-                capabilities=req_caps if isinstance(req_caps, (list, tuple, set, frozenset)) else None,
+                capabilities=raw_req_caps if isinstance(raw_req_caps, (list, tuple, set, frozenset)) else None,
                 min_context=min_ctx_val,
                 max_cost_tier=None if allow_paid_providers else CostTier.CHEAP,
                 allowed_providers=list(provider_names) if provider_names else None,
@@ -197,6 +247,7 @@ class Dispatcher:
         provider_registry: Optional[ProviderRegistry] = None,
         capabilities_registry: Optional[ProviderCapabilitiesRegistry] = None,
         model_registry: Optional[ModelRegistry] = None,
+        fabric: Optional[CapabilityFabric] = None,
         allow_paid_providers: bool = False,
     ) -> None:
         self._registry = agent_registry
@@ -206,6 +257,7 @@ class Dispatcher:
         self._provider_registry = provider_registry
         self._capabilities_registry = capabilities_registry
         self._model_registry = model_registry
+        self._fabric = fabric
         self._allow_paid_providers = allow_paid_providers
         if isinstance(fallback_chain, str):
             fallback_chain = tuple(
@@ -214,6 +266,11 @@ class Dispatcher:
         if any(not isinstance(name, str) or not name.strip() for name in fallback_chain):
             raise ValueError("fallback_chain must contain non-empty provider names")
         self._fallback_chain = tuple(dict.fromkeys(name.strip() for name in fallback_chain))
+
+    @property
+    def fabric(self) -> Optional[CapabilityFabric]:
+        """Return the bound CapabilityFabric instance if configured."""
+        return self._fabric
 
     def dispatch(
         self,
@@ -230,6 +287,7 @@ class Dispatcher:
             self._default_provider,
             capabilities=self._capabilities_registry,
             model_registry=self._model_registry,
+            fabric=self._fabric,
             registered_provider_names=(
                 self._provider_registry.list_providers()
                 if self._provider_registry is not None
@@ -260,7 +318,7 @@ class Dispatcher:
                 task.category == TaskCategory.OTHER
                 or task.category in self._SPECIALIZED_CATEGORIES
             )
-            and (self._capabilities_registry is not None or self._model_registry is not None)
+            and (self._capabilities_registry is not None or self._model_registry is not None or self._fabric is not None)
         )
         if provider_name is not None:
             attempts = [selected]
@@ -284,7 +342,8 @@ class Dispatcher:
                 task.category == TaskCategory.OTHER
                 or task.category in self._SPECIALIZED_CATEGORIES
             )
-            and (self._capabilities_registry is not None or self._model_registry is not None)
+            and (self._capabilities_registry is not None or self._model_registry is not None or self._fabric is not None)
+            and (decision.candidates or not task.parameters.get("required_capabilities"))
         ):
             permitted_fallbacks = []
             for name in self._fallback_chain:
@@ -349,6 +408,7 @@ class Dispatcher:
                     self._emit_provider_result(
                         observer, name, model_name, attempt_number,
                         attempt_started, False, unavailable_reason,
+                        task=task,
                     )
                     previous_name = name
                     continue
@@ -361,6 +421,7 @@ class Dispatcher:
                     self._emit_provider_result(
                         observer, name, model_name, attempt_number,
                         attempt_started, False, reason,
+                        task=task,
                     )
                     previous_name = name
                     continue
@@ -373,6 +434,7 @@ class Dispatcher:
                         self._emit_provider_result(
                             observer, name, model_name, attempt_number,
                             attempt_started, False, reason,
+                            task=task,
                         )
                         previous_name = name
                         continue
@@ -382,6 +444,7 @@ class Dispatcher:
                         self._emit_provider_result(
                             observer, name, model_name, attempt_number,
                             attempt_started, False, reason,
+                            task=task,
                         )
                         previous_name = name
                         continue
@@ -393,6 +456,7 @@ class Dispatcher:
                 self._emit_provider_result(
                     observer, name, model_name, attempt_number,
                     attempt_started, False, reason,
+                    task=task,
                 )
                 previous_name = name
                 continue
@@ -407,6 +471,7 @@ class Dispatcher:
                 self._emit_provider_result(
                     observer, name, model_name, attempt_number,
                     attempt_started, False, reason,
+                    task=task,
                 )
                 previous_name = name
                 continue
@@ -415,6 +480,7 @@ class Dispatcher:
                 self._emit_provider_result(
                     observer, name, model_name, attempt_number,
                     attempt_started, False, reason,
+                    task=task,
                 )
                 raise
 
@@ -427,7 +493,8 @@ class Dispatcher:
                     attempt_started,
                     True,
                     None,
-                    result,
+                    result=result,
+                    task=task,
                 )
                 return result
             reason = result.error or "provider returned failure"
@@ -440,15 +507,19 @@ class Dispatcher:
                 attempt_started,
                 False,
                 reason,
-                result,
+                result=result,
+                task=task,
             )
             previous_name = name
 
-        error = (
-            "No provider candidates are permitted by the cost policy"
-            if not attempts
-            else "Provider fallback chain exhausted: " + "; ".join(failures)
-        )
+        if not attempts:
+            if "CapabilityFabric rejected" in decision.reason:
+                error = decision.reason
+            else:
+                error = "No provider candidates are permitted by the cost policy"
+        else:
+            error = "Provider fallback chain exhausted: " + "; ".join(failures)
+
         return TaskResult(
             task_id=task.id,
             success=False,
@@ -466,9 +537,8 @@ class Dispatcher:
         if observer is not None:
             observer(event_type, data)
 
-    @classmethod
     def _emit_provider_result(
-        cls,
+        self,
         observer: Optional[Callable[[EventType, Dict[str, object]], None]],
         provider: str,
         model: Optional[str],
@@ -477,23 +547,51 @@ class Dispatcher:
         success: bool,
         error: Optional[str],
         result: Optional[TaskResult] = None,
+        task: Optional[Task] = None,
     ) -> None:
+        duration = max(0.0, time.perf_counter() - started)
         data: Dict[str, object] = {
             "provider": provider,
             "model": model,
             "attempt": attempt,
-            "duration_seconds": max(0.0, time.perf_counter() - started),
+            "duration_seconds": duration,
             "success": success,
         }
         if result is not None and result.usage is not None:
             data["usage"] = {
                 "input_tokens": result.usage.input_tokens,
                 "output_tokens": result.usage.output_tokens,
+                "cached_tokens": getattr(result.usage, "cached_tokens", 0),
+                "total_tokens": getattr(result.usage, "total_tokens", result.usage.input_tokens + result.usage.output_tokens),
                 "estimated_cost": result.usage.estimated_cost,
             }
         if error is not None:
             data["error"] = error
-        cls._emit(observer, EventType.PROVIDER_RESULT, **data)
+        self._emit(observer, EventType.PROVIDER_RESULT, **data)
+
+        if self._fabric is not None and task is not None:
+            run_id = str(task.context.get("run_id") or task.parameters.get("run_id") or task.id)
+            model_info = None
+            if self._model_registry is not None and model:
+                try:
+                    model_info = self._model_registry.get_model(model, provider_id=provider)
+                except LookupError:
+                    pass
+
+            attempt_rec = UsageAccountingAdapter.create_attempt_usage(
+                attempt_index=attempt,
+                agent_name=provider,
+                provider_name=provider,
+                model_name=result.model_name if (result and result.model_name) else (model or provider),
+                usage=result.usage if result else None,
+                duration_seconds=duration,
+                model_info=model_info,
+                provider_reported_cost=result.usage.estimated_cost if (result and result.usage and result.usage.estimated_cost is not None) else None,
+                success=success,
+                error_message=error,
+                is_fallback=(attempt > 1),
+            )
+            self._fabric.record_usage(run_id, attempt_rec)
 
     def _automatic_route_rejection(self, name: str, task: Task) -> Optional[str]:
         """Reject auto-route candidates that are disabled, unconfigured, or incapable."""

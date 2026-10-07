@@ -226,7 +226,9 @@ class RunExecutor:
     def _task_with_execution_context(
         task: Task, execution_context: ExecutionContext
     ) -> Task:
-        return replace(task, context={"forge_execution_context": execution_context.to_dict()})
+        context = dict(task.context) if isinstance(task.context, dict) else {}
+        context["forge_execution_context"] = execution_context.to_dict()
+        return replace(task, context=context)
 
     @staticmethod
     def _task_with_tool_results(task: Task, tool_results: list[ToolResult]) -> Task:
