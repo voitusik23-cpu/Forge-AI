@@ -53,6 +53,8 @@ from app.decision import (
 )
 from app.projects.state import ProjectState, derive_project_state
 from app.orchestrator.trace import RunEvent, RunTrace, build_trace_from_run
+from app.understanding.models import UnderstandingSnapshot
+from app.understanding.snapshotter import UnderstandingSnapshotter
 
 
 class EngineeringRunStatus(str, Enum):
@@ -85,6 +87,7 @@ class EngineeringRunRequest:
     context_assembler: DecisionContextAssembler | None = None
     # Immutable security perimeter for this run.
     run_scope: object | None = None
+    understanding_snapshot: UnderstandingSnapshot | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.execution_requests, list):
@@ -185,6 +188,18 @@ class EngineeringRunExecutor:
             require_active_scope(scope_run_id, scope)
 
         task, criteria, requirements, task_id, execution_profile = self._resolve_input(request)
+
+        # Resolve Project Understanding Snapshot (informational context)
+        effective_understanding_snapshot: UnderstandingSnapshot | None = None
+        if request.understanding_snapshot is not None:
+            effective_understanding_snapshot = request.understanding_snapshot
+        elif request.workspace is not None:
+            snapshotter = UnderstandingSnapshotter()
+            effective_understanding_snapshot = snapshotter.create_snapshot(
+                request.workspace,
+                project_id=task_id or scope_run_id or "default_project",
+            )
+
         revision_result = self._revision_executor.execute(
             task,
             provider_name=request.provider_name,
@@ -248,6 +263,8 @@ class EngineeringRunExecutor:
         start_data: dict[str, object] = {"run_id": run.id, "task_id": task_id, "status": "started"}
         if execution_profile is not None:
             start_data["profile_id"] = execution_profile.profile_id
+        if effective_understanding_snapshot is not None:
+            start_data["workspace_fingerprint"] = effective_understanding_snapshot.workspace_fingerprint
         start_ts = run.events[0].timestamp if run.events else datetime.now(timezone.utc)
         run.events.insert(0, Event(
             run_id=run.id,
@@ -363,6 +380,7 @@ class EngineeringRunExecutor:
                 blocking_conditions=tuple(conditions),
                 requirements=requirements or (),
                 acceptance_criteria=criteria or (),
+                understanding_snapshot=effective_understanding_snapshot,
             )
             context_envelopes.append(envelope)
 

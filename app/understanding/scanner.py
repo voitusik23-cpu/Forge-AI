@@ -185,13 +185,33 @@ class BoundedProjectScanner:
                 # Check binary file extension
                 ext = Path(filename).suffix.lower()
                 if ext in self._BINARY_EXTENSIONS:
-                    digest = self._hash_file(full_path)
+                    try:
+                        digest = self._hash_file(full_path)
+                    except OSError as exc:
+                        warnings.append(
+                            ScanWarning(
+                                warning_type="FILE_READ_ERROR",
+                                message=f"Could not read {rel_path}: {exc}",
+                                file_path=rel_path,
+                            )
+                        )
+                        continue
                     files.append(SnapshotFile(relative_path=rel_path, exists=True, fingerprint=digest))
                     continue
 
                 # Check max file size limit
                 if file_size > self.limits.max_file_size_bytes:
-                    digest = self._hash_file(full_path)
+                    try:
+                        digest = self._hash_file(full_path)
+                    except OSError as exc:
+                        warnings.append(
+                            ScanWarning(
+                                warning_type="FILE_READ_ERROR",
+                                message=f"Could not read {rel_path}: {exc}",
+                                file_path=rel_path,
+                            )
+                        )
+                        continue
                     files.append(SnapshotFile(relative_path=rel_path, exists=True, fingerprint=digest))
                     warnings.append(
                         ScanWarning(
