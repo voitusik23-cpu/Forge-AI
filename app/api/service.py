@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from app.api.models import (
@@ -18,14 +19,51 @@ from app.api.models import (
 from app.dashboard.models import DashboardReport, ProviderStatus
 from app.dashboard.provider_health import ProviderHealthMonitor
 from app.dashboard.service import CostDashboardService
+from app.execution.profile import ProjectExecutionProfile
 from app.fabric.fabric import CapabilityFabric
 from app.orchestrator.models import RunState, Task, TaskCategory
 from app.orchestrator.run import RunExecutor
 from app.runtime.bootstrap import create_runtime
 from app.runtime.context import RuntimeContext
+from app.runtime.run_scope import RunScope, require_active_scope
 from app.runtime.run_store import RunStore
+from app.tools.approval import ApprovalResolver
+from app.tools.acceptance import AcceptanceCriterion
+from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry, build_default_tool_registry
 from app.tools.workspace import Workspace
+
+
+def default_api_execution_profile() -> ProjectExecutionProfile:
+    """Return the execution profile bound into every API RunScope.
+
+    The profile must declare at least one executable, because ``RunScope``
+    rejects a profile with an empty command set - that rule exists to stop a
+    silently empty profile from being mistaken for a permissive one.
+
+    This does **not** authorize host process execution. The API never builds
+    execution requests, and the RunScope is created with
+    ``allowed_execution_commands=frozenset()``, which is the set that actually
+    gates command execution (``command_is_allowed`` consults the declared set,
+    not the profile). The profile therefore keeps ``network_access=False`` and
+    grants no reachable process execution until host process execution is
+    designed as its own stage.
+    """
+    return ProjectExecutionProfile(
+        profile_id="api-default",
+        allowed_commands=("python",),
+        network_access=False,
+    )
+
+
+# Minimal acceptance criterion required by RunScope. The API does not run an
+# acceptance gate today; the criterion exists only because RunScope requires a
+# non-empty declaration and must never be silently empty.
+API_RUN_CRITERION = AcceptanceCriterion(
+    criterion_id="api-run-completes",
+    description="API run reaches a terminal state",
+    requirement_id="api-run",
+)
 
 
 from pathlib import Path
@@ -42,14 +80,44 @@ class ForgeApiService:
         workspace: Optional[Workspace] = None,
         run_store: Optional[RunStore] = None,
         tool_registry: Optional[ToolRegistry] = None,
+        allowed_tool_ids: frozenset[str] = frozenset(),
+        execution_profile: Optional[ProjectExecutionProfile] = None,
+        approval_resolver: Optional[ApprovalResolver] = None,
     ) -> None:
-        self._runtime = runtime or create_runtime()
         self._workspace = workspace or Workspace(Path.cwd())
+
+        # SERVER-SIDE OPERATOR AUTHORITY. The tool allowlist is declared here, at
+        # composition time, by whoever starts the process. It is never derived
+        # from an HTTP request, request context, skill manifest, or the fabric,
+        # and it is never "all registered tools". The empty default is the
+        # fail-closed starting point.
+        self._allowed_tool_ids = frozenset(allowed_tool_ids)
+
         # One registry serves both execution and discovery, so capability
         # enumeration can never report a tool that execution cannot reach.
         self._tool_registry = tool_registry or build_default_tool_registry(
             self._workspace.root
         )
+        self._execution_profile = execution_profile or default_api_execution_profile()
+        # Reuses the canonical registry, permission policy, and approval policy.
+        # No resolver is invented: write tools therefore stay WAITING_FOR_APPROVAL.
+        self._tool_executor = ToolExecutor(
+            self._tool_registry,
+            approval_resolver=approval_resolver,
+        )
+
+        resolved_runtime = runtime or create_runtime(tool_registry=self._tool_registry)
+        # The shared ToolExecutor must reach the executor that actually dispatches
+        # tools. RunExecutor carries no mutable state beyond immutable references,
+        # so rebinding it to the same orchestrator preserves behavior exactly.
+        self._runtime = replace(
+            resolved_runtime,
+            run_executor=RunExecutor(
+                resolved_runtime.orchestrator,
+                tool_executor=self._tool_executor,
+            ),
+        )
+
         self._fabric = fabric or CapabilityFabric(
             workspace=self._workspace,
             tool_registry=self._tool_registry,
@@ -61,6 +129,39 @@ class ForgeApiService:
             health_monitor=self._health_monitor,
         )
         self._active_project_id = "default"
+
+    def _effective_tool_ids(self) -> frozenset[str]:
+        """Compute the tools this service may authorize for a Run.
+
+        Effective tools are the operator allowlist intersected with the tools
+        that are actually registered. Intersecting in this direction means:
+        a tool that is registered but not allow-listed is never authorized, and
+        an allow-listed id with no registered implementation never appears.
+        """
+        registered = {definition.id for definition in self._tool_registry.list_tools()}
+        return frozenset(self._allowed_tool_ids & registered)
+
+    def _build_run_scope(self, run_id: str) -> RunScope:
+        """Build and freeze the security perimeter for one API run.
+
+        The scope binds the run to the service's own Workspace as the explicit
+        execution root, to the fail-closed execution profile, and to the
+        server-side tool allowlist. It is frozen before any privileged action so
+        a later expansion attempt is detectable and rejected.
+        """
+        scope = RunScope(
+            run_id=run_id,
+            workspace=self._workspace,
+            execution_profile=self._execution_profile,
+            allowed_tool_ids=self._effective_tool_ids(),
+            # Empty: this patch closes tool execution, not host process
+            # execution. No command is reachable through this scope.
+            allowed_execution_commands=frozenset(),
+            acceptance_criteria=(API_RUN_CRITERION,),
+        )
+        scope.freeze()
+        require_active_scope(run_id, scope)
+        return scope
 
     @property
     def runtime(self) -> RuntimeContext:
@@ -246,11 +347,21 @@ class ForgeApiService:
             api_run_store = self._run_store.bind_run(run_id, task_id=task_id)
         except Exception:  # noqa: BLE001 - persistence must not block a run
             api_run_store = None
+
+        # Freeze this run's perimeter before any privileged action. The scope
+        # binds the run id, the service's own Workspace as the explicit execution
+        # root, the fail-closed execution profile, and the server-side tool
+        # allowlist. Nothing here is taken from the HTTP request.
+        scope = self._build_run_scope(run_id)
+        effective_tool_ids = scope.allowed_tool_ids
+
         run = self._runtime.run_executor.execute(
             task=task,
             provider_name=req.provider_name,
             workspace=self._workspace,
             run_id=run_id,
+            run_scope=scope,
+            allowed_tool_ids=effective_tool_ids,
             run_store=api_run_store,
         )
         duration = time.perf_counter() - t0

@@ -657,6 +657,84 @@ production request path, and the legacy `RunExecutor`-based API task endpoint
 does not yet dispatch tools; wiring execution onto the shared registry is
 tracked separately.
 
+## Production Tool Execution and RunScope v0.1
+
+The API task endpoint now dispatches tools through a frozen `RunScope`.
+
+`ForgeApiService` takes the operator's tool authority as a constructor argument,
+`allowed_tool_ids`, which defaults to `frozenset()`. That declaration is the only
+source of tool authority for an API run: it is never read from the HTTP request,
+`request.context`, a skill manifest, or the fabric. Effective tools are computed
+as `operator_allowlist & registered_tools`, so a registered tool that is not
+allow-listed is never authorized, and an allow-listed id with no registered
+implementation never reaches a scope.
+
+Each call to `run_task` builds a scope with `RunScope(run_id, workspace,
+execution_profile, allowed_tool_ids, allowed_execution_commands=frozenset())` and
+then calls `freeze()` followed by `require_active_scope` before invoking the
+executor. The scope binds the service's own `Workspace` as the explicit execution
+root, so `RunScope.validate_workspace` rejects any other root and tool input
+cannot move it. The execution profile is `api-default`: `network_access=False`
+and `allowed_commands=("python",)`, which `RunScope` requires in order to reject a
+silently empty profile. `allowed_execution_commands` is the empty set, so no
+command is reachable.
+
+The same `ToolRegistry` instance backs both `CapabilityFabric` (discovery) and the
+runtime `ToolExecutor` (execution), so enumeration cannot report a tool that
+execution cannot reach. `create_runtime` accepts an optional `tool_registry`;
+omitting it preserves the historical empty registry.
+
+Approval is unchanged and is not authorization: `read_project_file` runs without
+approval when allowed, `write_project_file` still requires it, and with no
+resolver the result is `WAITING_FOR_APPROVAL`. Unknown tools remain
+`UNKNOWN_TOOL` / DENY, and workspace escapes remain denied.
+
+**Host process execution is not wired.** `ExecutionCoordinator`,
+`LocalExecutionAdapter`, `AgentHarness`, `EngineeringRunExecutor`, and
+`execution_requests` remain outside the API path; the API never builds execution
+requests, so no shell or process command can run through an API task.
+
+## Production Tool Execution and RunScope v0.1 — русская версия
+
+API-endpoint выполнения задач теперь диспетчеризует tools через замороженный
+`RunScope`.
+
+`ForgeApiService` принимает authority оператора на tools аргументом конструктора
+`allowed_tool_ids` со значением по умолчанию `frozenset()`. Это объявление —
+единственный источник tool-authority для API-run: оно никогда не читается из
+HTTP-запроса, `request.context`, манифеста скилла или fabric. Effective tools
+вычисляются как `operator_allowlist & registered_tools`, поэтому
+зарегистрированный, но не разрешённый tool никогда не авторизуется, а разрешённый
+id без зарегистрированной реализации не попадает в scope.
+
+Каждый вызов `run_task` создаёт scope через `RunScope(run_id, workspace,
+execution_profile, allowed_tool_ids, allowed_execution_commands=frozenset())`,
+затем вызывает `freeze()` и `require_active_scope` — и только после этого
+обращается к executor'у. Scope привязывает собственный `Workspace` сервиса как
+явный execution root, поэтому `RunScope.validate_workspace` отвергает любой
+другой корень, и tool input не может его изменить. Профиль выполнения —
+`api-default`: `network_access=False` и `allowed_commands=("python",)`, что
+требует `RunScope`, чтобы отвергать молча пустой профиль.
+`allowed_execution_commands` — пустое множество, поэтому ни одна команда
+недостижима.
+
+Один и тот же экземпляр `ToolRegistry` используется и в `CapabilityFabric`
+(discovery), и в runtime `ToolExecutor` (execution), поэтому перечисление не
+может показать tool, недостижимый для выполнения. `create_runtime` принимает
+необязательный `tool_registry`; если его не передать, сохраняется исторический
+пустой реестр.
+
+Approval не изменён и не является authorization: `read_project_file` выполняется
+без approval, когда разрешён, `write_project_file` по-прежнему его требует, а без
+resolver результат — `WAITING_FOR_APPROVAL`. Неизвестные tools остаются
+`UNKNOWN_TOOL` / DENY, выход за пределы workspace остаётся запрещённым.
+
+**Host process execution не подключён.** `ExecutionCoordinator`,
+`LocalExecutionAdapter`, `AgentHarness`, `EngineeringRunExecutor` и
+`execution_requests` остаются вне API-пути; API никогда не формирует execution
+requests, поэтому ни одна shell- или process-команда не может выполниться через
+API-задачу.
+
 ## Capability and Tool Discovery v0.1 — русская версия
 
 Capability- и tool-discovery подключены к production-пути API. Композирующий

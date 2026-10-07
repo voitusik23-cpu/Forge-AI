@@ -170,7 +170,8 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 ### NEXT
 
 - [ ] Unify the two path validators (`app/execution/paths.py` and `app/tools/workspace.py`) behind one canonical implementation without weakening the tool boundary.
-- [ ] Wire the execution plane into a production entry point with an explicitly scoped execution root.
+- [x] Wire production **tool** execution into the API entry point with an explicitly scoped execution root (`RunScope` frozen per API run, operator-declared tool allowlist, service `Workspace` as the explicit root).
+- [ ] Wire production **host process** execution into the API entry point through `ExecutionCoordinator` / `LocalExecutionAdapter` (which commands an API run may spawn, and under which root, is still an open design question).
 
 ### DEFERRED вЂ” Block 2 (workspace and isolation)
 
@@ -378,7 +379,8 @@ workflow review/ревизии. Выполнение плана, управле�
 ### NEXT
 
 - [ ] Объединить два валидатора путей (`app/execution/paths.py` и `app/tools/workspace.py`) за одной канонической реализацией без ослабления tool-границы.
-- [ ] Подключить execution plane к production-точке входа с явно ограниченным корнем выполнения.
+- [x] Подключить production **tool** execution к API-точке входа с явно ограниченным корнем выполнения (`RunScope`, замораживаемый на каждый API-run, объявленный оператором allowlist tools, `Workspace` сервиса как явный корень).
+- [ ] Подключить production **host process** execution к API-точке входа через `ExecutionCoordinator` / `LocalExecutionAdapter` (какие команды может запускать API-run и под каким корнем — всё ещё открытый вопрос проектирования).
 
 ### DEFERRED — Block 2 (workspace и изоляция)
 

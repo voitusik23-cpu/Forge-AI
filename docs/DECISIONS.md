@@ -215,3 +215,168 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 3. Включить разрешённое окружение профиля в тело интента либо доказать, что оно не может влиять на выполнение.
 4. Решить, является ли идентичность программы именем, разрешаемым во время выполнения, или путём, закреплённым при одобрении (привязка PATH / TOCTOU).
 5. Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
+
+## Production Run Authority and RunScope v0.1
+
+Recorded at commit `451ffd1` (discovery wiring) and implemented in the production
+tool execution wiring block. Verified against the code in `app/api/service.py`,
+`app/runtime/bootstrap.py`, and `app/runtime/run_scope.py`.
+
+### Accepted decisions
+
+- **Tool authority belongs to the operator at the composition layer.** The
+  allowlist is declared once when `ForgeApiService` is constructed
+  (`allowed_tool_ids`). It is the only source of tool authority for an API run.
+- **The default operator allowlist is empty.** `frozenset()` is the starting
+  point, so an undeclared service authorizes no tool at all.
+- **Effective tools are exactly `operator_allowlist & registered_tools`.**
+  Intersecting in that direction means a registered tool that is not allow-listed
+  is never authorized, and an allow-listed id with no registered implementation
+  never appears in a scope.
+- **Discovery is not authorization.** `CapabilityFabric.list_capabilities()` and
+  the discovery endpoints enumerate; they grant nothing and are never consulted
+  to compute an allowlist.
+- **Registered is not allowed.** `ToolRegistry.list_tools()` is never used as an
+  allowlist, and `allowed_tool_ids = registry.list_tools()` is prohibited.
+- **Skills are not authority.** `SkillEvaluator` consumes an already-authorized
+  tool set and can only narrow it; `SkillManifest.requested_tools` is a request,
+  not a grant. The built-in skill demonstrates why: it requests
+  `python_test_runner`, a tool that does not exist.
+- **CapabilityFabric is not authority.** `resolve()` is not on the production
+  request path and issues no permissions.
+- **The API client cannot widen authority.** `TaskRunRequest` has no tool,
+  workspace, or approval fields, and `request.context` is never read to compute
+  an allowlist. An escalation attempt in `context` has no effect.
+- **RunScope is frozen before privileged execution.** `run_task` builds the scope
+  and calls `freeze()` followed by `require_active_scope` before invoking the
+  executor, so a later expansion attempt is rejected.
+- **Workspace is the explicit execution root.** The scope binds the service's own
+  `Workspace`; `RunScope.validate_workspace` rejects any other root, and existing
+  `Workspace` containment checks are unchanged.
+- **Approval is not authorization.** Approval runs after permission and cannot
+  grant a tool the allowlist withheld.
+- **`write_project_file` without a resolver stays `WAITING_FOR_APPROVAL`.** No
+  auto-approve resolver is introduced.
+- **One registry serves discovery and execution.** The same `ToolRegistry`
+  instance backs `CapabilityFabric` and the runtime `ToolExecutor`, so
+  enumeration cannot report a tool that execution cannot reach.
+- **Host process execution is not part of this patch.** `ExecutionCoordinator`,
+  `LocalExecutionAdapter`, `AgentHarness`, `EngineeringRunExecutor`, and
+  `execution_requests` remain unwired from the API. The API scope is created with
+  `allowed_execution_commands=frozenset()`, so no command is reachable.
+
+### Rejected or deferred alternatives (with rationale)
+
+- **Allow-listing every registered tool.** Rejected: it makes discovery into an
+  authorization source and lets a client-influenced task reach
+  `write_project_file` in the workspace root.
+- **Deriving authority from `TaskRunRequest` or `request.context`.** Rejected:
+  authority must never travel in the HTTP contract, and the caller is untrusted.
+- **Deriving authority from skills.** Rejected: skill manifests are content, not
+  grants, and `requested_tools` may name tools that do not exist.
+- **A project configuration layer supplying tool allowlists.** Rejected for this
+  block: no such configuration exists, and creating one would introduce a new
+  authority layer. Authority stays an explicit operator declaration.
+- **Auto-approving write tools to make runs complete.** Rejected: it converts
+  approval into authorization.
+- **Wiring `AgentHarness` or `EngineeringRunExecutor` as the API entry point.**
+  Deferred: `AgentHarness` does not dispatch tools at all, and
+  `EngineeringRunExecutor` requires acceptance criteria and verification
+  expectations the API cannot supply. Either would be its own architectural
+  stage, not a small patch.
+- **Host process execution through `ExecutionCoordinator`.** Deferred as the next
+  architectural stage. It needs its own decision about which commands an API run
+  may spawn and where.
+
+### Open follow-up items
+
+1. Decide whether an API run may ever spawn host processes, and if so which
+   commands and under which execution root.
+2. Decide whether tool authority should ever become configurable per project,
+   and if so where that configuration lives and who may edit it.
+3. Revisit whether the `api-default` execution profile should declare a real
+   executable set once host process execution is designed.
+4. Give the API a way to express a legitimate, narrowing tool request once a
+   server-side allowlist exists to narrow against.
+
+## Production Run Authority and RunScope v0.1 — русская версия
+
+Зафиксировано на коммите `451ffd1` (discovery wiring) и реализовано в блоке
+production tool execution wiring. Проверено по коду в `app/api/service.py`,
+`app/runtime/bootstrap.py` и `app/runtime/run_scope.py`.
+
+### Принятые решения
+
+- **Authority на tools принадлежит оператору на уровне композиции.** Allowlist
+  объявляется один раз при создании `ForgeApiService` (`allowed_tool_ids`) и
+  является единственным источником tool-authority для API-run.
+- **Default-allowlist оператора пуст.** `frozenset()` — отправная точка, поэтому
+  сервис без объявления не авторизует ни один tool.
+- **Effective tools — ровно `operator_allowlist & registered_tools`.**
+  Пересечение именно в эту сторону: зарегистрированный, но не разрешённый tool
+  никогда не авторизуется, а разрешённый id без реализации не попадает в scope.
+- **Discovery не является authorization.** `CapabilityFabric.list_capabilities()`
+  и discovery-endpoint'ы только перечисляют; они ничего не выдают и никогда не
+  используются для вычисления allowlist.
+- **Registered не равно allowed.** `ToolRegistry.list_tools()` не используется как
+  allowlist, а `allowed_tool_ids = registry.list_tools()` запрещено.
+- **Skills не являются authority.** `SkillEvaluator` потребляет уже
+  авторизованный набор tools и может только сужать его;
+  `SkillManifest.requested_tools` — это запрос, а не разрешение. Встроенный скилл
+  показывает почему: он запрашивает `python_test_runner`, которого не существует.
+- **CapabilityFabric не является authority.** `resolve()` не находится на
+  production-пути запроса и не выдаёт разрешений.
+- **API-клиент не может расширить authority.** В `TaskRunRequest` нет полей
+  tools, workspace или approval, а `request.context` никогда не читается для
+  вычисления allowlist. Попытка эскалации через `context` не даёт эффекта.
+- **RunScope замораживается до привилегированного выполнения.** `run_task`
+  создаёт scope, вызывает `freeze()`, затем `require_active_scope` — и только
+  после этого вызывает executor, поэтому последующее расширение отвергается.
+- **Workspace — явный execution root.** Scope привязывается к собственному
+  `Workspace` сервиса; `RunScope.validate_workspace` отвергает любой другой
+  корень, а существующие containment-проверки `Workspace` не изменены.
+- **Approval не является authorization.** Approval выполняется после permission и
+  не может выдать tool, который не прошёл allowlist.
+- **`write_project_file` без resolver остаётся `WAITING_FOR_APPROVAL`.**
+  Auto-approve resolver не вводится.
+- **Один registry обслуживает discovery и execution.** Один и тот же экземпляр
+  `ToolRegistry` используется и в `CapabilityFabric`, и в runtime `ToolExecutor`,
+  поэтому перечисление не может показать tool, недостижимый для выполнения.
+- **Host process execution не входит в этот патч.** `ExecutionCoordinator`,
+  `LocalExecutionAdapter`, `AgentHarness`, `EngineeringRunExecutor` и
+  `execution_requests` остаются не подключёнными к API. API-scope создаётся с
+  `allowed_execution_commands=frozenset()`, поэтому ни одна команда недостижима.
+
+### Отклонённые или отложенные альтернативы (с обоснованием)
+
+- **Разрешить все зарегистрированные tools.** Отклонено: это превращает discovery
+  в источник authorization и позволяет задаче, на которую влияет клиент, дойти до
+  `write_project_file` в корне workspace.
+- **Выводить authority из `TaskRunRequest` или `request.context`.** Отклонено:
+  authority не должна передаваться в HTTP-контракте, а вызывающий недоверенный.
+- **Выводить authority из скиллов.** Отклонено: манифесты скиллов — это контент,
+  а не разрешения, и `requested_tools` может называть несуществующие tools.
+- **Слой проектной конфигурации с allowlist'ами tools.** Отклонено для этого
+  блока: такой конфигурации не существует, а её создание добавило бы новый слой
+  authority. Authority остаётся явным объявлением оператора.
+- **Авто-одобрение write-tools ради завершения запусков.** Отклонено: это
+  превращает approval в authorization.
+- **Подключить `AgentHarness` или `EngineeringRunExecutor` как API entry point.**
+  Отложено: `AgentHarness` вообще не диспетчеризует tools, а
+  `EngineeringRunExecutor` требует acceptance criteria и verification
+  expectations, которых API предоставить не может. Любой из них — отдельный
+  архитектурный этап, а не маленький патч.
+- **Host process execution через `ExecutionCoordinator`.** Отложено как следующий
+  архитектурный этап. Требует отдельного решения о том, какие команды может
+  запускать API-run и где.
+
+### Открытые follow-up пункты
+
+1. Решить, может ли API-run вообще запускать host-процессы, и если да — какие
+   команды и под каким execution root.
+2. Решить, должна ли tool-authority когда-либо стать настраиваемой по проекту, и
+   если да — где живёт эта конфигурация и кто может её редактировать.
+3. Пересмотреть, должен ли профиль `api-default` объявлять реальный набор
+   исполняемых файлов после проектирования host process execution.
+4. Дать API способ выражать легитимный сужающий запрос tools, когда появится
+   server-side allowlist, относительно которого можно сужать.

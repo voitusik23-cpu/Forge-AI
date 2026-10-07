@@ -17,12 +17,15 @@ from app.orchestrator.orchestrator import Orchestrator
 from app.orchestrator.run import RunExecutor
 from app.runtime.context import RuntimeContext
 from app.runtime.logging import configure_logging
+from app.tools.executor import ToolExecutor
+from app.tools.registry import ToolRegistry
 
 
 def create_runtime(
     settings: Optional[RuntimeSettings] = None,
     fabric: Optional[CapabilityFabric] = None,
     model_registry: Optional[ModelRegistry] = None,
+    tool_registry: Optional[ToolRegistry] = None,
 ) -> RuntimeContext:
     """Build registries and orchestrator without making external API calls."""
     resolved_settings = settings if settings is not None else load_settings()
@@ -75,5 +78,13 @@ def create_runtime(
         provider_capabilities=capabilities_registry,
         agent_registry=agent_registry,
         orchestrator=orchestrator,
-        run_executor=RunExecutor(orchestrator),
+        run_executor=RunExecutor(
+            orchestrator,
+            # Tools are optional and default to the historical empty registry, so
+            # existing callers keep their previous behavior. Supplying a registry
+            # makes execution use exactly the tools that discovery enumerates.
+            tool_executor=(
+                ToolExecutor(tool_registry) if tool_registry is not None else None
+            ),
+        ),
     )
