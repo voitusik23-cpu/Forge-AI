@@ -7,8 +7,10 @@ from typing import Iterable, Optional
 from app.agents.base import AgentExecutionError
 from app.context import (
     ContextAssembler,
+    ContextBudgetPolicy,
     ContextFreshness,
     ContextItem,
+    ContextSelector,
     ContextTrust,
     ExecutionContext,
 )
@@ -37,10 +39,66 @@ class RunExecutor:
         orchestrator: Orchestrator,
         context_assembler: Optional[ContextAssembler] = None,
         tool_executor: Optional[ToolExecutor] = None,
+        selector: Optional[ContextSelector] = None,
+        budget_policy: Optional[ContextBudgetPolicy] = None,
     ) -> None:
         self._orchestrator = orchestrator
-        self._context_assembler = context_assembler or ContextAssembler()
+        self._context_assembler = context_assembler or ContextAssembler(
+            selector=selector,
+            budget_policy=budget_policy,
+        )
         self._tool_executor = tool_executor or ToolExecutor(ToolRegistry())
+
+    def _resolve_model_info(
+        self,
+        task: Task,
+        provider_name: Optional[str] = None,
+        agent_name: Optional[str] = None,
+    ) -> object | None:
+        """Deterministically lookup ProviderModelInfo if ModelRegistry is configured."""
+        if self._orchestrator is None:
+            return None
+        dispatcher = getattr(self._orchestrator, "_dispatcher", None)
+        if dispatcher is None:
+            return None
+        model_registry = getattr(dispatcher, "_model_registry", None)
+        if model_registry is None:
+            return None
+
+        target_provider = provider_name
+        if not target_provider and agent_name:
+            agent_reg = getattr(dispatcher, "_registry", None)
+            if agent_reg is not None:
+                try:
+                    agent = agent_reg.get(agent_name)
+                    target_provider = getattr(agent, "provider_name", None)
+                    if not target_provider and hasattr(agent, "provider"):
+                        target_provider = getattr(agent.provider, "name", None)
+                except Exception:
+                    pass
+        if not target_provider:
+            target_provider = getattr(dispatcher, "_default_provider", None)
+
+        if target_provider:
+            prov_reg = getattr(dispatcher, "_provider_registry", None)
+            model_name = None
+            if prov_reg is not None:
+                try:
+                    provider = prov_reg.get(target_provider)
+                    if hasattr(provider, "config"):
+                        model_name = getattr(provider.config, "model_name", None)
+                except Exception:
+                    pass
+            if model_name:
+                try:
+                    return model_registry.get(target_provider, model_name)
+                except Exception:
+                    pass
+            try:
+                return model_registry.get_default(target_provider)
+            except Exception:
+                pass
+        return None
 
     def execute(
         self,
@@ -63,9 +121,22 @@ class RunExecutor:
         run.state = RunState.RUNNING if _attempt_number == 0 else RunState.REVISING
 
         try:
-            execution_context = self._context_assembler.assemble(
-                task, run.id, explicit_inputs
+            model_info = self._resolve_model_info(
+                task=task,
+                provider_name=provider_name,
+                agent_name=agent_name,
             )
+            try:
+                execution_context = self._context_assembler.assemble(
+                    task,
+                    run.id,
+                    explicit_inputs,
+                    model_info=model_info,
+                )
+            except TypeError:
+                execution_context = self._context_assembler.assemble(
+                    task, run.id, explicit_inputs
+                )
             self._record_context_assembled(run, execution_context)
             dispatch_task = self._task_with_execution_context(task, execution_context)
             result = self._orchestrator.dispatch(

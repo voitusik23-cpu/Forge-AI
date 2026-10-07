@@ -183,6 +183,19 @@ class ContextSelector:
         ContextSourceType.USER_TASK,
     })
 
+    @classmethod
+    def is_tier_1(cls, item: ContextItem) -> bool:
+        """Return True if item represents a mandatory mission-critical specification/criterion."""
+        if item.source_type in (
+            ContextSourceType.TASK_SPECIFICATION,
+            ContextSourceType.REQUIREMENT,
+            ContextSourceType.ACCEPTANCE,
+        ):
+            return True
+        if item.source_type == ContextSourceType.USER_TASK and item.item_type != "task_context":
+            return True
+        return False
+
     # Base score weights by ContextSourceType
     _SOURCE_WEIGHTS: Mapping[ContextSourceType, float] = {
         # Tier 1 - Mission critical: Task, Requirements, Acceptance
@@ -286,7 +299,7 @@ class ContextSelector:
         # 2. Deterministic sorting: Tier 1 items strictly first, then highest score, source_type, item_id
         valid_candidates.sort(
             key=lambda entry: (
-                0 if entry[1].source_type in self._TIER_1_SOURCES else 1,
+                0 if self.is_tier_1(entry[1]) else 1,
                 -entry[0],
                 entry[1].source_type.value,
                 entry[1].item_id,
@@ -344,7 +357,7 @@ class ContextSelector:
         critical_dropped = [
             c.item_id
             for c in candidate_list
-            if c.source_type in self._TIER_1_SOURCES and c.item_id in dropped_reasons
+            if self.is_tier_1(c) and c.item_id in dropped_reasons
         ]
         critical_context_unfit = len(critical_dropped) > 0
 

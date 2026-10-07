@@ -64,7 +64,14 @@ class ContextBudgetExceededError(ContextAssemblyError):
 class ContextAssembler:
     """Assemble only caller-provided content; never reads files or networks (legacy)."""
 
-    def __init__(self, *, max_items: int = 16, max_characters: int = 20_000) -> None:
+    def __init__(
+        self,
+        *,
+        max_items: int = 16,
+        max_characters: int = 20_000,
+        selector: Optional[ContextSelector] = None,
+        budget_policy: Optional[ContextBudgetPolicy] = None,
+    ) -> None:
         if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items < 1:
             raise ValueError("max_items must be a positive integer")
         if (
@@ -75,14 +82,20 @@ class ContextAssembler:
             raise ValueError("max_characters must be a positive integer")
         self.max_items = max_items
         self.max_characters = max_characters
+        self._selector = selector
+        self._budget_policy = budget_policy
 
     def assemble(
         self,
         task: Task,
         run_id: str,
         explicit_inputs: Iterable[str | ContextItem] = (),
+        *,
+        model_info: Any | None = None,
+        budget_policy: Optional[ContextBudgetPolicy] = None,
+        selector: Optional[ContextSelector] = None,
     ) -> ExecutionContext:
-        """Build a bounded context with caller inputs marked as explicit/untrusted."""
+        """Build a bounded context with caller inputs filtered and prioritized through ContextSelector."""
         if not isinstance(task, Task):
             raise ContextAssemblyError("task must be a Task instance")
         if not isinstance(run_id, str) or not run_id.strip():
@@ -143,7 +156,34 @@ class ContextAssembler:
         ids = [item.id for item in items]
         if len(ids) != len(set(ids)):
             raise ContextAssemblyError("context item IDs must be unique")
-        return ExecutionContext(run_id=run_id, items=tuple(items))
+
+        eff_policy = budget_policy or (
+            ContextBudgetPolicy.from_model_info(
+                model_info,
+                max_items=self.max_items,
+            )
+            if model_info is not None
+            else (
+                self._budget_policy
+                or ContextBudgetPolicy(
+                    total_context_window=32_768,
+                    max_output_tokens=4_096,
+                    safety_headroom_tokens=2_048,
+                    min_input_budget_tokens=0,
+                    max_items=self.max_items,
+                    max_item_characters=self.max_characters,
+                    allow_truncation=False,
+                )
+            )
+        )
+        eff_selector = selector or self._selector or ContextSelector(policy=eff_policy)
+        selected_items, _ = eff_selector.select(
+            items,
+            budget_policy=eff_policy,
+            raise_on_critical_unfit=True,
+        )
+
+        return ExecutionContext(run_id=run_id, items=tuple(selected_items))
 
     def _check_budget(self, item_count: int, character_count: int) -> None:
         if item_count > self.max_items or character_count > self.max_characters:
