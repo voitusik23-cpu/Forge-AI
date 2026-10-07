@@ -32,6 +32,7 @@ class ExecutionIntent:
     profile_id: str
     network_access: bool
     capabilities: frozenset[ExecutionCapability]
+    profile_environment_variables: tuple[tuple[str, str], ...] = ()
 
     @property
     def fingerprint(self) -> str:
@@ -46,6 +47,9 @@ class ExecutionIntent:
             "executable": self.executable,
             "max_output_bytes": self.max_output_bytes,
             "network_access": self.network_access,
+            "profile_environment_variables": [
+                [k, v] for k, v in self.profile_environment_variables
+            ],
             "profile_id": self.profile_id,
             "timeout_seconds": self.timeout_seconds,
             "working_directory": self.working_directory,
@@ -61,6 +65,7 @@ class ExecutionIntent:
             "argv": list(self.argv),
             "working_directory": self.working_directory,
             "environment_variables": dict(self.environment_variables),
+            "profile_environment_variables": dict(self.profile_environment_variables),
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,
             "artifact_targets": list(self.artifact_targets),
@@ -84,6 +89,7 @@ class IntentBuilder:
         self._argv: tuple[str, ...] = ()
         self._working_directory: str = "."
         self._environment_variables: dict[str, str] = {}
+        self._profile_environment_variables: dict[str, str] = {}
         self._timeout_seconds: float = 30.0
         self._max_output_bytes: int = 1048576
         self._artifact_targets: set[str] = set()
@@ -109,6 +115,12 @@ class IntentBuilder:
         self, env_vars: Mapping[str, str]
     ) -> IntentBuilder:
         self._environment_variables = {str(k): str(v) for k, v in env_vars.items()}
+        return self
+
+    def with_profile_environment_variables(
+        self, env_vars: Mapping[str, str]
+    ) -> IntentBuilder:
+        self._profile_environment_variables = {str(k): str(v) for k, v in env_vars.items()}
         return self
 
     def with_timeout_seconds(self, timeout_seconds: float) -> IntentBuilder:
@@ -157,6 +169,7 @@ class IntentBuilder:
             detected_caps = frozenset(self._capabilities)
 
         sorted_env = tuple(sorted(self._environment_variables.items()))
+        sorted_prof_env = tuple(sorted(self._profile_environment_variables.items()))
         sorted_artifacts = tuple(sorted(self._artifact_targets))
 
         return ExecutionIntent(
@@ -170,6 +183,7 @@ class IntentBuilder:
             profile_id=self._profile_id,
             network_access=self._network_access,
             capabilities=detected_caps,
+            profile_environment_variables=sorted_prof_env,
         )
 
     @classmethod
@@ -186,12 +200,16 @@ class IntentBuilder:
         cwd = getattr(request, "working_directory", ".")
         builder.with_working_directory(cwd)
 
-        env = getattr(request, "environment_variables", {})
+        prof = profile or getattr(request, "profile", None)
+
+        env = getattr(request, "environment_variables", None)
         if env:
             builder.with_environment_variables(env)
 
+        if prof is not None and getattr(prof, "environment_variables", None):
+            builder.with_profile_environment_variables(prof.environment_variables)
+
         req_timeout = getattr(request, "timeout_seconds", None)
-        prof = profile or getattr(request, "profile", None)
 
         if req_timeout is not None:
             builder.with_timeout_seconds(req_timeout)

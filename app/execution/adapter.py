@@ -233,7 +233,10 @@ class LocalExecutionAdapter:
 
     def _prepare_redactor(self, intent: ExecutionIntent) -> SecretRedactor:
         secrets_to_register: list[str] = []
-        for k, v in intent.environment_variables:
+        all_envs = list(intent.environment_variables) + list(
+            getattr(intent, "profile_environment_variables", ())
+        )
+        for k, v in all_envs:
             val_str = str(v).strip()
             if not val_str:
                 continue

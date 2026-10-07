@@ -14,6 +14,7 @@ class ExecutionCapability(str, Enum):
     INTERPRET_TEXT = "INTERPRET_TEXT"
     INTERPRET_MODULE = "INTERPRET_MODULE"
     NETWORK = "NETWORK"
+    OPAQUE = "OPAQUE"
 
 
 # Regular expressions for interpreter flags
@@ -73,6 +74,51 @@ _GIT_NETWORK_SUBCOMMANDS = frozenset({
 })
 
 
+_KNOWN_STANDARD_TOOLS = frozenset({
+    "pytest",
+    "unittest",
+    "ruff",
+    "black",
+    "flake8",
+    "mypy",
+    "pylint",
+    "isort",
+    "eslint",
+    "prettier",
+    "jest",
+    "mocha",
+    "tsc",
+    "make",
+    "cmake",
+    "ninja",
+    "gcc",
+    "g++",
+    "clang",
+    "rustc",
+    "echo",
+    "cat",
+    "ls",
+    "dir",
+    "head",
+    "tail",
+    "grep",
+    "wc",
+    "diff",
+    "sed",
+    "awk",
+    "tar",
+    "zip",
+    "unzip",
+    "gzip",
+    "true",
+    "false",
+    "touch",
+    "cp",
+    "mv",
+    "rm",
+})
+
+
 def classify_invocation(
     executable: str, argv: Sequence[str] = ()
 ) -> frozenset[ExecutionCapability]:
@@ -83,12 +129,16 @@ def classify_invocation(
     stem = clean_exec.rsplit(".", 1)[0]
     arg_list = list(argv)
 
+    is_recognized = False
+
     # 1. Wrappers that execute child commands
     if stem in _WRAPPER_EXECUTABLES:
+        is_recognized = True
         caps.add(ExecutionCapability.EXEC_CHILD)
 
     # find -exec
     if stem == "find":
+        is_recognized = True
         for a in arg_list:
             if a in ("-exec", "-execdir", "-ok", "-okdir"):
                 caps.add(ExecutionCapability.EXEC_CHILD)
@@ -96,16 +146,19 @@ def classify_invocation(
 
     # 2. Network commands
     if stem in _NETWORK_EXECUTABLES:
+        is_recognized = True
         caps.add(ExecutionCapability.NETWORK)
 
     if stem == "git":
+        is_recognized = True
         for a in arg_list:
             if a.lower() in _GIT_NETWORK_SUBCOMMANDS:
                 caps.add(ExecutionCapability.NETWORK)
                 break
 
     # 3. Python family
-    if stem == "python" or stem.startswith("python3") or stem.startswith("pypy"):
+    if stem == "python" or stem.startswith("python") or stem.startswith("pypy"):
+        is_recognized = True
         for arg in arg_list:
             if arg == "-":
                 caps.add(ExecutionCapability.INTERPRET_TEXT)
@@ -123,6 +176,7 @@ def classify_invocation(
 
     # 4. Shell family
     elif stem in {"bash", "sh", "zsh", "dash", "ksh"}:
+        is_recognized = True
         for arg in arg_list:
             if arg in {"-", "-s"}:
                 caps.add(ExecutionCapability.INTERPRET_TEXT)
@@ -138,6 +192,7 @@ def classify_invocation(
 
     # 5. PowerShell family
     elif stem in {"powershell", "pwsh"}:
+        is_recognized = True
         for arg in arg_list:
             if arg.startswith(("-", "/")) and len(arg) > 1:
                 norm = arg.lstrip("-/").lower()
@@ -150,6 +205,7 @@ def classify_invocation(
 
     # 6. Windows CMD family
     elif stem == "cmd":
+        is_recognized = True
         for arg in arg_list:
             if arg.startswith(("/", "-")) and len(arg) > 1:
                 low = arg.lower()
@@ -159,6 +215,7 @@ def classify_invocation(
 
     # 7. Node / JS
     elif stem in {"node", "nodejs"}:
+        is_recognized = True
         for arg in arg_list:
             if arg == "-":
                 caps.add(ExecutionCapability.INTERPRET_TEXT)
@@ -172,6 +229,7 @@ def classify_invocation(
 
     # 8. Ruby
     elif stem == "ruby":
+        is_recognized = True
         for arg in arg_list:
             if arg == "-":
                 caps.add(ExecutionCapability.INTERPRET_TEXT)
@@ -185,6 +243,7 @@ def classify_invocation(
 
     # 9. Perl
     elif stem == "perl":
+        is_recognized = True
         for arg in arg_list:
             if arg == "-":
                 caps.add(ExecutionCapability.INTERPRET_TEXT)
@@ -198,11 +257,20 @@ def classify_invocation(
 
     # 10. PHP
     elif stem == "php":
+        is_recognized = True
         for arg in arg_list:
             if arg == "-":
                 caps.add(ExecutionCapability.INTERPRET_TEXT)
             elif arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
                 if _PHP_SHORT_EVAL_PATTERN.match(arg):
                     caps.add(ExecutionCapability.INTERPRET_TEXT)
+
+    # 11. Known standard developer tools
+    elif stem in _KNOWN_STANDARD_TOOLS:
+        is_recognized = True
+
+    # Fail closed for unclassified / unknown executables with free-form argv
+    if not is_recognized and arg_list:
+        caps.add(ExecutionCapability.OPAQUE)
 
     return frozenset(caps)
