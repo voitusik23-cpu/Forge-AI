@@ -38,6 +38,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from app.execution.identity import command_is_allowed
+from app.execution.sandbox import (
+    WorkspaceBoundary,
+    WorkspaceContainmentError,
+    assert_no_escape_targets,
+)
 from app.execution.profile import ProjectExecutionProfile
 from app.tools.workspace import Workspace
 
@@ -622,6 +627,29 @@ class RunScope:
         working_directory = getattr(request, "working_directory", ".")
         if not isinstance(working_directory, str) or not working_directory.strip():
             raise RunScopeError("execution request must declare a working directory")
+        # Filesystem authority is the frozen workspace. Prove here, at the
+        # authority boundary, that the declared working directory and every
+        # declared artifact target actually resolve inside it - a syntactic path
+        # check alone would accept `sub/../../outside` and a symlink that leaves
+        # the workspace lexically intact.
+        boundary = self.filesystem_boundary()
+        try:
+            boundary.resolve_relative(working_directory)
+            assert_no_escape_targets(
+                getattr(request, "artifact_targets", ()), boundary
+            )
+        except WorkspaceContainmentError as exc:
+            raise RunScopeError(
+                f"execution request leaves the workspace boundary: {exc}"
+            ) from exc
+
+    def filesystem_boundary(self) -> WorkspaceBoundary:
+        """The canonical filesystem perimeter of this run.
+
+        Derived from the frozen workspace only, so a request, a task, a decision,
+        a plan, or a tool intent can never widen it.
+        """
+        return WorkspaceBoundary.for_workspace(self.workspace)
 
     def assert_consistent(self, **authority: object) -> None:
         """Validate every supplied authority input against the frozen perimeter.

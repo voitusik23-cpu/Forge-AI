@@ -910,6 +910,114 @@ trusted task
 `AgentHarness` remains the only production orchestration loop; discovery adds a
 stage to it and no new coordinator, agent, or loop.
 
+**Execution filesystem boundary and network policy (GAP-A / GAP-B).**
+`app/execution/sandbox.py` owns the filesystem boundary of one execution, and the
+network policy lives on the frozen execution profile. Both are stated here as
+what they actually are.
+
+*What is guaranteed (filesystem).* `WorkspaceBoundary` is the single canonical
+answer to "is this path inside the run's workspace?". It canonicalizes the root
+with `os.path.realpath` (which follows junctions and substituted drives, not just
+symlinks), normalizes the requested path so `..` segments and absolute forms are
+refused outright, then canonicalizes the result and proves containment. It is
+enforced twice: at the authority boundary in
+`RunScope.validate_execution_request` - so an escaping working directory or
+artifact target is refused before any dispatch decision - and again inside
+`LocalExecutionAdapter._run_process` immediately before the child process is
+created. The adapter check re-canonicalizes the working directory from the live
+filesystem and proves it is contained by the **trusted execution root carried by
+the `AuthorizedExecution` token** (the isolation scratch root when workspace
+isolation is on, otherwise the token's workspace root); it then hands that
+canonical path to `Popen`, so a link swapped after the authority check is refused
+rather than followed. The boundary is always built with
+`WorkspaceBoundary.for_workspace(...)` from a trusted root, never from the path
+being checked. The root always comes from the frozen scope, never from a task, a
+decision, a plan, a tool intent, a request, or metadata.
+
+*Entry-point coverage.* The boundary applies to every execution that passes the
+trusted chain `ExecutionRequest -> ExecutionCoordinator -> AuthorizedExecution ->
+LocalExecutionAdapter`:
+
+| entry point | filesystem boundary | network policy |
+| --- | --- | --- |
+| `run_agent_loop` (with a declared `AcceptanceSpec`) | applies | applies |
+| `run_agent_loop` (no declared `AcceptanceSpec`) | applies to any execution it dispatches | applies |
+| `run_accepted_task` | applies | applies |
+| `run_declared_verification` (host execution) | applies | applies |
+| any other caller driving `ExecutionCoordinator` | applies | applies |
+| legacy `run_task` | reaches and applies | reaches and applies |
+| HTTP task-run compatibility path | reaches and applies | reaches and applies |
+| desktop dispatch compatibility path | reaches and applies | reaches and applies |
+
+The three compatibility paths call `ForgeApiService.run_task`, which is **not**
+outside the boundary. It builds a `RunScope` at the service boundary
+(`_build_run_scope`, whose execution root is the service's own `Workspace`, never
+the HTTP request) and delegates to `RunExecutor`, which dispatches through
+`ExecutionCoordinator` -> `AuthorizedExecution` -> `LocalExecutionAdapter` with that
+scope. `RunScope.validate_execution_request` therefore runs unconditionally on this
+path, so a declared host execution reaches and is subject to the same filesystem
+and network enforcement as any other coordinator caller.
+
+What differs is reachability, not enforcement: `RunExecutor` derives
+`command_authority` from the operator-declared execution commands, and with no
+server-side execution declaration that set is empty, so the executor returns before
+requesting anything and no process is reachable at all. In that default state the
+boundary is not exercised because nothing executes, not because it is absent.
+
+These paths receive none of the `AgentHarness`-specific behaviour (no
+`AgentHarness` phases, plan, revision loop, task/criterion binding, or acceptance
+routing); this paragraph is only about the filesystem/network enforcement boundary
+on the existing execution path.
+
+*What is refused.* Parent traversal (`../`, `sub/../../x`), traversal that ends
+back inside the workspace, absolute paths outside the workspace, Windows drive
+paths, UNC and device paths, empty and NUL-bearing paths, and a directory junction
+or symlink whose name sits inside the workspace but which resolves outside it.
+
+*Residual risk (filesystem).* **There is no OS-level filesystem sandbox, and
+GAP-A is therefore PARTIAL, not closed.** `RESIDUAL_RISK` in
+`app/execution/sandbox.py` states this, and
+`tests/test_execution_sandbox_boundary.py::test_child_process_can_still_read_outside_the_workspace`
+asserts it by running a child that reads a file outside the workspace.
+
+1. **Child-process inheritance - accepted residual risk.** A spawned process
+   inherits the host filesystem privileges of the parent and can open any path
+   that token may open. Without an OS-level sandbox the child is not confined to
+   the workspace at all, so this is not a defect in the boundary: the boundary
+   constrains the paths the execution plane itself resolves, not the syscalls of
+   the child.
+2. **TOCTOU between the check and the spawn - architectural limitation.** The
+   authority check and the adapter's live check both canonicalize the directory,
+   and `Popen` receives that canonical path, which narrows the window between
+   check and spawn considerably but cannot eliminate it: only an OS-level
+   mechanism can. A local writer able to swap a directory for a junction in that
+   window is not stopped by this architecture. Full elimination requires a
+   deployment primitive - a container, a restricted token with a filesystem ACL
+   on the workspace, or a Windows AppContainer / Linux namespace profile - which
+   this repository does not currently have. CPython's standard library exposes no
+   portable primitive for it, and this block deliberately did not add a privileged
+   or root-dependent mechanism that could not be verified on the target runtime.
+
+*What is guaranteed (network).* Network authority is deny-by-default and
+server-side: `ProjectExecutionProfile.network_access` defaults to `False`, the
+`RunScope` freezes that choice, and `RunScope.validate_execution_profile` refuses
+any request profile that tries to enable it (`run scope cannot enable network
+access`). A task, a decision, a plan, a tool intent, a `HarnessRequest`, or
+metadata cannot enable it. `ToolIntent` refuses `network`/`network_access`
+outright as authority-shaped argument keys.
+
+*Residual risk (network).* **GAP-B is PARTIAL, not closed.** The enforcement is a
+policy boundary, not a kernel sandbox: when network access is denied the adapter
+points `http_proxy`/`https_proxy`/`all_proxy` (and the uppercase variants) at a
+closed port and clears `NO_PROXY`. That is effective for well-behaved HTTP clients
+which honour those variables and ineffective against a process that opens a socket
+itself. `tests/test_execution_sandbox_boundary.py::test_proxy_denial_is_not_a_kernel_sandbox`
+asserts that socket creation still succeeds, so the documentation cannot drift
+into claiming a kernel-enforced denial. Deleting the proxy variables was never
+treated as a network sandbox. Closing it properly requires an OS mechanism -
+network namespace, firewall rule, or container - which needs privileges this
+repository cannot assume.
+
 **Task and criterion identity: one task, one criterion, one run.**
 `app/agent_runtime/criterion_identity.py` is the criterion-identity boundary. It
 makes a verdict attributable instead of anonymous:
@@ -999,6 +1107,11 @@ observations are real verdicts rather than `not_evaluated`. Without a declared
 spec nothing is invented: there is no criterion, so acceptance stays honestly
 deferred, and the legacy `run_task` path is untouched and stays
 execution-disabled by default.
+
+This table is about task/criterion identity only. It says nothing about the
+filesystem or network boundary: `run_task` carries no identity binding, yet it
+still reaches that boundary through `ExecutionCoordinator`, as the entry-point
+table in the *What is guaranteed (filesystem)* section records.
 
 Declared verification and acceptance still cover one action plus its verification.
 A run is only recorded as `COMPLETED` when the decision provider completes it after
@@ -1407,6 +1520,114 @@ loop. Он выполняется внутри `AgentHarness.run` до перв�
 `AgentHarness` остаётся единственным production-orchestration loop; discovery
 добавляет стадию в него, а не новый координатор, агент или loop.
 
+**Файловая граница исполнения и сетевая политика (GAP-A / GAP-B).**
+`app/execution/sandbox.py` владеет файловой границей одного исполнения, а сетевая
+политика живёт в frozen execution profile. Здесь оба описаны как то, чем они
+являются.
+
+*Что гарантируется (файловая система).* `WorkspaceBoundary` — единственный
+канонический ответ на вопрос «внутри ли этот путь workspace'а run?». Он
+каноникализирует корень через `os.path.realpath` (это раскрывает junction'ы и
+substituted drives, а не только symlink'и), нормализует запрошенный путь так, что
+сегменты `..` и абсолютные формы отвергаются сразу, затем каноникализирует
+результат и доказывает вложенность. Проверка применяется дважды: на границе
+authority в `RunScope.validate_execution_request` — поэтому выходящая за периметр
+рабочая директория или artifact target отвергается до любого решения о dispatch — и
+повторно внутри `LocalExecutionAdapter._run_process` непосредственно перед созданием
+дочернего процесса. Проверка в adapter'е заново каноникализирует рабочую директорию
+из живой файловой системы и доказывает, что она содержится **доверенным execution
+root, который несёт токен `AuthorizedExecution`** (scratch root изоляции, когда
+включена изоляция workspace, иначе workspace root токена); затем именно этот
+канонический путь передаётся в `Popen`, поэтому ссылка, подменённая после проверки
+authority, отвергается, а не раскрывается. Граница всегда строится через
+`WorkspaceBoundary.for_workspace(...)` от доверенного корня и никогда — от самой
+проверяемой директории. Корень всегда берётся из frozen scope и никогда — из задачи,
+решения, плана, tool intent, запроса или metadata.
+
+*Покрытие точек входа.* Граница применяется ко всякому исполнению, проходящему
+доверенную цепочку `ExecutionRequest -> ExecutionCoordinator -> AuthorizedExecution
+-> LocalExecutionAdapter`:
+
+| точка входа | файловая граница | сетевая политика |
+| --- | --- | --- |
+| `run_agent_loop` (с объявленным `AcceptanceSpec`) | применяется | применяется |
+| `run_agent_loop` (без объявленного `AcceptanceSpec`) | применяется к любому dispatch | применяется |
+| `run_accepted_task` | применяется | применяется |
+| `run_declared_verification` (host execution) | применяется | применяется |
+| любой другой вызывающий `ExecutionCoordinator` | применяется | применяется |
+| legacy `run_task` | достигает и применяется | достигает и применяется |
+| HTTP-путь совместимости task run | достигает и применяется | достигает и применяется |
+| desktop-путь совместимости | достигает и применяется | достигает и применяется |
+
+Эти три пути совместимости вызывают `ForgeApiService.run_task`, и он **не**
+находится вне границы. Он строит `RunScope` на границе сервиса
+(`_build_run_scope`, execution root которого — собственный `Workspace` сервиса, а
+никогда не HTTP-запрос) и делегирует в `RunExecutor`, который dispatch'ит через
+`ExecutionCoordinator` -> `AuthorizedExecution` -> `LocalExecutionAdapter` с этим
+scope. Поэтому `RunScope.validate_execution_request` выполняется на этом пути
+безусловно, и объявленное host execution достигает той же filesystem- и
+network-enforcement, что и любой другой вызывающий координатор.
+
+Отличается достижимость, а не enforcement: `RunExecutor` выводит
+`command_authority` из объявленных оператором execution-команд, и без серверного
+объявления execution это множество пусто, поэтому executor возвращается до запроса
+чего-либо и ни один процесс вообще не достижим. В этом дефолтном состоянии граница
+не задействована потому, что ничего не исполняется, а не потому, что её нет.
+
+Эти пути не получают ничего специфичного для `AgentHarness` (нет фаз
+`AgentHarness`, плана, revision loop, привязки task/criterion и маршрутизации
+acceptance); этот абзац — только о filesystem/network enforcement boundary на
+существующем execution path.
+
+*Что отвергается.* Обход вверх (`../`, `sub/../../x`), обход, возвращающийся внутрь
+workspace, абсолютные пути вне workspace, Windows drive paths, UNC и device paths,
+пустые пути и пути с NUL, а также directory junction или symlink, имя которого
+внутри workspace, но который разрешается наружу.
+
+*Остаточный риск (файловая система).* **OS-level filesystem sandbox отсутствует,
+поэтому GAP-A — PARTIAL, а не закрыт.** Константа `RESIDUAL_RISK` в
+`app/execution/sandbox.py` фиксирует это, а
+`tests/test_execution_sandbox_boundary.py::test_child_process_can_still_read_outside_the_workspace`
+доказывает это, запуская дочерний процесс, читающий файл вне workspace.
+
+1. **Наследование дочерним процессом — accepted residual risk.** Дочерний процесс
+   наследует файловые привилегии хоста от родителя и может открыть любой доступный
+   токену путь. Без OS-level sandbox дочерний процесс вообще не ограничен
+   workspace, поэтому это не дефект границы: граница ограничивает пути, которые
+   разрешает сама execution plane, но не системные вызовы дочернего процесса.
+2. **TOCTOU между проверкой и spawn — architectural limitation.** И проверка
+   authority, и живая проверка в adapter'е каноникализируют директорию, и `Popen`
+   получает именно этот канонический путь, что заметно сужает окно между проверкой и
+   spawn, но не может его устранить: это под силу только OS-level механизму.
+   Локальный писатель, способный подменить директорию junction'ом в этом окне, этой
+   архитектурой не останавливается. Полное устранение требует примитива уровня
+   развёртывания — контейнер, restricted token с ACL на workspace или профиль Windows
+   AppContainer / Linux namespaces — которого в этом репозитории сейчас нет.
+   Стандартная библиотека CPython не даёт переносимого примитива для этого, и этот
+   блок намеренно не добавил привилегированный или root-зависимый механизм, который
+   нельзя проверить на целевом runtime.
+
+*Что гарантируется (сеть).* Сетевая authority — deny-by-default и server-side:
+`ProjectExecutionProfile.network_access` по умолчанию `False`, `RunScope`
+замораживает этот выбор, а `RunScope.validate_execution_profile` отвергает любой
+профиль запроса, пытающийся его включить (`run scope cannot enable network access`).
+Задача, решение, план, tool intent, `HarnessRequest` или metadata не могут его
+включить. `ToolIntent` отвергает `network`/`network_access` сразу как
+authority-shaped ключи аргументов.
+
+*Остаточный риск (сеть).* **GAP-B — PARTIAL, а не закрыт.** Enforcement — это
+policy boundary, а не kernel sandbox: когда сетевой доступ запрещён, adapter
+направляет `http_proxy`/`https_proxy`/`all_proxy` (и варианты в верхнем регистре) на
+закрытый порт и очищает `NO_PROXY`. Это работает для корректных HTTP-клиентов,
+уважающих эти переменные, и не работает против процесса, открывающего сокет
+самостоятельно.
+`tests/test_execution_sandbox_boundary.py::test_proxy_denial_is_not_a_kernel_sandbox`
+доказывает, что создание сокета всё ещё succeeds, поэтому документация не может
+начать утверждать kernel-enforced запрет. Удаление proxy-переменных никогда не
+считалось сетевым sandbox'ом. Для настоящего закрытия нужен OS-механизм — network
+namespace, правило firewall или контейнер — требующий привилегий, которые этот
+репозиторий не может предполагать.
+
 **Идентичность task и criterion: одна задача, один criterion, один run.**
 `app/agent_runtime/criterion_identity.py` — это граница идентичности criterion.
 Она делает вердикт атрибутируемым вместо безымянного:
@@ -1495,6 +1716,11 @@ verification — это настоящие вердикты, а не `not_evalua
 ничего не выдумывается: criterion нет, поэтому acceptance остаётся честно
 отложенным, а legacy-путь `run_task` не тронут и по-прежнему отключён для
 исполнения по умолчанию.
+
+Эта таблица — только об идентичности task/criterion. Она ничего не говорит о
+filesystem- или network-границе: `run_task` не несёт привязки идентичности, но всё
+равно достигает этой границы через `ExecutionCoordinator`, что и фиксирует таблица
+точек входа в разделе *Что гарантируется (файловая система)*.
 
 Declared verification и acceptance по-прежнему покрывают одно действие и его
 verification. Run записывается как `COMPLETED` только когда провайдер решений

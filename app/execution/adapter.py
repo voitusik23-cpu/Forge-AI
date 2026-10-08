@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -24,6 +25,12 @@ from app.execution.request import (
     ExecutionStatus,
 )
 from app.execution.workspace_manager import EphemeralWorkspaceManager
+from app.execution.sandbox import (
+    RESIDUAL_RISK,
+    WorkspaceBoundary,
+    WorkspaceContainmentError,
+    canonical_root,
+)
 
 
 class ExecutionAuthorizationError(Exception):
@@ -92,6 +99,25 @@ class ExecutionBackend(Protocol):
         ...
 
 
+
+@dataclass(frozen=True)
+class _RootContract:
+    """Minimal workspace contract over a plain root path.
+
+    ``WorkspaceBoundary`` requires an explicit workspace, and the only trusted
+    root available inside the adapter is the one carried by the
+    ``AuthorizedExecution`` token. This adapts that path without inventing a
+    second workspace concept.
+    """
+
+    root: Path
+
+
+#: Surfaced so callers and documentation can see exactly what the execution
+#: boundary does not do.
+EXECUTION_RESIDUAL_RISK = RESIDUAL_RISK
+
+
 class LocalExecutionAdapter:
     """Executes AuthorizedExecution tokens as isolated local processes in ephemeral workspaces.
 
@@ -141,6 +167,9 @@ class LocalExecutionAdapter:
             )
             with ws_mgr:
                 scratch_root = ws_mgr.scratch_root
+                # The trusted execution root actually in use for this child. The
+                # boundary is derived from it, never from the path being checked.
+                boundary = WorkspaceBoundary.for_workspace(_RootContract(scratch_root))
                 resolved_cwd, err_res = self._resolve_working_directory(
                     intent.working_directory, scratch_root, request_id, metadata
                 )
@@ -148,7 +177,7 @@ class LocalExecutionAdapter:
                     return active_redactor.redact_result(err_res)
 
                 raw_result = self._run_process(
-                    intent, resolved_cwd, env, request_id, metadata
+                    intent, resolved_cwd, env, request_id, metadata, boundary=boundary
                 )
 
                 # Harvest artifacts before workspace cleanup
@@ -186,13 +215,15 @@ class LocalExecutionAdapter:
                             outcome_status=raw_result.outcome_status,
                         )
         else:
+            # The trusted execution root carried by the AuthorizedExecution token.
+            boundary = WorkspaceBoundary.for_workspace(_RootContract(workspace_root))
             resolved_cwd, err_res = self._resolve_working_directory(
                 intent.working_directory, workspace_root, request_id, metadata
             )
             if err_res is not None:
                 return active_redactor.redact_result(err_res)
             raw_result = self._run_process(
-                intent, resolved_cwd, env, request_id, metadata
+                intent, resolved_cwd, env, request_id, metadata, boundary=boundary
             )
 
         return active_redactor.redact_result(raw_result)
@@ -204,16 +235,19 @@ class LocalExecutionAdapter:
         request_id: str,
         metadata: dict[str, object],
     ) -> tuple[Path, ExecutionResult | None]:
-        resolved_cwd = (root / working_directory).resolve()
+        # One canonical containment implementation, shared with the authority
+        # boundary, so the adapter cannot disagree with the RunScope about what
+        # "inside the workspace" means.
         try:
-            resolved_cwd.relative_to(root)
-        except ValueError:
-            return resolved_cwd, ExecutionResult(
+            boundary = WorkspaceBoundary.for_workspace(_RootContract(root))
+            resolved_cwd = boundary.resolve_relative(working_directory)
+        except WorkspaceContainmentError as exc:
+            return root, ExecutionResult(
                 request_id=request_id,
                 status=ExecutionStatus.DENIED,
                 exit_code=None,
                 stdout="",
-                stderr="Execution denied: working directory escapes workspace root",
+                stderr=f"Execution denied by run scope: {exc}",
                 duration_seconds=0.0,
                 metadata={"denial_reason": "working_directory_escapes_workspace", **metadata},
             )
@@ -264,7 +298,10 @@ class LocalExecutionAdapter:
         for k, v in intent.environment_variables:
             env[str(k)] = str(v)
 
-        # Best-effort network restrictions
+        # Network denial is a POLICY boundary, not a kernel sandbox. It points the
+        # proxy variables of well-behaved HTTP clients at a closed port, which is
+        # effective for libraries that honour them and ineffective against a
+        # process that opens a socket directly. The child is not network-isolated.
         if not intent.network_access:
             env["http_proxy"] = "http://127.0.0.1:0"
             env["https_proxy"] = "http://127.0.0.1:0"
@@ -283,10 +320,49 @@ class LocalExecutionAdapter:
         env: dict[str, str],
         request_id: str,
         metadata: dict[str, object],
+        *,
+        boundary: WorkspaceBoundary,
     ) -> ExecutionResult:
         timeout = intent.timeout_seconds
         max_output_bytes = intent.max_output_bytes
         full_command = (intent.executable,) + intent.argv
+
+        # Last check before the child exists, against the trusted execution root -
+        # never against the path itself. The directory is re-canonicalized from the
+        # live filesystem and proved contained, and the canonical path is what
+        # Popen receives, so a link swapped after the authority check is caught
+        # here. This narrows the window between check and spawn; it cannot remove
+        # it, because only an OS-level sandbox can, so GAP-A stays PARTIAL.
+        if not isinstance(boundary, WorkspaceBoundary):
+            return ExecutionResult(
+                request_id=request_id,
+                status=ExecutionStatus.DENIED,
+                exit_code=None,
+                stdout="",
+                stderr="Execution denied by run scope: no trusted workspace boundary",
+                duration_seconds=0.0,
+                metadata={
+                    "denial_reason": "working_directory_escapes_workspace",
+                    **metadata,
+                },
+            )
+        live_cwd = canonical_root(cwd_path)
+        if not boundary.contains(live_cwd) or not live_cwd.is_dir():
+            return ExecutionResult(
+                request_id=request_id,
+                status=ExecutionStatus.DENIED,
+                exit_code=None,
+                stdout="",
+                stderr=(
+                    "Execution denied by run scope: working directory is no longer "
+                    "inside the trusted workspace root"
+                ),
+                duration_seconds=0.0,
+                metadata={
+                    "denial_reason": "working_directory_escapes_workspace",
+                    **metadata,
+                },
+            )
 
         start_time = time.monotonic()
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -295,7 +371,7 @@ class LocalExecutionAdapter:
         try:
             proc = subprocess.Popen(
                 list(full_command),
-                cwd=str(cwd_path),
+                cwd=str(live_cwd),
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

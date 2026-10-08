@@ -191,7 +191,9 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Secret, `.env` and VCS exclusion policy for staged workspaces
 - [ ] Scoped content digests for referenced inputs
 - [ ] Durable or persistent approval store (separate design: standing authorization semantics)
-- [ ] OS-level isolation and kernel network enforcement (namespaces, cgroups, Job Objects) вЂ” a separate project, not part of the authorization redesign
+- [~] **GAP-A PARTIAL** - filesystem containment is now enforced server-side at the authority boundary and re-proved immediately before the child process is created: traversal, absolute paths outside the workspace, drive/UNC paths, and junctions or symlinks that resolve outside are all refused. It is **not** an OS-level sandbox: a spawned process inherits the parent token and can still open any path that token may open.
+- [~] **GAP-B PARTIAL** - network authority is deny-by-default, frozen in the run scope, and cannot be enabled by a request profile; the adapter points the proxy variables at a closed port. It is a policy boundary, not a kernel sandbox: a process that opens a socket directly is not stopped.
+- [ ] **GAP-A / GAP-B remaining half** - OS-level isolation and kernel network enforcement (namespaces, cgroups, Job Objects) вЂ” a separate project, not part of the authorization redesign
 
 ## Phase 6 вЂ” Lifecycle, product surface and knowledge
 
@@ -437,6 +439,8 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Продвинутое динамическое перепланирование и история ревизий плана: первый срез делает revision один раз на объективный сбой и не хранит историю ревизий.
 - [ ] Более богатая retry-политика и параллельное/распределённое исполнение шагов плана: revision loop последователен и ограничен.
 - [x] Production **исполнение tools через `AgentHarness`**: `ToolIntent` (идентичность tool плюс ограниченные аргументы) авторизуется server-side из frozen `RunScope.allowed_tool_ids` run, компонуется в invocation и исполняется существующим production `ToolExecutor`, который по-прежнему владеет проверкой permission и approval. Результаты ограничиваются до попадания в event trail, а отказ терминален.
+- [~] **GAP-A PARTIAL** — файловая граница теперь применяется server-side на границе authority и повторно доказывается непосредственно перед созданием дочернего процесса: обход вверх, абсолютные пути вне workspace, drive/UNC пути, а также junction’ы и symlink’и, разрешающиеся наружу, отвергаются. Это **не** OS-level sandbox: дочерний процесс наследует токен родителя и всё ещё может открыть любой доступный ему путь.
+- [~] **GAP-B PARTIAL** — сетевая authority deny-by-default, заморожена в run scope и не может быть включена профилем запроса; adapter направляет proxy-переменные на закрытый порт. Это policy boundary, а не kernel sandbox: процесс, открывающий сокет напрямую, не останавливается.
 - [ ] Sandbox для tools и любое сетевое ограничение на уровне tools: исполнение tools переиспользует существующую in-process trust model и не закрывает GAP-A или GAP-B.
 - [ ] Несколько tool-действий на run и планирование от tools: первый срез предлагает одно tool-действие на run.
 - [ ] Параллельное исполнение и retries шагов плана: первый срез — детерминированный последовательный DAG.

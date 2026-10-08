@@ -2204,3 +2204,192 @@ Implemented in the criterion identity block. Verified against the code in
    перепланирование, параллельное и распределённое исполнение, продвинутая
    retry-политика, memory, knowledge, reviewer, idempotency и resume этим блоком не
    изменены.**
+
+## Execution Filesystem Boundary and Network Policy v0.1 (GAP-A / GAP-B)
+
+Implemented in the sandbox and network hardening block. Verified against the code
+in `app/execution/sandbox.py`, `app/execution/adapter.py`,
+`app/runtime/run_scope.py`, and `tests/test_execution_sandbox_boundary.py`.
+
+### Accepted decisions
+
+- **One canonical filesystem boundary.** `WorkspaceBoundary` is the single answer
+  to "is this path inside the run's workspace?". It canonicalizes the root with
+  `os.path.realpath` (following junctions and substituted drives, not only
+  symlinks), normalizes the requested path so `..` segments and absolute forms are
+  refused outright, then canonicalizes the result and proves containment by
+  `relative_to` on canonical paths.
+- **Enforced twice, at the right places.** The check runs at the authority
+  boundary - `RunScope.validate_execution_request` - so an escaping working
+  directory or artifact target is refused before any dispatch decision, and again
+  inside `LocalExecutionAdapter._run_process` immediately before the child process
+  is created. The adapter check re-canonicalizes the working directory from the
+  live filesystem, proves it is contained by the trusted execution root carried by
+  the `AuthorizedExecution` token, and hands that canonical path to `Popen`. The
+  boundary is always built with `WorkspaceBoundary.for_workspace(...)` from a
+  trusted root, never from the path being checked: a boundary built from the path
+  under test would compare that path with itself and could never refuse. The
+  adapter's `_resolve_working_directory` shares the same implementation instead of
+  a second lexical check.
+- **Entry points are stated explicitly.** The boundary applies to every execution
+  passing `ExecutionRequest -> ExecutionCoordinator -> AuthorizedExecution ->
+  LocalExecutionAdapter`. The legacy `run_task`, the HTTP task-run compatibility
+  path, and desktop dispatch all reach it: they call `ForgeApiService.run_task`,
+  which builds a `RunScope` through `_build_run_scope` and delegates to
+  `RunExecutor`, which dispatches through `ExecutionCoordinator` with that scope, so
+  `RunScope.validate_execution_request` runs on that path too. What differs is
+  reachability, not enforcement: `RunExecutor` derives `command_authority` from the
+  operator-declared execution commands, and with no server-side execution
+  declaration that set is empty, so no process is reachable and the boundary is
+  simply not exercised. Legacy behaviour was deliberately left unchanged: these
+  paths receive none of the `AgentHarness`-specific behaviour, and this record is
+  only about the filesystem/network boundary on the existing execution path.
+- **TOCTOU is an architectural limitation, not a defect.** Canonicalizing the
+  directory and passing that same canonical path to `Popen` narrows the window
+  between the check and the spawn; it cannot eliminate it. Only an OS-level
+  mechanism can. The limitation is recorded rather than claimed as closed.
+- **The root is authority-derived.** The boundary is built from the frozen
+  workspace only. A task, a decision, a plan, a tool intent, a request, or metadata
+  can never widen it; metadata is data.
+- **Network authority is deny-by-default and server-side.**
+  `ProjectExecutionProfile.network_access` defaults to `False`, the scope freezes
+  it, and `RunScope.validate_execution_profile` refuses a request profile that
+  tries to enable it. `ToolIntent` refuses `network`/`network_access` as
+  authority-shaped argument keys.
+
+### Rejected alternatives (with reasoning)
+
+- **Claiming GAP-A and GAP-B are closed.** Rejected: neither is. There is no
+  OS-level filesystem sandbox, and the network denial is a policy boundary rather
+  than a kernel one. Both are recorded as PARTIAL with explicit residual risk.
+- **A lexical path check as the only defense.** Rejected: `sub/../../outside`
+  contains no leading `..` and passes a naive prefix test, and a junction whose
+  name sits inside the workspace can resolve outside it. Containment is proved on
+  canonical paths, not on strings.
+- **Relying only on the adapter check.** Rejected: an escape would then be
+  discovered at the last moment inside the execution plane rather than refused by
+  the authority boundary that is supposed to own the perimeter.
+- **Adding `network_access=True` to the default profile** so an ordinary
+  development command keeps working. Rejected: it would make the production
+  default permissive. The default stays deny; an operator who needs network
+  declares it explicitly in the frozen profile.
+- **Adding a privileged or root-dependent isolation mechanism** (Windows firewall
+  rule, restricted token, AppContainer, Linux namespace) to look complete.
+  Rejected: it would not be verifiable on the target runtime and would introduce a
+  deployment requirement this repository cannot assume. The honest boundary and
+  the recorded risk are the correct outcome for this block.
+- **Deleting the proxy variables and calling network disabled.** Rejected: it was
+  never a sandbox and the code and docs now say so explicitly.
+
+### Consequences and open items
+
+1. **GAP-A is PARTIAL.** Two residual risks remain, each classified: child-process
+   inheritance is an **accepted residual risk** (a spawned process inherits the
+   parent's token and may open any path that token may open; `RESIDUAL_RISK`
+   records it and a test asserts it by reading an outside file from a child), and
+   the check-to-spawn window is an **architectural limitation**. Closing either
+   needs a deployment-level mechanism: a container, a restricted token with a
+   filesystem ACL on the workspace, or an AppContainer / namespace profile.
+2. **GAP-B is PARTIAL.** The proxy-variable denial stops well-behaved HTTP clients
+   and does not stop a direct socket; a test asserts that socket creation still
+   succeeds. Closing it needs a network namespace, a firewall rule, or a container.
+3. **The boundary constrains the execution plane, not the child's syscalls.** This
+   is stated in code, in the architecture document, and in the roadmap, and it is
+   asserted by tests rather than described only in prose.
+4. **Real task acceptance still respects the boundary.** The workspace and every
+   artifact target are checked at the authority boundary, so a run cannot be
+   accepted on the basis of a path it was never allowed to touch.
+
+## Execution Filesystem Boundary and Network Policy v0.1 — русская версия (GAP-A / GAP-B)
+
+Реализовано в блоке sandbox и network hardening. Проверено по коду в
+`app/execution/sandbox.py`, `app/execution/adapter.py`,
+`app/runtime/run_scope.py` и `tests/test_execution_sandbox_boundary.py`.
+
+### Принятые решения
+
+- **Одна каноническая файловая граница.** `WorkspaceBoundary` — единственный ответ
+  на вопрос «внутри ли этот путь workspace'а run?». Он каноникализирует корень через
+  `os.path.realpath` (раскрывая junction'ы и substituted drives, а не только
+  symlink'и), нормализует запрошенный путь так, что сегменты `..` и абсолютные формы
+  отвергаются сразу, затем каноникализирует результат и доказывает вложенность через
+  `relative_to` по каноническим путям.
+- **Проверка применяется дважды и в правильных местах.** Она выполняется на границе
+  authority — `RunScope.validate_execution_request` — поэтому выходящая за периметр
+  рабочая директория или artifact target отвергается до любого решения о dispatch, и
+  повторно внутри `LocalExecutionAdapter._run_process` непосредственно перед созданием
+  дочернего процесса. Проверка в adapter'е заново каноникализирует рабочую директорию
+  из живой файловой системы, доказывает её вложенность в доверенный execution root,
+  который несёт токен `AuthorizedExecution`, и передаёт в `Popen` именно этот
+  канонический путь. Граница всегда строится через `WorkspaceBoundary.for_workspace(...)`
+  от доверенного корня и никогда — от самой проверяемой директории: граница, построенная
+  от проверяемого пути, сравнивала бы этот путь с самим собой и не могла бы отказать.
+  `_resolve_working_directory` adapter'а использует ту же реализацию вместо второй
+  лексической проверки.
+- **Точки входа названы явно.** Граница применяется ко всякому исполнению, проходящему
+  `ExecutionRequest -> ExecutionCoordinator -> AuthorizedExecution ->
+  LocalExecutionAdapter`. Legacy `run_task`, HTTP-путь совместимости task run и
+  desktop dispatch её достигают: они вызывают `ForgeApiService.run_task`, который
+  строит `RunScope` через `_build_run_scope` и делегирует в `RunExecutor`, а тот
+  dispatch'ит через `ExecutionCoordinator` с этим scope, поэтому
+  `RunScope.validate_execution_request` выполняется и на этом пути. Отличается
+  достижимость, а не enforcement: `RunExecutor` выводит `command_authority` из
+  объявленных оператором execution-команд, и без серверного объявления execution это
+  множество пусто, поэтому ни один процесс не достижим и граница просто не
+  задействована. Legacy-поведение намеренно не менялось: эти пути не получают ничего
+  специфичного для `AgentHarness`, и эта запись — только о filesystem/network-границе
+  на существующем execution path.
+- **TOCTOU — architectural limitation, а не дефект.** Каноникализация директории и
+  передача того же канонического пути в `Popen` сужает окно между проверкой и spawn,
+  но не может его устранить. Это под силу только OS-level механизму. Ограничение
+  зафиксировано, а не объявлено закрытым.
+- **Корень выводится из authority.** Граница строится только из frozen workspace.
+  Задача, решение, план, tool intent, запрос или metadata никогда не могут её
+  расширить; metadata — это данные.
+- **Сетевая authority — deny-by-default и server-side.**
+  `ProjectExecutionProfile.network_access` по умолчанию `False`, scope замораживает
+  этот выбор, а `RunScope.validate_execution_profile` отвергает профиль запроса,
+  пытающийся его включить. `ToolIntent` отвергает `network`/`network_access` как
+  authority-shaped ключи аргументов.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Объявить GAP-A и GAP-B закрытыми.** Отклонено: ни один не закрыт. OS-level
+  filesystem sandbox отсутствует, а сетевой запрет — это policy boundary, а не
+  kernel-механизм. Оба зафиксированы как PARTIAL с явным остаточным риском.
+- **Лексическая проверка пути как единственная защита.** Отклонено:
+  `sub/../../outside` не содержит ведущего `..` и проходит наивную проверку
+  префикса, а junction, имя которого внутри workspace, может разрешаться наружу.
+  Вложенность доказывается по каноническим путям, а не по строкам.
+- **Полагаться только на проверку в adapter'е.** Отклонено: тогда выход за периметр
+  обнаруживался бы в последний момент внутри execution plane, а не отвергался
+  границей authority, которая владеет периметром.
+- **Добавить `network_access=True` в профиль по умолчанию**, чтобы обычная
+  development-команда продолжала работать. Отклонено: это сделало бы production
+  default разрешающим. Default остаётся deny; оператор, которому нужна сеть,
+  объявляет её явно в frozen profile.
+- **Добавить привилегированный или root-зависимый механизм изоляции** (правило
+  Windows firewall, restricted token, AppContainer, Linux namespace) ради
+  завершённости вида. Отклонено: это нельзя проверить на целевом runtime, и это
+  внесло бы требование к развёртыванию, которое репозиторий не может предполагать.
+  Честная граница и зафиксированный риск — правильный итог для этого блока.
+- **Удалить proxy-переменные и назвать сеть отключённой.** Отклонено: это никогда
+  не было sandbox'ом, и теперь код и документация говорят это явно.
+
+### Следствия и открытые пункты
+
+1. **GAP-A — PARTIAL.** Дочерний процесс наследует security token родителя и может
+   открыть любой доступный этому токену путь. `RESIDUAL_RISK` фиксирует это, а тест
+   доказывает это, читая файл вне workspace из дочернего процесса. Для закрытия нужен
+   механизм уровня развёртывания: контейнер, restricted token с ACL на workspace или
+   профиль AppContainer / namespaces.
+2. **GAP-B — PARTIAL.** Запрет через proxy-переменные останавливает корректные
+   HTTP-клиенты и не останавливает прямой сокет; тест доказывает, что создание сокета
+   всё ещё succeeds. Для закрытия нужен network namespace, правило firewall или
+   контейнер.
+3. **Граница ограничивает execution plane, а не системные вызовы дочернего
+   процесса.** Это сказано в коде, в архитектурном документе и в roadmap, и это
+   доказывается тестами, а не только описанием.
+4. **Реальное принятие задачи по-прежнему уважает границу.** Workspace и каждый
+   artifact target проверяются на границе authority, поэтому run не может быть
+   принят на основании пути, которого ему никогда не разрешали касаться.

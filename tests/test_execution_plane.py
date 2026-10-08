@@ -391,7 +391,8 @@ class TestExecutionPlane(unittest.TestCase):
 
     # F. Path traversal rejection
     def test_path_traversal_rejection(self) -> None:
-        # Invalid working directory traversal
+        # Invalid working directory traversal is now refused by the authority
+        # boundary itself, before the adapter is reached, with a containment reason.
         req = ExecutionRequest(
             command=(sys.executable, "-c", "print(1)"),
             working_directory="../outside",
@@ -399,7 +400,8 @@ class TestExecutionPlane(unittest.TestCase):
         )
         result = self.adapter.execute(req)
         self.assertEqual(result.status, ExecutionStatus.DENIED)
-        self.assertIn("denied by policy", result.stderr)
+        self.assertIn("workspace boundary", result.stderr)
+        self.assertIn("traversal", result.stderr)
 
         # Invalid artifact target traversal in request validation
         req_bad_target = ExecutionRequest(
