@@ -1,0 +1,395 @@
+-- Generated file. Do not edit by hand.
+-- Regenerate with: python -m app.platform.persistence.snapshot --dsn <dsn>
+--
+-- Committed snapshot of the Platform PostgreSQL schema and its
+-- row-level security policies, as PostgreSQL itself stores them.
+-- See 0015_schema_snapshot.sql for why this file exists.
+
+-- ============================================================
+-- Row-level security state (E and F must both be true on every table)
+-- ============================================================
+-- api_keys: ENABLE=True FORCE=True
+-- memberships: ENABLE=True FORCE=True
+-- organizations: ENABLE=True FORCE=True
+-- projects: ENABLE=True FORCE=True
+-- provider_accounts: ENABLE=True FORCE=True
+-- run_records: ENABLE=True FORCE=True
+-- usage_records: ENABLE=True FORCE=True
+-- users: ENABLE=True FORCE=True
+
+-- ============================================================
+-- Columns
+-- ============================================================
+
+-- api_keys
+--   id uuid null=NO default=-
+--   organization_id uuid null=NO default=-
+--   created_by_user_id uuid null=NO default=-
+--   name text null=NO default=-
+--   key_prefix text null=YES default=-
+--   scopes ARRAY null=NO default='{}'::text[]
+--   status text null=NO default='active'::text
+--   expires_at timestamp with time zone null=YES default=-
+--   revoked_at timestamp with time zone null=YES default=-
+--   last_used_at timestamp with time zone null=YES default=-
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- memberships
+--   id uuid null=NO default=-
+--   organization_id uuid null=NO default=-
+--   user_id uuid null=NO default=-
+--   role text null=NO default=-
+--   status text null=NO default='active'::text
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- organizations
+--   id uuid null=NO default=-
+--   name text null=NO default=-
+--   slug text null=YES default=-
+--   is_personal boolean null=NO default=false
+--   status text null=NO default='active'::text
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- projects
+--   id uuid null=NO default=-
+--   organization_id uuid null=NO default=-
+--   name text null=NO default=-
+--   slug text null=YES default=-
+--   status text null=NO default='active'::text
+--   workspace_ref text null=YES default=-
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- provider_accounts
+--   id uuid null=NO default=-
+--   organization_id uuid null=YES default=-
+--   provider_name text null=NO default=-
+--   secret_ref text null=NO default=-
+--   status text null=NO default='active'::text
+--   metadata jsonb null=NO default='{}'::jsonb
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- run_records
+--   id uuid null=NO default=-
+--   organization_id uuid null=NO default=-
+--   project_id uuid null=NO default=-
+--   core_run_id text null=YES default=-
+--   initiated_by_user_id uuid null=YES default=-
+--   task_id text null=NO default=''::text
+--   status text null=NO default='queued'::text
+--   started_at timestamp with time zone null=YES default=-
+--   finished_at timestamp with time zone null=YES default=-
+--   attempt_count integer null=NO default=0
+--   failure_classification text null=NO default=''::text
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- usage_records
+--   id uuid null=NO default=-
+--   organization_id uuid null=NO default=-
+--   run_record_id uuid null=NO default=-
+--   core_run_id text null=NO default=-
+--   attempt_number integer null=NO default=-
+--   provider_name text null=NO default=''::text
+--   model_name text null=NO default=''::text
+--   input_tokens bigint null=NO default=0
+--   output_tokens bigint null=NO default=0
+--   cached_tokens bigint null=NO default=0
+--   duration_seconds double precision null=NO default=0
+--   success boolean null=NO default=false
+--   fallback boolean null=NO default=false
+--   tool_call_count integer null=NO default=0
+--   completed_at timestamp with time zone null=YES default=-
+--   error_type text null=NO default=''::text
+--   created_at timestamp with time zone null=NO default=-
+
+-- users
+--   id uuid null=NO default=-
+--   email text null=NO default=-
+--   display_name text null=NO default=''::text
+--   status text null=NO default='active'::text
+--   created_at timestamp with time zone null=NO default=-
+--   updated_at timestamp with time zone null=YES default=-
+
+-- ============================================================
+-- Constraints
+-- ============================================================
+-- api_keys.api_keys_created_by_user_fk [b'f']: FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE RESTRICT
+-- api_keys.api_keys_key_prefix_not_blank [b'c']: CHECK (((key_prefix IS NULL) OR (length(btrim(key_prefix)) > 0)))
+-- api_keys.api_keys_name_not_blank [b'c']: CHECK ((length(btrim(name)) > 0))
+-- api_keys.api_keys_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
+-- api_keys.api_keys_pkey [b'p']: PRIMARY KEY (id)
+-- api_keys.api_keys_revocation_consistent [b'c']: CHECK (((status = 'revoked'::text) = (revoked_at IS NOT NULL)))
+-- api_keys.api_keys_scopes_no_blank [b'c']: CHECK ((NOT platform.text_array_has_blank_entry(scopes)))
+-- api_keys.api_keys_status_valid [b'c']: CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text])))
+-- memberships.memberships_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
+-- memberships.memberships_organization_user_unique [b'u']: UNIQUE (organization_id, user_id)
+-- memberships.memberships_pkey [b'p']: PRIMARY KEY (id)
+-- memberships.memberships_role_valid [b'c']: CHECK ((role = ANY (ARRAY['owner'::text, 'admin'::text, 'member'::text, 'billing'::text])))
+-- memberships.memberships_status_valid [b'c']: CHECK ((status = ANY (ARRAY['active'::text, 'inactive'::text, 'revoked'::text])))
+-- memberships.memberships_user_fk [b'f']: FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
+-- organizations.organizations_name_not_blank [b'c']: CHECK ((length(btrim(name)) > 0))
+-- organizations.organizations_pkey [b'p']: PRIMARY KEY (id)
+-- organizations.organizations_slug_not_blank [b'c']: CHECK (((slug IS NULL) OR (length(btrim(slug)) > 0)))
+-- organizations.organizations_status_valid [b'c']: CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text])))
+-- projects.projects_id_organization_unique [b'u']: UNIQUE (id, organization_id)
+-- projects.projects_name_not_blank [b'c']: CHECK ((length(btrim(name)) > 0))
+-- projects.projects_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
+-- projects.projects_pkey [b'p']: PRIMARY KEY (id)
+-- projects.projects_slug_not_blank [b'c']: CHECK (((slug IS NULL) OR (length(btrim(slug)) > 0)))
+-- projects.projects_status_valid [b'c']: CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
+-- projects.projects_workspace_ref_not_blank [b'c']: CHECK (((workspace_ref IS NULL) OR (length(btrim(workspace_ref)) > 0)))
+-- provider_accounts.provider_accounts_metadata_is_object [b'c']: CHECK ((jsonb_typeof(metadata) = 'object'::text))
+-- provider_accounts.provider_accounts_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
+-- provider_accounts.provider_accounts_pkey [b'p']: PRIMARY KEY (id)
+-- provider_accounts.provider_accounts_provider_name_not_blank [b'c']: CHECK ((length(btrim(provider_name)) > 0))
+-- provider_accounts.provider_accounts_secret_ref_not_blank [b'c']: CHECK ((length(btrim(secret_ref)) > 0))
+-- provider_accounts.provider_accounts_status_valid [b'c']: CHECK ((status = ANY (ARRAY['active'::text, 'disabled'::text])))
+-- run_records.run_records_attempt_count_non_negative [b'c']: CHECK ((attempt_count >= 0))
+-- run_records.run_records_core_run_id_distinct [b'c']: CHECK ((core_run_id IS DISTINCT FROM (id)::text))
+-- run_records.run_records_finished_after_started [b'c']: CHECK (((finished_at IS NULL) OR (finished_at >= started_at)))
+-- run_records.run_records_finished_requires_started [b'c']: CHECK (((finished_at IS NULL) OR (started_at IS NOT NULL)))
+-- run_records.run_records_id_organization_unique [b'u']: UNIQUE (id, organization_id)
+-- run_records.run_records_initiated_by_user_fk [b'f']: FOREIGN KEY (initiated_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+-- run_records.run_records_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
+-- run_records.run_records_pkey [b'p']: PRIMARY KEY (id)
+-- run_records.run_records_project_organization_fk [b'f']: FOREIGN KEY (project_id, organization_id) REFERENCES projects(id, organization_id) ON DELETE RESTRICT
+-- run_records.run_records_queued_has_no_core_identity [b'c']: CHECK (((status <> 'queued'::text) OR ((core_run_id IS NULL) AND (started_at IS NULL))))
+-- run_records.run_records_started_has_core_identity [b'c']: CHECK (((status = 'queued'::text) OR ((core_run_id IS NOT NULL) AND (started_at IS NOT NULL))))
+-- run_records.run_records_started_has_initiator [b'c']: CHECK (((status = 'queued'::text) OR (initiated_by_user_id IS NOT NULL)))
+-- run_records.run_records_status_valid [b'c']: CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'cancelled'::text, 'timed_out'::text, 'interrupted'::text])))
+-- run_records.run_records_succeeded_has_no_failure [b'c']: CHECK (((status <> 'succeeded'::text) OR (failure_classification = ''::text)))
+-- usage_records.usage_records_attempt_number_non_negative [b'c']: CHECK ((attempt_number >= 0))
+-- usage_records.usage_records_cached_tokens_non_negative [b'c']: CHECK ((cached_tokens >= 0))
+-- usage_records.usage_records_core_run_id_not_blank [b'c']: CHECK ((length(btrim(core_run_id)) > 0))
+-- usage_records.usage_records_duration_seconds_finite [b'c']: CHECK (((duration_seconds >= '-Infinity'::double precision) AND (duration_seconds < 'Infinity'::double precision)))
+-- usage_records.usage_records_duration_seconds_non_negative [b'c']: CHECK ((duration_seconds >= (0)::double precision))
+-- usage_records.usage_records_input_tokens_non_negative [b'c']: CHECK ((input_tokens >= 0))
+-- usage_records.usage_records_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
+-- usage_records.usage_records_output_tokens_non_negative [b'c']: CHECK ((output_tokens >= 0))
+-- usage_records.usage_records_pkey [b'p']: PRIMARY KEY (id)
+-- usage_records.usage_records_run_attempt_unique [b'u']: UNIQUE (run_record_id, attempt_number)
+-- usage_records.usage_records_run_organization_fk [b'f']: FOREIGN KEY (run_record_id, organization_id) REFERENCES run_records(id, organization_id) ON DELETE RESTRICT
+-- usage_records.usage_records_tool_call_count_non_negative [b'c']: CHECK ((tool_call_count >= 0))
+-- users.users_email_not_blank [b'c']: CHECK ((length(btrim(email)) > 0))
+-- users.users_email_unique [b'u']: UNIQUE (email)
+-- users.users_pkey [b'p']: PRIMARY KEY (id)
+-- users.users_status_valid [b'c']: CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text])))
+
+-- ============================================================
+-- Indexes
+-- ============================================================
+-- api_keys: CREATE INDEX api_keys_created_by_user_idx ON public.api_keys USING btree (created_by_user_id)
+-- api_keys: CREATE INDEX api_keys_organization_idx ON public.api_keys USING btree (organization_id)
+-- api_keys: CREATE INDEX api_keys_organization_status_idx ON public.api_keys USING btree (organization_id, status)
+-- api_keys: CREATE UNIQUE INDEX api_keys_pkey ON public.api_keys USING btree (id)
+-- memberships: CREATE INDEX memberships_organization_idx ON public.memberships USING btree (organization_id)
+-- memberships: CREATE INDEX memberships_organization_status_idx ON public.memberships USING btree (organization_id, status)
+-- memberships: CREATE UNIQUE INDEX memberships_organization_user_unique ON public.memberships USING btree (organization_id, user_id)
+-- memberships: CREATE UNIQUE INDEX memberships_pkey ON public.memberships USING btree (id)
+-- memberships: CREATE INDEX memberships_user_idx ON public.memberships USING btree (user_id)
+-- organizations: CREATE UNIQUE INDEX organizations_pkey ON public.organizations USING btree (id)
+-- organizations: CREATE INDEX organizations_slug_idx ON public.organizations USING btree (slug)
+-- organizations: CREATE INDEX organizations_status_idx ON public.organizations USING btree (status)
+-- projects: CREATE UNIQUE INDEX projects_id_organization_unique ON public.projects USING btree (id, organization_id)
+-- projects: CREATE INDEX projects_organization_idx ON public.projects USING btree (organization_id)
+-- projects: CREATE UNIQUE INDEX projects_organization_slug_unique ON public.projects USING btree (organization_id, slug) WHERE (slug IS NOT NULL)
+-- projects: CREATE INDEX projects_organization_status_idx ON public.projects USING btree (organization_id, status)
+-- projects: CREATE UNIQUE INDEX projects_pkey ON public.projects USING btree (id)
+-- provider_accounts: CREATE INDEX provider_accounts_metadata_idx ON public.provider_accounts USING gin (metadata jsonb_path_ops)
+-- provider_accounts: CREATE INDEX provider_accounts_organization_idx ON public.provider_accounts USING btree (organization_id)
+-- provider_accounts: CREATE UNIQUE INDEX provider_accounts_pkey ON public.provider_accounts USING btree (id)
+-- provider_accounts: CREATE INDEX provider_accounts_provider_name_idx ON public.provider_accounts USING btree (provider_name)
+-- provider_accounts: CREATE UNIQUE INDEX provider_accounts_system_provider_unique ON public.provider_accounts USING btree (provider_name) WHERE (organization_id IS NULL)
+-- provider_accounts: CREATE UNIQUE INDEX provider_accounts_tenant_provider_unique ON public.provider_accounts USING btree (organization_id, provider_name) WHERE (organization_id IS NOT NULL)
+-- run_records: CREATE INDEX run_records_core_run_id_idx ON public.run_records USING btree (core_run_id) WHERE (core_run_id IS NOT NULL)
+-- run_records: CREATE UNIQUE INDEX run_records_id_organization_unique ON public.run_records USING btree (id, organization_id)
+-- run_records: CREATE INDEX run_records_initiated_by_user_idx ON public.run_records USING btree (initiated_by_user_id)
+-- run_records: CREATE INDEX run_records_organization_created_idx ON public.run_records USING btree (organization_id, created_at DESC)
+-- run_records: CREATE INDEX run_records_organization_idx ON public.run_records USING btree (organization_id)
+-- run_records: CREATE INDEX run_records_organization_status_idx ON public.run_records USING btree (organization_id, status)
+-- run_records: CREATE UNIQUE INDEX run_records_pkey ON public.run_records USING btree (id)
+-- run_records: CREATE INDEX run_records_project_created_idx ON public.run_records USING btree (project_id, created_at DESC)
+-- usage_records: CREATE INDEX usage_records_core_run_id_idx ON public.usage_records USING btree (core_run_id)
+-- usage_records: CREATE INDEX usage_records_organization_created_idx ON public.usage_records USING btree (organization_id, created_at DESC)
+-- usage_records: CREATE INDEX usage_records_organization_idx ON public.usage_records USING btree (organization_id)
+-- usage_records: CREATE UNIQUE INDEX usage_records_pkey ON public.usage_records USING btree (id)
+-- usage_records: CREATE UNIQUE INDEX usage_records_run_attempt_unique ON public.usage_records USING btree (run_record_id, attempt_number)
+-- usage_records: CREATE INDEX usage_records_run_record_idx ON public.usage_records USING btree (run_record_id)
+-- users: CREATE UNIQUE INDEX users_email_unique ON public.users USING btree (email)
+-- users: CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)
+-- users: CREATE INDEX users_status_idx ON public.users USING btree (status)
+
+-- ============================================================
+-- Row-level security policies
+-- ============================================================
+-- policy api_keys.api_keys_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy api_keys.api_keys_tenant_delete cmd=DELETE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy api_keys.api_keys_tenant_insert cmd=INSERT roles={forge_platform_app}
+--   USING      None
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy api_keys.api_keys_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy api_keys.api_keys_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy memberships.memberships_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy memberships.memberships_tenant_delete cmd=DELETE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy memberships.memberships_tenant_insert cmd=INSERT roles={forge_platform_app}
+--   USING      None
+--   WITH CHECK (platform.is_current_organization(organization_id) AND (EXISTS ( SELECT 1
+   FROM organizations o
+  WHERE ((o.id = memberships.organization_id) AND (o.id = platform.current_organization_id())))))
+-- policy memberships.memberships_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy memberships.memberships_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy organizations.organizations_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy organizations.organizations_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      ((platform.current_organization_id() IS NOT NULL) AND (id = platform.current_organization_id()) AND (EXISTS ( SELECT 1
+   FROM memberships m
+  WHERE ((m.organization_id = organizations.id) AND (m.status = 'active'::text)))))
+--   WITH CHECK None
+-- policy projects.projects_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy projects.projects_tenant_delete cmd=DELETE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy projects.projects_tenant_insert cmd=INSERT roles={forge_platform_app}
+--   USING      None
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy projects.projects_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy projects.projects_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy provider_accounts.provider_accounts_system_owned cmd=ALL roles={forge_platform_system}
+--   USING      platform.is_system_owned_provider_account(organization_id)
+--   WITH CHECK platform.is_system_owned_provider_account(organization_id)
+-- policy provider_accounts.provider_accounts_tenant_delete cmd=DELETE roles={forge_platform_app}
+--   USING      ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
+--   WITH CHECK None
+-- policy provider_accounts.provider_accounts_tenant_insert cmd=INSERT roles={forge_platform_app}
+--   USING      None
+--   WITH CHECK ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
+-- policy provider_accounts.provider_accounts_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
+--   WITH CHECK None
+-- policy provider_accounts.provider_accounts_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
+--   WITH CHECK ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
+-- policy run_records.run_records_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy run_records.run_records_tenant_delete cmd=DELETE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy run_records.run_records_tenant_insert cmd=INSERT roles={forge_platform_app}
+--   USING      None
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy run_records.run_records_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy run_records.run_records_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy usage_records.usage_records_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy usage_records.usage_records_tenant_delete cmd=DELETE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy usage_records.usage_records_tenant_insert cmd=INSERT roles={forge_platform_app}
+--   USING      None
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy usage_records.usage_records_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK None
+-- policy usage_records.usage_records_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      platform.is_current_organization(organization_id)
+--   WITH CHECK platform.is_current_organization(organization_id)
+-- policy users.users_system_scope cmd=ALL roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy users.users_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      ((id = (NULLIF(current_setting('forge.user_id'::text, true), ''::text))::uuid) OR ((platform.current_organization_id() IS NOT NULL) AND (EXISTS ( SELECT 1
+   FROM (memberships m_self
+     JOIN memberships m_other ON ((m_other.organization_id = m_self.organization_id)))
+  WHERE ((m_self.user_id = (NULLIF(current_setting('forge.user_id'::text, true), ''::text))::uuid) AND (m_self.organization_id = platform.current_organization_id()) AND (m_other.user_id = users.id))))))
+--   WITH CHECK None
+
+-- ============================================================
+-- Helper functions in schema platform
+-- ============================================================
+
+-- CREATE OR REPLACE FUNCTION platform.current_organization_id()
+--  RETURNS uuid
+--  LANGUAGE sql
+--  STABLE
+-- AS $function$
+--     SELECT nullif(current_setting('forge.organization_id', true), '')::uuid
+-- $function$
+
+-- CREATE OR REPLACE FUNCTION platform.current_user_id()
+--  RETURNS uuid
+--  LANGUAGE sql
+--  STABLE
+-- AS $function$
+--     SELECT nullif(current_setting('forge.user_id', true), '')::uuid
+-- $function$
+
+-- CREATE OR REPLACE FUNCTION platform.is_current_organization(row_organization_id uuid)
+--  RETURNS boolean
+--  LANGUAGE sql
+--  STABLE
+-- AS $function$
+--     SELECT row_organization_id IS NOT NULL
+--        AND row_organization_id = platform.current_organization_id()
+-- $function$
+
+-- CREATE OR REPLACE FUNCTION platform.is_system_owned_provider_account(row_organization_id uuid)
+--  RETURNS boolean
+--  LANGUAGE sql
+--  STABLE
+-- AS $function$
+--     SELECT row_organization_id IS NULL
+--        AND platform.system_scope_is_declared()
+-- $function$
+
+-- CREATE OR REPLACE FUNCTION platform.system_scope_is_declared()
+--  RETURNS boolean
+--  LANGUAGE sql
+--  STABLE
+-- AS $function$
+--     SELECT coalesce(nullif(current_setting('forge.system_scope', true), ''), 'off') = 'on'
+-- $function$
+
+-- CREATE OR REPLACE FUNCTION platform.text_array_has_blank_entry(entries text[])
+--  RETURNS boolean
+--  LANGUAGE sql
+--  IMMUTABLE
+-- AS $function$
+--     SELECT EXISTS (
+--         SELECT 1 FROM unnest(entries) AS entry
+--         WHERE length(btrim(entry)) = 0
+--     )
+-- $function$

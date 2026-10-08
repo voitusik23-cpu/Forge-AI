@@ -4252,3 +4252,111 @@ O-9 решён как дизайн-решение. Реализация и V-1/V
    индексах K-4.
 6. **`D-PLATFORM-17` не отменяется.** Он записал дизайн-проход и оставил
    эти пункты предложенными; эта запись их решает.
+
+
+### Implementation status (recorded after the migration)
+
+The migration, the schema, and the row-level security policies are implemented.
+Twelve numbered SQL migrations under
+`app/platform/persistence/postgres/migrations/`, a consolidated
+`schema.sql` generated from them, and a committed `schema.snapshot.sql` that
+records the schema as PostgreSQL itself stores it.
+
+**Verifications V-1 and V-2 are complete, measured on PostgreSQL 17.11:**
+
+- **V-1.** With no tenant context, all eight tables return zero rows to the tenant
+  role, and insert, update and delete are rejected. The measurement produced a
+  result that refines this record: there are **two** no-context states, not one.
+  A setting that was *never assigned* returns `NULL`; a setting that was *assigned
+  and then reverted* returns an **empty string**. A predicate written only as
+  `IS NOT NULL` is therefore true in the second state, which is exactly the window
+  in which a pooled connection could serve the next request. The adopted
+  `nullif(..., '')` predicate denies in both, and the contract tests assert both —
+  including that the unsound predicate is **true** on an empty setting.
+- **V-2.** `SET LOCAL` lives only inside its transaction. After commit, the setting
+  is empty, the helper returns NULL, and the tenant role sees zero rows.
+
+**Two additions the implementation needed, neither of which changes a decision:**
+
+- **Row-level security does not apply to a table's owner**, so all eight tables
+  carry both `ENABLE` and `FORCE ROW LEVEL SECURITY`, and the two platform roles
+  are kept separate from the migration role. Both roles are `NOLOGIN`,
+  `NOSUPERUSER` and `NOBYPASSRLS`: they are authorization scopes reached with
+  `SET ROLE`, not login accounts, so no password exists in the schema.
+- **The tenant must be bound with `set_config(name, value, true)`, not with a
+  literal `SET LOCAL`.** `SET` accepts no placeholder, so `SET LOCAL
+  forge.organization_id = $1` is a parse error, and building the statement by
+  interpolation would splice a client-supplied value into SQL.
+
+**One correction.** PostgreSQL has no `isfinite(double precision)` — the function
+exists only for date and time types. The `duration_seconds` guard is written as a
+comparison against the two infinity values. NaN needs no separate clause and must
+not be handled by a self-equality test, because PostgreSQL considers NaN equal to
+itself and greater than every other float; such a clause would have **accepted**
+NaN rather than rejecting it.
+
+**Deliberate absences, asserted by the tests:** no unique constraint on
+`core_run_id` (K-8) or on `key_prefix` (K-5); no `scopes` GIN index (K-9); and a
+terminal `RunRecord` status without `finished_at` is accepted, because that
+question belongs to O-7.
+
+**Open decisions are unchanged.** O-1 … O-7 remain **open**; O-8 remains resolved
+at contract level; O-9 is resolved as a design decision and now implemented;
+O-10 … O-13 remain deferred. No billing table, money column, repository, service,
+endpoint, authentication mechanism, credential resolver, or Platform -> Core
+transport was created, and Core gained no database dependency.
+
+
+### Статус реализации (записано после миграции)
+
+Миграция, схема и политики row-level security реализованы. Двенадцать
+нумерованных SQL-миграций в `app/platform/persistence/postgres/migrations/`, консолидированный `schema.sql`,
+сгенерированный из них, и закоммиченный `schema.snapshot.sql`, фиксирующий схему
+так, как её хранит сам PostgreSQL.
+
+**Проверки V-1 и V-2 выполнены, измерены на PostgreSQL 17.11:**
+
+- **V-1.** Без tenant-контекста все восемь таблиц возвращают ноль строк
+  tenant-роли, а вставка, обновление и удаление отклоняются. Измерение дало
+  уточнение к этой записи: состояний «нет контекста» **два**, а не одно.
+  Никогда не заданная настройка возвращает `NULL`; настройка, которая была задана
+  и затем откачена, возвращает **пустую строку**. Предикат, написанный только как
+  `IS NOT NULL`, поэтому истинен во втором состоянии — именно в том окне, в котором
+  соединение из пула могло бы обслужить следующий запрос. Принятый
+  предикат `nullif(..., '')` отказывает в обоих, и контрактные тесты базы
+  данных проверяют оба — включая то, что ненадёжный предикат **истинен** на
+  пустой настройке.
+- **V-2.** `SET LOCAL` живёт только внутри своей транзакции. После commit
+  настройка пуста, хэлпер возвращает NULL, а tenant-роль видит ноль строк.
+
+**Два добавления, которые потребовала реализация, и ни одно из них
+не изменяет решение:**
+
+- **Row-level security не применяется к владельцу таблицы**, поэтому все
+  восемь таблиц несут и `ENABLE`, и `FORCE ROW LEVEL SECURITY`, а две роли Platform отделены от
+  роли миграций. Обе роли — `NOLOGIN`, `NOSUPERUSER` и `NOBYPASSRLS`: это скоупы
+  авторизации, достигаемые через `SET ROLE`, а не login-аккаунты, поэтому пароля в
+  схеме нет.
+- **Арендатора нужно связывать через `set_config(name, value, true)`, а не через
+  литеральный `SET LOCAL`.** `SET` не принимает плейсхолдер, поэтому
+  `SET LOCAL forge.organization_id = $1` — ошибка разбора, а сборка запроса
+  интерполяцией вставила бы клиентское значение в SQL.
+
+**Одна коррекция.** В PostgreSQL нет `isfinite(double precision)` — функция
+существует только для типов даты и времени. Защита `duration_seconds` написана как
+сравнение с двумя значениями бесконечности. NaN не требует отдельного условия
+и не должен обрабатываться проверкой самого себя на равенство, потому что
+PostgreSQL считает NaN равным самому себе и большим любого другого float; такое
+условие **приняло** бы NaN, а не отвергло бы его.
+
+**Намеренные отсутствия, проверяемые тестами:** нет уникального
+ограничения на `core_run_id` (K-8) и на `key_prefix` (K-5); нет GIN-индекса `scopes` (K-9);
+терминальный статус `RunRecord` без `finished_at` принимается, потому что этот
+вопрос относится к O-7.
+
+**Открытые решения не изменены.** O-1 … O-7 остаются **открытыми**; O-8
+остаётся решённым на уровне контракта; O-9 решён как дизайн-решение и теперь
+реализован; O-10 … O-13 остаются отложенными. Не создано ни одной
+Billing-таблицы, ни денежной колонки, ни репозитория, ни сервиса, ни endpoint'а, ни
+механизма аутентификации, ни разрешения кредилов, ни транспорта
+Platform -> Core, и Core не получил зависимости от базы данных.

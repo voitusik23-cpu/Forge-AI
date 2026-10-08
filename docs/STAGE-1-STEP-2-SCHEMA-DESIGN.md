@@ -19,7 +19,10 @@
 > **Baseline.** `281e7cc` (`docs(platform): formalize system-owned provider
 > accounts`), domain contracts from `2ddec41`.
 >
-> **Implementation status: NOT STARTED.**
+> **Implementation status: the migration, the schema, and the row-level security
+> policies are IMPLEMENTED and verified against PostgreSQL 17.11.** See section N
+> for what the implementation added beyond this contract. This document remains
+> the normative design contract.
 
 ---
 
@@ -501,11 +504,10 @@ erased by a later careless query.
 
 ## I. RLS design
 
-**Status: ACCEPTED as the O-9 design decision (`D-PLATFORM-18`).** The design below
-is decided, not proposed. It is still **not implemented**: no policy exists in any
-database, and the implementation task must create and test it. `D-PLATFORM-18`
-records the decision and the two verification points the implementation must
-confirm against a real PostgreSQL instance.
+**Status: ACCEPTED as the O-9 design decision (`D-PLATFORM-18`), and IMPLEMENTED.**
+The design below is decided and now exists as migrations 0003, 0011, 0012, 0013 and
+0014, verified against PostgreSQL 17.11. `D-PLATFORM-18` records the decision;
+section N records what the implementation added beyond it.
 
 ### I-1. How tenant context is conveyed — ACCEPTED
 
@@ -530,10 +532,20 @@ because it never sees it. See I-9 for the transaction discipline this requires.
 
 If the transaction did not set a tenant, every policy must deny. The design does
 not rely on the subtlety that `NULL = NULL` is `NULL` and therefore not `true`, and
-it does not rely on `current_setting(...)` returning `NULL`: a missing custom
-setting returns an **empty string**, not `NULL`, and an empty string is not `NULL`,
-so a predicate written only as `IS NOT NULL` would not fail closed. The condition is
-therefore written explicitly against both cases:
+it does not rely on `current_setting(...)` returning `NULL`.
+
+**There are two distinct "no context" states, and they return different values.**
+Both were measured on PostgreSQL 17 during implementation:
+
+| State | `current_setting('forge.organization_id', true)` |
+| --- | --- |
+| never assigned in this session | `NULL` |
+| assigned and then reverted (a `SET LOCAL` that was committed or rolled back) | **`''`**, not `NULL` |
+
+A predicate written only as `IS NOT NULL` is therefore **true in the second state**
+and would grant tenant access with no tenant set. `nullif(..., '')` collapses both
+states to `NULL`, and a `NULL` comparison is never true. The condition is therefore
+written explicitly against both cases:
 
 ```sql
 -- shape, not literal policy text
@@ -541,10 +553,11 @@ nullif(current_setting('forge.organization_id', true), '') IS NOT NULL
 AND organization_id = nullif(current_setting('forge.organization_id', true), '')::uuid
 ```
 
-The first conjunct makes the intent auditable and the empty-string case safe: no
-tenant context, no rows. This must hold for every operation, not only `SELECT`, and
-**its exact behaviour must be verified against a real PostgreSQL instance** during
-implementation (see `D-PLATFORM-18`, verification V-1).
+The first conjunct makes the intent auditable and both no-context states safe: no
+tenant context, no rows. This must hold for every operation, not only `SELECT`. It
+is verified: verification V-1 of `D-PLATFORM-18` was measured on PostgreSQL 17, and
+the database contract tests assert both states, including that the unsound
+predicate is **true** on an empty setting while the adopted one denies.
 
 ### I-3. Policies per table — ACCEPTED
 
@@ -653,7 +666,12 @@ primary one.
 - treat "no explicit transaction" as a defect, not as a degraded mode: without one,
   the setting does not apply and the fail-closed predicate denies, which surfaces as
   an empty result rather than as an error, so it must be covered by a test rather
-  than discovered in production.
+  than discovered in production;
+- **bind the tenant with `set_config(name, value, true)`, not with a literal
+  `SET LOCAL`.** `SET` does not accept a placeholder, so a server writing
+  `SET LOCAL forge.organization_id = $1` fails at parse time, and a server that
+  instead built the statement by interpolation would be splicing a client-supplied
+  value into SQL. `set_config` takes the tenant as an ordinary parameter.
 
 ## J. Fail-closed requirements
 
@@ -780,8 +798,9 @@ Stage 0.1  =  FROZEN / GO
 Stage 1    =  ARCHITECTURE CONTRACT READY
 Step 1     =  DOMAIN CONTRACTS READY
 Step 2     =  SCHEMA AND RLS DESIGN DECIDED
+Step 2     =  POSTGRESQL SCHEMA AND RLS IMPLEMENTED
 
-Implementation status:  NOT STARTED
+Implementation status:  SCHEMA IMPLEMENTED, DATABASE CONTRACT TESTS PASSING
 ```
 
 ## OPEN DECISIONS
@@ -802,6 +821,61 @@ its structural complement. Implementation and the two verifications of
 **Deferred to later stages:** O-10 provider pricing source; O-11 payment processor;
 O-12 tax/invoice; O-13 reseller/partner economics; all Billing and deferred
 entities.
+
+## N. Implementation notes (what the migration had to add)
+
+The migration and the policies implement this contract. Four points needed a
+decision that the design had left implicit, plus one correction. None of them
+changes an accepted decision; each is recorded here so the contract and the
+implementation cannot drift apart.
+
+**N-1. Row-level security does not apply to a table's owner.** An owner bypasses
+RLS unless the table is also marked `FORCE ROW LEVEL SECURITY`. Both keywords are
+therefore written on all eight tables, and the two platform roles are kept separate
+from the migration role. A test that connects as the owner and expects filtered
+rows would silently observe everything.
+
+**N-2. Two roles, because one predicate cannot express two ownership modes.**
+`forge_platform_app` is the ordinary tenant path. `forge_platform_system` is the
+separate server-only boundary for system-owned `provider_accounts` rows, and it is
+gated by its own explicit session flag. Both are `NOLOGIN`, neither is a superuser,
+and neither has `BYPASSRLS`: they are authorization scopes reached with `SET ROLE`,
+not login accounts, so no password exists anywhere in the schema.
+
+`users` and `organizations` are not tenant-owned, so neither uses the tenant
+predicate. `organizations` visibility is membership-mediated and requires an ACTIVE
+membership; `users` visibility is self plus shared-organization. The tenant role has
+**no** insert, update, or delete policy on `organizations`, because creating an
+organization and its first `OWNER` membership is a bootstrap step that cannot itself
+be tenant-scoped. An absent policy denies, which is the fail-closed direction.
+
+**N-3. The empty-string trap has two distinct states, not one.** Measured on
+PostgreSQL 17: a setting that was never assigned returns `NULL`, but a setting that
+was assigned and then reverted returns an **empty string**. A predicate written as
+`IS NOT NULL` is therefore true after any tenant-scoped transaction has ended, which
+is precisely the window in which a pooled connection could serve the next request.
+`nullif(..., '')` handles both. This is the single most important implementation
+detail in the RLS layer.
+
+**N-4. Bind the tenant with `set_config`, not `SET LOCAL`.** `SET` does not accept a
+parameter placeholder, so `SET LOCAL forge.organization_id = $1` is a parse error,
+and interpolating a client value into `SET` would be SQL injection. The
+implementation uses `set_config('forge.organization_id', $1, true)` inside an
+explicit transaction, which is both parameterisable and transaction-scoped.
+
+**N-5. Correction: PostgreSQL has no `isfinite(double precision)`.** The function
+exists only for the date and time types. The `duration_seconds` guard is written as
+a comparison against the two infinity values. NaN needs no separate clause and must
+not be "handled" by a self-equality test: PostgreSQL considers NaN equal to itself
+and greater than every other float, so NaN already fails both the non-negative check
+and the upper bound. A `duration_seconds = duration_seconds` clause would have
+accepted NaN instead of rejecting it.
+
+**N-6. Deliberate non-constraints, re-confirmed by the tests.** No unique constraint
+exists on `core_run_id` (K-8) or on `key_prefix` (K-5), the `scopes` GIN index does
+not exist (K-9), and a terminal `RunRecord` status without `finished_at` is
+accepted, because that question belongs to O-7. The contract tests assert each of
+these absences, so an over-eager constraint cannot be added unnoticed.
 
 ---
 
@@ -824,7 +898,10 @@ entities.
 > **Базовая точка.** `281e7cc` (`docs(platform): formalize system-owned provider
 > accounts`), доменные контракты из `2ddec41`.
 >
-> **Статус реализации: НЕ НАЧАТА.**
+> **Статус реализации: миграция, схема и политики row-level security
+> РЕАЛИЗОВАНЫ и проверены на PostgreSQL 17.11.** Что реализация добавила
+> сверх этого контракта, см. в разделе N. Этот документ остаётся нормативным
+> дизайн-контрактом.
 
 ## A. Область
 
@@ -1310,11 +1387,10 @@ usage_records.attempt_number  физическая попытка
 
 ## I. Дизайн RLS
 
-**Статус: ACCEPTED как решение по O-9 (`D-PLATFORM-18`).** Дизайн ниже решён, а не
-предложен. Он всё ещё **не реализован**: ни одной политики нет ни в какой базе
-данных, и задача реализации обязана их создать и протестировать. `D-PLATFORM-18`
-фиксирует решение и две точки проверки, которые реализация обязана
-подтвердить на реальном экземпляре PostgreSQL.
+**Статус: ACCEPTED как решение по O-9 (`D-PLATFORM-18`), и РЕАЛИЗОВАН.** Дизайн
+ниже решён и теперь существует как миграции 0003, 0011, 0012, 0013 и 0014, проверенные
+на PostgreSQL 17.11. `D-PLATFORM-18` фиксирует решение; раздел N фиксирует то, что
+реализация добавила сверх него.
 
 ### I-1. Как передаётся tenant-контекст — ACCEPTED
 
@@ -1340,9 +1416,19 @@ usage_records.attempt_number  физическая попытка
 
 Если транзакция не установила арендатора, каждая политика обязана отказать. Дизайн не
 полагается ни на тонкость, что `NULL = NULL` есть `NULL` и потому не `true`, ни на то, что
-`current_setting(...)` вернёт `NULL`: отсутствующая пользовательская настройка возвращает
-**пустую строку** (англ. *empty string*), а не `NULL`, и пустая строка не есть `NULL`, поэтому
-предикат, написанный только как `IS NOT NULL`, не был бы fail-closed. Условие поэтому
+`current_setting(...)` вернёт `NULL`.
+
+**Существуют два различных состояния «нет контекста», и они возвращают
+разные значения.** Оба измерены на PostgreSQL 17 во время реализации:
+
+| Состояние | `current_setting('forge.organization_id', true)` |
+| --- | --- |
+| никогда не задавалась в этой сессии | `NULL` |
+| задавалась и затем была откачена (`SET LOCAL`, завершённый или откаченный) | **`''`**, а не `NULL` |
+
+Предикат, написанный только как `IS NOT NULL`, поэтому **истинен во втором
+состоянии** и выдал бы доступ к арендатору без арендатора. `nullif(..., '')` сводит оба
+состояния к `NULL`, а сравнение с `NULL` никогда не истинно. Условие поэтому
 формулируется явно против обоих случаев:
 
 ```sql
@@ -1351,11 +1437,12 @@ nullif(current_setting('forge.organization_id', true), '') IS NOT NULL
 AND organization_id = nullif(current_setting('forge.organization_id', true), '')::uuid
 ```
 
-Первый конъюнкт делает намерение проверяемым и безопасным для случая
-пустой строки: нет tenant-контекста — нет строк. Это должно выполняться для
-каждой операции, а не только для `SELECT`, и **её точное поведение обязано быть
-проверено на реальном экземпляре PostgreSQL** во время реализации
-(см. `D-PLATFORM-18`, проверка V-1).
+Первый конъюнкт делает намерение проверяемым и безопасным для обоих
+состояний без контекста: нет tenant-контекста — нет строк. Это должно выполняться для
+каждой операции, а не только для `SELECT`. Это проверено: проверка V-1 из
+`D-PLATFORM-18` была измерена на PostgreSQL 17, и контрактные тесты базы данных
+проверяют оба состояния, включая то, что ненадёжный предикат **истинен** на
+пустой настройке, а принятый — отказывает.
 
 ### I-3. Политики по таблицам — ACCEPTED
 
@@ -1465,7 +1552,12 @@ RLS — механизм видимости строк и **не должен** 
 - считать «нет явной транзакции» дефектом, а не деградированным
   режимом: без неё настройка не действует и fail-closed предикат отказывает, что
   проявляется как пустой результат, а не как ошибка, поэтому это должно
-  быть покрыто тестом, а не обнаружено в production.
+  быть покрыто тестом, а не обнаружено в production;
+- **связывать арендатора через `set_config(name, value, true)`, а не через
+  литеральный `SET LOCAL`.** `SET` не принимает плейсхолдер, поэтому сервер с
+  `SET LOCAL forge.organization_id = $1` падает на этапе разбора, а сервер, который вместо
+  этого собирал бы запрос интерполяцией, вставлял бы клиентское значение
+  в SQL. `set_config` принимает арендатора обычным параметром.
 
 ## J. Требования fail-closed
 
@@ -1587,8 +1679,9 @@ Stage 0.1  =  FROZEN / GO
 Stage 1    =  ARCHITECTURE CONTRACT READY
 Step 1     =  DOMAIN CONTRACTS READY
 Step 2     =  SCHEMA AND RLS DESIGN DECIDED
+Step 2     =  POSTGRESQL SCHEMA AND RLS IMPLEMENTED
 
-Implementation status:  NOT STARTED
+Implementation status:  SCHEMA IMPLEMENTED, DATABASE CONTRACT TESTS PASSING
 ```
 
 ## OPEN DECISIONS
@@ -1609,3 +1702,58 @@ Platform -> Core; O-7 enum статусов `RunRecord`.
 **Отложено на более поздние этапы:** O-10 источник провайдерских цен; O-11
 платёжный процессор; O-12 налоги/инвойсы; O-13 экономика reseller/partner; все
 Billing- и отложенные сущности.
+
+## N. Заметки реализации (что миграция добавила сверх контракта)
+
+Миграция и политики реализуют этот контракт. Четыре пункта потребовали
+решения, которое дизайн оставил неявным, плюс одна коррекция. Ни один из них
+не изменяет принятое решение; каждый записан здесь, чтобы контракт и
+реализация не расходились.
+
+**N-1. Row-level security не применяется к владельцу таблицы.** Владелец
+обходит RLS, если таблица не помечена ещё и `FORCE ROW LEVEL SECURITY`. Поэтому оба
+ключевых слова написаны на всех восьми таблицах, а две роли Platform отделены от
+роли миграций. Тест, который подключается как владелец и ждёт отфильтрованных
+строк, молча увидел бы всё.
+
+**N-2. Две роли, потому что один предикат не выражает два режима
+владения.** `forge_platform_app` — обычный путь арендатора.
+`forge_platform_system` — отдельная server-only граница для system-owned строк
+`provider_accounts`, ограниченная собственным явным session-флагом. Обе — `NOLOGIN`,
+ни одна не superuser и ни одна не имеет `BYPASSRLS`: это скоупы авторизации,
+достигаемые через `SET ROLE`, а не login-аккаунты, поэтому пароля в схеме нет нигде.
+
+`users` и `organizations` не tenant-owned, поэтому ни одна из них не использует
+tenant-предикат. Видимость `organizations` опосредована membership и требует АКТИВНОГО
+membership; видимость `users` — себя плюс общая организация. У tenant-роли **нет**
+политик INSERT, UPDATE или DELETE на `organizations`, потому что создание
+организации и её первого `OWNER` membership — это bootstrap-шаг, который сам не может
+быть tenant-scoped. Отсутствующая политика отказывает — это направление fail-closed.
+
+**N-3. Ловушка пустой строки имеет два состояния, а не одно.** Измерено на
+PostgreSQL 17: никогда не заданная настройка возвращает `NULL`, но настройка, которая была
+задана и затем откачена, возвращает **пустую строку**. Предикат
+`IS NOT NULL` поэтому истинен после завершения любой tenant-scoped транзакции — именно в том
+окне, в котором соединение из пула могло бы обслужить следующий запрос. `nullif(..., '')`
+обрабатывает оба. Это самая важная деталь реализации в слое RLS.
+
+**N-4. Связывать арендатора через `set_config`, а не через `SET LOCAL`.** `SET` не
+принимает плейсхолдер, поэтому `SET LOCAL forge.organization_id = $1` — ошибка разбора, а
+интерполяция клиентского значения в `SET` была бы SQL-инъекцией. Реализация
+использует `set_config('forge.organization_id', $1, true)` внутри явной транзакции, что
+одновременно параметризуемо и ограничено транзакцией.
+
+**N-5. Коррекция: в PostgreSQL нет `isfinite(double precision)`.** Функция существует
+только для типов даты и времени. Защита `duration_seconds` написана как сравнение с
+двумя значениями бесконечности. NaN не требует отдельного условия и не должен
+«обрабатываться» проверкой самого себя на равенство: PostgreSQL считает NaN
+равным самому себе и большим любого другого float, поэтому NaN уже не проходит
+ни проверку неотрицательности, ни верхнюю границу. Условие
+`duration_seconds = duration_seconds` приняло бы NaN, а не отвергло бы его.
+
+**N-6. Намеренные не-ограничения, подтверждённые тестами.** Нет
+уникального ограничения на `core_run_id` (K-8) и на `key_prefix` (K-5), GIN-индекс `scopes`
+не существует (K-9), а терминальный статус `RunRecord` без `finished_at` принимается,
+потому что этот вопрос относится к O-7. Контрактные тесты базы данных
+проверяют каждое из этих отсутствий, поэтому лишнее ограничение не может быть
+добавлено незамеченным.
