@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
@@ -20,6 +21,7 @@ from app.context.assembler import DecisionContextAssembler
 from app.decision.models import Decision, DecisionAction, DecisionRequest, DecisionType
 from app.decision.provider import DecisionProvider, DeterministicDecisionProvider
 from app.decision.validator import DecisionValidationReport, validate_decision
+from app.planning.validation import require_valid_plan
 from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
 from app.execution.identity import command_is_allowed
@@ -68,6 +70,7 @@ class AgentHarness:
         memory_store: Any | None = None,
         observer: Callable[[EventType, Mapping[str, object]], None] | None = None,
         project_discovery: Any | None = None,
+        project_planner: Any | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -87,6 +90,10 @@ class AgentHarness:
         # Optional server-side observation layer. It holds no authority: it reads
         # the workspace the request carries and returns a bounded snapshot.
         self._project_discovery = project_discovery
+        # Optional declarative planning layer. It turns the trusted goal and the
+        # observation into an immutable intention; it holds no execution authority
+        # and cannot reach the filesystem, a coordinator, or an adapter.
+        self._project_planner = project_planner
 
     def _enforce_run_scope(self, request: HarnessRequest) -> None:
         """Freeze and enforce the run's security perimeter before any read.
@@ -123,6 +130,24 @@ class AgentHarness:
 
         scope.freeze()
         require_active_scope(request.run_id, scope)
+
+    def _planning_goal(self, request: HarnessRequest) -> str:
+        """Extract the trusted goal the planner may work from.
+
+        The goal comes only from the task specification's own text, which the
+        trusted server-side composition supplies. Nothing here reads a decision,
+        an LLM output, or a client-supplied authority field.
+        """
+        spec = request.task_specification
+        if spec is None:
+            return ""
+        # Only descriptive text is a goal. The task id is an identity, not an
+        # intention, so it is never used to fabricate one.
+        for attribute in ("description", "title"):
+            value = getattr(spec, attribute, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
 
     def run_verification(
         self,
@@ -291,6 +316,59 @@ class AgentHarness:
 
 
 
+        # Declarative planning stage. It runs after the observation and before the
+        # first decision, so the decision is informed by a validated intention. A
+        # plan is not authority: it names intentions only, and any real action
+        # still has to pass the existing authorization chain.
+        execution_plan: object | None = None
+        if self._project_planner is not None:
+            goal = self._planning_goal(request)
+            emit(EventType.PLANNING_STARTED, {"run_id": request.run_id})
+            planning_started = time.perf_counter()
+            try:
+                if goal:
+                    candidate = self._project_planner.plan_for_run(
+                        goal=goal,
+                        run_id=request.run_id,
+                        task_id=request.metadata.get("task_id") or request.run_id,
+                    )
+                    # A plan is usable only once server-side validation accepts it
+                    # as this run's plan. An unusable plan is reported, never used.
+                    validated, _order = require_valid_plan(
+                        candidate,
+                        run_id=request.run_id,
+                        task_id=request.metadata.get("task_id") or request.run_id,
+                    )
+                    execution_plan = validated
+                planning_failure = "" if execution_plan is not None else "no_goal"
+            except Exception as exc:  # noqa: BLE001 - a broken planner is a failure
+                execution_plan = None
+                planning_failure = type(exc).__name__
+            planning_seconds = time.perf_counter() - planning_started
+
+            if execution_plan is None:
+                emit(
+                    EventType.PLANNING_COMPLETED,
+                    {
+                        "run_id": request.run_id,
+                        "status": "failed",
+                        "failure_category": planning_failure or "planner_error",
+                        "duration_seconds": round(planning_seconds, 3),
+                    },
+                )
+            else:
+                summary = getattr(execution_plan, "bounded_summary", None)
+                payload = summary() if callable(summary) else {}
+                emit(
+                    EventType.PLANNING_COMPLETED,
+                    {
+                        "run_id": request.run_id,
+                        "status": "completed",
+                        "duration_seconds": round(planning_seconds, 3),
+                        **dict(payload),
+                    },
+                )
+
         while not current_state.terminal:
             # 0. Check bounds
             if current_state.iteration >= self.policy.max_iterations:
@@ -413,6 +491,16 @@ class AgentHarness:
                     except Exception:
                         model_info = None
 
+                # The plan reaches the decision as bounded planning context. It
+                # is a declarative intention, not authority, and only its counted
+                # summary and step purposes are exposed.
+                planning_context: dict[str, object] = {}
+                if execution_plan is not None:
+                    plan_dict = getattr(execution_plan, "to_context_dict", None)
+                    planning_context = {
+                        "plan": plan_dict() if callable(plan_dict) else {}
+                    }
+
                 context_envelope = self._context_assembler.assemble(
                     run_id=request.run_id,
                     attempt_number=current_state.attempt_number,
@@ -427,6 +515,7 @@ class AgentHarness:
                     skills=applicable_skills,
                     project_memory=project_memory,
                     understanding_snapshot=understanding_snapshot,
+                    metadata={**dict(request.metadata), **planning_context},
                     model_info=model_info,
                     budget_policy=getattr(request, "budget_policy", None),
                 )

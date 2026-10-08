@@ -47,6 +47,7 @@ from app.runtime.bootstrap import (
 from app.runtime.context import RuntimeContext
 from app.runtime.run_scope import RunScope, require_active_scope
 from app.runtime.run_store import RunStateSnapshot, RunStore
+from app.tasks.specification import TaskSpecification
 from app.tools.approval import ApprovalPolicy, ApprovalResolver
 from app.tools.acceptance import AcceptanceCriterion, AcceptanceStatus
 from app.tools.executor import ToolExecutor
@@ -577,9 +578,27 @@ class ForgeApiService:
         and is deliberately not invented here, so the acceptance stage stays
         deferred rather than pretending a successful process is task acceptance.
         """
+        # The planning goal is the operator's declared intent, delivered as a
+        # TaskSpecification so the planner has a trusted goal and the loop keeps
+        # one task identity. It is descriptive text, never authority. With no
+        # declared intent there is no goal, and the planning stage is skipped
+        # rather than given a fabricated one.
+        specification = (
+            TaskSpecification(
+                task_id=task_id,
+                title=declaration.declaration_id,
+                description=declaration.intent,
+                requirements=(),
+                acceptance_criteria=(API_RUN_CRITERION,),
+            )
+            if declaration.intent
+            else None
+        )
+
         return HarnessRequest(
             run_id=run_id,
             workspace=self._workspace,
+            task_specification=specification,
             execution_requests=(
                 to_execution_request(
                     declaration,

@@ -131,6 +131,8 @@ class EventType(str, Enum):
     ACCEPTANCE_COMPLETED = "acceptance_completed"
     PROJECT_DISCOVERY_STARTED = "project_discovery_started"
     PROJECT_DISCOVERY_COMPLETED = "project_discovery_completed"
+    PLANNING_STARTED = "planning_started"
+    PLANNING_COMPLETED = "planning_completed"
     REVISION_STARTED = "revision_started"
     REVISION_COMPLETED = "revision_completed"
     CHANGESET_CREATED = "changeset_created"

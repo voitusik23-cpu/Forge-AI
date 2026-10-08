@@ -1478,3 +1478,176 @@ and `tests/test_project_discovery_production.py`.
 4. **GAP-A, GAP-B, GAP-F (task-driven критерии), planning, revision loop,
    исполнение tools через harness, memory, knowledge, reviewer и
    idempotency/resume этим блоком не изменены.**
+
+## Production Planning v0.1
+
+Implemented in the planning block. Verified against the code in
+`app/planning/plan.py`, `app/planning/planner.py`, `app/planning/validation.py`,
+`app/agent_runtime/harness.py`, `app/execution/declaration.py`,
+`app/api/service.py`, `app/runtime/bootstrap.py`, and
+`tests/test_planning_production.py`.
+
+### Accepted decisions
+
+- **Planning is a declarative stage inside the existing loop.** It runs in
+  `AgentHarness.run` between the observation and the first decision. There is no
+  `PlanningServiceLoop`, `PlanCoordinator`, `PlannerAgentLoop`, or second harness:
+  `AgentHarness` remains the only production orchestration loop.
+- **The existing deterministic `Planner` was extended, not duplicated.**
+  `Planner.plan_for_run(goal, run_id, task_id)` reuses `create_plan` and the
+  existing templates and returns a run-bound `ExecutionPlan`. No second
+  Plan/TaskPlan abstraction was introduced.
+- **A plan is an intention, not a capability.** `PlanStepType` is a closed
+  taxonomy of `OBSERVE`, `MODIFY`, `VERIFY`, `ACCEPT`. `MODIFY` means the intent to
+  change the project; it does not grant a write.
+- **No command surface.** `ExecutionPlan` and `PlanStep` carry no argv,
+  executable, shell string, environment, working directory, timeout, network flag,
+  or tool grant, and forbid authority- or credential-shaped metadata keys at
+  construction. A plan cannot become an `AuthorizedExecution`, and nothing in the
+  planning modules can reach the coordinator, the adapter, a subprocess, or the
+  filesystem.
+- **Validation is mandatory and fail-closed.** `validate_plan` /
+  `require_valid_plan` check the run and task binding, structural soundness,
+  unique step ids, resolvable dependencies, no self-dependency, an acyclic graph
+  with a deterministic topological order, only known step types, and authority
+  isolation. An invalid plan is rejected outright; there is no silent repair.
+- **The harness validates what a planner returns.** A planner's output is
+  accepted only if `require_valid_plan` accepts it as this run's plan; otherwise
+  the stage is reported as failed and no plan reaches the loop.
+- **The goal is operator-supplied.** `ExecutionDeclaration` gained an `intent`
+  field - descriptive text naming what the declared execution is meant to achieve.
+  The service delivers it as a `TaskSpecification`. With no declared intent there
+  is no goal, so planning is skipped rather than given a fabricated one, and the
+  task id is never used as a goal because it is an identity, not an intention.
+- **One run, one plan, one identity.** The plan is bound to `run_id` and
+  `task_id`, and its fingerprint covers that binding, so a plan cannot be replayed
+  against another run. Planning runs once, before the first decision.
+- **Planning does not touch decision authority.** The plan reaches the decision as
+  bounded planning metadata. The `DecisionRequest` still carries no scope,
+  workspace, approval, command set, or execution requests, and the plan grants the
+  decision nothing it did not already have.
+- **Two events, sanitized metadata.** `PLANNING_STARTED` and
+  `PLANNING_COMPLETED` record the run id, task id, status, step count, step types,
+  dependency count, plan fingerprint, duration, and a safe failure category. No
+  command string, environment value, credential, or raw planner output is stored.
+- **Deferred on purpose.** Dynamic replanning, plan revision history, retries, and
+  parallel execution are not implemented. Revision belongs to a Revision Loop
+  block with its own decision.
+
+### Rejected alternatives (with rationale)
+
+- **A new plan model beside `ProjectPlan`.** Rejected: the existing deterministic
+  planner and its models already exist; the production need was an immutable,
+  run-bound, validated plan, which is an extension rather than a parallel system.
+- **Putting argv or a shell string in a plan step.** Rejected: that would make a
+  plan a command channel and let planning reach execution authority.
+- **Letting the planner read the workspace.** Rejected: observation already
+  happens in the discovery stage, and the planner works from the goal plus the
+  bounded observation.
+- **Letting a planner skip validation.** Rejected: the harness validates every
+  returned plan, so a planner cannot inject an unusable plan.
+- **Deriving the goal from the task id or the declaration id.** Rejected: both are
+  identities, and planning on an identity produces a meaningless plan.
+- **Repairing an invalid plan.** Rejected: silently fixing a plan that carries
+  authority-shaped data is exactly the failure the validation boundary exists to
+  prevent.
+
+### Consequences and open items
+
+1. **No replanning.** A run plans once. Reacting to new information mid-run is a
+   Revision Loop concern and stays deferred.
+2. **Sequential only.** The graph is a deterministic DAG with a single
+   topological order; parallel execution and retries are not implemented.
+3. **The templates are the planner's scope.** Planning quality is bounded by the
+   existing deterministic templates; richer planning needs its own decision.
+4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, tool execution
+   through the harness, memory, knowledge, reviewer, idempotency, and resume are
+   unchanged** by this block.
+
+## Production Planning v0.1 — русская версия
+
+Реализовано в блоке planning. Проверено по коду в `app/planning/plan.py`,
+`app/planning/planner.py`, `app/planning/validation.py`,
+`app/agent_runtime/harness.py`, `app/execution/declaration.py`,
+`app/api/service.py`, `app/runtime/bootstrap.py` и
+`tests/test_planning_production.py`.
+
+### Принятые решения
+
+- **Планирование — декларативная стадия внутри существующего loop.** Оно
+  выполняется в `AgentHarness.run` между наблюдением и первым решением.
+  `PlanningServiceLoop`, `PlanCoordinator`, `PlannerAgentLoop` или второй harness не
+  создавались: `AgentHarness` остаётся единственным production-orchestration loop.
+- **Существующий детерминированный `Planner` расширен, а не продублирован.**
+  `Planner.plan_for_run(goal, run_id, task_id)` переиспользует `create_plan` и
+  существующие шаблоны и возвращает привязанный к run `ExecutionPlan`. Вторая
+  абстракция Plan/TaskPlan не вводилась.
+- **План — намерение, а не возможность.** `PlanStepType` — закрытая таксономия
+  `OBSERVE`, `MODIFY`, `VERIFY`, `ACCEPT`. `MODIFY` означает намерение изменить
+  проект; права на запись он не даёт.
+- **Нет командной поверхности.** `ExecutionPlan` и `PlanStep` не несут ни argv, ни
+  executable, ни shell-строки, ни окружения, ни рабочей директории, ни timeout, ни
+  сетевого флага, ни выдачи tool, а на композиции запрещают ключи метаданных,
+  похожие на authority или credentials. План не может стать
+  `AuthorizedExecution`, и ничто в модулях планирования не может достичь
+  координатора, adapter'а, subprocess или файловой системы.
+- **Валидация обязательна и fail-closed.** `validate_plan` / `require_valid_plan`
+  проверяют привязку к run и task, структурную корректность, уникальность step id,
+  разрешимость зависимостей, отсутствие self-dependency, ацикличность с
+  детерминированным топологическим порядком, только известные типы шагов и
+  изоляцию authority. Невалидный план отвергается сразу; молчаливой починки нет.
+- **Harness валидирует то, что вернул планировщик.** Результат планировщика
+  принимается только если `require_valid_plan` принимает его как план этого run;
+  иначе стадия сообщается как неуспешная, и ни один план не достигает loop.
+- **Цель задаёт оператор.** `ExecutionDeclaration` получил поле `intent` —
+  описательный текст, называющий, что объявленное выполнение должно достичь.
+  Сервис доставляет его как `TaskSpecification`. Без объявленного intent цели нет,
+  поэтому планирование пропускается, а не получает выдуманную цель, и task id
+  никогда не используется как цель, поскольку это идентичность, а не намерение.
+- **Один run — один план — одна идентичность.** План привязан к `run_id` и
+  `task_id`, и его fingerprint покрывает эту привязку, поэтому план нельзя
+  переиграть на другом run. Планирование выполняется один раз, до первого решения.
+- **Планирование не затрагивает authority решения.** План достигает решения как
+  ограниченные planning-метаданные. `DecisionRequest` по-прежнему не несёт ни
+  scope, ни workspace, ни approval, ни набора команд, ни execution requests, и план
+  не даёт решению ничего, чего у него не было.
+- **Два события, санитизированные метаданные.** `PLANNING_STARTED` и
+  `PLANNING_COMPLETED` записывают run id, task id, статус, число шагов, типы шагов,
+  число зависимостей, fingerprint плана, длительность и безопасную категорию сбоя.
+  Ни командная строка, ни значение окружения, ни credentials, ни сырой вывод
+  планировщика не сохраняются.
+- **Отложено намеренно.** Динамическое перепланирование, история ревизий плана,
+  retries и параллельное исполнение не реализованы. Ревизия относится к блоку
+  Revision Loop с собственным решением.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Новая модель плана рядом с `ProjectPlan`.** Отклонено: существующий
+  детерминированный планировщик и его модели уже есть; production-потребностью был
+  неизменяемый, привязанный к run и провалидированный план, а это расширение, а не
+  параллельная система.
+- **Помещать argv или shell-строку в шаг плана.** Отклонено: это превратило бы
+  план в командный канал и позволило бы планированию достичь execution authority.
+- **Позволять планировщику читать workspace.** Отклонено: наблюдение уже
+  происходит на стадии discovery, а планировщик работает от цели и ограниченного
+  наблюдения.
+- **Позволять планировщику пропускать валидацию.** Отклонено: harness валидирует
+  каждый возвращённый план, поэтому планировщик не может внедрить непригодный план.
+- **Выводить цель из task id или declaration id.** Отклонено: и то и другое —
+  идентичности, и планирование по идентичности даёт бессмысленный план.
+- **Починить невалидный план.** Отклонено: молчаливое исправление плана, несущего
+  данные в форме authority, — ровно тот сбой, который обязана предотвращать
+  граница валидации.
+
+### Следствия и открытые пункты
+
+1. **Нет перепланирования.** Run планируется один раз. Реакция на новую информацию
+   в середине run — забота Revision Loop и остаётся отложенной.
+2. **Только последовательно.** Граф — детерминированный DAG с единственным
+   топологическим порядком; параллельное исполнение и retries не реализованы.
+3. **Область планировщика — это шаблоны.** Качество планирования ограничено
+   существующими детерминированными шаблонами; более богатое планирование требует
+   своего решения.
+4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, исполнение tools
+   через harness, memory, knowledge, reviewer, idempotency и resume этим блоком не
+   изменены.**

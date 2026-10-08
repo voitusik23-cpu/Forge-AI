@@ -910,6 +910,55 @@ trusted task
 `AgentHarness` remains the only production orchestration loop; discovery adds a
 stage to it and no new coordinator, agent, or loop.
 
+**Planning: a declarative intention, never authority.**
+`Planner.plan_for_run(goal, run_id, task_id)`
+(`app/planning/planner.py`) reuses the existing deterministic templates to turn
+the trusted goal plus the run's observation into an immutable, run-bound
+`ExecutionPlan` (`app/planning/plan.py`). It is a stage of `AgentHarness.run`,
+between the observation and the first decision:
+
+```text
+DISCOVER -> CONTEXT -> PLAN -> DECIDE -> VALIDATE -> AUTHORIZE -> ACT -> VERIFY -> ACCEPT
+```
+
+* **A plan is an intention, not a capability.** `PlanStepType` is a closed
+  taxonomy - `OBSERVE`, `MODIFY`, `VERIFY`, `ACCEPT`. `MODIFY` means the intent to
+  change the project and `VERIFY` the intent to check the result; neither grants a
+  write or a command.
+* **No command surface.** `ExecutionPlan` and `PlanStep` carry no argv, no
+  executable, no shell string, no environment, no working directory, no timeout,
+  no network flag, and no tool grant. A plan therefore cannot become an
+  `AuthorizedExecution`, and the planning modules cannot reach the coordinator,
+  the adapter, a subprocess, or the filesystem.
+* **Every plan is validated server-side before use.** `validate_plan` /
+  `require_valid_plan` (`app/planning/validation.py`) check the run and task
+  binding, structural soundness, unique step ids, resolvable dependencies, no
+  self-dependency, an acyclic graph with a deterministic topological order, only
+  known step types, and the absence of authority- or credential-shaped keys. An
+  invalid plan is rejected outright: there is no "best effort" repair.
+* **The goal is trusted.** It comes from the operator's
+  `ExecutionDeclaration.intent`, delivered as a `TaskSpecification`; it is
+  descriptive text, never authority. With no declared intent there is no goal and
+  planning is skipped rather than given a fabricated one. The task id is an
+  identity, so it is never used as a goal.
+* **One run, one plan.** The plan is bound to the run and task and its
+  fingerprint covers that binding, so a plan cannot be replayed against another
+  run. Planning runs once, before the first decision.
+* **Failure fails closed.** A planner error, an unusable plan, or a plan that
+  fails validation is reported as a failed planning stage and no plan reaches the
+  loop; the decision then runs without planning context and no execution is
+  authorized by the plan.
+* **Observability.** `PLANNING_STARTED` and `PLANNING_COMPLETED` record the run
+  id, task id, status, step count, step types, dependency count, the plan
+  fingerprint, duration, and a safe failure category. No command string,
+  environment, credential, or raw planner output is stored.
+* **The plan reaches the decision as context.** It is passed as bounded planning
+  metadata, so the decision is informed by the intention without the planning
+  layer gaining any say over what is allowed.
+
+Dynamic replanning, plan revision history, retries, and parallel execution are
+**not** implemented; revision is deferred to a separate Revision Loop block.
+
 **Acceptance slice: criterion, verification, and verdict.**
 `ForgeApiService.run_accepted_task(declaration_id)` is the production acceptance
 entry point. It is trusted in-process code whose only input is a declaration id.
@@ -1153,6 +1202,55 @@ loop. Он выполняется внутри `AgentHarness.run` до перв�
 
 `AgentHarness` остаётся единственным production-orchestration loop; discovery
 добавляет стадию в него, а не новый координатор, агент или loop.
+
+**Планирование: декларативное намерение, а не authority.**
+`Planner.plan_for_run(goal, run_id, task_id)` (`app/planning/planner.py`)
+переиспользует существующие детерминированные шаблоны, превращая доверенную цель
+вместе с наблюдением run в неизменяемый, привязанный к run `ExecutionPlan`
+(`app/planning/plan.py`). Это стадия `AgentHarness.run`, между наблюдением и первым
+решением:
+
+```text
+DISCOVER -> CONTEXT -> PLAN -> DECIDE -> VALIDATE -> AUTHORIZE -> ACT -> VERIFY -> ACCEPT
+```
+
+* **Plan — это намерение, а не возможность.** `PlanStepType` — закрытая
+  таксономия: `OBSERVE`, `MODIFY`, `VERIFY`, `ACCEPT`. `MODIFY` означает намерение
+  изменить проект, `VERIFY` — намерение проверить результат; ни то, ни другое не
+  даёт права на запись или команду.
+* **Нет поверхности команд.** `ExecutionPlan` и `PlanStep` не несут ни argv, ни
+  executable, ни shell-строки, ни окружения, ни рабочей директории, ни timeout, ни
+  сетевого флага, ни выдачи tool. Поэтому plan не может стать
+  `AuthorizedExecution`, а модули планирования не могут достичь координатора,
+  adapter'а, subprocess или файловой системы.
+* **Каждый план валидируется server-side до использования.** `validate_plan` /
+  `require_valid_plan` (`app/planning/validation.py`) проверяют привязку к run и
+  task, структурную корректность, уникальность step id, разрешимость зависимостей,
+  отсутствие self-dependency, ацикличность с детерминированным топологическим
+  порядком, только известные типы шагов и отсутствие ключей, похожих на authority
+  или credentials. Невалидный план отвергается сразу: «best effort»-починки нет.
+* **Цель доверенная.** Она приходит из операторского
+  `ExecutionDeclaration.intent`, доставляемого как `TaskSpecification`; это
+  описательный текст, а не authority. Без объявленного intent цели нет, и
+  планирование пропускается, а не получает выдуманную цель. Task id — это
+  идентичность, поэтому он никогда не используется как цель.
+* **Один run — один план.** План привязан к run и task, и его fingerprint
+  покрывает эту привязку, поэтому план нельзя переиграть на другом run.
+  Планирование выполняется один раз, до первого решения.
+* **Сбой — fail closed.** Ошибка планировщика, непригодный план или план, не
+  прошедший валидацию, сообщаются как неуспешная стадия планирования, и ни один
+  план не достигает loop; решение затем выполняется без контекста планирования, и
+  план не авторизует никакого исполнения.
+* **Наблюдаемость.** `PLANNING_STARTED` и `PLANNING_COMPLETED` записывают run id,
+  task id, статус, число шагов, типы шагов, число зависимостей, fingerprint плана,
+  длительность и безопасную категорию сбоя. Ни командная строка, ни окружение, ни
+  credentials, ни сырой вывод планировщика не сохраняются.
+* **План достигает решения как контекст.** Он передаётся как ограниченные
+  planning-метаданные, поэтому решение информируется намерением, но слой
+  планирования не получает права голоса в том, что разрешено.
+
+Динамическое перепланирование, история ревизий плана, retries и параллельное
+исполнение **не** реализованы; ревизия отложена в отдельный блок Revision Loop.
 
 **Срез acceptance: criterion, verification и вердикт.**
 `ForgeApiService.run_accepted_task(declaration_id)` — production-вход acceptance.

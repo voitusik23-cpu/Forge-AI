@@ -114,6 +114,8 @@ def create_agent_harness(
     policy: object | None = None,
     project_discovery: object | None = None,
     with_discovery: bool = True,
+    project_planner: object | None = None,
+    with_planning: bool = True,
 ) -> "AgentHarness":
     """Build the canonical production orchestration loop.
 
@@ -128,6 +130,12 @@ def create_agent_harness(
     workspace. Discovery holds no authority: it reads through the existing bounded
     scanner and can neither widen the perimeter nor choose its own root.
 
+    It also enables the declarative planning stage: the existing deterministic
+    ``Planner`` turns the trusted goal plus that observation into an immutable,
+    run-bound ``ExecutionPlan``. A plan is an intention, not authority - it has no
+    argv, executable, environment, timeout, or tool grant, and it cannot reach the
+    coordinator, the adapter, or the filesystem.
+
     Defaults are the deterministic decision provider and a coordinator over a
     local adapter, matching the historical behaviour; callers may inject a bounded
     policy (for example the one-action policy of the first vertical slice).
@@ -136,6 +144,7 @@ def create_agent_harness(
     from app.agent_runtime.policy import AgentHarnessPolicy
     from app.agent_runtime.project_discovery import ProjectDiscovery
     from app.decision.provider import DeterministicDecisionProvider
+    from app.planning.planner import Planner
     from app.execution.adapter import LocalExecutionAdapter
     from app.execution.authorizer import ExecutionCoordinator
 
@@ -148,6 +157,13 @@ def create_agent_harness(
             project_discovery
             if project_discovery is not None
             else (ProjectDiscovery() if with_discovery else None)
+        ),
+        # Declarative planning layer, also composition-owned. It produces
+        # intentions only and holds no execution authority.
+        "project_planner": (
+            project_planner
+            if project_planner is not None
+            else (Planner() if with_planning else None)
         ),
     }
     resolved_coordinator = coordinator

@@ -130,6 +130,10 @@ class HarnessRequest:
     # stage. It is populated inside the run loop, never supplied by a caller, a
     # decision, or an LLM, and it carries no authority.
     understanding_snapshot: object | None = None
+    # Per-run declarative execution intention produced by the harness's planning
+    # stage. Like the snapshot it is produced inside the run loop, is bound to
+    # this run and task, and carries no execution authority.
+    execution_plan: object | None = None
     # Immutable security perimeter for this run. When present it binds the
     # authority-relevant inputs and is validated before any context, memory,
     # knowledge, or provider output is read.

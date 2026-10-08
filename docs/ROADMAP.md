@@ -200,6 +200,9 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [x] Wire production **project discovery** into the agent loop: `ProjectDiscovery` observes the workspace through the existing `BoundedProjectScanner`/`UnderstandingSnapshotter` before the first context assembly, and the immutable snapshot reaches the decision as `PROJECT_UNDERSTANDING` context via the existing `DecisionContextAssembler`. Bounded, per-run, non-authoritative, fail-closed.
 - [ ] Directory-depth bound for the project scanner: the existing bounds cover file count, per-file size, and total bytes, but not depth. Adding one changes the scanner's own contract and needs its own decision.
 - [ ] Re-observation mid-run and snapshot-consistency mechanism: discovery currently runs once per run and the workspace may change afterwards; locking or re-observation is deferred.
+- [x] Wire production **planning** into the agent loop: `Planner.plan_for_run` reuses the existing deterministic templates to produce an immutable, run-bound `ExecutionPlan`, validated server-side before use. A plan is a declarative intention with no command surface - no argv, executable, environment, timeout, or tool grant - and it cannot become an `AuthorizedExecution`. The goal is the operator's `ExecutionDeclaration.intent`; no intent means no plan.
+- [ ] Dynamic replanning and plan revision history: planning runs once per run and a plan is immutable. Replanning on new information belongs to a Revision Loop and needs its own decision.
+- [ ] Parallel execution and retries of planned steps: the first slice is a deterministic sequential DAG.
 - [ ] Project classification and capability selection (В§22)
 - [ ] Project Brief, Architecture and Technical Specification generation for target projects
 - [ ] Ready-to-run project generation
@@ -422,6 +425,9 @@ workflow review/ревизии. Выполнение плана, управле�
 - [x] Подключить production **project discovery** к agent loop: `ProjectDiscovery` наблюдает workspace через существующие `BoundedProjectScanner`/`UnderstandingSnapshotter` до первой сборки контекста, и неизменяемый snapshot достигает decision как контекст `PROJECT_UNDERSTANDING` через существующий `DecisionContextAssembler`. Bounded, per-run, без authority, fail-closed.
 - [ ] Ограничение глубины каталогов для сканера проекта: существующие границы покрывают число файлов, размер файла и общий объём байт, но не глубину. Его добавление меняет контракт самого сканера и требует отдельного решения.
 - [ ] Повторное наблюдение в середине run и механизм согласованности snapshot: сейчас discovery выполняется один раз на run, и workspace может измениться после него; блокировка или повторное наблюдение отложены.
+- [x] Подключить production **planning** к agent loop: `Planner.plan_for_run` переиспользует существующие детерминированные шаблоны и создаёт неизменяемый, привязанный к run `ExecutionPlan`, валидируемый server-side до использования. План — декларативное намерение без командной поверхности (ни argv, ни executable, ни окружения, ни timeout, ни выдачи tool), и он не может стать `AuthorizedExecution`. Цель — операторский `ExecutionDeclaration.intent`; нет intent — нет плана.
+- [ ] Динамическое перепланирование и история ревизий плана: планирование выполняется один раз на run, и план неизменяем. Перепланирование по новой информации относится к Revision Loop и требует своего решения.
+- [ ] Параллельное исполнение и retries шагов плана: первый срез — детерминированный последовательный DAG.
 - [ ] Классификация проектов и выбор capabilities (§22)
 - [ ] Генерация Project Brief, Architecture и Technical Specification для целевых проектов
 - [ ] Генерация готового к запуску проекта

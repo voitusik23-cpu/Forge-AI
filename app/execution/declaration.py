@@ -139,6 +139,11 @@ class ExecutionDeclaration:
     timeout_seconds: float | None = None
     expected_exit_code: int = 0
     profile_id: str = ""
+    # Operator-declared intent: what this declared execution is meant to achieve.
+    # It is the trusted goal the planning stage may work from. It is descriptive
+    # text only and grants no authority; an empty intent simply means the run has
+    # no planning goal.
+    intent: str = ""
     environment_variables: Mapping[str, str] = field(default_factory=dict)
     artifact_targets: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
@@ -158,6 +163,10 @@ class ExecutionDeclaration:
             )
 
         object.__setattr__(self, "command", _normalize_command(self.command))
+
+        if not isinstance(self.intent, str):
+            raise ExecutionDeclarationError("intent must be a string")
+        object.__setattr__(self, "intent", self.intent.strip())
 
         if (
             not isinstance(self.working_directory, str)
