@@ -12,9 +12,18 @@
 > is authoritative. For **current** architecture in detail, see
 > [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Verified baseline.** Commit `33d3af5` (`feat: add Together AI provider`),
-> working tree at the time of writing. Verification command:
-> `python -m unittest discover tests` → **755 tests, OK (skipped=2)**.
+> **Verified baseline.** Commit `5ec648f` (`feat(agent): extend idempotency
+> across trusted entry points`), working tree at the time of writing. Verification
+> command, run per test file:
+> `python -m unittest discover -s tests -p <file>` → **1625 tests across 99 test
+> files**.
+>
+> **Two files are not OK, and this file does not claim otherwise.**
+> `tests/test_api.py::test_07_task_run_via_api` and
+> `tests/test_desktop.py::test_04_home_view_task_dispatch` fail with
+> `API service unavailable`, which is a provider-side baseline failure in this
+> local environment: the configured default provider is `mock`. Neither test
+> executes an idempotency path. Everything else in the suite passes.
 
 ## Status legend
 
@@ -147,6 +156,10 @@ review-engine module; the reviewer exists as an agent inside
 | Verification boundary and acceptance gate | **CURRENT / VERIFIED** | `app/tools/verification.py`, `app/tools/acceptance.py` — `tests/test_verification.py`, `tests/test_verification_contract.py`, `tests/test_acceptance.py` |
 | Test verification adapter | **CURRENT / VERIFIED** | `app/tools/test_verification.py` — `tests/test_test_verification_adapter.py` |
 | Change sets and project snapshots | **CURRENT / VERIFIED** | `app/tools/changesets.py`, `app/snapshots.py` — `tests/test_changesets.py`, `tests/test_project_snapshots.py` |
+| Server-side filesystem/workspace boundary (`WorkspaceBoundary`) | **PARTIAL** — see §4.4 | `app/execution/sandbox.py`, enforced in `app/runtime/run_scope.py` and `app/execution/adapter.py` — `tests/test_execution_sandbox_boundary.py` |
+| Network authority deny-by-default, frozen in the scope | **PARTIAL** — see §4.5 | `app/execution/profile.py`, `app/runtime/run_scope.py`, `app/execution/adapter.py` — `tests/test_execution_sandbox_boundary.py` |
+| Trusted task / criterion identity for the harness entry points | **CURRENT / VERIFIED** | `app/agent_runtime/criterion_identity.py` — `tests/test_criterion_identity_production.py`, `tests/test_identity_binding_hardening.py` |
+| Run-level production idempotency (durable ledger, atomic claim, terminal-state protection) | **PARTIAL** — see §4.8 | `app/agent_runtime/idempotency.py`, `app/agent_runtime/idempotency_integration.py`, `app/api/service.py` — `tests/test_idempotency_production.py` |
 
 ### 3.5 Memory and knowledge
 
@@ -229,18 +242,74 @@ profile marker absent.
 
 **Status: PARTIAL (hardening candidate).**
 
-### 4.4 There is no OS-level sandbox, and none is claimed
+### 4.4 There is a server-side filesystem boundary, and no OS-level sandbox
 
-`LocalExecutionAdapter` runs local processes with `shell=False`, an ephemeral
-copy of the workspace, a scoped environment whitelist, timeouts with process-tree
-termination, output caps, and secret redaction. It does **not** provide
-namespaces, cgroups, Job Objects, filesystem confinement enforced by the kernel,
-or network enforcement. `network_access=False` is enforced only by setting proxy
-environment variables — it is best-effort, not a control.
+Two different things must not be confused here.
 
-**Block 2 (sandbox / isolation / workspace-input staging) is NOT implemented.**
+**Implemented (PARTIAL): a server-side filesystem/workspace boundary.**
+`app/execution/sandbox.py::WorkspaceBoundary` is the single canonical answer to
+"is this path inside the run's workspace?". It canonicalizes the workspace root
+with `os.path.realpath` (which follows junctions and substituted drives, not only
+symlinks), normalizes the requested path, then canonicalizes the result and proves
+containment on canonical paths. It refuses:
 
-### 4.5 Staging is mirror-based, not declared-inputs
+- parent traversal (`../`, `sub/../../x`), including traversal that ends back
+  inside the workspace;
+- absolute paths outside the workspace, and Windows drive paths;
+- UNC and device paths, empty paths, and NUL-bearing paths;
+- a directory junction or symlink whose name sits inside the workspace but which
+  resolves outside it.
+
+It is enforced twice: at the authority boundary in
+`RunScope.validate_execution_request` (working directory and artifact targets), and
+again inside `LocalExecutionAdapter._run_process` immediately before the child
+process is created, which then receives the canonicalized path. The boundary is
+always built with `WorkspaceBoundary.for_workspace(...)` from a trusted root,
+never from the path being checked. The workspace root always comes from the frozen
+scope, never from a task, a request, or metadata.
+
+**Not implemented: OS/kernel-level isolation.** `LocalExecutionAdapter` runs local
+processes with `shell=False`, an ephemeral copy of the workspace, a scoped
+environment whitelist, timeouts with process-tree termination, output caps, and
+secret redaction. It does **not** provide namespaces, cgroups, Job Objects, or
+filesystem confinement enforced by the kernel. A spawned process inherits the
+parent's security token and may open any path that token may open; a child that
+opens an absolute path outside the workspace is not stopped. This residual risk is
+recorded in `RESIDUAL_RISK` and asserted by
+`tests/test_execution_sandbox_boundary.py::test_child_process_can_still_read_outside_the_workspace`.
+
+**Block 2 split into its actual parts.** The filesystem/workspace boundary is
+**PARTIAL/IMPLEMENTED** as above. OS-level sandbox and isolation remain
+**DEFERRED**. Workspace-input staging and mirroring remain **PARTIAL** (see §4.5).
+The previous blanket statement that Block 2 "is NOT implemented" was stale and has
+been removed.
+
+### 4.5 Network authority is deny-by-default; the network is not isolated
+
+Network authority is server-side and fail-closed.
+`ProjectExecutionProfile.network_access` defaults to `False`, the value is frozen
+into the `RunScope`, and `RunScope.validate_execution_profile` refuses any request
+profile that tries to enable it (`run scope cannot enable network access`). A task,
+a decision, a plan, a tool intent, a `HarnessRequest`, or metadata cannot enable
+it, and `ToolIntent` refuses `network`/`network_access` outright as
+authority-shaped argument keys. A resume must reproduce the recorded operation
+under the current authority ceiling
+(`ResumeContract.validate_against_current_authority`), so a broader current
+authority cannot be obtained from persisted state.
+
+**Enforcement mechanism.** When network access is denied, `LocalExecutionAdapter`
+points `http_proxy`/`https_proxy`/`all_proxy` (and the uppercase variants) at a
+closed port and clears `NO_PROXY`. This stops proxy-honouring HTTP clients and does
+nothing to a process that opens a socket itself.
+
+**Not implemented: kernel network isolation.** There is no network namespace, no
+firewall rule, and no container. Direct socket creation, DNS resolution, IPv4 and
+IPv6 sockets, and direct outbound connections all still work; this is asserted by
+`tests/test_execution_sandbox_boundary.py::test_proxy_denial_is_not_a_kernel_sandbox`.
+The denial is a **policy boundary, not a kernel sandbox**, and the module and
+documentation say so explicitly. GAP-B is therefore PARTIAL.
+
+### 4.6 Staging is mirror-based, not declared-inputs
 
 `EphemeralWorkspaceManager` copies the supplied workspace root (skipping `.git`
 and `__pycache__`) into a temporary scratch directory. There is no declared-input
@@ -250,7 +319,7 @@ inputs. Whatever the caller passes as `workspace_root` is what gets staged.
 **Status: PARTIAL** (workspace identity, declared inputs, deny-by-default
 staging are Block 2 / deferred).
 
-### 4.6 The execution plane has no production entry point
+### 4.7 The execution plane has no production entry point
 
 `app/runtime/bootstrap.py::create_runtime` assembles settings, providers,
 registries, the Orchestrator and `RunExecutor`. It does **not** construct an
@@ -261,8 +330,72 @@ constructed by callers: `app/agent_runtime/harness.py` and
 workspace is absent, a local spawn is denied with
 `workspace_root_required`.
 
-Consequence: several execution-plane concerns are **latent** rather than live —
-they become reachable when a production run loop is wired to the execution plane.
+**Partially superseded.** This remains true of `create_runtime` itself, but the
+production run loop now exists and is reachable from trusted server-side code:
+`ForgeApiService.run_agent_loop`, `run_accepted_task`, and
+`run_declared_verification` are the production entry points, and
+`ForgeApiService.run_task` remains the HTTP/desktop compatibility path. What is
+still latent is the *resume* path, not the execution path — see §4.8.
+
+### 4.8 Production idempotency exists; a resume driver does not
+
+Run-level idempotency is implemented, committed (`0244157`, extended by `5ec648f`),
+and covered by tests. A trusted operator may pass an `idempotency_key` to one of the
+**three trusted in-process entry points**:
+
+| entry point | operation class |
+| --- | --- |
+| `ForgeApiService.run_agent_loop` | `AGENT_LOOP` |
+| `ForgeApiService.run_accepted_task` | `ACCEPTED_TASK` |
+| `ForgeApiService.run_declared_verification` | `DECLARED_VERIFICATION` |
+
+Without a key each call keeps its previous semantics exactly.
+
+What is implemented:
+
+- a **durable idempotency ledger**, one file per key
+  (`app/agent_runtime/idempotency.py`), separate from `RunStore`, which remains an
+  observation sink and is not a resume engine;
+- an **atomic claim** through `O_EXCL` create-if-absent, so two simultaneous
+  deliveries of one key cannot both win;
+- three outcomes - **claim** (start), **replay** (a terminal record is reported
+  instead of re-executed), and **conflict** (the key is bound to a different
+  operation identity);
+- identity binding over the operation class, the canonical key, the trusted task
+  fingerprint, and every criterion fingerprint;
+- **terminal-state protection** enforced in code by
+  `validate_lifecycle_transition`: `COMPLETED`, `FAILED`, `LIMIT_REACHED`,
+  `DENIED`, and `SECURITY_FAILURE` cannot be reopened, a refused write leaves the
+  durable record untouched, and an unprovable side effect cannot be moved into a
+  recoverable state;
+- **current-authority revalidation**, so a resume must reproduce the recorded
+  operation under the current authority ceiling;
+- the claim is taken **before** the scope freeze, the `RunStore` binding, and the
+  durable `RUN_STARTED` event, so a duplicate writes no run-start event, freezes no
+  scope, and starts no run.
+
+The **idempotency key is not authority**. It cannot carry a command, a workspace, a
+profile, a tool set, network access, or an approval; it only selects which durable
+operation record a delivery belongs to.
+
+`run_task`, the HTTP task-run path, and desktop dispatch are **outside** this
+protection: their `task_id` is caller-supplied, so there is no trusted task
+identity to bind a key to. This is deliberately not "all entry points protected".
+
+Resume is **contract only**. `ResumeContract` plus the durable lifecycle state
+machine are implemented and tested, including lineage through
+`AttemptIdentity`. There is **no operator resume driver**: `AgentHarness.run()`
+always starts at `HarnessPhase.OBSERVE` and has no start-from-checkpoint
+parameter, so an automatic crash-resume would re-run the whole loop rather than
+continue safely. **Nothing in the current implementation claims working
+crash-resume.**
+
+The **`SideEffectLedger` is NOT WIRED into production.** Two-phase side-effect
+recording (`NOT_STARTED`/`STARTED`/`COMMITTED`/`FAILED`, plus the derived
+`UNKNOWN_AFTER_CRASH`) is implemented and tested as a component, but
+`begin_side_effect` and `complete_side_effect` have no caller in `app/` outside the
+module, so `UNKNOWN_AFTER_CRASH` is not reachable from the current production run
+path. GAP-I and GAP-R are PARTIAL.
 
 ## 5. Planning, deferred and rejected
 
@@ -274,7 +407,14 @@ they become reachable when a production run loop is wired to the execution plane
 | Agent/Skill/Tool/Capability governance beyond the current skill system | **PLANNED / FUTURE** | [`STAGE_1_6_AGENT_SKILL_SYSTEM.md`](STAGE_1_6_AGENT_SKILL_SYSTEM.md) |
 | Domain patterns and integrations | **CANDIDATE** | [`STAGE_1_7_EXTERNAL_SOFTWARE_DOMAIN_HARVEST.md`](STAGE_1_7_EXTERNAL_SOFTWARE_DOMAIN_HARVEST.md) |
 | Declared-invocation / fail-closed capability model | **PLANNED (candidate for Block 1.1)** | `DECISIONS.md` Execution Authorization Contract v0.2 |
-| Block 2 sandbox / isolation / declared workspace inputs | **DEFERRED** | `DECISIONS.md`, `ROADMAP.md` |
+| Block 2 filesystem/workspace boundary | **PARTIAL / IMPLEMENTED** — see §4.4 | `DECISIONS.md` (Execution Filesystem Boundary and Network Policy v0.1), `ROADMAP.md` GAP-A |
+| Block 2 OS-level sandbox and kernel isolation | **DEFERRED** | `DECISIONS.md`, `ROADMAP.md` |
+| Block 2 declared workspace inputs / deny-by-default staging | **DEFERRED** | `DECISIONS.md`, `ROADMAP.md` |
+| Operator resume driver for interrupted runs | **PLANNED / FOLLOW-UP** — contract exists, driver does not (§4.8) | `ROADMAP.md` GAP-R, `DECISIONS.md` |
+| Side-effect journal wired into production execution | **PLANNED / FOLLOW-UP** — component exists, not wired (§4.8) | `ROADMAP.md`, `DECISIONS.md` |
+| Server-derived operation identity for `run_task` / HTTP / desktop idempotency | **PLANNED / FOLLOW-UP** | `ROADMAP.md` GAP-I |
+| Compare-and-set, lease or distributed lock for cross-process claims | **DEFERRED** — documented limitation, deliberately not simulated | `ROADMAP.md`, `DECISIONS.md` |
+| Global action-level suppression across idempotency keys | **DEFERRED** — protection is key-scoped today | `ROADMAP.md`, `DECISIONS.md` |
 | Durable/persistent approval store with expiration | **DEFERRED (separate design)** | `DECISIONS.md` rejected-alternatives register |
 | MCP as permission model | **REJECTED** | `DECISIONS.md` |
 | Universal retries / rollback / parallelism / swarm execution | **REJECTED as defaults** | `AGENTS.md`, `TECHNICAL_SPECIFICATION.md` §18 |
@@ -307,9 +447,18 @@ they become reachable when a production run loop is wired to the execution plane
 > [`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md). Подробное описание
 > **текущей** архитектуры — в [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Проверенная база.** Коммит `33d3af5` (`feat: add Together AI provider`),
-> рабочее дерево на момент написания. Команда проверки:
-> `python -m unittest discover tests` → **755 tests, OK (skipped=2)**.
+> **Проверенная база.** Коммит `5ec648f`
+> (`feat(agent): extend idempotency across trusted entry points`), рабочее дерево
+> на момент написания. Команда проверки, по каждому тестовому файлу:
+> `python -m unittest discover -s tests -p <file>` → **1625 тестов в 99 тестовых
+> файлах**.
+>
+> **Два файла не OK, и этот документ не утверждает обратного.**
+> `tests/test_api.py::test_07_task_run_via_api` и
+> `tests/test_desktop.py::test_04_home_view_task_dispatch` падают с
+> `API service unavailable` — это provider-side отказ в текущем локальном
+> окружении: настроенный по умолчанию провайдер — `mock`. Ни один из этих тестов
+> не исполняет idempotency-путь. Всё остальное в наборе проходит.
 
 ## Легенда статусов
 
@@ -442,6 +591,10 @@ review-engine **нет**; reviewer существует как агент вну
 | Граница верификации и acceptance gate | **CURRENT / VERIFIED** | `app/tools/verification.py`, `app/tools/acceptance.py` — `tests/test_verification.py`, `tests/test_verification_contract.py`, `tests/test_acceptance.py` |
 | Адаптер верификации тестов | **CURRENT / VERIFIED** | `app/tools/test_verification.py` — `tests/test_test_verification_adapter.py` |
 | Change sets и снапшоты проектов | **CURRENT / VERIFIED** | `app/tools/changesets.py`, `app/snapshots.py` — `tests/test_changesets.py`, `tests/test_project_snapshots.py` |
+| Server-side файловая/workspace-граница (`WorkspaceBoundary`) | **PARTIAL** — см. §4.4 | `app/execution/sandbox.py`, применяется в `app/runtime/run_scope.py` и `app/execution/adapter.py` — `tests/test_execution_sandbox_boundary.py` |
+| Сетевая authority deny-by-default, замороженная в scope | **PARTIAL** — см. §4.5 | `app/execution/profile.py`, `app/runtime/run_scope.py`, `app/execution/adapter.py` — `tests/test_execution_sandbox_boundary.py` |
+| Доверенная идентичность task/criterion для точек входа harness | **CURRENT / VERIFIED** | `app/agent_runtime/criterion_identity.py` — `tests/test_criterion_identity_production.py`, `tests/test_identity_binding_hardening.py` |
+| Run-level production idempotency (durable журнал, атомарный claim, защита терминальных состояний) | **PARTIAL** — см. §4.8 | `app/agent_runtime/idempotency.py`, `app/agent_runtime/idempotency_integration.py`, `app/api/service.py` — `tests/test_idempotency_production.py` |
 
 ### 3.5 Память и знания
 
@@ -526,18 +679,73 @@ if res_fp and res_fp != intent.fingerprint:   # empty res_fp short-circuits
 
 **Статус: PARTIAL (кандидат на усиление).**
 
-### 4.4 OS-песочницы нет, и она не заявляется
+### 4.4 Есть server-side файловая граница, но нет OS-level песочницы
 
-`LocalExecutionAdapter` запускает локальные процессы с `shell=False`, временной
-копией workspace, ограниченным белым списком окружения, таймаутами с завершением
-дерева процессов, лимитами вывода и маскированием секретов. Он **не**
-предоставляет namespaces, cgroups, Job Objects, файловое ограничение на уровне
-ядра или сетевое ограничение. `network_access=False` обеспечивается только
-установкой переменных окружения прокси — это best-effort, а не контроль.
+Здесь нельзя смешивать две разные вещи.
 
-**Block 2 (песочница / изоляция / подготовка входов workspace) НЕ реализован.**
+**Реализовано (PARTIAL): server-side файловая/workspace-граница.**
+`app/execution/sandbox.py::WorkspaceBoundary` — единственный канонический ответ на
+вопрос «внутри ли этот путь workspace'а run?». Он каноникализирует корень
+workspace через `os.path.realpath` (это раскрывает junction'ы и substituted
+drives, а не только symlink'и), нормализует запрошенный путь, затем каноникализирует
+результат и доказывает вложенность по каноническим путям. Он отвергает:
 
-### 4.5 Подготовка основана на зеркалировании, а не на объявленных входах
+- обход вверх (`../`, `sub/../../x`), включая обход, возвращающийся внутрь
+  workspace;
+- абсолютные пути вне workspace и Windows drive paths;
+- UNC и device paths, пустые пути и пути с NUL;
+- directory junction или symlink, имя которого внутри workspace, но который
+  разрешается наружу.
+
+Проверка применяется дважды: на границе authority в
+`RunScope.validate_execution_request` (рабочая директория и artifact targets) и
+повторно внутри `LocalExecutionAdapter._run_process` непосредственно перед созданием
+дочернего процесса, который затем получает канонический путь. Граница всегда
+строится через `WorkspaceBoundary.for_workspace(...)` от доверенного корня и
+никогда — от самой проверяемой директории. Корень workspace всегда берётся из
+frozen scope и никогда — из задачи, запроса или metadata.
+
+**Не реализовано: OS/kernel-level изоляция.** `LocalExecutionAdapter` запускает
+локальные процессы с `shell=False`, временной копией workspace, ограниченным белым
+списком окружения, таймаутами с завершением дерева процессов, лимитами вывода и
+маскированием секретов. Он **не** предоставляет namespaces, cgroups, Job Objects
+или файловое ограничение на уровне ядра. Дочерний процесс наследует security token
+родителя и может открыть любой доступный этому токену путь; ребёнок, открывающий
+абсолютный путь вне workspace, не останавливается. Этот остаточный риск записан в
+`RESIDUAL_RISK` и доказан тестом
+`tests/test_execution_sandbox_boundary.py::test_child_process_can_still_read_outside_the_workspace`.
+
+**Block 2 разделён на фактические части.** Файловая/workspace-граница —
+**PARTIAL/IMPLEMENTED**, как выше. OS-level песочница и изоляция остаются
+**DEFERRED**. Подготовка/mirroring входов workspace остаётся **PARTIAL** (см. §4.5).
+Прежнее утверждение, что Block 2 «НЕ реализован», было устаревшим и удалено.
+
+### 4.5 Сетевая authority — deny-by-default; сеть не изолирована
+
+Сетевая authority — server-side и fail-closed.
+`ProjectExecutionProfile.network_access` по умолчанию `False`, значение
+замораживается в `RunScope`, а `RunScope.validate_execution_profile` отклоняет любой
+профиль запроса, пытающийся его включить (`run scope cannot enable network
+access`). Задача, решение, план, tool intent, `HarnessRequest` или metadata не могут
+его включить, а `ToolIntent` сразу отвергает `network`/`network_access` как
+authority-shaped ключи аргументов. Resume обязан воспроизвести записанную операцию
+под текущим authority ceiling
+(`ResumeContract.validate_against_current_authority`), поэтому более широкая текущая
+authority не может быть получена из persisted-состояния.
+
+**Механизм enforcement.** Когда сетевой доступ запрещён, `LocalExecutionAdapter`
+направляет `http_proxy`/`https_proxy`/`all_proxy` (и варианты в верхнем регистре) на
+закрытый порт и очищает `NO_PROXY`. Это останавливает HTTP-клиенты, уважающие прокси,
+и не делает ничего процессу, открывающему сокет самостоятельно.
+
+**Не реализовано: kernel network isolation.** Нет network namespace, нет правила
+firewall, нет контейнера. Создание сокета напрямую, разрешение DNS, сокеты IPv4 и
+IPv6 и прямые исходящие соединения по-прежнему работают; это доказано тестом
+`tests/test_execution_sandbox_boundary.py::test_proxy_denial_is_not_a_kernel_sandbox`.
+Запрет — это **policy boundary, а не kernel sandbox**, и модуль с документацией
+говорят это явно. Поэтому GAP-B — PARTIAL.
+
+### 4.6 Подготовка основана на зеркалировании, а не на объявленных входах
 
 `EphemeralWorkspaceManager` копирует переданный корень workspace (пропуская `.git`
 и `__pycache__`) во временный scratch-каталог. Нет белого списка объявленных
@@ -547,7 +755,7 @@ referenced inputs. Что вызывающий передал как `workspace_
 **Статус: PARTIAL** (идентичность workspace, объявленные входы, deny-by-default
 подготовка относятся к Block 2 / отложены).
 
-### 4.6 У execution plane нет production-точки входа
+### 4.7 У execution plane нет production-точки входа
 
 `app/runtime/bootstrap.py::create_runtime` собирает настройки, провайдеров,
 реестры, Orchestrator и `RunExecutor`. Он **не** создаёт `ExecutionCoordinator`,
@@ -557,8 +765,71 @@ referenced inputs. Что вызывающий передал как `workspace_
 `EngineeringRunRequest.workspace`). Когда workspace отсутствует, локальный запуск
 отклоняется с `workspace_root_required`.
 
-Следствие: ряд аспектов execution plane **латентны**, а не активны — они становятся
-достижимыми, когда production-цикл запуска будет подключён к execution plane.
+**Частично устарело.** Это по-прежнему верно для самого `create_runtime`, но
+production-цикл запуска теперь существует и достижим из доверенного server-side
+кода: `ForgeApiService.run_agent_loop`, `run_accepted_task` и
+`run_declared_verification` — это production-точки входа, а
+`ForgeApiService.run_task` остаётся HTTP/desktop-путём совместимости. Латентным
+остаётся путь *resume*, а не путь исполнения — см. §4.8.
+
+### 4.8 Production idempotency существует; драйвера resume нет
+
+Run-level идемпотентность реализована, закоммичена (`0244157`, расширена `5ec648f`)
+и покрыта тестами. Доверенный оператор может передать `idempotency_key` в одну из
+**трёх доверенных in-process точек входа**:
+
+| точка входа | класс операции |
+| --- | --- |
+| `ForgeApiService.run_agent_loop` | `AGENT_LOOP` |
+| `ForgeApiService.run_accepted_task` | `ACCEPTED_TASK` |
+| `ForgeApiService.run_declared_verification` | `DECLARED_VERIFICATION` |
+
+Без ключа каждый вызов сохраняет прежнюю семантику ровно.
+
+Что реализовано:
+
+- **durable журнал идемпотентности**, по одному файлу на ключ
+  (`app/agent_runtime/idempotency.py`), отдельный от `RunStore`, который остаётся
+  observation sink и не является resume-движком;
+- **атомарный claim** через create-if-absent `O_EXCL`, поэтому две одновременные
+  доставки одного ключа не могут обе победить;
+- три исхода — **claim** (старт), **replay** (терминальная запись отдаётся вместо
+  повторного исполнения) и **conflict** (ключ привязан к другой идентичности
+  операции);
+- привязка идентичности по классу операции, каноническому ключу, fingerprint'у
+  доверенной задачи и каждому fingerprint'у criterion;
+- **защита терминальных состояний**, обеспеченная кодом через
+  `validate_lifecycle_transition`: `COMPLETED`, `FAILED`, `LIMIT_REACHED`,
+  `DENIED` и `SECURITY_FAILURE` нельзя переоткрыть, отклонённая запись оставляет
+  durable-запись нетронутой, а недоказуемый side effect нельзя перевести в
+  recoverable-состояние;
+- **перепроверка текущей authority**, поэтому resume обязан воспроизвести
+  записанную операцию под текущим authority ceiling;
+- claim берётся **до** freeze scope, привязки `RunStore` и durable-события
+  `RUN_STARTED`, поэтому дубликат не пишет событие старта run, не фризит scope и не
+  запускает run.
+
+**Ключ идемпотентности не является authority.** Он не может нести команду, workspace,
+профиль, набор tools, сетевой доступ или одобрение; он лишь выбирает, к какой
+durable-записи операции относится доставка.
+
+`run_task`, HTTP-путь task run и desktop dispatch **вне** этой защиты: их `task_id`
+поставляет вызывающий, поэтому доверенной идентичности задачи для привязки ключа
+нет. Это намеренно **не** «все точки входа защищены».
+
+Resume — **только контракт**. `ResumeContract` и durable state machine жизненного
+цикла реализованы и протестированы, включая линию преемственности через
+`AttemptIdentity`. **Драйвера operator resume нет**: `AgentHarness.run()` всегда
+стартует с `HarnessPhase.OBSERVE` и не имеет параметра старта с чекпоинта, поэтому
+автоматический crash-resume повторно прогнал бы весь цикл, а не продолжил
+безопасно. **Ничто в текущей реализации не заявляет работающий crash-resume.**
+
+**`SideEffectLedger` НЕ ПОДКЛЮЧЁН к production.** Двухфазная запись side effects
+(`NOT_STARTED`/`STARTED`/`COMMITTED`/`FAILED` плюс производный
+`UNKNOWN_AFTER_CRASH`) реализована и протестирована как компонент, но у
+`begin_side_effect` и `complete_side_effect` нет вызывающих в `app/` вне модуля,
+поэтому `UNKNOWN_AFTER_CRASH` недостижим из текущего production-пути run. GAP-I и
+GAP-R — PARTIAL.
 
 ## 5. Планируемое, отложенное и отклонённое
 
@@ -570,7 +841,14 @@ referenced inputs. Что вызывающий передал как `workspace_
 | Governance Agent/Skill/Tool/Capability сверх текущей skill-системы | **PLANNED / FUTURE** | [`STAGE_1_6_AGENT_SKILL_SYSTEM.md`](STAGE_1_6_AGENT_SKILL_SYSTEM.md) |
 | Доменные паттерны и интеграции | **CANDIDATE** | [`STAGE_1_7_EXTERNAL_SOFTWARE_DOMAIN_HARVEST.md`](STAGE_1_7_EXTERNAL_SOFTWARE_DOMAIN_HARVEST.md) |
 | Модель declared-invocation / fail-closed capability | **PLANNED (кандидат для Block 1.1)** | `DECISIONS.md`, Execution Authorization Contract v0.2 |
-| Песочница / изоляция / объявленные входы workspace (Block 2) | **DEFERRED** | `DECISIONS.md`, `ROADMAP.md` |
+| Файловая/workspace-граница (Block 2) | **PARTIAL / IMPLEMENTED** — см. §4.4 | `DECISIONS.md` (Execution Filesystem Boundary and Network Policy v0.1), `ROADMAP.md` GAP-A |
+| OS-level песочница и kernel-изоляция (Block 2) | **DEFERRED** | `DECISIONS.md`, `ROADMAP.md` |
+| Объявленные входы workspace / deny-by-default подготовка (Block 2) | **DEFERRED** | `DECISIONS.md`, `ROADMAP.md` |
+| Драйвер operator resume для прерванных запусков | **PLANNED / FOLLOW-UP** — контракт есть, драйвера нет (§4.8) | `ROADMAP.md` GAP-R, `DECISIONS.md` |
+| Подключение журнала side effects к production-исполнению | **PLANNED / FOLLOW-UP** — компонент есть, не подключён (§4.8) | `ROADMAP.md`, `DECISIONS.md` |
+| Server-derived идентичность операции для `run_task` / HTTP / desktop идемпотентности | **PLANNED / FOLLOW-UP** | `ROADMAP.md` GAP-I |
+| Compare-and-set, lease или distributed lock для межпроцессных claim'ов | **DEFERRED** — задокументированное ограничение, намеренно не имитируется | `ROADMAP.md`, `DECISIONS.md` |
+| Глобальное подавление на уровне действия между ключами идемпотентности | **DEFERRED** — сегодня защита привязана к ключу | `ROADMAP.md`, `DECISIONS.md` |
 | Долговременное (durable) хранилище одобрений с истечением срока | **DEFERRED (отдельный дизайн)** | реестр отклонённых альтернатив в `DECISIONS.md` |
 | MCP как модель разрешений | **REJECTED** | `DECISIONS.md` |
 | Универсальные retries / rollback / параллелизм / swarm-исполнение | **REJECTED as defaults** | `AGENTS.md`, `TECHNICAL_SPECIFICATION.md` §18 |
