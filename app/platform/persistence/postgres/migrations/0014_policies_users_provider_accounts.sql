@@ -2,8 +2,8 @@
 --
 -- RLS policies for `users` and `provider_accounts`.
 --
--- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-4, I-5, and F,
--- D-PLATFORM-16.
+-- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-4, I-5, O, and F,
+-- D-PLATFORM-16, D-PLATFORM-19.
 --
 -- These are the two tables where the ordinary tenant predicate is NOT enough or
 -- NOT applicable, and both are easy to get wrong in the same way: by widening a
@@ -17,12 +17,6 @@
 --
 --   * a subject may see itself;
 --   * other users are visible only through a shared organization.
---
--- The current user is read from a second transaction-local setting,
--- forge.user_id. It is read through the same nullif(..., '') treatment as the
--- tenant, for the same reason: an unset setting is an empty string, and an empty
--- string would otherwise compare unequal to every id but still not fail closed in
--- an expression that only tested IS NOT NULL.
 --
 -- A blanket SELECT on users would be a cross-tenant leak of identities, so it is
 -- not granted. INSERT/UPDATE/DELETE have no policy for the tenant role at all,
@@ -49,10 +43,13 @@ CREATE POLICY users_tenant_select ON users
         )
     );
 
-CREATE POLICY users_system_scope ON users
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
-    WITH CHECK (platform.system_scope_is_declared());
+-- The system scope needs to resolve a subject BEFORE a tenant context exists.
+-- That is a read of identity, and it is granted as a read only: this scope has no
+-- INSERT, UPDATE, or DELETE policy on `users`, and no such privilege either. It
+-- cannot create an account, change one, or erase one.
+CREATE POLICY users_system_select ON users
+    FOR SELECT TO forge_platform_system
+    USING (platform.system_scope_is_declared());
 
 ---------------------------------------------------------------------
 -- provider_accounts
@@ -75,11 +72,6 @@ CREATE POLICY users_system_scope ON users
 -- forge_platform_app in every operation. They are reachable only through the
 -- explicit system-owned policy below, which requires BOTH a null
 -- organization_id AND an explicitly declared server-side system scope.
---
--- That system policy is a SEPARATE AUTHORIZATION BOUNDARY, not a tenant RLS
--- bypass: it is attached to a different role, is off unless the server declares
--- it, and grants no execution authority. System ownership is an ownership
--- boundary and nothing more.
 
 CREATE POLICY provider_accounts_tenant_select ON provider_accounts
     FOR SELECT TO forge_platform_app
@@ -113,9 +105,17 @@ CREATE POLICY provider_accounts_tenant_delete ON provider_accounts
         AND platform.is_current_organization(organization_id)
     );
 
--- The system-owned path. Both the row shape and an explicit server-side
--- declaration are required, so no tenant request can reach these rows and no
--- client can manufacture system ownership by sending a null organization.
+-- The system-owned path. BOTH conditions are required: the row must have a null
+-- organization_id AND the server must have declared the system scope. This is the
+-- only table where the system scope may write operational data, and the reason is
+-- structural rather than discretionary -- a system-owned credential belongs to no
+-- organization, so no tenant context can ever reach it.
+--
+-- `FOR ALL` is used here, unlike every other system policy, because the row shape
+-- predicate is exact and is applied to every operation: there is no row that
+-- satisfies it other than a system-owned one, and none of these operations can
+-- touch a tenant-owned row. On a table where the predicate were merely a scope
+-- flag, `FOR ALL` would be the wildcard this design forbids.
 CREATE POLICY provider_accounts_system_owned ON provider_accounts
     FOR ALL TO forge_platform_system
     USING (platform.is_system_owned_provider_account(organization_id))

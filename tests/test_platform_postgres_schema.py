@@ -53,43 +53,47 @@ TABLES = (
 # Every policy the migrations create, by table. Used to assert that the policy set
 # is complete rather than merely non-empty.
 EXPECTED_POLICIES = {
-    "organizations": {"organizations_tenant_select", "organizations_system_scope"},
+    "organizations": {
+        "organizations_tenant_select",
+        "organizations_system_select",
+        "organizations_system_insert",
+    },
     "memberships": {
         "memberships_tenant_select",
         "memberships_tenant_insert",
         "memberships_tenant_update",
         "memberships_tenant_delete",
-        "memberships_system_scope",
+        "memberships_system_select",
+        "memberships_system_insert",
+        "memberships_system_update",
+        "memberships_system_delete",
     },
+    # No system policy on the operational tables. The server-only scope is
+    # confined to the identity and tenancy layer plus system-owned credentials.
     "projects": {
         "projects_tenant_select",
         "projects_tenant_insert",
         "projects_tenant_update",
         "projects_tenant_delete",
-        "projects_system_scope",
     },
     "api_keys": {
         "api_keys_tenant_select",
         "api_keys_tenant_insert",
         "api_keys_tenant_update",
         "api_keys_tenant_delete",
-        "api_keys_system_scope",
     },
+    # No DELETE policy: execution history is retired by status, not deleted.
     "run_records": {
         "run_records_tenant_select",
         "run_records_tenant_insert",
         "run_records_tenant_update",
-        "run_records_tenant_delete",
-        "run_records_system_scope",
     },
+    # Append-only: SELECT and INSERT only.
     "usage_records": {
         "usage_records_tenant_select",
         "usage_records_tenant_insert",
-        "usage_records_tenant_update",
-        "usage_records_tenant_delete",
-        "usage_records_system_scope",
     },
-    "users": {"users_tenant_select", "users_system_scope"},
+    "users": {"users_tenant_select", "users_system_select"},
     "provider_accounts": {
         "provider_accounts_tenant_select",
         "provider_accounts_tenant_insert",
@@ -180,42 +184,112 @@ class Tenant:
         self.run_id = uuid.uuid4()
 
     async def create(self, conn) -> None:
-        await set_context(conn, system_scope="on")
-        await conn.execute(
-            "INSERT INTO organizations (id, name, slug, created_at) "
-            "VALUES ($1, $2, $3, now())",
-            self.organization_id, f"Org {self.label}",
-            f"org-{self.label.lower()}-{self.organization_id.hex[:8]}",
-        )
-        await conn.execute(
-            "INSERT INTO users (id, email, created_at) VALUES ($1, $2, now())",
-            self.user_id, f"{self.label.lower()}-{self.user_id.hex[:8]}@example.test",
-        )
-        await conn.execute(
-            "INSERT INTO memberships (id, organization_id, user_id, role, created_at) "
-            "VALUES ($1, $2, $3, 'owner', now())",
-            self.membership_id, self.organization_id, self.user_id,
-        )
-        await conn.execute(
-            "INSERT INTO projects (id, organization_id, name, slug, created_at) "
-            "VALUES ($1, $2, $3, $4, now())",
-            self.project_id, self.organization_id, f"Project {self.label}",
-            f"project-{self.label.lower()}",
-        )
+        """Create the tenant using the least privilege each step needs.
+
+        The bootstrap steps that cannot be tenant-scoped -- organization, user,
+        first membership -- run under the server-only system scope. Everything
+        that IS tenant-scoped, the project here, runs under the ordinary tenant
+        path with a real tenant context, so the tests exercise the same policies a
+        request would.
+
+        Each phase is its own explicit transaction, because the context settings
+        are transaction-local and must not leak into the next phase or into the
+        test body.
+        """
+
+        await conn.execute("BEGIN")
+        try:
+            await set_context(conn, system_scope="on")
+            await conn.execute(
+                "INSERT INTO organizations (id, name, slug, created_at) "
+                "VALUES ($1, $2, $3, now())",
+                self.organization_id, f"Org {self.label}",
+                f"org-{self.label.lower()}-{self.organization_id.hex[:8]}",
+            )
+            await conn.execute(
+                "INSERT INTO users (id, email, created_at) VALUES ($1, $2, now())",
+                self.user_id,
+                f"{self.label.lower()}-{self.user_id.hex[:8]}@example.test",
+            )
+            await conn.execute(
+                "INSERT INTO memberships (id, organization_id, user_id, role, "
+                "created_at) VALUES ($1, $2, $3, 'owner', now())",
+                self.membership_id, self.organization_id, self.user_id,
+            )
+            await conn.execute("COMMIT")
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
+
+        await conn.execute("BEGIN")
+        try:
+            await set_context(conn, organization_id=self.organization_id,
+                              user_id=self.user_id)
+            await conn.execute(
+                "INSERT INTO projects (id, organization_id, name, slug, created_at) "
+                "VALUES ($1, $2, $3, $4, now())",
+                self.project_id, self.organization_id, f"Project {self.label}",
+                f"project-{self.label.lower()}",
+            )
+            await conn.execute("COMMIT")
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
 
     async def create_run(self, conn, *, status="running", core_run_id=None,
-                         attempt_count=0, failure_classification=""):
+                         attempt_count=0, failure_classification="",
+                         initiated_by_user_id="default"):
+        """Seed a run through the ordinary tenant path."""
+
+        if not hasattr(self, "_project_created"):
+            await self.create(conn)
+            self._project_created = True
+
         core_run_id = core_run_id or f"core-{self.run_id.hex[:10]}"
-        await self.create(conn)
-        await conn.execute(
-            "INSERT INTO run_records (id, organization_id, project_id, core_run_id, "
-            "initiated_by_user_id, status, started_at, attempt_count, "
-            "failure_classification, created_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, now(), $7, $8, now())",
-            self.run_id, self.organization_id, self.project_id, core_run_id,
-            self.user_id, status, attempt_count, failure_classification,
-        )
+        initiator = (self.user_id if initiated_by_user_id == "default"
+                     else initiated_by_user_id)
+
+        await conn.execute("BEGIN")
+        try:
+            await set_context(conn, organization_id=self.organization_id,
+                              user_id=self.user_id)
+            await conn.execute(
+                "INSERT INTO run_records (id, organization_id, project_id, "
+                "core_run_id, initiated_by_user_id, status, started_at, "
+                "attempt_count, failure_classification, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, now(), $7, $8, now())",
+                self.run_id, self.organization_id, self.project_id, core_run_id,
+                initiator, status, attempt_count, failure_classification,
+            )
+            await conn.execute("COMMIT")
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
         return self.run_id
+
+    async def create_usage(self, conn, *, attempt_number=0, core_run_id="core-u",
+                           **columns):
+        """Append one usage observation through the tenant path."""
+
+        if not hasattr(self, "_project_created"):
+            await self.create(conn)
+            self._project_created = True
+
+        await conn.execute("BEGIN")
+        try:
+            await set_context(conn, organization_id=self.organization_id,
+                              user_id=self.user_id)
+            await conn.execute(
+                "INSERT INTO usage_records (id, organization_id, run_record_id, "
+                "core_run_id, attempt_number, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, now())",
+                uuid.uuid4(), self.organization_id, self.run_id, core_run_id,
+                attempt_number,
+            )
+            await conn.execute("COMMIT")
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
 
 
 # --------------------------------------------------------------------------- #
@@ -394,9 +468,13 @@ class ForeignKeyTests(AsyncTestCase):
                     ("provider_accounts", "provider_accounts_organization_fk"),
                     ("api_keys", "api_keys_organization_fk"),
                     ("api_keys", "api_keys_created_by_user_fk"),
+                    # tenant-safe provenance (F-04)
+                    ("api_keys", "api_keys_creator_membership_fk"),
                     ("run_records", "run_records_organization_fk"),
                     ("run_records", "run_records_project_organization_fk"),
                     ("run_records", "run_records_initiated_by_user_fk"),
+                    # tenant-safe provenance (F-04)
+                    ("run_records", "run_records_initiator_membership_fk"),
                     ("usage_records", "usage_records_organization_fk"),
                     ("usage_records", "usage_records_run_organization_fk"),
                 }
@@ -425,6 +503,17 @@ class ForeignKeyTests(AsyncTestCase):
                     "FOREIGN KEY (run_record_id, organization_id) "
                     "REFERENCES run_records(id, organization_id)",
                     by_name["usage_records_run_organization_fk"],
+                )
+                # Tenant-safe provenance (F-04): the pair, not the bare user id.
+                self.assertIn(
+                    "FOREIGN KEY (organization_id, created_by_user_id) "
+                    "REFERENCES memberships(organization_id, user_id)",
+                    by_name["api_keys_creator_membership_fk"],
+                )
+                self.assertIn(
+                    "FOREIGN KEY (organization_id, initiated_by_user_id) "
+                    "REFERENCES memberships(organization_id, user_id)",
+                    by_name["run_records_initiator_membership_fk"],
                 )
 
                 # The referenced targets must be unique, or the FK could not exist.
@@ -529,7 +618,9 @@ class ForeignKeyTests(AsyncTestCase):
                 )
                 for name in ("usage_records_run_organization_fk",
                              "run_records_project_organization_fk",
-                             "api_keys_created_by_user_fk"):
+                             "api_keys_created_by_user_fk",
+                             "api_keys_creator_membership_fk",
+                             "run_records_initiator_membership_fk"):
                     self.assertIn(name, restrict)
         run_async(body())
 
@@ -741,12 +832,21 @@ class RowLevelSecurityTests(AsyncTestCase):
                     "IS NOT NULL"
                 )
 
-                # State 1: never assigned in this session.
-                never = await conn.fetchval(
+                # State 1: not set to a tenant, whatever the underlying value
+                # is. It may be NULL (never assigned in this session) or an empty
+                # string (assigned and reverted earlier in the same session); both
+                # mean "no tenant", and the adopted predicate must deny in both.
+                initial = await conn.fetchval(
                     f"SELECT current_setting('{TENANT_SETTING}', true)"
                 )
-                self.assertIsNone(never, "a never-assigned setting is NULL")
-                self.assertFalse(await conn.fetchval(f"SELECT {adopted}"))
+                self.assertIn(
+                    initial, (None, ""),
+                    "no tenant context must read as NULL or empty",
+                )
+                self.assertFalse(
+                    await conn.fetchval(f"SELECT {adopted}"),
+                    "the adopted predicate must deny with no tenant set",
+                )
 
                 # State 2: assigned then reverted, which leaves an empty string.
                 await conn.execute("BEGIN")
@@ -964,33 +1064,65 @@ class RowLevelSecurityTests(AsyncTestCase):
                     await conn.execute("RESET ROLE")
         run_async(body())
 
-    def test_34_organizations_require_an_active_membership(self):
+    def test_34_organizations_are_scoped_to_the_context_or_a_live_membership(self):
+        """The two permitted readings, and the one that is refused.
+
+        Permitted: an organization that shares an ACTIVE membership with the
+        subject, and the organization the transaction is acting in. The second is
+        deliberate -- an actor must be able to read the tenant it is acting in
+        before any membership row exists for it, otherwise the first membership
+        could never be written.
+
+        Refused: an organization the subject is neither acting in nor a live
+        member of. A revoked membership must not leave the tenant reachable.
+        """
+
         async def body():
             async with LiveDatabase() as db:
                 await db.apply_migrations()
                 conn = db.connection
-                tenant = Tenant("A")
-                await tenant.create(conn)
+                org_a, org_b = Tenant("A"), Tenant("B")
+                await org_a.create(conn)
+                await org_b.create(conn)
 
+                # Acting in A while a live member of A: A is visible, B is not.
                 await conn.execute("BEGIN")
                 await conn.execute(f"SET LOCAL ROLE {APP_ROLE}")
-                await set_context(conn, organization_id=tenant.organization_id)
-                self.assertEqual(
-                    await conn.fetchval("SELECT count(*) FROM organizations"), 1
-                )
-                # Deactivate the membership: the organization must disappear.
-                await conn.execute("RESET ROLE")
+                await set_context(conn, organization_id=org_a.organization_id,
+                                  user_id=org_a.user_id)
+                visible = {r["id"] for r in await conn.fetch(
+                    "SELECT id FROM organizations")}
+                self.assertEqual(visible, {org_a.organization_id})
+                await conn.execute("COMMIT")
+
+                # Revoke A's membership. A stays visible because it is the tenant
+                # the transaction names; B stays invisible. Nothing is enumerated.
+                await conn.execute("BEGIN")
                 await set_context(conn, system_scope="on")
                 await conn.execute(
                     "UPDATE memberships SET status = 'revoked' WHERE id = $1",
-                    tenant.membership_id,
-                )
-                await conn.execute(f"SET LOCAL ROLE {APP_ROLE}")
-                await set_context(conn, organization_id=tenant.organization_id)
-                self.assertEqual(
-                    await conn.fetchval("SELECT count(*) FROM organizations"), 0
+                    org_a.membership_id,
                 )
                 await conn.execute("COMMIT")
+
+                await conn.execute("BEGIN")
+                await conn.execute(f"SET LOCAL ROLE {APP_ROLE}")
+                await set_context(conn, organization_id=org_a.organization_id,
+                                  user_id=org_a.user_id)
+                visible = {r["id"] for r in await conn.fetch(
+                    "SELECT id FROM organizations")}
+                self.assertEqual(visible, {org_a.organization_id})
+                self.assertNotIn(org_b.organization_id, visible)
+                await conn.execute("COMMIT")
+
+                # With no tenant context at all, organizations are not readable.
+                await conn.execute(f"SET ROLE {APP_ROLE}")
+                try:
+                    self.assertEqual(
+                        await conn.fetchval("SELECT count(*) FROM organizations"), 0
+                    )
+                finally:
+                    await conn.execute("RESET ROLE")
         run_async(body())
 
     def test_35_tenant_role_cannot_create_an_organization(self):

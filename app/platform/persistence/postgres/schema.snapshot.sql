@@ -119,6 +119,7 @@
 -- Constraints
 -- ============================================================
 -- api_keys.api_keys_created_by_user_fk [b'f']: FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE RESTRICT
+-- api_keys.api_keys_creator_membership_fk [b'f']: FOREIGN KEY (organization_id, created_by_user_id) REFERENCES memberships(organization_id, user_id) ON DELETE RESTRICT
 -- api_keys.api_keys_key_prefix_not_blank [b'c']: CHECK (((key_prefix IS NULL) OR (length(btrim(key_prefix)) > 0)))
 -- api_keys.api_keys_name_not_blank [b'c']: CHECK ((length(btrim(name)) > 0))
 -- api_keys.api_keys_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
@@ -155,6 +156,7 @@
 -- run_records.run_records_finished_requires_started [b'c']: CHECK (((finished_at IS NULL) OR (started_at IS NOT NULL)))
 -- run_records.run_records_id_organization_unique [b'u']: UNIQUE (id, organization_id)
 -- run_records.run_records_initiated_by_user_fk [b'f']: FOREIGN KEY (initiated_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+-- run_records.run_records_initiator_membership_fk [b'f']: FOREIGN KEY (organization_id, initiated_by_user_id) REFERENCES memberships(organization_id, user_id) ON DELETE RESTRICT
 -- run_records.run_records_organization_fk [b'f']: FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE RESTRICT
 -- run_records.run_records_pkey [b'p']: PRIMARY KEY (id)
 -- run_records.run_records_project_organization_fk [b'f']: FOREIGN KEY (project_id, organization_id) REFERENCES projects(id, organization_id) ON DELETE RESTRICT
@@ -227,9 +229,6 @@
 -- ============================================================
 -- Row-level security policies
 -- ============================================================
--- policy api_keys.api_keys_system_scope cmd=ALL roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
---   WITH CHECK platform.system_scope_is_declared()
 -- policy api_keys.api_keys_tenant_delete cmd=DELETE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK None
@@ -242,7 +241,16 @@
 -- policy api_keys.api_keys_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK platform.is_current_organization(organization_id)
--- policy memberships.memberships_system_scope cmd=ALL roles={forge_platform_system}
+-- policy memberships.memberships_system_delete cmd=DELETE roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK None
+-- policy memberships.memberships_system_insert cmd=INSERT roles={forge_platform_system}
+--   USING      None
+--   WITH CHECK platform.system_scope_is_declared()
+-- policy memberships.memberships_system_select cmd=SELECT roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK None
+-- policy memberships.memberships_system_update cmd=UPDATE roles={forge_platform_system}
 --   USING      platform.system_scope_is_declared()
 --   WITH CHECK platform.system_scope_is_declared()
 -- policy memberships.memberships_tenant_delete cmd=DELETE roles={forge_platform_app}
@@ -259,17 +267,17 @@
 -- policy memberships.memberships_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK platform.is_current_organization(organization_id)
--- policy organizations.organizations_system_scope cmd=ALL roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
+-- policy organizations.organizations_system_insert cmd=INSERT roles={forge_platform_system}
+--   USING      None
 --   WITH CHECK platform.system_scope_is_declared()
--- policy organizations.organizations_tenant_select cmd=SELECT roles={forge_platform_app}
---   USING      ((platform.current_organization_id() IS NOT NULL) AND (id = platform.current_organization_id()) AND (EXISTS ( SELECT 1
-   FROM memberships m
-  WHERE ((m.organization_id = organizations.id) AND (m.status = 'active'::text)))))
+-- policy organizations.organizations_system_select cmd=SELECT roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
 --   WITH CHECK None
--- policy projects.projects_system_scope cmd=ALL roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
---   WITH CHECK platform.system_scope_is_declared()
+-- policy organizations.organizations_tenant_select cmd=SELECT roles={forge_platform_app}
+--   USING      ((platform.current_organization_id() IS NOT NULL) AND ((id = platform.current_organization_id()) OR (EXISTS ( SELECT 1
+   FROM memberships m
+  WHERE ((m.organization_id = organizations.id) AND (m.status = 'active'::text) AND (m.user_id = (NULLIF(current_setting('forge.user_id'::text, true), ''::text))::uuid))))))
+--   WITH CHECK None
 -- policy projects.projects_tenant_delete cmd=DELETE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK None
@@ -297,12 +305,6 @@
 -- policy provider_accounts.provider_accounts_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
 --   WITH CHECK ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
--- policy run_records.run_records_system_scope cmd=ALL roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
---   WITH CHECK platform.system_scope_is_declared()
--- policy run_records.run_records_tenant_delete cmd=DELETE roles={forge_platform_app}
---   USING      platform.is_current_organization(organization_id)
---   WITH CHECK None
 -- policy run_records.run_records_tenant_insert cmd=INSERT roles={forge_platform_app}
 --   USING      None
 --   WITH CHECK platform.is_current_organization(organization_id)
@@ -312,24 +314,15 @@
 -- policy run_records.run_records_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK platform.is_current_organization(organization_id)
--- policy usage_records.usage_records_system_scope cmd=ALL roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
---   WITH CHECK platform.system_scope_is_declared()
--- policy usage_records.usage_records_tenant_delete cmd=DELETE roles={forge_platform_app}
---   USING      platform.is_current_organization(organization_id)
---   WITH CHECK None
 -- policy usage_records.usage_records_tenant_insert cmd=INSERT roles={forge_platform_app}
 --   USING      None
 --   WITH CHECK platform.is_current_organization(organization_id)
 -- policy usage_records.usage_records_tenant_select cmd=SELECT roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK None
--- policy usage_records.usage_records_tenant_update cmd=UPDATE roles={forge_platform_app}
---   USING      platform.is_current_organization(organization_id)
---   WITH CHECK platform.is_current_organization(organization_id)
--- policy users.users_system_scope cmd=ALL roles={forge_platform_system}
+-- policy users.users_system_select cmd=SELECT roles={forge_platform_system}
 --   USING      platform.system_scope_is_declared()
---   WITH CHECK platform.system_scope_is_declared()
+--   WITH CHECK None
 -- policy users.users_tenant_select cmd=SELECT roles={forge_platform_app}
 --   USING      ((id = (NULLIF(current_setting('forge.user_id'::text, true), ''::text))::uuid) OR ((platform.current_organization_id() IS NOT NULL) AND (EXISTS ( SELECT 1
    FROM (memberships m_self
@@ -373,6 +366,15 @@
 -- AS $function$
 --     SELECT row_organization_id IS NULL
 --        AND platform.system_scope_is_declared()
+-- $function$
+
+-- CREATE OR REPLACE FUNCTION platform.platform_scopes_are_separate()
+--  RETURNS boolean
+--  LANGUAGE sql
+--  STABLE
+-- AS $function$
+--     SELECT NOT pg_has_role('forge_platform_app', 'forge_platform_system', 'MEMBER')
+--        AND NOT pg_has_role('forge_platform_system', 'forge_platform_app', 'MEMBER')
 -- $function$
 
 -- CREATE OR REPLACE FUNCTION platform.system_scope_is_declared()

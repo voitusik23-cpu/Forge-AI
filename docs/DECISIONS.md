@@ -4360,3 +4360,225 @@ PostgreSQL считает NaN равным самому себе и больши
 Billing-таблицы, ни денежной колонки, ни репозитория, ни сервиса, ни endpoint'а, ни
 механизма аутентификации, ни разрешения кредилов, ни транспорта
 Platform -> Core, и Core не получил зависимости от базы данных.
+
+
+## Platform security boundaries hardened after adversarial review (D-PLATFORM-19)
+
+An independent adversarial review of the PostgreSQL schema found **no real tenant
+escape** in the row-level security implementation. It raised four boundaries that
+were implicit rather than enforced. This record closes them.
+
+### The four boundaries
+
+**1. The two platform scopes are separate roles, and a GUC is not authorization.**
+`forge_platform_app` is the tenant path; `forge_platform_system` is the server-only
+scope. Both are `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS` and `NOINHERIT`, neither is
+ever a member of the other, the migrations revoke that membership on every run, and
+`platform.platform_scopes_are_separate()` lets a deployment assert it. `NOINHERIT`
+matters: a session holding both memberships would still not pick up the system
+policies merely by connecting.
+
+`forge.system_scope` is **not** an authorization mechanism. Any session can set a
+custom GUC, so what gates the system scope is the policy's `TO` clause plus the role
+membership the deployment controls. The flag only narrows the scope further.
+
+**Responsibility split, stated rather than masked.** The database owns the role
+attributes, the mutual non-membership, the policies, and the grants. The deployment
+owns which login role connects: tenant traffic and system traffic must be served by
+different login roles, so that a connection serving a tenant request cannot also
+`SET ROLE` into the system scope. **The application owns** setting the tenant
+context from the resolved membership, and never from client input. Neither the
+migration nor this decision can decide a deployment's login roles, and neither
+pretends to.
+
+**2. The server scope is discovery and bootstrap, not administration.** It may read
+`users`, `memberships` and `organizations`; it may insert the bootstrap rows (a user
+account, an organization, its first `OWNER` membership) and update, reactivate or
+delete a membership; and it manages system-owned provider credentials. That is the
+whole list. It has **no privilege and no policy** on `projects`, `api_keys`,
+`run_records` or `usage_records`, so it cannot read or write another tenant's work
+at all. The former `FOR ALL ... USING (system_scope_is_declared())` policies are
+gone: `FOR ALL` now survives only on `provider_accounts`, where every operation is
+bound to the system-owned row shape.
+
+The pre-tenant discovery sequence is therefore fixed: resolve the subject, read its
+memberships, read the organizations those memberships name, then enter a tenant
+context and act through the ordinary tenant path.
+
+**3. Usage is append-only and run history is not deletable.** `usage_records` may
+be inserted and read, never updated or deleted. `run_records` may transition state
+but never be deleted by the tenant path. Both rules are enforced in the policy layer
+**and** the privilege layer, so a later policy edit cannot re-open a privilege that
+was never granted. System-owned provider credentials remain the only rows the
+server scope may delete.
+
+**4. Provenance is tenant-safe.** `api_keys.created_by_user_id` and
+`run_records.initiated_by_user_id` referenced `users(id)` alone, which proved the
+user existed but not that they belonged to the row's organization; a tenant that
+knew another tenant's user id could record it as its own key creator or run
+initiator. Both now also carry a composite foreign key on
+`(organization_id, <user column>)` referencing
+`memberships (organization_id, user_id)`, which is already unique. The creator or
+initiator must be a member of the row's own organization, enforced by PostgreSQL.
+The single-column keys remain, so a queued run's null initiator is still permitted.
+Both provenance keys are `ON DELETE RESTRICT`, consistent with the rule that no
+foreign key cascades.
+
+### Rejected alternatives
+
+- **Treating `forge.system_scope = 'on'` as the system boundary.** Rejected: a GUC
+  is settable by any session, so it can never grant access.
+- **Leaving `FOR ALL` system policies in place on the operational tables and relying
+  on the `TO` clause.** Rejected: it makes the server scope a universal cross-tenant
+  reader and writer the moment one policy is edited, and it gives that scope a
+  capability no accepted contract requires.
+- **Removing UPDATE on `memberships` from the server scope.** Rejected, but the
+  question was examined: K-2 allows one membership row per organization and user
+  pair, so a returning member must be a status change on the existing row, which
+  needs UPDATE.
+- **Making identity updates available to the server scope.** Rejected: nothing in
+  the accepted contract needs them, and `NO UPDATE` is a stronger statement than a
+  policy that happens to match nothing.
+- **Enforcing cross-tenant provenance in application code.** Rejected by the task
+  and by the design: a database check cannot be bypassed by a missed code path.
+- **`ON DELETE SET NULL` on the provenance keys.** Rejected: `created_by_user_id` is
+  `NOT NULL`, so it is not available there, and where it would be available it would
+  silently erase provenance instead of making deletion deliberate.
+- **`FORCE ROW LEVEL SECURITY` alone, without separate roles.** Rejected: the owner
+  exempts itself, so a test or deployment running as the owner would observe every
+  row while appearing to pass.
+
+### Consequences
+
+1. **No tenant escape was found and none is claimed.** The review's verdict was GO
+   WITH FIXES, and the fixes close implicit boundaries rather than a live breach.
+2. **The security tests run from a real non-superuser login role.** A superuser and
+   a table owner both bypass row-level security, so proving "the tenant path cannot
+   reach system rows" from such a session would prove nothing.
+3. **The server scope lost capabilities it did not need.** `UPDATE` on `users` and
+   on `organizations` is gone, along with every policy and privilege on the four
+   operational tables.
+4. **Deleting a membership or a user is now stricter**, because provenance keys
+   RESTRICT. Memberships are retired by `status`, which K-2 already required.
+5. **Open decisions are unchanged.** O-1 … O-7 remain **open**; O-8 stays resolved
+   at contract level; O-9 stays resolved and implemented; O-10 … O-13 stay deferred.
+   O-7 in particular is untouched: no status gained or lost a terminal-state rule.
+6. **No billing table, money column, repository, service, endpoint, authentication
+   mechanism, credential resolver, or Platform -> Core transport was added**, and
+   Core gained no database dependency.
+
+
+## Границы безопасности Platform усилены после adversarial review (D-PLATFORM-19) — русская версия
+
+Независимый adversarial review схемы PostgreSQL не нашёл **реального tenant
+escape** в реализации row-level security. Он выявил четыре границы, которые были
+неявными, а не принудительными. Эта запись их закрывает.
+
+### Четыре границы
+
+**1. Два скоупа Platform — разные роли, и GUC — не авторизация.**
+`forge_platform_app` — путь арендатора; `forge_platform_system` — server-only скоуп. Обе —
+`NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS` и `NOINHERIT`, ни одна никогда не является членом
+другой, миграции отозывают это членство при каждом запуске, а
+`platform.platform_scopes_are_separate()` позволяет деплою это проверить. `NOINHERIT`
+важен: сессия, владеющая обоими членствами, всё равно не подхватила бы
+system-политики просто при подключении.
+
+`forge.system_scope` **не** является механизмом авторизации. Любая
+сессия может установить пользовательскую GUC, поэтому доступ даёт клауза `TO` в
+политике вместе с членством в роли, которым управляет деплой. Флаг лишь
+дополнительно сужает скоуп.
+
+**Разделение ответственности сформулировано, а не замаскировано.**
+База данных владеет атрибутами ролей, взаимным нечленством, политиками
+и привилегиями. Деплой владеет тем, какая login-роль подключается: трафик
+арендатора и трафик system-скоупа должны обслуживаться разными login-ролями,
+чтобы соединение, обслуживающее запрос арендатора, не могло также
+выполнить `SET ROLE` в system-скоуп. **Приложение владеет** установкой
+tenant-контекста из разрешённого membership и никогда из клиентского ввода. Ни
+миграция, ни это решение не могут определить login-роли деплоя, и ни одно из
+них не делает вид, что может.
+
+**2. Серверный скоуп — discovery и bootstrap, а не администрирование.** Он
+может читать `users`, `memberships` и `organizations`; может вставлять bootstrap-строки
+(аккаунт, организацию, её первый `OWNER` membership) и обновлять, реактивировать
+или удалять membership; и управляет system-owned провайдерскими кредилами. Это весь
+список. У него **нет ни привилегий, ни политик** на `projects`, `api_keys`,
+`run_records` или `usage_records`, поэтому он вообще не может читать или писать работу
+другого арендатора. Бывшие политики
+`FOR ALL ... USING (system_scope_is_declared())` удалены: `FOR ALL` теперь есть только на
+`provider_accounts`, где каждая операция привязана к форме system-owned строки.
+
+Последовательность pre-tenant discovery тем самым зафиксирована:
+разрешить субъект, прочитать его memberships, прочитать организации, на
+которые они указывают, а затем войти в тенантный контекст и действовать
+через обычный путь арендатора.
+
+**3. Потребление — append-only, история запусков не удаляется.**
+`usage_records` можно вставлять и читать, но никогда не обновлять или
+удалять. `run_records` может менять статус, но никогда не удаляется путём
+арендатора. Оба правила обеспечены в слое политик **и** в слое
+привилегий. System-owned провайдерские кредилы остаются
+единственными строками, которые серверный скоуп может удалить.
+
+**4. Provenance безопасен для арендатора.**
+`api_keys.created_by_user_id` и `run_records.initiated_by_user_id` ссылались только на
+`users(id)`, что доказывало существование пользователя, но не его
+принадлежность организации строки; арендатор, знающий id пользователя
+другого арендатора, мог записать его создателем своего ключа или
+инициатором своего запуска. Теперь оба несут дополнительный составной
+внешний ключ на `(organization_id, <колонка user>)`, ссылающийся на
+`memberships (organization_id, user_id)`, который уже уникален. Создатель или инициатор
+обязан быть участником собственной организации строки, и это
+обеспечивает PostgreSQL. Одноколоночные ключи сохранены, поэтому null
+инициатор queued-запуска по-прежнему допустим. Оба ключа provenance —
+`ON DELETE RESTRICT`, что согласуется с правилом об отсутствии каскадов.
+
+### Отклонённые альтернативы
+
+- **Считать `forge.system_scope = 'on'` границей system-доступа.** Отклонено: GUC
+  устанавливается любой сессией, поэтому он никогда не может давать доступ.
+- **Оставить `FOR ALL` system-политики на операционных таблицах,
+  полагаясь на клаузу `TO`.** Отклонено: это делает серверный скоуп
+  универсальным кросс-арендаторным читателем и писателем при первой же
+  правке политики.
+- **Убрать UPDATE на `memberships` у серверного скоупа.** Отклонено, но
+  вопрос рассмотрен: K-2 допускает одну строку membership на пару
+  организация-пользователь, поэтому возвращающийся участник — это
+  смена статуса существующей строки.
+- **Дать серверному скоупу изменение идентичности.** Отклонено: ни один
+  принятый контракт этого не требует, а `NO UPDATE` — более сильное утверждение,
+  чем политика, которая просто ничего не сопоставляет.
+- **Проверять кросс-арендаторный provenance в коде приложения.** Отклонено
+  задачей и дизайном: проверку базы нельзя обойти забытым путём в коде.
+- **`ON DELETE SET NULL` на ключах provenance.** Отклонено:
+  `created_by_user_id` — `NOT NULL`, там это недоступно, а там, где доступно, это
+  молча стирало бы provenance вместо того, чтобы сделать удаление
+  осознанным.
+- **Только `FORCE ROW LEVEL SECURITY`, без разделения ролей.** Отклонено:
+  владелец освобождает себя от неё, поэтому тест или деплой, работающий
+  как владелец, видел бы все строки, выглядя при этом успешным.
+
+### Следствия
+
+1. **Tenant escape не найден, и ничего такого не заявляется.** Вердикт
+   ревью был GO WITH FIXES, и исправления закрывают неявные границы, а не
+   живущую брешь.
+2. **Безопасные тесты выполняются от реальной non-superuser login-роли.**
+   И superuser, и владелец таблицы обходят row-level security, поэтому доказательство
+   «путь арендатора не достаёт system-строк» от такой сессии не доказывало бы
+   ничего.
+3. **Серверный скоуп потерял возможности, которые ему не нужны.** `UPDATE` на
+   `users` и `organizations` убран, вместе со всеми политиками и привилегиями на
+   четырёх операционных таблицах.
+4. **Удаление membership или пользователя теперь строже**, потому что
+   ключи provenance — RESTRICT. Membership выводится из эксплуатации через `status`, чего K-2
+   уже требовал.
+5. **Открытые решения не изменены.** O-1 … O-7 остаются **открытыми**; O-8 —
+   решён на уровне контракта; O-9 — решён и реализован; O-10 … O-13 — отложены. O-7
+   в частности не затронут: ни один статус не получил и не потерял правило
+   терминального состояния.
+6. **Не добавлено ни Billing-таблицы, ни денежной колонки, ни
+   репозитория, ни сервиса, ни endpoint'а, ни механизма аутентификации, ни
+   разрешения кредилов, ни транспорта Platform -> Core, и Core не получил
+   зависимости от базы данных.

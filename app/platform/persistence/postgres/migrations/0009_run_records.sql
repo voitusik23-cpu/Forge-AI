@@ -94,7 +94,30 @@ CREATE TABLE run_records (
         ON DELETE RESTRICT,
     CONSTRAINT run_records_initiated_by_user_fk
         FOREIGN KEY (initiated_by_user_id) REFERENCES users (id)
-        ON DELETE SET NULL
+        ON DELETE SET NULL,
+    -- TENANT-SAFE PROVENANCE. As with api_keys, the single-column key above
+    -- proves the initiator exists but not that they belonged to this
+    -- organization, which would let a tenant name another tenant's user as the
+    -- initiator of its run.
+    --
+    -- The composite key references the membership pair, so the initiator must be
+    -- a member of the run's own organization.
+    --
+    -- NULL SEMANTICS ARE PRESERVED. `initiated_by_user_id` is legitimately NULL
+    -- for a queued run, and by default a composite foreign key is satisfied
+    -- whenever ANY of its columns is NULL, so a queued run with no initiator
+    -- still passes. Only the case that matters -- a non-null initiator who is not
+    -- a member of this organization -- is rejected.
+    --
+    -- ON DELETE RESTRICT, consistent with K-6. Note that the single-column key
+    -- above is SET NULL: the two are not in conflict, because a user cannot be
+    -- deleted while they still have runs, and once the membership row is gone
+    -- there is nothing left referencing it. Memberships are retired by setting
+    -- `status`, not by deleting the row.
+    CONSTRAINT run_records_initiator_membership_fk
+        FOREIGN KEY (organization_id, initiated_by_user_id)
+        REFERENCES memberships (organization_id, user_id)
+        ON DELETE RESTRICT
 );
 
 CREATE INDEX run_records_organization_idx ON run_records (organization_id);

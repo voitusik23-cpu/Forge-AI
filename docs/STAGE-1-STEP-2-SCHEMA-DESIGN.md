@@ -877,6 +877,88 @@ not exist (K-9), and a terminal `RunRecord` status without `finished_at` is
 accepted, because that question belongs to O-7. The contract tests assert each of
 these absences, so an over-eager constraint cannot be added unnoticed.
 
+## O. Security boundaries after adversarial review
+
+An independent adversarial review found no real tenant escape in the row-level
+security implementation. It did find four boundaries that were implicit rather
+than enforced. This section states them; `D-PLATFORM-19` records them.
+
+### O-1. The tenant path and the server-only path are different roles
+
+`forge_platform_app` is the ordinary tenant request path.
+`forge_platform_system` is the server-only scope used for pre-tenant discovery and
+for system-owned provider credentials.
+
+Both are `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS`, and `NOINHERIT`. They are never
+members of each other, the migrations revoke that membership on every run, and
+`platform.platform_scopes_are_separate()` lets a deployment assert it. `NOINHERIT`
+is load-bearing: it means a session that somehow held both memberships still would
+not pick up the system policies merely by connecting.
+
+### O-2. `forge.system_scope` is not an authorization mechanism
+
+Any session can set a custom GUC, so a GUC can never be what grants access. What
+gates the system scope is the policy's `TO forge_platform_system` clause together
+with that role's membership, which the deployment controls. The GUC only narrows
+the scope further and keeps system-owned rows invisible by default. The security
+tests assert that the tenant path gains nothing by setting the flag, and that the
+system scope sees nothing without it.
+
+**Responsibility split.** The database owns the role attributes, the mutual
+non-membership, the policies, and the grants. It does **not** and cannot decide
+which login role a deployment uses. The deployment owns that: tenant traffic and
+system traffic must be served by different login roles, so that a connection
+serving a tenant request is not also able to `SET ROLE` into the system scope. The
+tests prove the boundary from a real non-superuser login role, because a superuser
+and a table owner both bypass row-level security and would prove nothing.
+
+### O-3. The server scope is discovery and bootstrap, not administration
+
+`forge_platform_system` can read the identity and tenancy layer (`users`,
+`memberships`, `organizations`), write the bootstrap rows (a user account, an
+organization, its first `OWNER` membership, and membership reactivation or
+removal), and manage system-owned provider credentials. That is the whole list.
+
+It has **no privilege and no policy** on `projects`, `api_keys`, `run_records`, or
+`usage_records`. It cannot read or write another tenant's work at all, so it is not
+a universal cross-tenant reader or writer. There is no `FOR ALL` policy anywhere
+except on `provider_accounts`, where every operation is bound to the system-owned
+row shape.
+
+The pre-tenant discovery sequence the next step needs is therefore exactly this:
+resolve the subject, read its memberships, read the organizations those memberships
+name, then enter a tenant context and act through the ordinary tenant path.
+
+### O-4. Usage is append-only and run history is not deletable
+
+`usage_records` is a physical observation: inserted once, never rewritten, never
+removed. `run_records` history is durable truth, retired by status rather than by
+deletion. Both rules are enforced twice, in the policy layer and in the privilege
+layer, so a later policy edit cannot re-open a privilege that was never granted.
+
+System-owned provider credentials remain the only row the server scope may delete.
+
+### O-5. Provenance is tenant-safe
+
+`api_keys.created_by_user_id` and `run_records.initiated_by_user_id` previously
+referenced `users(id)` alone. That proved the user existed but not that the user
+belonged to the row's own organization, so a tenant that knew another tenant's user
+id could record it as the creator of its key or the initiator of its run.
+
+Both now also carry a composite foreign key on
+`(organization_id, <user column>)` referencing
+`memberships (organization_id, user_id)`, which `memberships` already constrains as
+unique. The creator or initiator must therefore be a member of the row's own
+organization, enforced by PostgreSQL rather than by application code. The single
+column keys remain, so the nullable semantics of a queued run's initiator are
+preserved: a composite key is satisfied whenever any of its columns is null.
+
+Both provenance keys are `ON DELETE RESTRICT`, consistent with section D's rule
+that no foreign key cascades. The practical consequence is that a membership row
+cannot be removed while key or run provenance still points at it, and a user cannot
+be removed while those rows exist. Memberships are retired by setting `status`,
+which is what K-2 already forces for a returning member.
+
 ---
 
 # Forge AI — Stage 1 / Шаг 2: схема PostgreSQL и дизайн RLS — русская версия
@@ -1757,3 +1839,94 @@ PostgreSQL 17: никогда не заданная настройка возв�
 потому что этот вопрос относится к O-7. Контрактные тесты базы данных
 проверяют каждое из этих отсутствий, поэтому лишнее ограничение не может быть
 добавлено незамеченным.
+
+## O. Границы безопасности после adversarial review
+
+Независимый adversarial review не нашёл реального tenant escape в реализации
+row-level security. Он нашёл четыре границы, которые были неявными, а не
+принудительными. Этот раздел их фиксирует; `D-PLATFORM-19` их записывает.
+
+### O-1. Путь арендатора и server-only путь — разные роли
+
+`forge_platform_app` — обычный путь запроса арендатора.
+`forge_platform_system` — server-only скоуп для pre-tenant discovery и для
+system-owned провайдерских кредилов.
+
+Обе — `NOLOGIN`, `NOSUPERUSER`, `NOBYPASSRLS` и `NOINHERIT`. Они никогда не являются членами
+друг друга, миграции отозывают это членство при каждом запуске, а
+`platform.platform_scopes_are_separate()` позволяет деплою это проверить. `NOINHERIT`
+несёт нагрузку: сессия, которая каким-то образом получила оба членства, всё равно
+не подхватила бы system-политики просто при подключении.
+
+### O-2. `forge.system_scope` — не механизм авторизации
+
+Любая сессия может установить пользовательскую GUC, поэтому GUC никогда не
+может быть тем, что даёт доступ. Доступ к system-скоупу даёт клауза
+`TO forge_platform_system` в политике вместе с членством в этой роли, которым
+управляет деплой. GUC лишь дополнительно сужает скоуп и держит system-owned
+строки невидимыми по умолчанию. Безопасные тесты проверяют, что путь
+арендатора не получает ничего от установки флага, а system-скоуп не видит ничего
+без него.
+
+**Разделение ответственности.** База данных владеет атрибутами ролей,
+взаимным нечленством, политиками и привилегиями. Она **не** решает и не может
+решить, какой login-ролью пользуется деплой. Это владеет деплой: трафик
+арендатора и трафик system-скоупа должны обслуживаться разными
+login-ролями, чтобы соединение, обслуживающее запрос арендатора, не могло также
+выполнить `SET ROLE` в system-скоуп. Тесты доказывают границу от реальной
+non-superuser login-роли, потому что и superuser, и владелец таблицы обходят
+row-level security и ничего бы не доказали.
+
+### O-3. Серверный скоуп — это discovery и bootstrap, а не администрирование
+
+`forge_platform_system` может читать слой идентичности и аренды (`users`,
+`memberships`, `organizations`), писать bootstrap-строки (аккаунт
+пользователя, организацию, её первый `OWNER` membership, а также реактивацию
+или удаление membership) и управлять system-owned провайдерскими кредилами. Это
+весь список.
+
+У него **нет ни привилегий, ни политик** на `projects`, `api_keys`,
+`run_records` или `usage_records`. Он вообще не может читать или писать работу другого
+арендатора, поэтому он не является универсальным кросс-арендаторным
+читателем или писателем. Ни одной политики `FOR ALL` нет нигде, кроме
+`provider_accounts`, где каждая операция привязана к форме system-owned строки.
+
+Последовательность pre-tenant discovery, которая нужна следующему шагу,
+такова: разрешить субъект, прочитать его memberships, прочитать
+организации, на которые эти memberships указывают, а затем войти в тенантный
+контекст и действовать через обычный путь арендатора.
+
+### O-4. Потребление — append-only, история запусков не удаляется
+
+`usage_records` — физическое наблюдение: вставляется один раз, никогда не
+перезаписывается и не удаляется. История `run_records` — durable истина, она выводится из
+эксплуатации через статус, а не через удаление. Оба правила обеспечены дважды: в
+слое политик и в слое привилегий, поэтому последующая правка политики не может
+открыть привилегию, которая никогда не выдавалась.
+
+System-owned провайдерские кредилы остаются единственной строкой, которую
+серверный скоуп может удалить.
+
+### O-5. Provenance безопасен для арендатора
+
+`api_keys.created_by_user_id` и `run_records.initiated_by_user_id` раньше ссылались
+только на `users(id)`. Это доказывало, что пользователь существует, но не
+то, что он принадлежит собственной организации строки, поэтому арендатор,
+знающий id пользователя другого арендатора, мог записать его как
+создателя своего ключа или инициатора своего запуска.
+
+Теперь оба несут дополнительный составной внешний ключ на
+`(organization_id, <колонка user>)`, ссылающийся на
+`memberships (organization_id, user_id)`, который `memberships` уже ограничивает как
+уникальный. Создатель или инициатор обязан быть участником собственной
+организации строки, и это обеспечивает PostgreSQL, а не код приложения.
+Одноколоночные ключи сохранены, поэтому nullable-семантика
+инициатора queued-запуска сохранена: составной ключ считается
+удовлетворённым, если любая его колонка равна null.
+
+Оба ключа provenance — `ON DELETE RESTRICT`, что согласуется с правилом
+раздела D о том, что ни один внешний ключ не каскадит. Практическое
+следствие: строку membership нельзя удалить, пока на неё ссылается
+provenance ключа или запуска, а пользователя — пока такие строки
+существуют. Membership выводится из эксплуатации через изменение
+`status`, чего K-2 уже требует для возвращающегося участника.

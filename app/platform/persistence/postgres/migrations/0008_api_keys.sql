@@ -56,6 +56,23 @@ CREATE TABLE api_keys (
         ON DELETE RESTRICT,
     CONSTRAINT api_keys_created_by_user_fk
         FOREIGN KEY (created_by_user_id) REFERENCES users (id)
+        ON DELETE RESTRICT,
+    -- TENANT-SAFE PROVENANCE. The single-column key above proves the creator
+    -- exists; it does not prove the creator belongs to THIS organization, which
+    -- would let a tenant record another tenant's user as the creator of its key
+    -- just by knowing that user's id.
+    --
+    -- This composite key closes that gap by referencing the membership pair,
+    -- which `memberships` already constrains as UNIQUE (organization_id,
+    -- user_id). The creator must therefore be a member of the key's own
+    -- organization, and PostgreSQL enforces it -- not application code.
+    --
+    -- ON DELETE RESTRICT, consistent with K-6: a membership row is not silently
+    -- removable while key provenance still points at it. Memberships are retired
+    -- by setting `status`, not by deleting the row.
+    CONSTRAINT api_keys_creator_membership_fk
+        FOREIGN KEY (organization_id, created_by_user_id)
+        REFERENCES memberships (organization_id, user_id)
         ON DELETE RESTRICT
 );
 

@@ -75,24 +75,37 @@ CREATE INDEX users_status_idx ON users (status);
 -- ==================================================================
 -- 0002_roles.sql
 --
--- Platform roles.
+-- Platform roles, and the checks that keep the two scopes from being merged.
 --
--- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md section I, D-PLATFORM-18.
+-- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md section I and section O,
+-- D-PLATFORM-18, D-PLATFORM-19.
 --
--- Two roles separate the ordinary tenant request path from the server-only
--- path that may reach system-owned rows:
+-- TWO ROLES, AND THEY MUST STAY TWO ROLES:
 --
 --   forge_platform_app     the ordinary tenant request path
---   forge_platform_system  the server-only path for system-owned rows
+--   forge_platform_system  the server-only path for system-owned rows and for
+--                          pre-tenant discovery
 --
--- Both roles are NOLOGIN. They are authorization scopes reached with SET ROLE
--- inside the server's own session, not login accounts, so there is no password
--- and no secret anywhere in this migration.
+-- Both are NOLOGIN. They are authorization scopes reached with SET ROLE inside a
+-- login session, not login accounts, so no password exists anywhere in this
+-- schema. A NOLOGIN role cannot be connected to directly, which is what makes the
+-- SET ROLE step an unavoidable, explicit act rather than an accident of who
+-- happened to connect.
 --
--- THE APPLICATION ROLE IS NOT THE TABLE OWNER. Row-level security does not
--- apply to a table's owner, because the owner bypasses it by default. Keeping the
--- roles separate from the migration role is what makes the policies observable --
--- see 0011_rls_enable.sql.
+-- WHY `forge.system_scope = 'on'` IS NOT AN AUTHORIZATION MECHANISM. Any session
+-- can set a custom GUC, so a GUC can never be the thing that grants access. The
+-- system policies are written `TO forge_platform_system`, which is what actually
+-- gates them; the GUC only narrows what the system scope may touch and keeps the
+-- system rows invisible by default. Setting the GUC on the tenant connection
+-- grants nothing, and the tests assert that.
+--
+-- WHAT THIS MIGRATION CANNOT DECIDE. Which login role a deployment uses, and which
+-- of the two scopes that login role holds. That is a deployment decision, and
+-- section O of the schema document states the requirement: tenant traffic and
+-- system traffic must be served by different login roles, so that a connection
+-- serving a tenant request is not also able to SET ROLE into the system scope.
+-- What this migration does instead is make the dangerous configuration detectable
+-- and the safe one self-asserting, from inside the database.
 --
 -- `platform` schema USAGE and function EXECUTE grants are issued in
 -- 0003_rls_helpers.sql, immediately after those functions exist.
@@ -131,8 +144,52 @@ $$;
 -- The two roles must never be superusers or bypass RLS, even if they already
 -- existed with different attributes. Re-asserted so the migration is the source
 -- of truth for this invariant.
-ALTER ROLE forge_platform_app NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
-ALTER ROLE forge_platform_system NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+--
+-- NOINHERIT is load-bearing, not tidiness. Because both roles are NOINHERIT, a
+-- login role that somehow held both memberships would still not pick up the
+-- system policies merely by connecting; it would have to issue SET ROLE
+-- explicitly, which is the auditable act the boundary depends on. Inheritance
+-- would silently hand the system scope to every query on the tenant connection.
+ALTER ROLE forge_platform_app NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+ALTER ROLE forge_platform_system NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+
+-- Neither scope is reachable from the other. Written explicitly, and re-run on
+-- every migration, so a stray grant is undone rather than silently kept.
+REVOKE forge_platform_system FROM forge_platform_app;
+REVOKE forge_platform_app FROM forge_platform_system;
+
+-- The tenant scope must never be a member of the system scope. This is checked
+-- from a helper so the same check can be asserted by a test, and so a deployment
+-- can run it as a health check against its own database.
+CREATE SCHEMA IF NOT EXISTS platform;
+
+CREATE OR REPLACE FUNCTION platform.platform_scopes_are_separate()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT NOT pg_has_role('forge_platform_app', 'forge_platform_system', 'MEMBER')
+       AND NOT pg_has_role('forge_platform_system', 'forge_platform_app', 'MEMBER')
+$$;
+
+COMMENT ON FUNCTION platform.platform_scopes_are_separate() IS
+    'True when neither platform scope is a member of the other. A deployment must '
+    'be able to assert this; if it is false, the two scopes have been merged and '
+    'forge.system_scope stops being a boundary.';
+
+-- Fail the migration loudly rather than leaving a merged pair behind. The
+-- REVOKE statements above make this unreachable in a fresh database; this check
+-- is what catches a database where somebody re-granted the membership by hand
+-- before re-running the migrations.
+DO $$
+BEGIN
+    IF NOT platform.platform_scopes_are_separate() THEN
+        RAISE EXCEPTION
+            'platform scopes are merged: forge_platform_app and '
+            'forge_platform_system must not be members of each other';
+    END IF;
+END
+$$;
 
 -- ==================================================================
 -- 0003_rls_helpers.sql
@@ -592,6 +649,23 @@ CREATE TABLE api_keys (
         ON DELETE RESTRICT,
     CONSTRAINT api_keys_created_by_user_fk
         FOREIGN KEY (created_by_user_id) REFERENCES users (id)
+        ON DELETE RESTRICT,
+    -- TENANT-SAFE PROVENANCE. The single-column key above proves the creator
+    -- exists; it does not prove the creator belongs to THIS organization, which
+    -- would let a tenant record another tenant's user as the creator of its key
+    -- just by knowing that user's id.
+    --
+    -- This composite key closes that gap by referencing the membership pair,
+    -- which `memberships` already constrains as UNIQUE (organization_id,
+    -- user_id). The creator must therefore be a member of the key's own
+    -- organization, and PostgreSQL enforces it -- not application code.
+    --
+    -- ON DELETE RESTRICT, consistent with K-6: a membership row is not silently
+    -- removable while key provenance still points at it. Memberships are retired
+    -- by setting `status`, not by deleting the row.
+    CONSTRAINT api_keys_creator_membership_fk
+        FOREIGN KEY (organization_id, created_by_user_id)
+        REFERENCES memberships (organization_id, user_id)
         ON DELETE RESTRICT
 );
 
@@ -699,7 +773,30 @@ CREATE TABLE run_records (
         ON DELETE RESTRICT,
     CONSTRAINT run_records_initiated_by_user_fk
         FOREIGN KEY (initiated_by_user_id) REFERENCES users (id)
-        ON DELETE SET NULL
+        ON DELETE SET NULL,
+    -- TENANT-SAFE PROVENANCE. As with api_keys, the single-column key above
+    -- proves the initiator exists but not that they belonged to this
+    -- organization, which would let a tenant name another tenant's user as the
+    -- initiator of its run.
+    --
+    -- The composite key references the membership pair, so the initiator must be
+    -- a member of the run's own organization.
+    --
+    -- NULL SEMANTICS ARE PRESERVED. `initiated_by_user_id` is legitimately NULL
+    -- for a queued run, and by default a composite foreign key is satisfied
+    -- whenever ANY of its columns is NULL, so a queued run with no initiator
+    -- still passes. Only the case that matters -- a non-null initiator who is not
+    -- a member of this organization -- is rejected.
+    --
+    -- ON DELETE RESTRICT, consistent with K-6. Note that the single-column key
+    -- above is SET NULL: the two are not in conflict, because a user cannot be
+    -- deleted while they still have runs, and once the membership row is gone
+    -- there is nothing left referencing it. Memberships are retired by setting
+    -- `status`, not by deleting the row.
+    CONSTRAINT run_records_initiator_membership_fk
+        FOREIGN KEY (organization_id, initiated_by_user_id)
+        REFERENCES memberships (organization_id, user_id)
+        ON DELETE RESTRICT
 );
 
 CREATE INDEX run_records_organization_idx ON run_records (organization_id);
@@ -825,7 +922,8 @@ CREATE INDEX usage_records_organization_created_idx
 --
 -- Row-level security enablement and table access grants.
 --
--- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md section I, D-PLATFORM-18.
+-- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md section I, section O,
+-- D-PLATFORM-18, D-PLATFORM-19.
 --
 -- THE CENTRAL POINT: row-level security does NOT apply to a table's owner,
 -- because the owner bypasses RLS by default. A test or deployment that connects
@@ -835,9 +933,16 @@ CREATE INDEX usage_records_organization_created_idx
 -- ENABLE + FORCE are both written on every table. FORCE alone is not enough:
 -- it modifies the behaviour of an already-enabled table.
 --
--- Tables are granted one operation at a time (SELECT, INSERT, UPDATE, DELETE)
--- rather than with ALL. An accidental future grant of TRUNCATE must not arrive
--- bundled with DML, because TRUNCATE is not filtered by row-level security.
+-- GRANTS ARE THE OUTER OF TWO LAYERS. A table privilege says an operation is
+-- possible at all; a policy says which rows it may touch. Both must permit an
+-- operation for it to succeed, so a revoked privilege is a second, independent
+-- way to forbid something. That is why the append-only rule for `usage_records`
+-- and the no-delete rule for `run_records` are enforced in BOTH places rather
+-- than in the policy alone: a future policy edit cannot re-open a privilege that
+-- was never granted.
+--
+-- GRANTS ARE DELIBERATELY NARROW. A capability that no accepted contract needs is
+-- not granted, so it cannot be reached by accident.
 
 -- Enable and force row-level security on every table. FORCE is what makes the
 -- policies apply to the table owner as well.
@@ -858,26 +963,70 @@ ALTER TABLE run_records       FORCE  ROW LEVEL SECURITY;
 ALTER TABLE usage_records     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_records     FORCE  ROW LEVEL SECURITY;
 
--- One operation at a time on purpose: no ALL, and therefore no TRUNCATE.
+---------------------------------------------------------------------
+-- forge_platform_app: the ordinary tenant request path
+---------------------------------------------------------------------
+-- One operation at a time on purpose: no ALL, and therefore no TRUNCATE, which
+-- row-level security does not filter.
 GRANT SELECT, INSERT, UPDATE, DELETE ON users             TO forge_platform_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON organizations     TO forge_platform_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON memberships       TO forge_platform_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON projects          TO forge_platform_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON provider_accounts TO forge_platform_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON api_keys          TO forge_platform_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON run_records       TO forge_platform_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON usage_records     TO forge_platform_app;
+-- run_records: lifecycle transitions are needed, deletion is not. The DELETE
+-- privilege is withheld because no accepted contract requires deleting execution
+-- history; without the privilege, no policy can make it possible.
+GRANT SELECT, INSERT, UPDATE ON run_records TO forge_platform_app;
+-- usage_records is APPEND-ONLY: a measurement is inserted once and never
+-- rewritten or removed. Corrections are new records, and O-8's
+-- UNIQUE (run_record_id, attempt_number) already prevents a silent overwrite of
+-- an attempt's measurement. UPDATE and DELETE are not granted, so the
+-- append-only rule survives any future policy change.
+GRANT SELECT, INSERT ON usage_records TO forge_platform_app;
 
--- The system role is granted access too; what separates it is not the table
--- privilege but which policies exist for it (see 0012_..., 0013_..., 0014_...).
-GRANT SELECT, INSERT, UPDATE, DELETE ON users             TO forge_platform_system;
-GRANT SELECT, INSERT, UPDATE, DELETE ON organizations     TO forge_platform_system;
-GRANT SELECT, INSERT, UPDATE, DELETE ON memberships       TO forge_platform_system;
-GRANT SELECT, INSERT, UPDATE, DELETE ON projects          TO forge_platform_system;
+---------------------------------------------------------------------
+-- forge_platform_system: the server-only scope
+---------------------------------------------------------------------
+-- This scope exists for two things and nothing else:
+--
+--   1. reading the identity and tenancy layer to resolve a subject BEFORE a
+--      tenant context exists (find the user, their memberships, their
+--      organizations);
+--   2. the bootstrap that cannot itself be tenant-scoped -- creating an
+--      organization and its first OWNER membership -- plus the system-owned
+--      provider credentials, which belong to no tenant by definition.
+--
+-- It is NOT a general cross-tenant reader or writer. The operational tables that
+-- carry tenant work -- projects, api_keys, run_records, usage_records -- are
+-- deliberately absent from the list below. There is no grant to revoke because
+-- there is no grant: this scope cannot read or write another tenant's runs or
+-- measurements at all.
+--
+-- The grants are held to the minimum each numbered capability needs, and an
+-- undesired operation is removed rather than merely left unpoliced:
+--
+--   users:         SELECT (resolve a subject) + INSERT (bootstrap the account).
+--                  NO UPDATE -- changing an account, including its email, is not
+--                  part of this scope, and an UPDATE privilege that no capability
+--                  requires is a capability waiting to be used.
+--   organizations: SELECT (resolve a tenant) + INSERT (bootstrap the tenant).
+--                  NO UPDATE -- suspending a tenant is not required by any
+--                  accepted contract, so it is not granted; adding it later is a
+--                  deliberate expansion with a policy to match.
+--   memberships:   SELECT (discovery) + INSERT (the first OWNER) + UPDATE
+--                  (reactivating a returning member, which K-2 forces to be a
+--                  status change rather than a second row) + DELETE (the
+--                  administrative counterpart of the RESTRICT keys, so that
+--                  provenance rows do not block user removal forever).
+GRANT SELECT, INSERT ON users             TO forge_platform_system;
+GRANT SELECT, INSERT ON organizations     TO forge_platform_system;
+GRANT SELECT, INSERT, UPDATE, DELETE ON memberships TO forge_platform_system;
+-- System-owned provider credentials are the one operational exception: they
+-- belong to no tenant, so no tenant context can ever reach them. The policy
+-- restricts this scope to rows with a NULL organization_id and requires the
+-- explicit system scope flag.
 GRANT SELECT, INSERT, UPDATE, DELETE ON provider_accounts TO forge_platform_system;
-GRANT SELECT, INSERT, UPDATE, DELETE ON api_keys          TO forge_platform_system;
-GRANT SELECT, INSERT, UPDATE, DELETE ON run_records       TO forge_platform_system;
-GRANT SELECT, INSERT, UPDATE, DELETE ON usage_records     TO forge_platform_system;
 
 -- The migration ledger is written by the migration role, never by the platform
 -- roles, so it is deliberately not granted to either.
@@ -891,7 +1040,8 @@ GRANT USAGE ON SCHEMA platform TO forge_platform_app, forge_platform_system;
 --
 -- RLS policies for `organizations` and `memberships`.
 --
--- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md section I-5 and I-3.
+-- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-5, O,
+-- D-PLATFORM-19.
 --
 -- NEITHER TABLE USES THE ORDINARY TENANT PREDICATE.
 --
@@ -902,23 +1052,40 @@ GRANT USAGE ON SCHEMA platform TO forge_platform_app, forge_platform_system;
 --
 -- `memberships` DOES carry organization_id and uses the ordinary containment
 -- predicate. The extra nuance is on writing: a membership may only be created or
--- changed for the CURRENT tenant, and only while the current tenant is itself
--- visible. Otherwise an actor could insert a membership into an organization it
--- cannot even read.
+-- changed for the CURRENT tenant.
+--
+-- THE SYSTEM SCOPE IS THE BOOTSTRAP AND DISCOVERY SCOPE, AND NOTHING MORE. It is
+-- confined to exactly three things here and in 0014:
+--
+--   1. discovering a subject BEFORE any tenant context exists: find the user,
+--      find their memberships, find the organizations those memberships name;
+--   2. the bootstrap that cannot itself be tenant-scoped: creating an
+--      organization and its first OWNER membership;
+--   3. system-owned provider credentials.
+--
+-- It is NOT a general cross-tenant reader or writer, and it does not reach the
+-- operational tables at all (see 0013). There is no `FOR ALL` policy anywhere on
+-- this scope: every capability is enumerated, so a new table or a new operation
+-- is denied by default rather than permitted by a wildcard.
+--
+-- `forge.system_scope` IS NOT AN AUTHORIZATION MECHANISM. Any session can set a
+-- custom GUC. What gates system access is the policy's `TO forge_platform_system`
+-- clause plus that role's membership, which the deployment controls. The GUC only
+-- narrows the scope further and keeps system-owned rows invisible by default.
 --
 -- CREATING AN ORGANIZATION AND ITS FIRST OWNER MEMBERSHIP IS A SERVER-ONLY PATH.
--- There is deliberately no policy here that lets the ordinary tenant role create
--- an organization, because the role that creates it must also be able to create
--- its first membership -- a bootstrap step that cannot itself be tenant-scoped.
--- The system role owns that step; see the policies at the end of this file.
---
--- FOR THE ORDINARY TENANT ROLE, ONLY SELECT POLICIES ARE DEFINED. An absent
--- policy means denied, so INSERT, UPDATE, and DELETE on organizations are denied
--- outright, which is the fail-closed direction.
+-- There is deliberately no policy that lets the tenant role create an
+-- organization, because the role that creates it must also be able to create its
+-- first membership -- a bootstrap step that cannot itself be tenant-scoped.
 
 ---------------------------------------------------------------------
--- memberships: ordinary tenant containment
+-- memberships
 ---------------------------------------------------------------------
+-- The EXISTS conjunct on the INSERT is not decorative: it prevents an actor from
+-- inserting a membership into an organization it cannot itself read. On INSERT
+-- the SELECT policy is evaluated against the new row, so this is also what makes
+-- the bootstrap order work -- the organization must become visible before its
+-- first membership can be written.
 CREATE POLICY memberships_tenant_select ON memberships
     FOR SELECT TO forge_platform_app
     USING (platform.is_current_organization(organization_id));
@@ -944,49 +1111,92 @@ CREATE POLICY memberships_tenant_delete ON memberships
     USING (platform.is_current_organization(organization_id));
 
 ---------------------------------------------------------------------
--- memberships: system role, gated by the explicit system scope flag
+-- memberships: system scope, enumerated
 ---------------------------------------------------------------------
-CREATE POLICY memberships_system_scope ON memberships
-    FOR ALL TO forge_platform_system
+-- Discovery reads. UPDATE exists so the bootstrap path can reactivate an
+-- existing membership (K-2 allows one row per organization and user pair, so a
+-- returning member is a status change, not a second row). DELETE is granted
+-- because membership removal is the administrative counterpart of the RESTRICT
+-- keys: provenance rows must not block it forever.
+CREATE POLICY memberships_system_select ON memberships
+    FOR SELECT TO forge_platform_system
+    USING (platform.system_scope_is_declared());
+
+CREATE POLICY memberships_system_insert ON memberships
+    FOR INSERT TO forge_platform_system
+    WITH CHECK (platform.system_scope_is_declared());
+
+CREATE POLICY memberships_system_update ON memberships
+    FOR UPDATE TO forge_platform_system
     USING (platform.system_scope_is_declared())
     WITH CHECK (platform.system_scope_is_declared());
+
+CREATE POLICY memberships_system_delete ON memberships
+    FOR DELETE TO forge_platform_system
+    USING (platform.system_scope_is_declared());
 
 ---------------------------------------------------------------------
 -- organizations: membership-mediated visibility, read-only for tenants
 ---------------------------------------------------------------------
--- Visible only through an ACTIVE membership of the current tenant. The
--- o.id = platform.current_organization_id() conjunct is re-stated here so that
--- this policy does not depend on the memberships policy still being in force.
+-- Two distinct readings are permitted:
+--
+--   * the organization named by the CURRENT TENANT CONTEXT. This is a lookup of
+--     an identifier the server already resolved and put into the transaction, not
+--     a client-supplied value, and it is what makes tenancy work at all: an
+--     actor must be able to read the tenant it is acting in before any membership
+--     row is written for it.
+--   * an organization the subject SHARES through an active membership.
+--
+-- What is NOT permitted is enumerating organizations. Both branches require the
+-- tenant context to be already set; a null context matches neither.
 CREATE POLICY organizations_tenant_select ON organizations
     FOR SELECT TO forge_platform_app
     USING (
         platform.current_organization_id() IS NOT NULL
-        AND id = platform.current_organization_id()
-        AND EXISTS (
-            SELECT 1 FROM memberships m
-            WHERE m.organization_id = organizations.id
-              AND m.status = 'active'
+        AND (
+            -- the tenant this transaction is acting in
+            id = platform.current_organization_id()
+            -- or one the subject shares through an active membership
+            OR EXISTS (
+                SELECT 1 FROM memberships m
+                WHERE m.organization_id = organizations.id
+                  AND m.status = 'active'
+                  AND m.user_id =
+                        nullif(current_setting('forge.user_id', true), '')::uuid
+            )
         )
     );
 
 -- No INSERT/UPDATE/DELETE policy for forge_platform_app: creating an
 -- organization and its first OWNER membership is a server-only bootstrap step.
-CREATE POLICY organizations_system_scope ON organizations
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
+-- An absent policy denies, which is the fail-closed direction.
+CREATE POLICY organizations_system_select ON organizations
+    FOR SELECT TO forge_platform_system
+    USING (platform.system_scope_is_declared());
+
+CREATE POLICY organizations_system_insert ON organizations
+    FOR INSERT TO forge_platform_system
     WITH CHECK (platform.system_scope_is_declared());
+
+-- There is deliberately NO system UPDATE or DELETE policy on organizations, and
+-- neither privilege is granted. Suspending a tenant and destroying a tenant are
+-- not operations any accepted contract requires; the RESTRICT keys mean a delete
+-- could not succeed while any tenant data existed anyway. Omitting both keeps
+-- "the system scope can mutate or erase a tenant" off the list of things a reader
+-- has to rule out, and makes adding either a deliberate expansion.
 
 -- ==================================================================
 -- 0013_policies_tenancy.sql
 -- ==================================================================
 -- 0013_policies_tenancy.sql
 --
--- RLS policies for the remaining tenant-owned tables:
+-- RLS policies for the operational tenant tables:
 -- `projects`, `api_keys`, `run_records`, `usage_records`.
 --
--- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-3 and I-8.
+-- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-3, I-8 and O,
+-- D-PLATFORM-19.
 --
--- THE SAME FOUR POLICIES ON EVERY TABLE, and the operation split is the point:
+-- THE OPERATION SPLIT IS THE POINT:
 --
 --   SELECT / DELETE  ->  USING  (which rows are visible)
 --   INSERT / UPDATE  ->  WITH CHECK  (which rows may be written)
@@ -995,16 +1205,25 @@ CREATE POLICY organizations_system_scope ON organizations
 -- tenant. WITH CHECK is what actually prevents a cross-tenant INSERT and, because
 -- UPDATE carries both clauses, what prevents a row being MOVED between tenants.
 --
+-- NO SYSTEM SCOPE REACHES THESE TABLES. The server-only `forge_platform_system`
+-- scope is confined to the identity and tenancy layer (users, organizations,
+-- memberships) plus system-owned provider credentials. It has no policy and no
+-- table privilege here, so it cannot read or write any tenant's projects, keys,
+-- runs, or measurements. There is deliberately no `FOR ALL ... USING
+-- (system_scope_is_declared())` policy on this file's tables: such a policy would
+-- make the system scope a universal cross-tenant reader and writer, and
+-- `forge.system_scope` is a GUC, not an authorization mechanism.
+--
 -- Cross-tenant references are NOT left to RLS. Row-level security sees one table,
 -- so it cannot observe that a row points at a parent in another organization.
--- That is K-7's job: the composite foreign keys in 0006_projects.sql,
--- 0009_run_records.sql, and 0010_usage_records.sql make such a reference
--- structurally impossible. RLS is the second layer, not the only one.
+-- That is the job of the composite foreign keys in 0006_projects.sql,
+-- 0008_api_keys.sql, 0009_run_records.sql, and 0010_usage_records.sql. RLS is the
+-- second layer, not the only one.
 --
 -- TENANT CONTEXT IS FAIL-CLOSED. platform.is_current_organization() is false
 -- when the transaction-local setting is unset OR empty, so with no tenant context
 -- a SELECT returns no rows and every write is rejected. See 0003_rls_helpers.sql
--- for why the empty-string case has to be handled explicitly.
+-- for why both no-context states have to be handled explicitly.
 
 ---------------------------------------------------------------------
 -- projects
@@ -1026,17 +1245,14 @@ CREATE POLICY projects_tenant_delete ON projects
     FOR DELETE TO forge_platform_app
     USING (platform.is_current_organization(organization_id));
 
-CREATE POLICY projects_system_scope ON projects
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
-    WITH CHECK (platform.system_scope_is_declared());
-
 ---------------------------------------------------------------------
 -- api_keys
 ---------------------------------------------------------------------
 -- An API key is never workspace or filesystem authority and can never bypass
--- membership, organization, or project authorization. Row-level security makes
--- it tenant-visible; it does not make it a permission.
+-- membership, organization, or project authorization. Row-level security makes it
+-- tenant-visible; it does not make it a permission. Revocation is a status change
+-- with an explicit `revoked_at`, which is why UPDATE exists here and DELETE is
+-- only for an administrative cleanup that is still tenant-scoped.
 CREATE POLICY api_keys_tenant_select ON api_keys
     FOR SELECT TO forge_platform_app
     USING (platform.is_current_organization(organization_id));
@@ -1054,14 +1270,16 @@ CREATE POLICY api_keys_tenant_delete ON api_keys
     FOR DELETE TO forge_platform_app
     USING (platform.is_current_organization(organization_id));
 
-CREATE POLICY api_keys_system_scope ON api_keys
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
-    WITH CHECK (platform.system_scope_is_declared());
-
 ---------------------------------------------------------------------
 -- run_records
 ---------------------------------------------------------------------
+-- Execution history is durable truth. Transitions are expected: a run moves
+-- from queued to running to a terminal status, and Core's reported progress sets
+-- core_run_id, started_at, finished_at, and attempt_count.
+--
+-- THERE IS NO TENANT DELETE POLICY. A run is retired by its status, never by
+-- removing the row, and the DELETE privilege is withheld in 0011_rls_enable.sql
+-- as well. Both layers say no, so a later policy edit cannot re-open deletion.
 CREATE POLICY run_records_tenant_select ON run_records
     FOR SELECT TO forge_platform_app
     USING (platform.is_current_organization(organization_id));
@@ -1075,18 +1293,16 @@ CREATE POLICY run_records_tenant_update ON run_records
     USING (platform.is_current_organization(organization_id))
     WITH CHECK (platform.is_current_organization(organization_id));
 
-CREATE POLICY run_records_tenant_delete ON run_records
-    FOR DELETE TO forge_platform_app
-    USING (platform.is_current_organization(organization_id));
-
-CREATE POLICY run_records_system_scope ON run_records
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
-    WITH CHECK (platform.system_scope_is_declared());
-
 ---------------------------------------------------------------------
 -- usage_records
 ---------------------------------------------------------------------
+-- APPEND-ONLY. A usage record is a physical observation: inserted once, never
+-- rewritten, never removed. Corrections are new records, and
+-- UNIQUE (run_record_id, attempt_number) already prevents a silent overwrite of
+-- an attempt's measurement.
+--
+-- SELECT and INSERT policies only. UPDATE and DELETE have no policy AND no
+-- table privilege, so the append-only guarantee holds at both layers.
 CREATE POLICY usage_records_tenant_select ON usage_records
     FOR SELECT TO forge_platform_app
     USING (platform.is_current_organization(organization_id));
@@ -1095,23 +1311,6 @@ CREATE POLICY usage_records_tenant_insert ON usage_records
     FOR INSERT TO forge_platform_app
     WITH CHECK (platform.is_current_organization(organization_id));
 
--- A usage record is an observation and is not updated in normal operation. The
--- policy is still written with both clauses so that no future writer can move a
--- measurement between tenants.
-CREATE POLICY usage_records_tenant_update ON usage_records
-    FOR UPDATE TO forge_platform_app
-    USING (platform.is_current_organization(organization_id))
-    WITH CHECK (platform.is_current_organization(organization_id));
-
-CREATE POLICY usage_records_tenant_delete ON usage_records
-    FOR DELETE TO forge_platform_app
-    USING (platform.is_current_organization(organization_id));
-
-CREATE POLICY usage_records_system_scope ON usage_records
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
-    WITH CHECK (platform.system_scope_is_declared());
-
 -- ==================================================================
 -- 0014_policies_users_provider_accounts.sql
 -- ==================================================================
@@ -1119,8 +1318,8 @@ CREATE POLICY usage_records_system_scope ON usage_records
 --
 -- RLS policies for `users` and `provider_accounts`.
 --
--- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-4, I-5, and F,
--- D-PLATFORM-16.
+-- Contract: docs/STAGE-1-STEP-2-SCHEMA-DESIGN.md sections I-4, I-5, O, and F,
+-- D-PLATFORM-16, D-PLATFORM-19.
 --
 -- These are the two tables where the ordinary tenant predicate is NOT enough or
 -- NOT applicable, and both are easy to get wrong in the same way: by widening a
@@ -1134,12 +1333,6 @@ CREATE POLICY usage_records_system_scope ON usage_records
 --
 --   * a subject may see itself;
 --   * other users are visible only through a shared organization.
---
--- The current user is read from a second transaction-local setting,
--- forge.user_id. It is read through the same nullif(..., '') treatment as the
--- tenant, for the same reason: an unset setting is an empty string, and an empty
--- string would otherwise compare unequal to every id but still not fail closed in
--- an expression that only tested IS NOT NULL.
 --
 -- A blanket SELECT on users would be a cross-tenant leak of identities, so it is
 -- not granted. INSERT/UPDATE/DELETE have no policy for the tenant role at all,
@@ -1166,10 +1359,13 @@ CREATE POLICY users_tenant_select ON users
         )
     );
 
-CREATE POLICY users_system_scope ON users
-    FOR ALL TO forge_platform_system
-    USING (platform.system_scope_is_declared())
-    WITH CHECK (platform.system_scope_is_declared());
+-- The system scope needs to resolve a subject BEFORE a tenant context exists.
+-- That is a read of identity, and it is granted as a read only: this scope has no
+-- INSERT, UPDATE, or DELETE policy on `users`, and no such privilege either. It
+-- cannot create an account, change one, or erase one.
+CREATE POLICY users_system_select ON users
+    FOR SELECT TO forge_platform_system
+    USING (platform.system_scope_is_declared());
 
 ---------------------------------------------------------------------
 -- provider_accounts
@@ -1192,11 +1388,6 @@ CREATE POLICY users_system_scope ON users
 -- forge_platform_app in every operation. They are reachable only through the
 -- explicit system-owned policy below, which requires BOTH a null
 -- organization_id AND an explicitly declared server-side system scope.
---
--- That system policy is a SEPARATE AUTHORIZATION BOUNDARY, not a tenant RLS
--- bypass: it is attached to a different role, is off unless the server declares
--- it, and grants no execution authority. System ownership is an ownership
--- boundary and nothing more.
 
 CREATE POLICY provider_accounts_tenant_select ON provider_accounts
     FOR SELECT TO forge_platform_app
@@ -1230,9 +1421,17 @@ CREATE POLICY provider_accounts_tenant_delete ON provider_accounts
         AND platform.is_current_organization(organization_id)
     );
 
--- The system-owned path. Both the row shape and an explicit server-side
--- declaration are required, so no tenant request can reach these rows and no
--- client can manufacture system ownership by sending a null organization.
+-- The system-owned path. BOTH conditions are required: the row must have a null
+-- organization_id AND the server must have declared the system scope. This is the
+-- only table where the system scope may write operational data, and the reason is
+-- structural rather than discretionary -- a system-owned credential belongs to no
+-- organization, so no tenant context can ever reach it.
+--
+-- `FOR ALL` is used here, unlike every other system policy, because the row shape
+-- predicate is exact and is applied to every operation: there is no row that
+-- satisfies it other than a system-owned one, and none of these operations can
+-- touch a tenant-owned row. On a table where the predicate were merely a scope
+-- flag, `FOR ALL` would be the wildcard this design forbids.
 CREATE POLICY provider_accounts_system_owned ON provider_accounts
     FOR ALL TO forge_platform_system
     USING (platform.is_system_owned_provider_account(organization_id))

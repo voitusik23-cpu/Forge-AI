@@ -93,6 +93,42 @@ def new_database_name() -> str:
     return "forge_platform_test_" + uuid.uuid4().hex[:12]
 
 
+# A real, non-superuser, non-BYPASSRLS login role. The security-sensitive tests
+# need a session that is genuinely subject to the policies: a superuser and a
+# table owner both bypass row-level security, so proving "the tenant path cannot
+# reach system rows" from such a session would prove nothing. This role exists
+# only for the duration of a test and is dropped afterwards.
+PROOF_LOGIN_ROLE = "forge_proof_login"
+PROOF_LOGIN_PASSWORD = "proof-login-not-a-secret"  # noqa: S105 - throwaway test role
+
+
+def proof_login_available() -> bool:
+    """Whether a password-authenticated login can be created and used.
+
+    A server configured with trust or peer authentication still works, but a
+    server that forbids password logins would make this fixture impossible; the
+    tests that need it skip with a reason rather than silently weakening.
+    """
+
+    return os.environ.get("FORGE_PLATFORM_TEST_NO_LOGIN", "") != "1"
+
+
+def login_connect_kwargs(database: str) -> dict:
+    """Connection arguments for the non-superuser proof login role."""
+
+    dsn = os.environ.get(DSN_ENV)
+    if dsn:
+        return {"dsn": dsn, "user": PROOF_LOGIN_ROLE,
+                "password": PROOF_LOGIN_PASSWORD, "database": database}
+    return {
+        "host": os.environ.get("FORGE_PLATFORM_TEST_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("FORGE_PLATFORM_TEST_PORT", "5432")),
+        "user": PROOF_LOGIN_ROLE,
+        "password": PROOF_LOGIN_PASSWORD,
+        "database": database,
+    }
+
+
 async def schema_file_sql() -> str:
     path = (
         REPO_ROOT
@@ -147,10 +183,64 @@ class LiveDatabase:
     async def apply_consolidated_schema(self) -> None:
         await self._connection.execute(await schema_file_sql())
 
+    async def create_proof_login(self, *, grant_app: bool = True,
+                                 grant_system: bool = False) -> str:
+        """Create a real non-superuser login role scoped to the platform roles.
+
+        The role is deliberately created WITHOUT inheriting anything
+        (`INHERIT` is not set), so reaching a platform scope requires an explicit
+        `SET ROLE`. That is the shape a deployment must use, and these tests assert
+        the boundary holds in exactly that shape.
+        """
+
+        asyncpg = asyncpg_module()
+        if asyncpg is None:
+            raise RuntimeError(SKIP_REASON_NO_DRIVER)
+
+        await self._maintenance.execute(
+            f"DROP ROLE IF EXISTS {PROOF_LOGIN_ROLE}"
+        )
+        await self._maintenance.execute(
+            f"CREATE ROLE {PROOF_LOGIN_ROLE} LOGIN PASSWORD "
+            f"'{PROOF_LOGIN_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            f"NOBYPASSRLS"
+        )
+        for role, granted in ((APP_ROLE, grant_app), (SYSTEM_ROLE, grant_system)):
+            if granted:
+                await self._maintenance.execute(
+                    f"GRANT {role} TO {PROOF_LOGIN_ROLE}"
+                )
+        return PROOF_LOGIN_ROLE
+
+    async def drop_proof_login(self) -> None:
+        if self._maintenance is not None:
+            await self._maintenance.execute(
+                f"DROP ROLE IF EXISTS {PROOF_LOGIN_ROLE}"
+            )
+
+    async def login_as_proof_role(self, role: str):
+        """Open a second connection as the proof login role, with SET ROLE."""
+
+        asyncpg = asyncpg_module()
+        if asyncpg is None:
+            raise RuntimeError(SKIP_REASON_NO_DRIVER)
+
+        connection = await asyncpg.connect(
+            **login_connect_kwargs(self.name), timeout=10
+        )
+        await connection.execute(f"SET ROLE {role}")
+        return connection
+
     async def __aexit__(self, exc_type, exc, tb):
         if self._connection is not None:
             await self._connection.close()
         if self._maintenance is not None:
+            try:
+                await self._maintenance.execute(
+                    f"DROP ROLE IF EXISTS {PROOF_LOGIN_ROLE}"
+                )
+            except Exception:  # noqa: BLE001 - cleanup must never mask a failure
+                pass
             if self.name:
                 await self._maintenance.execute(
                     f'DROP DATABASE IF EXISTS "{self.name}" WITH (FORCE)'
