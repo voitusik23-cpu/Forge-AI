@@ -1651,3 +1651,189 @@ Implemented in the planning block. Verified against the code in
 4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, исполнение tools
    через harness, memory, knowledge, reviewer, idempotency и resume этим блоком не
    изменены.**
+
+## Production Revision Loop v0.1
+
+Implemented in the revision block. Verified against the code in
+`app/agent_runtime/revision_decision.py`, `app/agent_runtime/revision_policy.py`,
+`app/agent_runtime/harness.py`, `app/runtime/bootstrap.py`, and
+`tests/test_revision_loop_production.py`.
+
+### Accepted decisions
+
+- **The revision loop lives inside `AgentHarness`.** There is no
+  `RevisionAgentLoop`, `RevisionCoordinator`, `PlannerAgentLoop`, or second
+  harness. One `AgentHarness.run` call owns the whole run, including revisions.
+- **The trigger is objective.** `evaluate_revision` allows a revision only when a
+  real verification outcome exists, the failure is actionable, budget remains,
+  and a current plan exists to replace. A planner's or a decision provider's
+  wish for another step is never sufficient.
+- **The classification is a closed taxonomy and it decides actionability.**
+  `ACTIONABLE_CATEGORIES` is `{VERIFICATION_FAILED, ACCEPTANCE_FAILED,
+  EXECUTION_FAILED}`; `SECURITY_FAILURE`, `VALIDATION_FAILED`,
+  `NON_ACTIONABLE_FAILURE`, and `NO_PROGRESS` are terminal and disjoint from it.
+  A security, authority, validation, or no-progress failure ends the run.
+- **The budget is server-side.** `RevisionBudget` is immutable, rejects negative
+  and non-integer values, and is never read from a task request, a plan, an LLM,
+  or a decision. With no explicit budget the harness derives it from its own
+  `AgentHarnessPolicy.max_revision_attempts`, so the loop is bounded either way.
+- **Revision numbers are semantic and monotonic.** Revision 0 is the initial
+  attempt and revision 1 is the first revision. The number is computed
+  server-side and travels with `run_id` and `task_id`.
+- **Every revision is a new immutable plan.** The old plan is never mutated. The
+  same existing `Planner` is asked for a plan against a bounded revision goal, and
+  that plan passes the same `require_valid_plan` validation as the initial plan.
+- **No blind retry, detected structurally.** `plan_structure_signature` captures a
+  plan's ordered intentions. A revision that resolves to the same shape as the
+  plan it replaces - or to an already-superseded shape - terminates the run as
+  `revision_no_progress`, because a new identity over the same intentions is still
+  the same attempt.
+- **No self-approval and no shortcut.** A revision re-enters plan validation, the
+  decision, the harness's own authorization step, `RunScope`,
+  `ExecutionCoordinator`, `AuthorizedExecution`, and approval semantics.
+- **One run and one task for the whole loop.** `run_id` and `task_id` never
+  change, so the run store, acceptance, observability, and the final outcome stay
+  coherent. Cross-run and cross-task plans and decisions are rejected.
+- **Acceptance stays terminal and independent.** A passed acceptance ends the run
+  and no revision is attempted. A revision cannot add, drop, replace, weaken, or
+  self-satisfy a criterion, and it never fabricates an acceptance verdict.
+- **A refused revision is a bounded refusal, not a run failure.** When a decision
+  asks for a revision that eligibility refuses, the refusal is recorded as a
+  denied action and the loop continues until one of its configured bounds ends it.
+  Nothing is executed and no plan is produced.
+- **Two events with sanitized metadata.** `REVISION_STARTED` and
+  `REVISION_COMPLETED` record identities, the revision number, bounded plan
+  identity, status, failure category, actionability, remaining budget, and the
+  previous and new plan fingerprints. No stdout, stderr, environment, credential,
+  or raw model output.
+
+### Rejected alternatives (with rationale)
+
+- **Honouring every `REQUEST_REVISION` decision.** Rejected: it makes the model's
+  preference the trigger, which is exactly the subjective basis the boundary must
+  exclude.
+- **Retrying the same action until it passes.** Rejected: that is a blind retry,
+  not a revision, and it converts a failed verification into an unbounded loop.
+- **Treating a security or authority denial as retryable.** Rejected: a run must
+  never attempt to work around a boundary it was denied.
+- **Letting a revision mutate the existing plan.** Rejected: it would let a
+  revision reuse a trusted identity for untrusted content.
+- **Putting the revision budget in the task request or the plan.** Rejected: it
+  makes the bound client-controlled and defeats the purpose of bounding the loop.
+- **Letting a revision bypass approval or execute directly.** Rejected: that would
+  give the planning layer execution authority through the back door.
+- **Widening the harness's existing action/iteration bounds.** Rejected: the
+  existing policy bounds already cap the loop, and reusing them keeps one source
+  of truth.
+
+### Consequences and open items
+
+1. **The deterministic planner makes no-progress the common outcome.** The
+   existing templates cannot invent different intentions, so a revision over the
+   same goal currently resolves to the same shape and terminates as
+   `revision_no_progress`. Genuinely different revisions need a planner that can
+   produce a different intention set; that is deferred.
+2. **The `run_agent_loop` path cannot trigger a revision today.** Its verification
+   observations are `not_evaluated` because criterion identity on that path is
+   GAP-F, so no objective verification outcome exists to react to. An objective
+   revision trigger currently requires the operator-declared criteria of the
+   accepted-task path.
+3. **No revision history.** Only the previous and new plan fingerprints are
+   recorded; a full revision history is deferred.
+4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, parallel and
+   distributed execution, richer retry policies, tool execution through the
+   harness, memory, knowledge, reviewer, idempotency, and resume are unchanged**
+   by this block.
+
+## Production Revision Loop v0.1 — русская версия
+
+Реализовано в блоке revision. Проверено по коду в
+`app/agent_runtime/revision_decision.py`, `app/agent_runtime/revision_policy.py`,
+`app/agent_runtime/harness.py`, `app/runtime/bootstrap.py` и
+`tests/test_revision_loop_production.py`.
+
+### Принятые решения
+
+- **Revision loop живёт внутри `AgentHarness`.** `RevisionAgentLoop`,
+  `RevisionCoordinator`, `PlannerAgentLoop` или второй harness не создавались. Один
+  вызов `AgentHarness.run` владеет всем run, включая revisions.
+- **Триггер объективен.** `evaluate_revision` разрешает revision лишь когда есть
+  реальный вердикт verification, сбой actionable, остался бюджет и есть текущий план
+  для замены. Желание планировщика или провайдера решений получить ещё один шаг
+  никогда не достаточно.
+- **Классификация — закрытая таксономия, и она определяет actionable.**
+  `ACTIONABLE_CATEGORIES` — это `{VERIFICATION_FAILED, ACCEPTANCE_FAILED,
+  EXECUTION_FAILED}`; `SECURITY_FAILURE`, `VALIDATION_FAILED`,
+  `NON_ACTIONABLE_FAILURE` и `NO_PROGRESS` терминальны и не пересекаются с ней.
+  Сбой security, authority, validation или no-progress завершает run.
+- **Бюджет на стороне сервера.** `RevisionBudget` неизменяем, отвергает
+  отрицательные и нецелые значения и никогда не читается из task request, плана, LLM
+  или решения. Без явного бюджета harness выводит его из собственного
+  `AgentHarnessPolicy.max_revision_attempts`, поэтому loop ограничен в любом случае.
+- **Номера revision семантичны и монотонны.** Revision 0 — исходная попытка,
+  revision 1 — первая revision. Номер вычисляется на сервере и связан с `run_id` и
+  `task_id`.
+- **Каждая revision — новый неизменяемый план.** Старый план никогда не мутируется.
+  Тот же существующий `Planner` получает план под ограниченную revision goal, и этот
+  план проходит ту же валидацию `require_valid_plan`, что и исходный.
+- **Никакого blind retry, детекция структурная.** `plan_structure_signature`
+  фиксирует упорядоченные намерения плана. Revision, сводящаяся к той же форме, что и
+  заменяемый план — или к уже заменённой форме — завершает run как
+  `revision_no_progress`, поскольку новая идентичность при тех же намерениях всё
+  равно остаётся той же попыткой.
+- **Никакого self-approval и никаких сокращений.** Revision заново проходит
+  валидацию плана, решение, собственный шаг авторизации harness, `RunScope`,
+  `ExecutionCoordinator`, `AuthorizedExecution` и approval semantics.
+- **Один run и один task на весь loop.** `run_id` и `task_id` не меняются, поэтому
+  run store, acceptance, наблюдаемость и итоговый результат остаются согласованными.
+  Кросс-run и кросс-task планы и решения отвергаются.
+- **Acceptance остаётся терминальным и независимым.** Пройденный acceptance
+  завершает run, и revision не выполняется. Revision не может добавить, удалить,
+  заменить, ослабить criterion или самостоятельно его удовлетворить, и она никогда не
+  фабрикует вердикт acceptance.
+- **Отклонённая revision — ограниченный отказ, а не сбой run.** Когда решение просит
+  revision, а eligibility отказывает, отказ фиксируется как denied action, и loop
+  продолжается до одной из настроенных границ. Ничего не исполняется и никакой план не
+  создаётся.
+- **Два события с санитизированными метаданными.** `REVISION_STARTED` и
+  `REVISION_COMPLETED` записывают идентичности, номер revision, ограниченную
+  идентичность плана, статус, категорию сбоя, actionable, остаток бюджета и прежний и
+  новый fingerprint плана. Ни stdout, ни stderr, ни окружение, ни credentials, ни
+  сырой вывод модели.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Исполнять каждое решение `REQUEST_REVISION`.** Отклонено: это делает
+  предпочтение модели триггером — ровно то субъективное основание, которое граница
+  обязана исключать.
+- **Повторять то же действие до успеха.** Отклонено: это blind retry, а не revision,
+  и он превращает неуспешную verification в неограниченный цикл.
+- **Считать отказ security или authority повторяемым.** Отклонено: run никогда не
+  должен пытаться обойти границу, в которой ему отказано.
+- **Позволять revision мутировать существующий план.** Отклонено: это позволило бы
+  revision переиспользовать доверенную идентичность для недоверенного содержимого.
+- **Помещать бюджет revision в task request или в план.** Отклонено: это делает
+  границу управляемой клиентом и лишает смысла ограничение loop.
+- **Позволять revision обходить approval или исполнять напрямую.** Отклонено: это
+  дало бы слою планирования execution authority в обход.
+- **Расширять существующие границы действий/итераций harness.** Отклонено:
+  существующие границы policy уже ограничивают loop, и их переиспользование сохраняет
+  единственный источник истины.
+
+### Следствия и открытые пункты
+
+1. **Детерминированный планировщик делает no-progress обычным исходом.**
+   Существующие шаблоны не могут изобрести другие намерения, поэтому revision по той
+   же цели сейчас сводится к той же форме и завершается как `revision_no_progress`.
+   Действительно иные revisions требуют планировщика, способного дать другой набор
+   намерений; это отложено.
+2. **Путь `run_agent_loop` сегодня не может вызвать revision.** Его наблюдения
+   verification равны `not_evaluated`, поскольку идентичность критериев на этом пути —
+   GAP-F, поэтому объективного вердикта verification нет. Объективный триггер revision
+   сейчас требует операторских критериев пути accepted-task.
+3. **Истории ревизий нет.** Записываются только прежний и новый fingerprint плана;
+   полная история ревизий отложена.
+4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, параллельное и
+   распределённое исполнение, более богатые retry-политики, исполнение tools через
+   harness, memory, knowledge, reviewer, idempotency и resume этим блоком не
+   изменены.**

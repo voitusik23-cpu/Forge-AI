@@ -22,6 +22,16 @@ from app.decision.models import Decision, DecisionAction, DecisionRequest, Decis
 from app.decision.provider import DecisionProvider, DeterministicDecisionProvider
 from app.decision.validator import DecisionValidationReport, validate_decision
 from app.planning.validation import require_valid_plan
+from app.agent_runtime.revision_decision import (
+    RevisionBudget,
+    RevisionDecision,
+    RevisionError,
+)
+from app.agent_runtime.revision_policy import (
+    RevisionEligibility,
+    evaluate_revision,
+    plan_structure_signature,
+)
 from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
 from app.execution.identity import command_is_allowed
@@ -71,6 +81,7 @@ class AgentHarness:
         observer: Callable[[EventType, Mapping[str, object]], None] | None = None,
         project_discovery: Any | None = None,
         project_planner: Any | None = None,
+        revision_budget: RevisionBudget | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -94,6 +105,14 @@ class AgentHarness:
         # observation into an immutable intention; it holds no execution authority
         # and cannot reach the filesystem, a coordinator, or an adapter.
         self._project_planner = project_planner
+        # Server-side bound on the revision loop. When no explicit budget is
+        # supplied it is derived from the existing policy, so the loop stays
+        # bounded either way and nothing per-run can widen it.
+        self._revision_budget = revision_budget or RevisionBudget(
+            max_revisions=self.policy.max_revision_attempts
+        )
+        if not isinstance(self._revision_budget, RevisionBudget):
+            raise RevisionError("revision_budget must be a RevisionBudget")
 
     def _enforce_run_scope(self, request: HarnessRequest) -> None:
         """Freeze and enforce the run's security perimeter before any read.
@@ -245,6 +264,18 @@ class AgentHarness:
         revision_count = 0
         exec_index = 0
 
+        # Revision loop bookkeeping. Every value here is server-side; nothing
+        # per-run can change the budget, the counter, or the no-progress history.
+        revision_decision: RevisionDecision | None = None
+        revision_number = 0
+        revision_plan_pending = False
+        seen_plan_fingerprints: list[str] = []
+        seen_plan_structures: list[str] = []
+        plan_structure = ""
+        verification_attempted = False
+        last_execution_outcome = ""
+        base_goal = ""
+
         current_project_state = request.initial_project_state or self._state_derivator(
             run_id=request.run_id,
             attempt_number=request.attempt_number,
@@ -316,19 +347,27 @@ class AgentHarness:
 
 
 
-        # Declarative planning stage. It runs after the observation and before the
-        # first decision, so the decision is informed by a validated intention. A
-        # plan is not authority: it names intentions only, and any real action
-        # still has to pass the existing authorization chain.
+        # Declarative planning stage, extracted so the revision loop can replan
+        # by calling the same existing Planner. It runs after the observation and
+        # before the decision, so the decision is informed by a validated
+        # intention. A plan is not authority: it names intentions only, and any
+        # real action still has to pass the existing authorization chain.
+        base_goal = self._planning_goal(request)
         execution_plan: object | None = None
-        if self._project_planner is not None:
-            goal = self._planning_goal(request)
+        plan_fingerprint = ""
+
+        def plan_once(revision_goal: str = "") -> object | None:
+            """Produce and validate one plan; returns None when unusable."""
+            nonlocal execution_plan, plan_fingerprint, plan_structure
             emit(EventType.PLANNING_STARTED, {"run_id": request.run_id})
-            planning_started = time.perf_counter()
+            started_at = time.perf_counter()
+            candidate_plan: object | None = None
+            failure = ""
+            goal_text = revision_goal or base_goal
             try:
-                if goal:
+                if goal_text:
                     candidate = self._project_planner.plan_for_run(
-                        goal=goal,
+                        goal=goal_text,
                         run_id=request.run_id,
                         task_id=request.metadata.get("task_id") or request.run_id,
                     )
@@ -339,35 +378,49 @@ class AgentHarness:
                         run_id=request.run_id,
                         task_id=request.metadata.get("task_id") or request.run_id,
                     )
-                    execution_plan = validated
-                planning_failure = "" if execution_plan is not None else "no_goal"
+                    candidate_plan = validated
+                failure = "" if candidate_plan is not None else "no_goal"
             except Exception as exc:  # noqa: BLE001 - a broken planner is a failure
-                execution_plan = None
-                planning_failure = type(exc).__name__
-            planning_seconds = time.perf_counter() - planning_started
+                candidate_plan = None
+                failure = type(exc).__name__
+            elapsed = time.perf_counter() - started_at
 
-            if execution_plan is None:
+            if candidate_plan is None:
                 emit(
                     EventType.PLANNING_COMPLETED,
                     {
                         "run_id": request.run_id,
                         "status": "failed",
-                        "failure_category": planning_failure or "planner_error",
-                        "duration_seconds": round(planning_seconds, 3),
+                        "failure_category": failure or "planner_error",
+                        "duration_seconds": round(elapsed, 3),
                     },
                 )
-            else:
-                summary = getattr(execution_plan, "bounded_summary", None)
-                payload = summary() if callable(summary) else {}
-                emit(
-                    EventType.PLANNING_COMPLETED,
-                    {
-                        "run_id": request.run_id,
-                        "status": "completed",
-                        "duration_seconds": round(planning_seconds, 3),
-                        **dict(payload),
-                    },
-                )
+                return None
+
+            summary = getattr(candidate_plan, "bounded_summary", None)
+            payload = summary() if callable(summary) else {}
+            emit(
+                EventType.PLANNING_COMPLETED,
+                {
+                    "run_id": request.run_id,
+                    "status": "completed",
+                    "duration_seconds": round(elapsed, 3),
+                    **dict(payload),
+                },
+            )
+            execution_plan = candidate_plan
+            plan_fingerprint = str(payload.get("plan_fingerprint") or "")
+            plan_structure = plan_structure_signature(
+                getattr(candidate_plan, "steps", ())
+            )
+            if plan_fingerprint:
+                seen_plan_fingerprints.append(plan_fingerprint)
+            if plan_structure:
+                seen_plan_structures.append(plan_structure)
+            return candidate_plan
+
+        if self._project_planner is not None:
+            plan_once()
 
         while not current_state.terminal:
             # 0. Check bounds
@@ -645,14 +698,41 @@ class AgentHarness:
                 auth_waiting = True
 
             elif action == DecisionAction.RUN_VERIFICATION:
+                verification_attempted = True
                 authorized = True
 
             elif action == DecisionAction.REQUEST_REVISION:
-                if revision_count < self.policy.max_revision_attempts:
+                # A revision is never granted merely because a decision asked for
+                # one. Eligibility is objective and server-side: a real
+                # verification outcome, an actionable failure, and remaining
+                # budget. Security, authority, validation, and no-progress
+                # failures terminate instead of being retried.
+                revision_decision = evaluate_revision(
+                    eligibility=RevisionEligibility(
+                        run_id=request.run_id,
+                        task_id=request.metadata.get("task_id") or request.run_id,
+                        revision_number=revision_count,
+                        verification_attempted=verification_attempted,
+                        acceptance_passed=bool(
+                            acceptance_result is not None
+                            and acceptance_result.status == AcceptanceStatus.PASS
+                        ),
+                        execution_outcome=last_execution_outcome,
+                        plan_id=getattr(execution_plan, "plan_id", ""),
+                        plan_fingerprint=plan_fingerprint,
+                        plan_structure=plan_structure,
+                    ),
+                    budget=self._revision_budget,
+                    base_goal=base_goal,
+                )
+                if revision_decision.revision_allowed:
                     authorized = True
+                    # The revision about to run is numbered from one; `revision_count`
+                    # is the number of revisions already completed.
+                    revision_number = revision_count + 1
                 else:
                     authorized = False
-                    auth_denial_reason = "revision_limit_reached"
+                    auth_denial_reason = revision_decision.reason
 
             elif action == DecisionAction.EXECUTE:
                 if execution_count >= self.policy.max_execution_attempts:
@@ -723,6 +803,16 @@ class AgentHarness:
                     )
                     emit(EventType.EXECUTION_DENIED, {"reason": "approval_rejected"})
                     emit(EventType.HARNESS_FAILED, {"reason": "approval_rejected"})
+                elif action == DecisionAction.REQUEST_REVISION:
+                    # A refused revision is a bounded refusal, not a failure of the
+                    # run: the decision was evaluated server-side and denied for a
+                    # concrete reason, and the loop continues until one of its
+                    # configured bounds ends it. Nothing was executed.
+                    action_outcome = f"revision_denied:{auth_denial_reason}"
+                    emit(
+                        EventType.EXECUTION_DENIED,
+                        {"reason": auth_denial_reason, "action": "REQUEST_REVISION"},
+                    )
                 else:
                     action_outcome = f"denied:{auth_denial_reason}"
                     current_state = replace(
@@ -768,6 +858,7 @@ class AgentHarness:
                     emit(EventType.HARNESS_PHASE_CHANGED, {"phase": HarnessPhase.WAITING.value})
 
                 elif action == DecisionAction.REQUEST_REVISION:
+                    assert revision_decision is not None
                     revision_count += 1
                     action_outcome = "revision_requested"
                     current_state = replace(
@@ -776,8 +867,61 @@ class AgentHarness:
                     )
                     emit(
                         EventType.REVISION_STARTED,
-                        {"attempt_number": current_state.attempt_number},
+                        {
+                            # The server-side revision number wins over the
+                            # decision's own record of the opportunity index.
+                            **revision_decision.bounded_summary(),
+                            "revision_number": revision_number,
+                        },
                     )
+                    # The old plan stays immutable. The next iteration asks the
+                    # same Planner for a plan against the bounded revision goal,
+                    # and that plan is validated again before it is used.
+                    previous_plan_fingerprint = plan_fingerprint
+                    previous_plan_structure = plan_structure
+                    replanned = plan_once(revision_decision.revision_goal)
+                    new_fingerprint = plan_fingerprint
+                    new_structure = plan_structure
+                    # Progress means a genuinely different intention set: a new
+                    # identity describing the same ordered intentions is a blind
+                    # retry, and so is reusing any earlier shape.
+                    # `plan_once` has just appended the new shape, so the history
+                    # without its final entry is the set of superseded shapes.
+                    superseded_structures = seen_plan_structures[:-1]
+                    progressed = (
+                        replanned is not None
+                        and bool(new_fingerprint)
+                        and new_fingerprint != previous_plan_fingerprint
+                        and bool(new_structure)
+                        and new_structure != previous_plan_structure
+                        and new_structure not in superseded_structures
+                    )
+                    emit(
+                        EventType.REVISION_COMPLETED,
+                        {
+                            "revision_number": revision_number,
+                            "run_id": request.run_id,
+                            "status": "replanned" if progressed else "no_progress",
+                            "previous_plan_fingerprint": previous_plan_fingerprint,
+                            "plan_fingerprint": new_fingerprint,
+                            "plan_id": getattr(replanned, "plan_id", ""),
+                        },
+                    )
+                    if not progressed:
+                        # A revision that cannot produce a genuinely new plan is a
+                        # blind retry. Terminate rather than loop.
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.FAILED,
+                            status=HarnessStatus.FAILED,
+                            terminal=True,
+                            metadata={"reason": "revision_no_progress"},
+                        )
+                        emit(
+                            EventType.HARNESS_FAILED,
+                            {"reason": "revision_no_progress"},
+                        )
+                    revision_decision = None
 
                 elif action == DecisionAction.EXECUTE:
                     execution_count += 1
@@ -805,6 +949,9 @@ class AgentHarness:
                     )
                     latest_exec_id = exec_res.request_id
 
+                    # Record the trusted execution outcome so revision eligibility
+                    # can classify the failure objectively.
+                    last_execution_outcome = exec_res.outcome_status.value
                     if exec_res.outcome_status == ExecutionOutcomeStatus.APPROVAL_WAITING:
                         action_outcome = "approval_waiting"
                         current_state = replace(
@@ -862,6 +1009,7 @@ class AgentHarness:
                         request,
                         emit,
                     )
+                    verification_attempted = True
                     verification_results.extend(verifs_for_this_round)
                     if verifs_for_this_round:
                         latest_verif_id = verifs_for_this_round[-1].verification_id

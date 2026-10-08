@@ -116,6 +116,7 @@ def create_agent_harness(
     with_discovery: bool = True,
     project_planner: object | None = None,
     with_planning: bool = True,
+    revision_budget: object | None = None,
 ) -> "AgentHarness":
     """Build the canonical production orchestration loop.
 
@@ -164,6 +165,13 @@ def create_agent_harness(
             project_planner
             if project_planner is not None
             else (Planner() if with_planning else None)
+        ),
+        # Server-side bound on the revision loop. An explicit budget is passed
+        # through; otherwise the harness derives it from its own policy.
+        **(
+            {"revision_budget": revision_budget}
+            if revision_budget is not None
+            else {}
         ),
     }
     resolved_coordinator = coordinator

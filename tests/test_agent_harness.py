@@ -43,6 +43,8 @@ from app.execution.request import (
     ExecutionRequest,
 )
 from app.orchestrator.models import EventType
+from app.planning.planner import Planner
+from app.agent_runtime.revision_decision import RevisionBudget
 from app.runtime.run_scope import RunScope
 from app.orchestrator.trace import RunEvent, RunTrace
 from app.projects.state import ProjectState, ProjectStateStatus, derive_project_state
@@ -525,7 +527,13 @@ class TestAgentHarness(unittest.TestCase):
     # Test H: Revision trigger
     # =========================================================================
     def test_scenario_h_revision_trigger(self) -> None:
-        """Prove that failed verification triggers revision request and attempt increment."""
+        """Failed verification no longer grants a revision by itself.
+
+        Revision eligibility is objective and server-side: it needs a real
+        verification outcome, an actionable failure, remaining budget, **and** a
+        current plan to replace. This run has no plan, so the revision decision is
+        terminal and the attempt counter must not advance.
+        """
         req = Requirement(requirement_id="req-h", description="Check file")
         crit = AcceptanceCriterion(
             criterion_id="crit-h", requirement_id="req-h", description="file exists"
@@ -550,12 +558,107 @@ class TestAgentHarness(unittest.TestCase):
         harness = AgentHarness(policy=AgentHarnessPolicy(max_actions=2))
         result = harness.run(h_req)
 
-        # Action 1: RUN_VERIFICATION -> fails -> ProjectState FAILED
-        # Action 2: REQUEST_REVISION -> attempt becomes 1
+        # The action is proposed and recorded, but it is denied: the decision was
+        # evaluated server-side and refused for a concrete reason. A refused
+        # revision is a bounded refusal, not a run failure.
         actions = [obs.action for obs in result.observations]
         self.assertIn("RUN_VERIFICATION", actions)
         self.assertIn("REQUEST_REVISION", actions)
+        self.assertEqual(result.final_state.attempt_number, 0)
+        denials = [
+            dict(event.metadata)
+            for event in result.events
+            if event.event_type.name == "EXECUTION_DENIED"
+        ]
+        reasons = {entry.get("reason") for entry in denials}
+        self.assertIn("no_current_plan", reasons)
+        self.assertNotIn("REVISION_STARTED", [
+            event.event_type.name for event in result.events
+        ])
+
+    def test_scenario_h2_revision_runs_when_objectively_eligible(self) -> None:
+        """An objectively eligible revision is authorized and replanned.
+
+        With a real verification outcome, an actionable failure, remaining budget,
+        and a current plan, the revision is authorized: the attempt advances, a new
+        immutable plan identity is produced, and the loop then checks that the new
+        plan is genuinely different.
+        """
+        req = Requirement(requirement_id="req-h2", description="Check file")
+        crit = AcceptanceCriterion(
+            criterion_id="crit-h2", requirement_id="req-h2", description="file exists"
+        )
+        h_req = self._scope_request(
+            HarnessRequest(
+                run_id="run-h2",
+                workspace=self.workspace,
+                task_specification=TaskSpecification(
+                    task_id="task-h2",
+                    title="revision scenario",
+                    description="build a web application",
+                    requirements=(req,),
+                    acceptance_criteria=(crit,),
+                ),
+                verification_expectations={
+                    "crit-h2": VerificationExpectation(
+                        relative_path="file.txt", exists=True
+                    )
+                },
+                acceptance_criteria=(crit,),
+                requirements=(req,),
+                metadata={"task_id": "task-h2"},
+                initial_project_state=ProjectState(
+                    run_id="run-h2", attempt_number=0, status=ProjectStateStatus.CHANGED
+                ),
+            ),
+            (),
+            (crit,),
+        )
+
+        harness = AgentHarness(
+            policy=AgentHarnessPolicy(max_actions=2, max_revision_attempts=2),
+            project_planner=Planner(),
+            revision_budget=RevisionBudget(max_revisions=1),
+        )
+        result = harness.run(h_req)
+
+        actions = [obs.action for obs in result.observations]
+        self.assertIn("REQUEST_REVISION", actions)
         self.assertEqual(result.final_state.attempt_number, 1)
+        names = [event.event_type.name for event in result.events]
+        self.assertIn("REVISION_STARTED", names)
+        self.assertIn("REVISION_COMPLETED", names)
+
+        started = [
+            dict(event.metadata)
+            for event in result.events
+            if event.event_type.name == "REVISION_STARTED"
+        ][0]
+        self.assertTrue(started.get("revision_allowed"))
+        self.assertEqual(started.get("failure_category"), "acceptance_failed")
+        self.assertTrue(started.get("actionable"))
+
+        completed = [
+            dict(event.metadata)
+            for event in result.events
+            if event.event_type.name == "REVISION_COMPLETED"
+        ][0]
+        # The deterministic templates cannot invent different intentions, so a
+        # replan resolves to the same ordered steps. That is exactly the blind
+        # retry the loop must refuse: it terminates instead of repeating the work.
+        self.assertEqual(completed.get("status"), "no_progress")
+        self.assertNotEqual(
+            completed.get("plan_fingerprint"),
+            completed.get("previous_plan_fingerprint"),
+        )
+        self.assertIn(
+            "revision_no_progress",
+            {
+                dict(event.metadata).get("reason")
+                for event in result.events
+                if event.event_type.name == "HARNESS_FAILED"
+            },
+        )
 
     # =========================================================================
     # Test I: Acceptance success
