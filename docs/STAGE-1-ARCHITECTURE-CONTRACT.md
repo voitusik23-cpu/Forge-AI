@@ -59,7 +59,7 @@ separate decision record.
 | `Organization` | Tenant: isolation, ownership and (future) billing root | the boundary itself | `id`, `name`, `slug` (unique), `is_personal`, `billing_account_ref` (nullable, future), `referred_by_partner_id` (nullable, future), `created_at` | **Is** the isolation and ownership root. **Is not** an execution authority |
 | `Membership` | Authorization link `User` <-> `Organization` with a role | belongs to Organization | `id`, `user_id`, `organization_id`, `role`, `created_at` | **Is** the only path from a subject to tenant authority. **Is not** an execution authority |
 | `Project` | Unit of work inside a tenant | belongs to Organization | `id`, `organization_id`, `name`, `slug`, `status`, `created_at` | **Is** the owner of runs and workspace roots. **Is not** an execution authority |
-| `ProviderAccount` | Reference to a provider credential | belongs to Organization, or is system-owned | `id`, `organization_id` (nullable = system), `provider_name`, `secret_ref`, `enabled`, `metadata` | **Is** a credential *reference*. **Is not** a Core authority and holds **no** plaintext secret, wholesale price, or cost |
+| `ProviderAccount` | Reference to a provider credential. Has exactly two ownership modes (see section 10) | **tenant-owned**: belongs to one Organization, `organization_id` non-null. **system-owned / Forge-managed**: belongs to no Organization, `organization_id` null, never reachable through a tenant-scoped read | `id`, `organization_id` (null only for a system-owned account), `provider_name`, `secret_ref`, `enabled`, `metadata` | **Is** a credential *reference*. **Is not** a Core authority and holds **no** plaintext secret, wholesale price, or cost. Ownership mode is not authority |
 | `APIKey` | Programmatic access token for one Organization | belongs to Organization | `id`, `organization_id`, `created_by_user_id`, safe representation (hash) + `prefix`, `scopes`, `expires_at`, `revoked_at`, `created_at`, `last_used_at` | **Is** an authentication credential. **Is not** a filesystem, workspace, command, or tool authority |
 | `RunRecord` | Durable external lifecycle truth of one run | belongs to Project | `id`, `project_id`, `initiated_by_user_id`, `task_id`, `status`, `started_at`, `completed_at`, `core_run_id` (unique correlation id) | **Is** the external lifecycle record. **Is not** Core authorization |
 | `UsageRecord` | Immutable physical measurement attached to a run | derived from RunRecord | `id`, `run_id`, `attempt_number`, `provider_name`, `model_name`, `input_tokens`, `output_tokens`, `cached_tokens`, `duration`, `request_count`, outcome metadata | **Is** a measurement. **Is not** money, price, charge, or balance |
@@ -237,18 +237,59 @@ This pipeline is **not** implemented in Stage 1.
 
 ## 10. Provider account and BYOK
 
-`ProviderAccount` belongs to the **Organization** on the Platform side. Core does
-not own `ProviderAccount`.
+`ProviderAccount` is a **Platform-side** record. Core does not own it, never imports
+it, and never reads it.
 
-A persistent `ProviderAccount` holds: provider identity, tenant ownership, a
-`secret_ref`, and metadata. It holds **no** plaintext secret.
+### Two ownership modes, and only two
 
-BYOK versus Forge-managed semantics are separated at the **Platform/Billing** level,
-not in Core. Core receives a resolved credential context for one execution and
-learns nothing about which commercial model produced it.
+A `ProviderAccount` is exactly one of:
 
-No provider wholesale pricing and no financial cost may be added to Core's provider
-account model.
+1. **tenant-owned** — it belongs to one `Organization`, and `organization_id` is
+   **required and non-null**. This is the BYOK case: a tenant supplies its own
+   provider credential.
+2. **system-owned** (Forge-managed) — it belongs to **no** `Organization`, and
+   `organization_id` is **null**. This is the Forge-managed case: the credential is
+   the platform's own and is not a tenant resource.
+
+The ownership mode is a **server-side domain fact**. It is never a
+client-supplied claim, and a client can never manufacture system ownership by
+sending a null or empty organization reference.
+
+### Rules that follow from a null `organization_id`
+
+These are normative, because a null tenant column is the classic place a tenant
+filter silently stops filtering:
+
+- a null `organization_id` **never** means "all tenants";
+- a null `organization_id` **never** widens a tenant scope;
+- a **tenant-scoped read must select only records explicitly belonging to that
+  organization**, and must never match a system-owned record merely because
+  `organization_id IS NULL`;
+- a system-owned record is **not** available through an ordinary tenant-scoped
+  client read;
+- a client request **cannot** select or reference a system-owned
+  `ProviderAccount` unless a separate, explicitly server-authorized path permits
+  exactly that;
+- a tenant-scoped query must treat `NULL` as an absence of ownership, not as a
+  wildcard.
+
+### What a persistent record holds
+
+Provider identity, its ownership mode, a `secret_ref`, and metadata. It holds **no**
+plaintext secret.
+
+### What system ownership is not
+
+System-owned means **only** an ownership boundary. It introduces no new entity, no
+new authority mechanism, and no new permission object. A `ProviderAccount` — of
+either mode — is still not Core authority, and system ownership by itself grants no
+execution authority. Core receives a resolved credential context for one execution
+and learns nothing about which commercial model produced it.
+
+BYOK versus Forge-managed **commercial** semantics are separated at the
+**Platform/Billing** level, not in Core. No provider wholesale pricing, cost, or
+margin may be added to Core's provider account model, and none is added to the
+Platform record by this contract.
 
 ## 11. API key
 
@@ -503,11 +544,28 @@ Every tenant-owned Platform entity carries an explicit `organization_id` as an
 force **before** step 1 (DTO / domain contracts) begins, and it does not replace
 future PostgreSQL RLS.
 
+**One explicit exception exists, and it is the only one.** `ProviderAccount`
+supports two ownership modes:
+
+- **tenant-owned** — `organization_id` required and non-null;
+- **system-owned / Forge-managed** — `organization_id` null.
+
+A system-owned `ProviderAccount` is outside tenant ownership. It is not a tenant
+resource, it does not belong to any organization, and it must not be reachable
+through an ordinary tenant-scoped read.
+
+**`NULL` `organization_id` is never a tenant wildcard.** The containment invariant
+is: a tenant-scoped query selects **only** records that explicitly belong to that
+organization. A system-owned record must not appear merely because
+`organization_id IS NULL`, and a null tenant column must never be read as "any
+tenant".
+
 The three layers are **defense-in-depth**, not alternatives:
 
 ```
 application authorization
   + explicit organization_id containment on tenant-owned entities
+  + explicit exclusion of system-owned records from tenant-scoped reads
   + PostgreSQL RLS (future)
 ```
 
@@ -599,6 +657,12 @@ Added to the permanent list in section 16:
     boundary**.
 20. `APIKey` authority semantics must have **explicit revocation behavior**.
 21. `RunRecord` must **not remain indefinitely running** after worker loss.
+22. A null `organization_id` **never means any tenant**. It is never a wildcard and
+    never widens a tenant scope.
+23. System-owned `ProviderAccount` records are **outside tenant ownership** and are
+    **not exposed through ordinary tenant-scoped reads**.
+24. **Client-controlled identifiers cannot select system-owned provider
+    credentials.** Ownership mode is a server-side fact, not a client claim.
 
 ---
 
@@ -688,7 +752,7 @@ Platform может его только понизить.
 | `Organization` | Арендатор: изоляция, владение и (в будущем) корень биллинга | сама граница | `id`, `name`, `slug` (unique), `is_personal`, `billing_account_ref` (nullable, будущее), `referred_by_partner_id` (nullable, будущее), `created_at` | **Является** корнем изоляции и владения. **Не является** execution authority |
 | `Membership` | Связь авторизации `User` <-> `Organization` с ролью | принадлежит Organization | `id`, `user_id`, `organization_id`, `role`, `created_at` | **Является** единственным путём от субъекта к authority арендатора. **Не является** execution authority |
 | `Project` | Единица работы внутри арендатора | принадлежит Organization | `id`, `organization_id`, `name`, `slug`, `status`, `created_at` | **Является** владельцем запусков и корней workspace. **Не является** execution authority |
-| `ProviderAccount` | Ссылка на провайдерский кредил | принадлежит Organization либо системный | `id`, `organization_id` (nullable = системный), `provider_name`, `secret_ref`, `enabled`, `metadata` | **Является** *ссылкой* на кредил. **Не является** authority Core и не хранит **ни** plaintext-секрета, **ни** оптовой цены, **ни** себестоимости |
+| `ProviderAccount` | Ссылка на провайдерский кредил. Имеет ровно два режима владения (см. раздел 10) | **tenant-owned**: принадлежит одной Organization, `organization_id` non-null. **system-owned / Forge-managed**: не принадлежит никакой Organization, `organization_id` null, никогда не доступен через tenant-scoped чтение | `id`, `organization_id` (null только для system-owned аккаунта), `provider_name`, `secret_ref`, `enabled`, `metadata` | **Является** *ссылкой* на кредил. **Не является** authority Core и не хранит **ни** plaintext-секрета, **ни** оптовой цены, **ни** себестоимости. Режим владения не является authority |
 | `APIKey` | Токен программного доступа для одной Organization | принадлежит Organization | `id`, `organization_id`, `created_by_user_id`, безопасное представление (hash) + `prefix`, `scopes`, `expires_at`, `revoked_at`, `created_at`, `last_used_at` | **Является** учётным данным аутентификации. **Не является** authority на filesystem, workspace, команды или инструменты |
 | `RunRecord` | Durable истина внешнего жизненного цикла запуска | принадлежит Project | `id`, `project_id`, `initiated_by_user_id`, `task_id`, `status`, `started_at`, `completed_at`, `core_run_id` (уникальная корреляционная идентичность) | **Является** записью внешнего жизненного цикла. **Не является** authorization для Core |
 | `UsageRecord` | Неизменяемое физическое измерение, привязанное к запуску | выводится из RunRecord | `id`, `run_id`, `attempt_number`, `provider_name`, `model_name`, `input_tokens`, `output_tokens`, `cached_tokens`, `duration`, `request_count`, метаданные исхода | **Является** измерением. **Не является** деньгами, ценой, списанием или балансом |
@@ -868,18 +932,59 @@ Usage -> Cost -> Price -> Charge -> Ledger
 
 ## 10. Провайдерский аккаунт и BYOK
 
-`ProviderAccount` принадлежит **Organization** на стороне Platform. Core не владеет
-`ProviderAccount`.
+`ProviderAccount` — **Platform-side** запись. Core им не владеет, никогда его не
+импортирует и никогда его не читает.
 
-Persistent `ProviderAccount` хранит: идентичность провайдера, владение арендатором,
-`secret_ref` и метаданные. Он **не** хранит plaintext-секрет.
+### Два режима владения, и только два
 
-Семантика BYOK против Forge-managed разделяется на уровне **Platform/Billing**, а не
-в Core. Core получает разрешённый контекст кредила на одно исполнение и не узнаёт,
-какая коммерческая модель его породила.
+`ProviderAccount` — это ровно одно из:
 
-Никакая оптовая цена провайдера и никакая финансовая себестоимость не должны
-добавляться в модель провайдерского аккаунта Core.
+1. **tenant-owned** — принадлежит одной `Organization`, и `organization_id` **обязателен и
+   non-null**. Это кейс BYOK: арендатор поставляет свой собственный кредил
+   провайдера.
+2. **system-owned** (Forge-managed) — не принадлежит **никакой** `Organization`, и
+   `organization_id` **null**. Это кейс Forge-managed: кредил принадлежит самой платформе и не
+   является ресурсом арендатора.
+
+Режим владения — это **server-side доменный факт**. Он никогда не является
+заявлением клиента, и клиент никогда не может создать системное владение,
+отправив пустую или null-ссылку на организацию.
+
+### Правила, следующие из null `organization_id`
+
+Они нормативны, потому что null-колонка арендатора — классическое место,
+где фильтр по арендатору молча перестаёт фильтровать:
+
+- null `organization_id` **никогда** не означает «все арендаторы»;
+- null `organization_id` **никогда** не расширяет область арендатора;
+- **tenant-scoped чтение должно выбирать только записи, явно
+  принадлежащие этой организации**, и никогда не должно совпадать с
+  system-owned записью просто потому, что `organization_id IS NULL`;
+- system-owned запись **не** доступна через обычное tenant-scoped
+  клиентское чтение;
+- клиентский запрос **не может** выбрать или сослаться на system-owned
+  `ProviderAccount`, если только отдельный, явно авторизованный на сервере путь
+  разрешает именно это;
+- tenant-scoped запрос должен трактовать `NULL` как отсутствие
+  владения, а не как подстановочный символ.
+
+### Что хранит persistent-запись
+
+Идентичность провайдера, режим владения, `secret_ref` и метаданные. Она
+**не** хранит plaintext-секрет.
+
+### Чем системное владение НЕ является
+
+Системное владение означает **только** границу владения. Оно не вводит ни
+новой сущности, ни нового механизма authority, ни нового permission-объекта.
+`ProviderAccount` любого режима по-прежнему не является authority Core, и системное
+владение само по себе не даёт execution authority. Core получает разрешённый контекст
+кредила на одно исполнение и не узнаёт, какая коммерческая модель его породила.
+
+Коммерческая семантика BYOK против Forge-managed разделяется на уровне
+**Platform/Billing**, а не в Core. Никакая оптовая цена провайдера, себестоимость или
+маржа не должны добавляться в модель провайдерского аккаунта Core, и ни одна из
+них не добавлена в Platform-запись этим контрактом.
 
 ## 11. API key
 
@@ -1138,16 +1243,33 @@ Platform передаёт plaintext в Core, **не** говорит, что Cor
 действует **до** начала шага 1 (DTO / доменные контракты) и не заменяет
 будущий PostgreSQL RLS.
 
+**Существует ровно одно явное исключение.** `ProviderAccount`
+поддерживает два режима владения:
+
+- **tenant-owned** — `organization_id` обязателен и non-null;
+- **system-owned / Forge-managed** — `organization_id` null.
+
+System-owned `ProviderAccount` находится вне владения арендатора. Он не
+является ресурсом арендатора, не принадлежит никакой организации и не
+должен быть доступен через обычное tenant-scoped чтение.
+
+**`NULL` в `organization_id` никогда не является подстановочным
+символом арендатора.** Инвариант containment таков: tenant-scoped запрос выбирает
+**только** записи, явно принадлежащие этой организации. System-owned
+запись не должна появляться только потому, что `organization_id IS NULL`, и null
+колонка арендатора никогда не должна читаться как «любой арендатор».
+
 Три слоя — это **defense-in-depth**, а не альтернативы:
 
 ```
 авторизация на уровне приложения
   + явный containment organization_id на tenant-owned сущностях
+  + явное исключение system-owned записей из tenant-scoped чтений
   + PostgreSQL RLS (будущее)
 ```
 
 O-9 остаётся открытым для *точной реализации RLS*. Сам инвариант
-сontainment'а арендаторов больше не открыт.
+containment'а арендаторов больше не открыт.
 
 ### R-4 — Workspace-корни проектов взаимно изолированы
 
@@ -1237,6 +1359,14 @@ worker'а.
 20. Семантика authority `APIKey` должна иметь **явное поведение отзыва**.
 21. `RunRecord` **не должен оставаться бесконечно в running** после
     потери worker'а.
+22. Нулевой `organization_id` **никогда не означает любого арендатора**. Он
+    никогда не является подстановочным символом и никогда не расширяет
+    область арендатора.
+23. System-owned записи `ProviderAccount` находятся **вне владения
+    арендатора** и **не показываются через обычные tenant-scoped чтения**.
+24. **Клиентские идентификаторы не могут выбрать system-owned
+    провайдерские кредилы.** Режим владения — server-side факт, а не заявление
+    клиента.
 
 ---
 

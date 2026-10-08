@@ -3657,3 +3657,145 @@ unchanged.
    отложенными на более поздние этапы.
 5. **Billing по-прежнему не реализован.** Fail-closed инвариант телеметрии из
    `D-PLATFORM-13` повторён в контракте и остаётся будущим требованием.
+
+
+## ProviderAccount ownership: tenant-owned or system-owned (D-PLATFORM-16)
+
+Formalizes the one gap the Stage 1 domain-contract security gate found: the
+`ProviderAccount` domain record permits a null `organization_id`, which the Stage 1
+Architecture Contract already allowed in its entity table but never described as an
+explicit, permitted ownership mode. Version 1 is adopted: the system-owned record is
+a legitimate domain case, not an exception to be removed.
+
+### Accepted decisions
+
+- **`ProviderAccount` has exactly two ownership modes, and only two.**
+  **tenant-owned** — belongs to one `Organization`, `organization_id` required and
+  non-null (the BYOK case). **system-owned / Forge-managed** — belongs to no
+  `Organization`, `organization_id` null.
+- **Ownership mode is a server-side domain fact.** It is never a client-supplied
+  claim, and a client cannot manufacture system ownership by sending a null or
+  empty organization reference.
+- **A null `organization_id` is never a wildcard.** It never means "all tenants", it
+  never widens a tenant scope, and a tenant-scoped query must treat `NULL` as an
+  absence of ownership rather than as a match.
+- **A tenant-scoped read selects only records explicitly belonging to that
+  organization.** A system-owned record must not appear merely because
+  `organization_id IS NULL`.
+- **System-owned records are outside tenant ownership.** They are not a tenant
+  resource and are not exposed through an ordinary tenant-scoped client read.
+- **System-owned records are reachable only through an explicitly
+  server-authorized path**, if such a path is ever defined.
+- **System ownership is an ownership boundary and nothing more.** It introduces no
+  new entity, no new authority mechanism, and no permission object.
+  `ProviderAccount` of either mode remains not-Core-authority, and system ownership
+  by itself grants no execution authority.
+
+### Rejected alternatives
+
+- **`NULL` organization_id as "any tenant".** Rejected: it is the classic place a
+  tenant filter silently stops filtering, and it would let a single null column
+  become a cross-tenant read.
+- **Treating the system-owned case as an implicit exception.** Rejected: an
+  undocumented null in a tenant column is indistinguishable from a bug, and Step 2
+  would have had to guess whether the schema may be `NOT NULL`.
+- **Removing the system-owned case and requiring `organization_id` on every
+  `ProviderAccount`.** Rejected: the architecture already needs a Forge-managed
+  provider credential, and inventing a second entity for it would add a concept the
+  contract does not need.
+- **Adding pricing, wholesale cost, or billing semantics to the system-owned
+  case.** Rejected: system ownership is an ownership boundary, and those remain
+  later-stage decisions.
+
+### Consequences
+
+1. **The Step 2 schema must permit a nullable `organization_id` on
+   `ProviderAccount`.** A blanket `NOT NULL` is not available for this table.
+2. **Application and domain containment must distinguish tenant-owned from
+   system-owned.** The distinction must be explicit rather than inferred from a
+   null at read time.
+3. **RLS and ordinary queries must never interpret `NULL` as a wildcard.** O-9
+   remains open for the exact RLS implementation, but this rule binds whatever is
+   implemented.
+4. **No client API may let a caller choose a provider account's ownership mode.**
+5. **System ownership grants no execution authority by itself.**
+6. **Nothing is implemented.** No code, schema, migration, or credential
+   resolution is created by this decision; the domain record already matched it.
+
+### Open decisions unchanged
+
+O-1, O-2, O-3, O-4, O-5, O-6, O-7 and O-9 remain **open**; O-8 remains resolved at
+contract level; O-10..O-13 remain deferred. No RLS implementation is chosen.
+
+
+## Владение ProviderAccount: tenant-owned или system-owned (D-PLATFORM-16) — русская версия
+
+Формализует единственный пробел, найденный security-гейтом доменных контрактов Stage 1:
+доменная запись `ProviderAccount` допускает null `organization_id`, что контракт Stage 1 уже
+разрешал в таблице сущностей, но никогда не описывал как явный, разрешённый
+режим владения. Принят вариант 1: system-owned запись — легитимный доменный кейс,
+а не исключение, которое нужно убрать.
+
+### Принятые решения
+
+- **У `ProviderAccount` ровно два режима владения, и только два.** **tenant-owned** —
+  принадлежит одной `Organization`, `organization_id` обязателен и non-null (кейс BYOK).
+  **system-owned / Forge-managed** — не принадлежит никакой `Organization`,
+  `organization_id` null.
+- **Режим владения — server-side доменный факт.** Он никогда не является
+  заявлением клиента, и клиент не может создать системное владение,
+  отправив пустую или null-ссылку на организацию.
+- **Нулевой `organization_id` никогда не является подстановочным символом.** Он
+  никогда не означает «все арендаторы», никогда не расширяет область
+  арендатора, и tenant-scoped запрос должен трактовать `NULL` как отсутствие
+  владения, а не как совпадение.
+- **Tenant-scoped чтение выбирает только записи, явно принадлежащие этой
+  организации.** System-owned запись не должна появляться только потому,
+  что `organization_id IS NULL`.
+- **System-owned записи находятся вне владения арендатора.** Они не являются
+  ресурсом арендатора и не показываются через обычное tenant-scoped клиентское
+  чтение.
+- **System-owned записи доступны только через явно авторизованный на сервере
+  путь**, если такой путь вообще будет определён.
+- **Системное владение — это граница владения и больше ничего.** Оно не
+  вводит ни новой сущности, ни нового механизма authority, ни permission-объекта.
+  `ProviderAccount` любого режима остаётся не-authority для Core, и системное владение само
+  по себе не даёт execution authority.
+
+### Отклонённые альтернативы
+
+- **`NULL` в organization_id как «любой арендатор».** Отклонено: это
+  классическое место, где фильтр по арендатору молча перестаёт фильтровать, и одна
+  null-колонка становится межарендаторным чтением.
+- **Трактовка system-owned кейса как неявного исключения.** Отклонено:
+  недокументированный null в колонке арендатора неотличим от ошибки, и Step 2
+  должен был бы угадывать, может ли схема быть `NOT NULL`.
+- **Удаление system-owned кейса и требование `organization_id` для каждого
+  `ProviderAccount`.** Отклонено: архитектуре уже нужен Forge-managed провайдерский кредил, и
+  изобретение для него второй сущности добавило бы концепцию, которая контракту не
+  нужна.
+- **Добавление ценообразования, оптовой себестоимости или биллинговой
+  семантики в system-owned кейс.** Отклонено: системное владение — это граница
+  владения, а эти вещи остаются решениями более поздних этапов.
+
+### Следствия
+
+1. **Схема Step 2 должна допускать nullable `organization_id` у `ProviderAccount`.**
+   Сплошной `NOT NULL` для этой таблицы недоступен.
+2. **Application- и доменный containment должны различать tenant-owned
+   и system-owned.** Различие должно быть явным, а не выводиться из null во время чтения.
+3. **RLS и обычные запросы никогда не должны трактовать `NULL` как
+   подстановочный символ.** O-9 остаётся открытым для точной реализации RLS, но
+   это правило обязывает любую её реализацию.
+4. **Ни один клиентский API не должен позволять вызывающему выбрать режим
+   владения провайдерского аккаунта.**
+5. **Системное владение само по себе не даёт execution authority.**
+6. **Ничего не реализовано.** Этим решением не создаётся ни код, ни схема,
+   ни миграция, ни разрешение кредилов; доменная запись уже ему
+   соответствовала.
+
+### Открытые решения без изменений
+
+O-1, O-2, O-3, O-4, O-5, O-6, O-7 и O-9 остаются **открытыми**; O-8 остаётся
+решённым на уровне контракта; O-10..O-13 остаются отложенными. Никакая
+реализация RLS не выбрана.
