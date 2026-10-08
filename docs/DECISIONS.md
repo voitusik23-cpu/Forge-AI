@@ -3444,3 +3444,216 @@ no code, no runtime component, no dependency, and no Platform entity.
 5. **Открытые решения гейтят шаги реализации, а не контракт.** O-1..O-13 должны быть
    решены до зависимого шага, и каждое решение должно быть записано здесь, а не
    подразумеваться в коде.
+
+
+## Stage 1 Contract Refinements (D-PLATFORM-15)
+
+Refines [`STAGE-1-ARCHITECTURE-CONTRACT.md`](STAGE-1-ARCHITECTURE-CONTRACT.md) after
+an independent architecture review of `D-PLATFORM-14`. The review is an **input**,
+not a source of truth; the binding text is the contract itself, section 21. Nothing
+here creates code, a dependency, or a runtime component, and `D-PLATFORM-01..14` are
+unchanged.
+
+### Accepted decisions
+
+- **R-1 — Platform run identity and Core run identity are distinct.**
+  `RunRecord.id` is the Platform identity; `RunRecord.core_run_id` is the immutable
+  Core correlation identity carried in `PhysicalTelemetry.run_id`. `UsageRecord`
+  must carry `run_record_id`, `core_run_id`, and `attempt_number` under explicitly
+  distinct names, and must not use an ambiguous single field named `run_id`. The
+  bridge is one-way: `PhysicalTelemetry.run_id -> core_run_id -> resolves the
+  Platform RunRecord -> creates the usage record`.
+- **R-1 — `UNIQUE(run_record_id, attempt_number)` resolves O-8 at contract level.**
+  This is a uniqueness statement about one physical attempt of one Platform run. It
+  is **not** financial truth, does not authorize anything, and does not replace
+  Core's local idempotency. If implementation later needs additional dimensions,
+  that is a separate decision record and never a silent change.
+- **R-2 — Credential resolution boundary.** `TrustedExecutionRequest` never contains
+  plaintext provider secrets; it carries only an opaque credential or secret
+  reference. Core depends only on an abstract port, named
+  `EphemeralSecretResolver`, which imports no Platform module, no KMS or vault SDK,
+  no database driver, and no payment library, and which is injected by the Platform
+  or application composition layer. A plaintext secret never enters a serialized
+  trusted request, a `RunRecord`, a `UsageRecord`, `PhysicalTelemetry`, an ordinary
+  API response, or a log. This is a boundary statement: it does not assert that
+  Platform hands plaintext to Core, does not say Core knows about KMS or Vault, and
+  does not freeze a resolver implementation.
+- **R-3 — Tenant containment is in force before DTO implementation.** Every
+  tenant-owned Platform entity carries an explicit `organization_id` as an
+  application-level containment invariant, in force before step 1 (DTO / domain
+  contracts) begins, and it does not replace future PostgreSQL RLS. The three
+  layers are defense-in-depth: application authorization plus explicit
+  `organization_id` containment plus RLS. O-9 remains open only for the exact RLS
+  implementation.
+- **R-4 — Project workspace roots are mutually isolated.** The workspace root of
+  each `Project` must be isolated from the workspace roots of all other projects,
+  including two projects inside the same `Organization`. A run in one project must
+  not traverse into, read, write, or execute against another project's workspace.
+  No filesystem topology, Linux path, or OS mechanism is fixed.
+- **R-5 — API key authority semantics and revocation.** The `APIKey` authority model
+  is open, and exactly one of two models must be chosen before step 8: an
+  organization-scoped service principal, or a creator-membership-derived
+  credential. Whichever is chosen, revocation behavior must be unambiguous, and the
+  state where a creator loses membership while a key they created silently retains
+  authority is explicitly forbidden. No token format, JWT, hash algorithm, or prefix
+  is fixed; O-1 stays open.
+- **R-6 — RunRecord failure and orphan semantics.** The final status enum stays open
+  (O-7), but the lifecycle must have explicit semantics for normal success, normal
+  failure, cancellation, timeout, and execution interruption, crash, or orphaned
+  run, and there must be a mechanism that prevents a `RunRecord` from remaining
+  indefinitely running or claimed after its execution worker is lost. Whether that
+  is a lease, a heartbeat, a timeout, or a reconciliation sweep is left open.
+- **R-7 — Explicitly NOT frozen.** A concrete token format such as
+  `forge_live_<base62>`, JWT, stateful sessions, a concrete envelope-encryption
+  scheme, a concrete reference grammar such as `env:<VAR_NAME>` or
+  `vault:<secret_id>`, a specific KMS or vault vendor, a specific workspace
+  topology, Linux-specific paths, and a specific payment provider are recorded as
+  **review recommendations, not contract**. Each needs its own decision record.
+- **R-8 — Eight security invariants added**, bringing the permanent list to 21:
+  distinct Platform and Core run identities; `UsageRecord` preserves both;
+  tenant-owned entities carry `organization_id`; project workspace roots are
+  isolated; credential references are non-secret handles; plaintext credentials
+  never cross a serialized Platform -> Core boundary; `APIKey` semantics have
+  explicit revocation; `RunRecord` never remains indefinitely running after worker
+  loss.
+- **O-6 stays open.** The Platform -> Core port contract is a mandatory
+  architectural boundary, but the exact transport — in-process, subprocess, local
+  IPC, RPC, or another safe transport — is deliberately not chosen here.
+
+### Rejected alternatives
+
+- **A single `UsageRecord.run_id` field.** Rejected: it cannot say whether it names
+  the Platform record or the Core correlation identity, and the two must stay
+  distinguishable.
+- **Passing plaintext provider secrets as ordinary DTO fields.** Rejected: a
+  serialized boundary must carry a reference, never the secret.
+- **Treating tenant containment as an RLS-only concern.** Rejected: containment is
+  an application-level invariant that must hold before any database exists, with RLS
+  as an additional layer rather than the only one.
+- **Fixing the Platform -> Core transport now.** Rejected: it would freeze a
+  deployment decision before the boundary has an implementation.
+- **Promoting review recommendations into the contract.** Rejected: a token format,
+  a crypto scheme, a reference grammar, or a vendor are implementation decisions
+  with their own tradeoffs, and recording them as architecture would remove the
+  choice without a decision.
+
+### Consequences and open items
+
+1. **Nothing is implemented.** Stage 1 remains **NOT STARTED**; the refinements are
+   normative text only.
+2. **O-8 is resolved at contract level only.** `UNIQUE(run_record_id, attempt_number)`
+   binds the contract; an implementation review that needs more dimensions must
+   raise a new decision rather than widen the uniqueness silently.
+3. **O-7 and O-9 remain open** for the exact status enum and the exact RLS
+   implementation, while their required semantics are now fixed by R-6 and R-3.
+4. **O-1, O-2, O-3, O-4, O-5, O-6 remain open**, and O-10..O-13 remain deferred to
+   later stages.
+5. **Billing is still not implemented.** The fail-closed telemetry invariant from
+   `D-PLATFORM-13` is restated in the contract and remains a future requirement.
+
+
+## Уточнения контракта Stage 1 (D-PLATFORM-15) — русская версия
+
+Уточняет [`STAGE-1-ARCHITECTURE-CONTRACT.md`](STAGE-1-ARCHITECTURE-CONTRACT.md) после
+независимого архитектурного ревью `D-PLATFORM-14`. Ревью — это **входные данные**, а
+не источник истины; обязывает сам контракт, раздел 21. Ничто здесь не создаёт код,
+зависимость или runtime-компонент, а `D-PLATFORM-01..14` не изменяются.
+
+### Принятые решения
+
+- **R-1 — Идентичность запуска Platform и идентичность запуска Core различны.**
+  `RunRecord.id` — идентичность Platform; `RunRecord.core_run_id` — неизменяемая
+  корреляционная идентичность Core, переносимая в `PhysicalTelemetry.run_id`.
+  `UsageRecord` должен нести `run_record_id`, `core_run_id` и `attempt_number` под
+  явно различными именами и не должен использовать неоднозначное единое поле с
+  именем `run_id`. Мост односторонний: `PhysicalTelemetry.run_id -> core_run_id ->
+  разрешает Platform RunRecord -> создаёт запись потребления`.
+- **R-1 — `UNIQUE(run_record_id, attempt_number)` разрешает O-8 на уровне
+  контракта.** Это утверждение об уникальности одной физической попытки одного
+  запуска Platform. Это **не** финансовая истина, оно ничего не авторизует и не
+  заменяет локальную идемпотентность Core. Если реализации позже потребуются
+  дополнительные измерения, это отдельная запись решения, и никогда — молчаливое
+  изменение.
+- **R-2 — Граница разрешения кредилов.** `TrustedExecutionRequest` никогда не
+  содержит plaintext-секретов провайдера; он несёт только непрозрачную ссылку на
+  кредил или секрет. Core зависит только от абстрактного порта, названного
+  `EphemeralSecretResolver`, который не импортирует ни модуль Platform, ни SDK KMS
+  или vault, ни драйвер базы данных, ни платёжную библиотеку, и который внедряется
+  слоем композиции Platform или приложения. Plaintext-секрет никогда не входит в
+  сериализованный trusted request, в `RunRecord`, в `UsageRecord`, в
+  `PhysicalTelemetry`, в обычный ответ API или в лог. Это утверждение о **границе**:
+  оно не утверждает, что Platform передаёт plaintext в Core, не говорит, что Core
+  знает о KMS или Vault, и не замораживает реализацию resolver'а.
+- **R-3 — Containment арендаторов действует до реализации DTO.** Каждая
+  tenant-owned сущность Platform несёт явный `organization_id` как
+  application-level инвариант containment, действующий до начала шага 1 (DTO /
+  доменные контракты), и он не заменяет будущий PostgreSQL RLS. Три слоя образуют
+  defense-in-depth: авторизация приложения плюс явный containment `organization_id`
+  плюс RLS. O-9 остаётся открытым только для точной реализации RLS.
+- **R-4 — Workspace-корни проектов взаимно изолированы.** Workspace-корень каждого
+  `Project` должен быть изолирован от workspace-корней всех остальных проектов,
+  включая два проекта внутри одной `Organization`. Запуск в одном проекте не должен
+  проходить внутрь, читать, писать или исполнять в отношении workspace другого
+  проекта. Ни топология файловой системы, ни Linux-путь, ни механизм ОС не
+  фиксируются.
+- **R-5 — Authority и отзыв API key.** Модель authority `APIKey` открыта, и до шага
+  8 должна быть выбрана ровно одна из двух моделей: сервисный принципал уровня
+  Organization либо кредил, выведенный из membership создателя. Какую бы модель ни
+  выбрали, поведение отзыва должно быть однозначным, а состояние, когда создатель
+  теряет membership, а созданный им ключ молча сохраняет authority, явно запрещено.
+  Формат токена, JWT, алгоритм хэша и префикс не фиксируются; O-1 остаётся открытым.
+- **R-6 — Семантика отказа и orphan для RunRecord.** Итоговый enum статусов остаётся
+  открытым (O-7), но жизненный цикл должен иметь явную семантику для нормального
+  успеха, нормального отказа, отмены, таймаута и прерывания исполнения, краха или
+  orphaned run, и должен существовать механизм, предотвращающий бесконечное
+  зависание `RunRecord` в running или claimed после потери execution worker'а.
+  Является ли это lease, heartbeat, таймаутом или reconciliation-обходом —
+  оставлено открытым.
+- **R-7 — Явно НЕ заморожено.** Конкретный формат токена вида
+  `forge_live_<base62>`, JWT, stateful-сессии, конкретная схема
+  envelope-шифрования, конкретная грамматика ссылки вида `env:<VAR_NAME>` или
+  `vault:<secret_id>`, конкретный вендор KMS или vault, конкретная топология
+  workspace, Linux-специфичные пути и конкретный платёжный провайдер записаны как
+  **рекомендации ревью, а не контракт**. Каждому нужна собственная запись решения.
+- **R-8 — Добавлены восемь инвариантов безопасности**, доводя постоянный список до
+  21: различные идентичности запуска Platform и Core; `UsageRecord` сохраняет обе;
+  tenant-owned сущности несут `organization_id`; workspace-корни проектов
+  изолированы; ссылки на кредилы — non-secret хэндлы; plaintext-кредилы никогда не
+  пересекают сериализованную границу Platform -> Core; семантика `APIKey` имеет
+  явный отзыв; `RunRecord` никогда не остаётся бесконечно в running после потери
+  worker'а.
+- **O-6 остаётся открытым.** Контракт порта Platform -> Core — обязательная
+  архитектурная граница, но точный транспорт — in-process, subprocess, локальный
+  IPC, RPC или другой безопасный транспорт — здесь намеренно не выбирается.
+
+### Отклонённые альтернативы
+
+- **Единое поле `UsageRecord.run_id`.** Отклонено: оно не может сказать, называет
+  ли оно запись Platform или корреляционную идентичность Core, а они должны
+  оставаться различимыми.
+- **Передача plaintext-секретов провайдера как обычных полей DTO.** Отклонено:
+  сериализованная граница должна нести ссылку, а не секрет.
+- **Рассмотрение containment арендаторов как заботы только RLS.** Отклонено:
+  containment — application-level инвариант, который должен действовать до
+  появления любой базы данных, а RLS — дополнительный слой, а не единственный.
+- **Фиксация транспорта Platform -> Core сейчас.** Отклонено: это заморозило бы
+  решение о развёртывании до появления реализации границы.
+- **Превращение рекомендаций ревью в контракт.** Отклонено: формат токена, схема
+  шифрования, грамматика ссылки или вендор — это implementation-решения с
+  собственными компромиссами, и запись их как архитектуры убрала бы выбор без
+  решения.
+
+### Следствия и открытые пункты
+
+1. **Ничего не реализовано.** Stage 1 остаётся **НЕ НАЧАТЫМ**; уточнения — это
+   только нормативный текст.
+2. **O-8 разрешён только на уровне контракта.** `UNIQUE(run_record_id,
+   attempt_number)` обязывает контракт; implementation review, которому потребуются
+   дополнительные измерения, должен поднять новое решение, а не расширять
+   уникальность молча.
+3. **O-7 и O-9 остаются открытыми** для точного enum статусов и точной реализации
+   RLS, тогда как их требуемая семантика теперь зафиксирована R-6 и R-3.
+4. **O-1, O-2, O-3, O-4, O-5, O-6 остаются открытыми**, а O-10..O-13 остаются
+   отложенными на более поздние этапы.
+5. **Billing по-прежнему не реализован.** Fail-closed инвариант телеметрии из
+   `D-PLATFORM-13` повторён в контракте и остаётся будущим требованием.
