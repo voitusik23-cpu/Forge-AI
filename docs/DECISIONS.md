@@ -3318,3 +3318,129 @@ Implements the first half of the Stage 0.1 boundary frozen in `D-PLATFORM-06` an
    идентичность; строковые поля не имеют ограничения длины, а `error_type` не
    канонизируется; `completed_at` не валидируется; ротации файлов и `fsync`
    нет.
+
+
+## Stage 1 Architecture Contract (D-PLATFORM-14)
+
+The normative contract for Stage 1 lives in
+[`STAGE-1-ARCHITECTURE-CONTRACT.md`](STAGE-1-ARCHITECTURE-CONTRACT.md). It binds the
+Platform work that follows and restates the frozen Stage 0 decisions
+(`D-PLATFORM-01..12`) and the Stage 0.1 telemetry decision (`D-PLATFORM-13`) in one
+implementable form.
+
+What this decision adds, beyond restating frozen material:
+
+- **The Platform -> Core port is normative, not optional.** Stage 1 must introduce a
+  single narrow typed contract (`TrustedExecutionRequest` or an equivalent internal
+  port) carrying only server-derived trusted execution context. A port that accepts
+  plaintext provider secret material as an ordinary DTO field is **rejected**; a
+  contract shaped like `provider_secret_environ: Mapping[str, str]` is explicitly
+  named as forbidden. Secrets are addressed by an **opaque secret reference**,
+  resolved only at a controlled boundary, and never written to a persistent
+  `RunRecord`, to `PhysicalTelemetry`, or to an ordinary API response.
+- **No secret backend is frozen.** Neither a KMS/vault vendor nor a reference
+  grammar such as `kms:v1:<base64_ciphertext>` is mandated here. The existing
+  `ProviderAccount.secret_ref` reference model is extended, not replaced.
+- **The workspace contract is platform-neutral.** It is expressed as an abstract
+  server-derived resource root. A Linux-only layout must not be baked into the
+  architecture, and Core stays cross-platform. `Workspace`, `WorkspaceBoundary`,
+  and `RunScope` remain boundaries, never authorization.
+- **Nine entities are fixed for Stage 1**, and no further entity may be added
+  without its own decision record: `User`, `Organization`, `Membership`, `Project`,
+  `ProviderAccount`, `APIKey`, `RunRecord`, `UsageRecord`, plus the `Membership`-based
+  role model (no separate role entity). Billing entities — `Wallet`,
+  `CreditTransaction`, `CostRecord`, `PricingPlan`, `PriceRule`, `Payment` — must not
+  appear in Stage 1 without a separate gate.
+- **Thirteen security invariants are permanent**, including "client IDs are not
+  authority", "workspace is not permission", "`RunRecord` ownership is not execution
+  authority", and "Platform may deny a launch but cannot expand Core authority".
+- **Thirteen open decisions are recorded as open**, with the implementation step each
+  one gates. They are deliberately not invented in the contract.
+
+**Status: NOT STARTED.** This decision freezes direction and sequencing. It creates
+no code, no runtime component, no dependency, and no Platform entity.
+
+### Consequences and open items
+
+1. **Nothing from Stage 1 exists.** No `User`, `Organization`, `Membership`,
+   `Project`, `APIKey`, `RunRecord`, `UsageRecord`, PostgreSQL, authentication, or
+   Platform -> Core port is implemented. The contract is a plan, and must not be
+   described in the present tense.
+2. **Stage 0.1 remains frozen and unchanged.** `PhysicalTelemetry` stays an
+   exclusively physical measurement; the contract adds no field to it and changes no
+   Core behaviour.
+3. **Two deferred review findings are carried forward.** F-46-03 (concurrent writers
+   can duplicate a telemetry record) and F-46-04 (lossy `run_id` sanitizer;
+   `list_run_ids` returns the sanitized stem) remain open until a persistent storage
+   layer exists.
+4. **The fail-closed telemetry invariant is restated, not implemented.** Billing is
+   not built, so a lost measurement still does not block a run on Stage 0.1.
+   Before a `Charge` can exist, missing durable `PhysicalTelemetry` must make the
+   execution financially incomplete.
+5. **The open decisions gate implementation steps, not the contract.** O-1..O-13 must
+   be decided before their dependent step, and each decision must be recorded here
+   rather than assumed in code.
+
+
+## Архитектурный контракт Stage 1 (D-PLATFORM-14) — русская версия
+
+Нормативный контракт Stage 1 находится в
+[`STAGE-1-ARCHITECTURE-CONTRACT.md`](STAGE-1-ARCHITECTURE-CONTRACT.md). Он обязателен
+для последующей работы над Platform и переформулирует замороженные решения Stage 0
+(`D-PLATFORM-01..12`) и решение о телеметрии Stage 0.1 (`D-PLATFORM-13`) в одной
+реализуемой форме.
+
+Что это решение добавляет сверх повторения замороженного материала:
+
+- **Порт Platform -> Core нормативен, а не опционален.** Stage 1 должен ввести единый
+  узкий типизированный контракт (`TrustedExecutionRequest` или эквивалентный
+  внутренний порт), передающий только server-derived доверенный контекст исполнения.
+  Порт, принимающий plaintext-секреты провайдера как обычное поле DTO,
+  **отклонён**; контракт вида `provider_secret_environ: Mapping[str, str]` явно
+  назван запрещённым. Секреты адресуются **непрозрачной ссылкой на секрет**,
+  разрешаются только на контролируемой границе и никогда не пишутся в persistent
+  `RunRecord`, в `PhysicalTelemetry` или в обычный ответ API.
+- **Бэкенд секретов не фиксируется.** Ни вендор KMS/vault, ни грамматика ссылки вида
+  `kms:v1:<base64_ciphertext>` здесь не предписываются. Существующая ссылочная модель
+  `ProviderAccount.secret_ref` расширяется, а не заменяется.
+- **Контракт workspace платформенно-нейтрален.** Он выражается как абстрактный
+  server-derived корень ресурса. Linux-only раскладка не должна зашиваться в
+  архитектуру, и Core остаётся кросс-платформенным. `Workspace`, `WorkspaceBoundary`
+  и `RunScope` остаются границами и никогда — авторизацией.
+- **Девять сущностей фиксируются для Stage 1**, и ни одна дополнительная сущность не
+  вводится без собственной записи решения: `User`, `Organization`, `Membership`,
+  `Project`, `ProviderAccount`, `APIKey`, `RunRecord`, `UsageRecord` плюс модель ролей
+  на основе `Membership` (без отдельной сущности роли). Сущности биллинга — `Wallet`,
+  `CreditTransaction`, `CostRecord`, `PricingPlan`, `PriceRule`, `Payment` — не должны
+  появиться в Stage 1 без отдельного gate.
+- **Тринадцать инвариантов безопасности постоянны**, включая «клиентские ID — не
+  authority», «workspace — не разрешение», «владение `RunRecord` — не execution
+  authority» и «Platform может отказать в запуске, но не может расширить authority
+  Core».
+- **Тринадцать открытых решений зафиксированы как открытые**, с указанием шага
+  реализации, который каждое из них гейтит. Они намеренно не выдумываются в
+  контракте.
+
+**Статус: НЕ НАЧАТА.** Это решение замораживает направление и порядок. Оно не
+создаёт ни кода, ни runtime-компонента, ни зависимости, ни сущности Platform.
+
+### Следствия и открытые пункты
+
+1. **Ничего из Stage 1 не существует.** Ни `User`, ни `Organization`, ни
+   `Membership`, ни `Project`, ни `APIKey`, ни `RunRecord`, ни `UsageRecord`, ни
+   PostgreSQL, ни аутентификация, ни порт Platform -> Core не реализованы. Контракт —
+   это план, и его нельзя описывать в настоящем времени.
+2. **Stage 0.1 остаётся замороженным и неизменным.** `PhysicalTelemetry` остаётся
+   исключительно физическим измерением; контракт не добавляет ей полей и не меняет
+   поведение Core.
+3. **Два отложенных finding'а переносятся дальше.** F-46-03 (конкурентные писатели
+   могут дублировать запись телеметрии) и F-46-04 (lossy-санитайзер `run_id`;
+   `list_run_ids` возвращает санитизированный stem) остаются открытыми до появления
+   слоя постоянного хранилища.
+4. **Fail-closed инвариант телеметрии повторяется, а не реализуется.** Billing не
+   построен, поэтому на Stage 0.1 потерянное измерение по-прежнему не блокирует
+   запуск. До появления `Charge` отсутствие durable `PhysicalTelemetry` обязано
+   делать исполнение финансово незавершённым.
+5. **Открытые решения гейтят шаги реализации, а не контракт.** O-1..O-13 должны быть
+   решены до зависимого шага, и каждое решение должно быть записано здесь, а не
+   подразумеваться в коде.
