@@ -285,6 +285,13 @@ class AgentHarness:
         configured. A sink failure is raised to the caller, which reports it as an
         observable event: a durable boundary that dropped a record silently would
         not be a boundary.
+
+        The sink call is the **only** thing wrapped here. Any failure it raises is
+        normalized into :class:`TelemetryWriteError` so the caller has one
+        exception to handle, and the original error is kept as ``__cause__`` so it
+        is never lost. The scope is deliberately this one call: an execution-stage
+        failure earlier in the run must keep propagating as itself, and must never
+        be relabelled as a telemetry failure.
         """
         telemetry = self._build_attempt_telemetry(
             request,
@@ -295,7 +302,15 @@ class AgentHarness:
         self._last_telemetry = telemetry
         if self._telemetry_sink is None:
             return telemetry
-        self._telemetry_sink.record(telemetry)
+        try:
+            self._telemetry_sink.record(telemetry)
+        except TelemetryWriteError:
+            # Already the canonical durable-write failure.
+            raise
+        except Exception as exc:  # noqa: BLE001 - one call, normalized below
+            raise TelemetryWriteError(
+                f"physical telemetry sink failed: {type(exc).__name__}"
+            ) from exc
         return telemetry
 
     def _record_telemetry_or_report(
@@ -313,6 +328,13 @@ class AgentHarness:
         be silent either: a dropped record would make the durable boundary
         untrustworthy. The failure is reported as an observable event, and the run
         keeps its own outcome.
+
+        The handler is deliberately narrow. It catches exactly one exception -
+        :class:`TelemetryWriteError`, which
+        :meth:`_record_attempt_telemetry` guarantees for *any* failure raised by the
+        sink - and nothing else. An execution-stage failure from elsewhere in the
+        run therefore keeps propagating as itself and can never be relabelled as a
+        telemetry failure.
         """
         try:
             telemetry = self._record_attempt_telemetry(
@@ -322,11 +344,15 @@ class AgentHarness:
                 tool_call_count=tool_call_count,
             )
         except TelemetryWriteError as exc:
+            cause = exc.__cause__
             emit(
                 EventType.HARNESS_FAILED,
                 {
                     "reason": "physical_telemetry_write_failed",
                     "failure_category": type(exc).__name__,
+                    # The original sink error is preserved diagnostically; it is
+                    # sanitized like every other event payload.
+                    "cause_category": type(cause).__name__ if cause is not None else "",
                 },
             )
             return

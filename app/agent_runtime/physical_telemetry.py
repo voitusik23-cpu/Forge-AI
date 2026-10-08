@@ -32,6 +32,7 @@ and is never the user's workspace.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -45,7 +46,40 @@ __all__ = [
     "FileTelemetrySink",
     "TelemetryWriteError",
     "default_telemetry_root",
+    "MAX_TOKEN_COUNT",
+    "MAX_TOOL_CALL_COUNT",
+    "MAX_ATTEMPT_NUMBER",
 ]
+
+# --------------------------------------------------------------------------- #
+# canonical measurement bounds
+# --------------------------------------------------------------------------- #
+# A physical measurement must be a real measurement, not a pathological value
+# that silently poisons every later calculation. The bounds below are chosen to
+# be far above any real workload while still rejecting nonsense, and they are
+# enforced for every construction path (including deserialization), so a durable
+# record can never contain an out-of-range value.
+#
+# Why these numbers:
+#
+# * ``MAX_TOKEN_COUNT = 10**12`` (one trillion). A single provider call is
+#   measured in thousands to low millions of tokens, and an attempt that
+#   accumulates many calls still stays far below this. One trillion keeps five
+#   to six orders of magnitude of headroom, stays exactly representable, and is
+#   well inside a 64-bit signed integer, so it cannot overflow a downstream
+#   counter written in any common language.
+# * ``MAX_TOOL_CALL_COUNT = 10**6`` (one million). Tool invocations are counted
+#   per attempt and are bounded by the run loop itself, so a separate and much
+#   smaller ceiling applies. It is deliberately not the token ceiling: a token
+#   budget says nothing about how many tools may run.
+# * ``MAX_ATTEMPT_NUMBER = 10**6``. Attempt numbers advance only on resume, so a
+#   low ceiling is correct here and catches a corrupted counter.
+#
+# These are measurement bounds, not policy limits: they do not grant, deny, or
+# budget anything, and they never reach the execution authority chain.
+MAX_TOKEN_COUNT = 10**12
+MAX_TOOL_CALL_COUNT = 10**6
+MAX_ATTEMPT_NUMBER = 10**6
 
 # Environment variable that relocates the telemetry root. Its own variable, so
 # telemetry can be moved independently of run history and of the idempotency
@@ -140,13 +174,38 @@ class PhysicalTelemetry:
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id.strip():
             raise ValueError("physical telemetry requires a non-empty run_id")
-        if not isinstance(self.attempt_number, int) or self.attempt_number < 0:
-            raise ValueError("attempt_number must be a non-negative integer")
-        for field_name in ("input_tokens", "output_tokens", "cached_tokens", "tool_call_count"):
+        if not isinstance(self.attempt_number, int) or isinstance(self.attempt_number, bool):
+            raise ValueError("attempt_number must be an integer")
+        if not 0 <= self.attempt_number <= MAX_ATTEMPT_NUMBER:
+            raise ValueError(
+                f"attempt_number must be between 0 and {MAX_ATTEMPT_NUMBER}"
+            )
+        for field_name in ("input_tokens", "output_tokens", "cached_tokens"):
             value = getattr(self, field_name)
-            if not isinstance(value, int) or value < 0:
-                raise ValueError(f"{field_name} must be a non-negative integer")
-        if not isinstance(self.duration_seconds, (int, float)) or self.duration_seconds < 0:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{field_name} must be an integer")
+            if not 0 <= value <= MAX_TOKEN_COUNT:
+                raise ValueError(
+                    f"{field_name} must be between 0 and {MAX_TOKEN_COUNT}"
+                )
+        if not isinstance(self.tool_call_count, int) or isinstance(self.tool_call_count, bool):
+            raise ValueError("tool_call_count must be an integer")
+        if not 0 <= self.tool_call_count <= MAX_TOOL_CALL_COUNT:
+            raise ValueError(
+                f"tool_call_count must be between 0 and {MAX_TOOL_CALL_COUNT}"
+            )
+        # ``NaN`` and the infinities must be rejected explicitly: the
+        # ``value < 0`` comparison below is False for ``NaN``, so a plain
+        # non-negativity check would let it through and it would then be written
+        # to the durable log as a bare ``NaN`` token that a strict JSON reader
+        # rejects.
+        if isinstance(self.duration_seconds, bool) or not isinstance(
+            self.duration_seconds, (int, float)
+        ):
+            raise ValueError("duration_seconds must be a number")
+        if not math.isfinite(self.duration_seconds):
+            raise ValueError("duration_seconds must be a finite number")
+        if self.duration_seconds < 0:
             raise ValueError("duration_seconds must be a non-negative number")
         if not isinstance(self.success, bool):
             raise ValueError("success must be a boolean")
@@ -237,9 +296,21 @@ class PhysicalTelemetrySink(Protocol):
     """Minimal port for durable physical telemetry.
 
     The contract is deliberately one method: a sink either durably records one
-    terminal attempt or it raises. A sink that silently drops a record would make
-    the durable boundary untrustworthy, so implementations must not swallow
-    write errors.
+    terminal attempt or it signals failure. A sink that silently drops a record
+    would make the durable boundary untrustworthy, so implementations must not
+    swallow write errors.
+
+    **Failure contract.** A sink should raise :class:`TelemetryWriteError` for a
+    persistence failure. It does not have to: the caller normalizes any exception
+    raised by ``record`` into :class:`TelemetryWriteError`, preserving the
+    original as ``__cause__``, and reports it as an observable
+    ``physical_telemetry_write_failed`` event. Either way the guarantees hold:
+
+    * a telemetry write failure never destroys an already-determined terminal
+      run outcome;
+    * it is never silent;
+    * it is never confused with an execution failure, because the normalization
+      wraps this one call only.
     """
 
     def record(self, telemetry: PhysicalTelemetry) -> bool:
@@ -336,8 +407,16 @@ class FileTelemetrySink:
         path = self.path_for_run(telemetry.run_id)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            # ``allow_nan=False`` is the durable guarantee: a non-finite value
+            # can never be written as a bare ``NaN``/``Infinity`` token, because
+            # that is not valid JSON and a strict reader would reject the line.
+            # A non-finite measurement is refused here rather than persisted.
             line = json.dumps(
-                telemetry.to_dict(), ensure_ascii=False, sort_keys=True, default=str
+                telemetry.to_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                allow_nan=False,
             )
             if "\n" in line or "\r" in line:
                 raise TelemetryWriteError(
@@ -350,6 +429,13 @@ class FileTelemetrySink:
         except OSError as exc:
             raise TelemetryWriteError(
                 f"cannot append telemetry for run '{telemetry.run_id}': {exc}"
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            # Reached only if a non-finite or otherwise unserializable value
+            # survived validation. It is a durable-write failure like any other,
+            # never a silent skip.
+            raise TelemetryWriteError(
+                f"telemetry for run '{telemetry.run_id}' is not serializable: {exc}"
             ) from exc
         self._recorded[telemetry.run_id].add(identity)
         return True

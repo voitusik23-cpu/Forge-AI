@@ -3050,10 +3050,34 @@ Implements the first half of the Stage 0.1 boundary frozen in `D-PLATFORM-06` an
   contributes nothing and is recorded as measured zero, not as an estimate.
   `tool_call_count` is the measured number of tool invocations the attempt
   recorded a bounded result for; a measured zero means no tool ran.
-- **A write failure is reported, and it does not abort the run.** A failing sink
-  raises `TelemetryWriteError`; the harness reports it as a
-  `physical_telemetry_write_failed` event and keeps the run's own outcome. A
-  dropped record is never silent.
+- **Every number is finite and bounded.** `duration_seconds` must be a finite,
+  non-negative number: `NaN`, `+inf`, and `-inf` are refused, because `NaN`
+  compares false against a plain non-negativity check and `json.dumps` would then
+  write a bare `NaN` token that is not valid JSON and that a strict reader in
+  another language rejects. The writer additionally uses `allow_nan=False`, so the
+  durable log cannot contain `NaN` or `Infinity` even if a value bypassed
+  construction. Counters are bounded by three documented canonical constants, all
+  enforced on every construction path including deserialization:
+  `MAX_TOKEN_COUNT = 10**12` for `input_tokens`, `output_tokens`, and
+  `cached_tokens`; `MAX_TOOL_CALL_COUNT = 10**6` for `tool_call_count`, which is
+  bounded separately and much lower because tool invocations are bounded by the run
+  loop and a token budget says nothing about how many tools may run;
+  `MAX_ATTEMPT_NUMBER = 10**6` for `attempt_number`, which advances only on resume.
+  The token ceiling keeps five to six orders of magnitude of headroom over any real
+  workload, stays exactly representable, and fits well inside a 64-bit signed
+  integer, so it cannot overflow a downstream counter. These are measurement
+  bounds: they grant, deny, and budget nothing, and they never reach the execution
+  authority chain.
+- **A write failure is reported, and it does not abort the run.** The port's
+  failure contract is explicit and enforced by the caller, not merely by
+  convention: a sink *should* raise `TelemetryWriteError`, and any other exception
+  it raises is normalized into `TelemetryWriteError` with the original kept as
+  `__cause__`. The normalization wraps **only the sink call**, so an
+  execution-stage failure elsewhere in the run keeps propagating as itself and can
+  never be relabelled as a telemetry failure. The harness then reports a
+  `physical_telemetry_write_failed` event, carrying the original error's type as
+  `cause_category`, and keeps the run's own outcome. A dropped record is never
+  silent, and telemetry can never destroy an already-determined terminal outcome.
 - **The measurement carries no authority.** The `AgentHarness` builds it from
   counts and durations it already holds. Nothing in `decision -> authorization ->
   execution` changed: `AuthorizedExecution` stays the only execution authority,
@@ -3120,6 +3144,20 @@ Implements the first half of the Stage 0.1 boundary frozen in `D-PLATFORM-06` an
 6. **No financial semantics were added and none were moved.** Cost, price, charge,
    wallet, credits, billing account, project ownership, organization ownership, and
    user identity are absent from the contract and asserted absent by tests.
+7. **The sink failure contract has a known escalation point.** On this stage a
+   lost measurement never blocks or reclassifies a run, which is correct while no
+   money moves. Before a `Charge` can exist, a missing durable `PhysicalTelemetry`
+   for an attempt must make the run financially incomplete: either the terminal
+   state becomes fail-closed (`physical_telemetry_unavailable`) or the ledger must
+   carry a compensating marker that the billing pipeline rejects. Until that
+   invariant exists, `PhysicalTelemetry -> UsageRecord -> CostRecord -> Charge`
+   would admit a successful execution that is never billed.
+8. **Deferred from the Stage 0.1 review, still open:** concurrent writers can
+   still produce a duplicate record (no compare-and-set); the `run_id` sanitizer is
+   lossy, and `list_run_ids` returns the sanitized stem rather than the original
+   id; the caller-supplied `attempt_id` can override the derived identity; string
+   fields have no length bound and `error_type` is not canonicalized;
+   `completed_at` is not validated; and there is no file rotation or `fsync`.
 
 
 ## Physical Execution Telemetry v0.1 (D-PLATFORM-13) — русская версия
@@ -3167,10 +3205,36 @@ Implements the first half of the Stage 0.1 boundary frozen in `D-PLATFORM-06` an
   оценка. `tool_call_count` — измеренное число вызовов инструментов, для которых
   попытка записала bounded-результат; измеренный ноль означает, что ни один
   инструмент не выполнялся.
-- **Сбой записи сообщается и не прерывает run.** Падающий sink поднимает
-  `TelemetryWriteError`; harness сообщает об этом событием
-  `physical_telemetry_write_failed` и сохраняет собственный исход run. Потерянная
-  запись никогда не бывает беззвучной.
+- **Каждое число конечно и ограничено.** `duration_seconds` должно быть конечным
+  неотрицательным числом: `NaN`, `+inf` и `-inf` отвергаются, потому что `NaN`
+  даёт ложь при простой проверке неотрицательности, и тогда `json.dumps` записал бы
+  голый токен `NaN`, который не является валидным JSON и который строгий читатель на
+  другом языке отвергает. Писатель дополнительно использует `allow_nan=False`,
+  поэтому durable-журнал не может содержать `NaN` или `Infinity`, даже если значение
+  как-то обошло конструирование. Счётчики ограничены тремя
+  документированными каноническими константами, причём на всех путях
+  конструирования, включая десериализацию: `MAX_TOKEN_COUNT = 10**12` для
+  `input_tokens`, `output_tokens` и `cached_tokens`; `MAX_TOOL_CALL_COUNT = 10**6` для
+  `tool_call_count`, который ограничен отдельно и намного ниже, потому что вызовы
+  инструментов ограничены циклом run, а бюджет токенов ничего не говорит о том,
+  сколько инструментов может выполниться; `MAX_ATTEMPT_NUMBER = 10**6` для
+  `attempt_number`, который увеличивается только при resume. Потолок токенов оставляет пять-
+  шесть порядков запаса относительно любой реальной нагрузки, точно
+  представим и умещается в 64-битное целое со знаком, поэтому не может
+  переполнить нижний счётчик. Это границы измерения: они ничего не
+  разрешают, не запрещают и не бюджетируют, и никогда не достигают цепочки
+  execution authority.
+- **Сбой записи сообщается и не прерывает run.** Контракт отказа порта
+  явный и обеспечивается вызывающим, а не только договорённостью: sink
+  **должен** поднимать `TelemetryWriteError`, а любое другое его исключение
+  нормализуется в `TelemetryWriteError` с сохранением исходного как `__cause__`.
+  Нормализация оборачивает **только вызов sink**, поэтому ошибка стадии
+  исполнения в другом месте run продолжает распространяться как она есть и никогда не
+  переклассифицируется как ошибка телеметрии. Затем harness сообщает событие
+  `physical_telemetry_write_failed`, неся тип исходной ошибки как `cause_category`, и сохраняет
+  собственный исход run. Потерянная запись никогда не бывает беззвучной, а
+  телеметрия никогда не может уничтожить уже определённый терминальный
+  исход.
 - **Измерение не несёт authority.** `AgentHarness` строит его из счётчиков и
   длительностей, которые у него уже есть. В цепочке `decision -> authorization ->
   execution` ничего не изменилось: `AuthorizedExecution` остаётся единственной
@@ -3238,3 +3302,19 @@ Implements the first half of the Stage 0.1 boundary frozen in `D-PLATFORM-06` an
    charge, wallet, credits, billing account, project ownership, organization
    ownership и user identity отсутствуют в контракте, и тесты утверждают их
    отсутствие.
+7. **У контракта отказа sink есть известная точка эскалации.** На этом этапе
+   потерянное измерение никогда не блокирует и не переклассифицирует run, и это
+   правильно, пока не начинаются деньги. До появления `Charge` отсутствие
+   durable `PhysicalTelemetry` для попытки обязано делать run финансово незавершённым: либо
+   терминальное состояние становится fail-closed
+   (`physical_telemetry_unavailable`), либо в ledger должна появиться компенсирующая
+   отметка, которую billing-конвейер отвергает. Пока этого инварианта нет,
+   `PhysicalTelemetry -> UsageRecord -> CostRecord -> Charge` допускал бы успешное исполнение, за
+   которое никогда не выставляется счёт.
+8. **Отложено из review Stage 0.1 и остаётся открытым:** конкурентные
+   писатели всё ещё могут создать дубликат записи (нет compare-and-set); санитайзер
+   `run_id` lossy, а `list_run_ids` возвращает санитизированный stem, а не исходный id;
+   передаваемый вызывающим `attempt_id` может переопределить производную
+   идентичность; строковые поля не имеют ограничения длины, а `error_type` не
+   канонизируется; `completed_at` не валидируется; ротации файлов и `fsync`
+   нет.

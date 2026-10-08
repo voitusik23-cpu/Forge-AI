@@ -26,6 +26,9 @@ from app.agent_runtime.harness import AgentHarness
 from app.agent_runtime.models import HarnessPhase, HarnessRequest, HarnessStatus
 from app.agent_runtime.physical_telemetry import (
     FORBIDDEN_TELEMETRY_FIELDS,
+    MAX_ATTEMPT_NUMBER,
+    MAX_TOOL_CALL_COUNT,
+    MAX_TOKEN_COUNT,
     FileTelemetrySink,
     PhysicalTelemetry,
     TelemetryWriteError,
@@ -128,14 +131,19 @@ class _CountingSink:
 
 
 class _FailingSink:
-    """A sink double that always fails, to prove failure is never silent."""
+    """A sink double that always fails, to prove failure is never silent.
 
-    def __init__(self) -> None:
+    The exception type is configurable because the port promises that *any*
+    persistence failure is normalized, not only :class:`TelemetryWriteError`.
+    """
+
+    def __init__(self, error: BaseException | None = None) -> None:
         self.calls = 0
+        self._error = error or TelemetryWriteError("disk on fire")
 
     def record(self, telemetry: PhysicalTelemetry) -> bool:
         self.calls += 1
-        raise TelemetryWriteError("disk on fire")
+        raise self._error
 
 
 class PhysicalTelemetrySchemaTests(unittest.TestCase):
@@ -637,6 +645,290 @@ class TerminalOutcomeMappingTests(unittest.TestCase):
         self.assertEqual(records[0].tool_call_count, 0)
 
 
+class SinkFailureNormalizationTests(unittest.TestCase):
+    """F-46-01: any sink failure is normalized, and none destroys the outcome.
+
+    The port promises that a persistence failure never destroys an
+    already-determined terminal outcome and is never silent. That promise must
+    hold for *any* exception a sink raises, not only for the project's own
+    exception type, because a future sink (for example a database-backed one)
+    will raise its driver's errors.
+    """
+
+    def setUp(self) -> None:
+        from app.runtime.run_scope import RunScope
+
+        RunScope.release_all()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "a.txt").write_text("x", encoding="utf-8")
+        self.workspace = Workspace(self.root)
+
+    def tearDown(self) -> None:
+        from app.runtime.run_scope import RunScope
+
+        RunScope.release_all()
+        self._tmp.cleanup()
+
+    def _drive(self, error: BaseException):
+        sink = _FailingSink(error)
+        harness = AgentHarness(
+            decision_provider=_FixedActionProvider(
+                DecisionAction.FAIL_RUN, DecisionType.FAIL
+            ),
+            policy=AgentHarnessPolicy(),
+            telemetry_sink=sink,
+        )
+        result = harness.run(
+            HarnessRequest(
+                run_id="run-sink-norm",
+                workspace=self.workspace,
+                attempt_number=0,
+            )
+        )
+        return sink, result
+
+    def _assert_normalized(self, error: BaseException) -> None:
+        sink, result = self._drive(error)
+        self.assertEqual(sink.calls, 1)
+        self.assertEqual(result.final_state.status, HarnessStatus.FAILED)
+        self.assertTrue(result.final_state.terminal)
+        failures = [
+            event
+            for event in result.events
+            if event.event_type.name == "HARNESS_FAILED"
+            and event.metadata.get("reason") == "physical_telemetry_write_failed"
+        ]
+        self.assertEqual(len(failures), 1, [e.metadata for e in result.events])
+        self.assertEqual(failures[0].metadata.get("cause_category"), type(error).__name__)
+
+    def test_sink_raising_oserror_is_normalized(self) -> None:
+        """A: an OSError from the sink does not destroy the terminal outcome."""
+        self._assert_normalized(OSError("disk full"))
+
+    def test_sink_raising_valueerror_is_normalized(self) -> None:
+        """B: a ValueError from the sink does not destroy the terminal outcome."""
+        self._assert_normalized(ValueError("bad record"))
+
+    def test_sink_raising_arbitrary_exception_is_normalized(self) -> None:
+        """C: any Exception from the sink is normalized."""
+        self._assert_normalized(RuntimeError("driver exploded"))
+        self._assert_normalized(TypeError("wrong type"))
+        self._assert_normalized(KeyError("missing column"))
+
+    def test_the_original_error_is_preserved_as_the_cause(self) -> None:
+        """The normalization keeps the original error rather than discarding it."""
+        original = OSError("disk full")
+        sink = _FailingSink(original)
+        harness = AgentHarness(telemetry_sink=sink)
+
+        with self.assertRaises(TelemetryWriteError) as ctx:
+            harness._record_attempt_telemetry(
+                HarnessRequest(run_id="run-cause", workspace=self.workspace),
+                self._completed_result(),
+                duration_seconds=0.0,
+                tool_call_count=0,
+            )
+        self.assertIs(ctx.exception.__cause__, original)
+
+    def _completed_result(self):
+        from app.agent_runtime.models import HarnessResult, HarnessState
+
+        state = HarnessState(
+            run_id="run-cause",
+            attempt_number=0,
+            iteration=0,
+            phase=HarnessPhase.OBSERVE,
+            status=HarnessStatus.COMPLETED,
+            terminal=True,
+        )
+        return HarnessResult(
+            run_id="run-cause",
+            final_state=state,
+            iterations=(state,),
+            observations=(),
+            decisions=(),
+            execution_results=(),
+            verification_results=(),
+            final_acceptance=None,
+            final_project_state=None,
+            events=(),
+        )
+
+    def test_an_execution_error_outside_the_sink_is_not_relabelled(self) -> None:
+        """C: the normalization is scoped to the sink call, not to the whole run."""
+        class _ExplodingDecisionProvider:
+            def decide(self, request):
+                raise RuntimeError("execution stage exploded")
+
+        harness = AgentHarness(
+            decision_provider=_ExplodingDecisionProvider(),
+            policy=AgentHarnessPolicy(),
+            telemetry_sink=_FailingSink(OSError("should never be reached")),
+        )
+        # The execution failure must propagate as itself. If the telemetry
+        # handling were a blanket catch around the run, this would surface as a
+        # TelemetryWriteError instead.
+        with self.assertRaises(RuntimeError) as ctx:
+            harness.run(
+                HarnessRequest(
+                    run_id="run-exec-error",
+                    workspace=self.workspace,
+                    attempt_number=0,
+                )
+            )
+        self.assertNotIsInstance(ctx.exception, TelemetryWriteError)
+        self.assertEqual(str(ctx.exception), "execution stage exploded")
+
+    def test_a_failing_sink_is_not_reported_as_a_run_failure_outcome(self) -> None:
+        """The run keeps its own outcome; only the measurement is lost."""
+        sink, result = self._drive(OSError("disk full"))
+        self.assertEqual(sink.calls, 1)
+        # The run failed for its own reason, not because telemetry failed.
+        self.assertNotEqual(
+            result.final_state.metadata.get("reason"), "physical_telemetry_write_failed"
+        )
+        self.assertNotIn(
+            "physical_telemetry_write_failed",
+            str(result.final_state.metadata.get("reason", "")),
+        )
+
+
+class NumericBoundTests(unittest.TestCase):
+    """F-46-02: durable telemetry can only contain finite, bounded numbers."""
+
+    def test_duration_accepts_finite_and_zero(self) -> None:
+        """D: a real duration is accepted, including zero."""
+        self.assertEqual(PhysicalTelemetry(run_id="r", duration_seconds=0).duration_seconds, 0)
+        self.assertEqual(
+            PhysicalTelemetry(run_id="r", duration_seconds=1.5).duration_seconds, 1.5
+        )
+        self.assertEqual(
+            PhysicalTelemetry(run_id="r", duration_seconds=0.000001).duration_seconds,
+            0.000001,
+        )
+
+    def test_duration_rejects_non_finite_and_negative(self) -> None:
+        """D: NaN, both infinities, and a negative duration are all refused."""
+        for bad in (float("nan"), float("inf"), float("-inf"), -0.1, -1.0):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    PhysicalTelemetry(run_id="r", duration_seconds=bad)
+
+    def test_token_counters_accept_zero_and_the_maximum(self) -> None:
+        """F: 0 and the documented maximum are both valid measurements."""
+        for field in ("input_tokens", "output_tokens", "cached_tokens"):
+            with self.subTest(field=field):
+                self.assertEqual(
+                    getattr(PhysicalTelemetry(run_id="r", **{field: 0}), field), 0
+                )
+                self.assertEqual(
+                    getattr(
+                        PhysicalTelemetry(run_id="r", **{field: MAX_TOKEN_COUNT}), field
+                    ),
+                    MAX_TOKEN_COUNT,
+                )
+
+    def test_token_counters_reject_above_the_maximum_and_negative(self) -> None:
+        """F: MAX+1 and a negative count are both refused."""
+        for field in ("input_tokens", "output_tokens", "cached_tokens"):
+            for bad in (MAX_TOKEN_COUNT + 1, -1):
+                with self.subTest(field=field, value=bad):
+                    with self.assertRaises(ValueError):
+                        PhysicalTelemetry(run_id="r", **{field: bad})
+
+    def test_tool_call_count_has_its_own_smaller_bound(self) -> None:
+        """G: tool calls are bounded separately from tokens."""
+        self.assertEqual(
+            PhysicalTelemetry(run_id="r", tool_call_count=0).tool_call_count, 0
+        )
+        self.assertEqual(
+            PhysicalTelemetry(
+                run_id="r", tool_call_count=MAX_TOOL_CALL_COUNT
+            ).tool_call_count,
+            MAX_TOOL_CALL_COUNT,
+        )
+        for bad in (MAX_TOOL_CALL_COUNT + 1, -1):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    PhysicalTelemetry(run_id="r", tool_call_count=bad)
+        self.assertLess(MAX_TOOL_CALL_COUNT, MAX_TOKEN_COUNT)
+
+    def test_attempt_number_is_bounded(self) -> None:
+        """The attempt counter is bounded too, so a corrupt value is refused."""
+        self.assertEqual(
+            PhysicalTelemetry(
+                run_id="r", attempt_number=MAX_ATTEMPT_NUMBER
+            ).attempt_number,
+            MAX_ATTEMPT_NUMBER,
+        )
+        with self.assertRaises(ValueError):
+            PhysicalTelemetry(run_id="r", attempt_number=MAX_ATTEMPT_NUMBER + 1)
+        with self.assertRaises(ValueError):
+            PhysicalTelemetry(run_id="r", attempt_number=-1)
+
+    def test_non_integer_counters_are_refused(self) -> None:
+        """A counter must be an integer; a bool is not a measurement."""
+        for bad in (1.5, "12", None, True):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    PhysicalTelemetry(run_id="r", input_tokens=bad)
+
+    def test_deserialization_cannot_bypass_the_bounds(self) -> None:
+        """Every construction path is validated, including from_dict."""
+        with self.assertRaises(ValueError):
+            PhysicalTelemetry.from_dict(
+                {"run_id": "r", "input_tokens": MAX_TOKEN_COUNT + 1}
+            )
+        with self.assertRaises(ValueError):
+            PhysicalTelemetry.from_dict(
+                {"run_id": "r", "tool_call_count": MAX_TOOL_CALL_COUNT + 1}
+            )
+
+    def test_no_nan_or_infinity_can_reach_the_durable_file(self) -> None:
+        """E: allow_nan=False is the durable guarantee, not just validation.
+
+        Two independent layers are checked. Construction refuses a non-finite
+        duration, and the writer itself refuses to serialize one even if a value
+        somehow bypassed construction - which is what makes the durable file safe
+        rather than merely the constructor.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = FileTelemetrySink(Path(tmp) / "telemetry")
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(value=bad):
+                    with self.assertRaises(ValueError):
+                        PhysicalTelemetry(run_id="run-nan", duration_seconds=bad)
+
+            good = PhysicalTelemetry(run_id="run-finite", duration_seconds=1.0, success=True)
+            self.assertTrue(sink.record(good))
+            raw = sink.path_for_run("run-finite").read_text(encoding="utf-8")
+            self.assertNotIn("NaN", raw)
+            self.assertNotIn("Infinity", raw)
+            parsed = json.loads(raw, parse_constant=_reject_constant)
+            self.assertEqual(parsed["duration_seconds"], 1.0)
+
+    def test_the_writer_refuses_a_non_finite_value_on_its_own(self) -> None:
+        """E: the writer is fail-closed even if validation is bypassed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = FileTelemetrySink(Path(tmp) / "telemetry")
+            smuggled = PhysicalTelemetry(run_id="run-smuggled", success=True)
+            # Bypass the frozen constructor's validation to simulate any future
+            # code path that reaches the writer with a non-finite measurement.
+            object.__setattr__(smuggled, "duration_seconds", float("nan"))
+            with self.assertRaises(TelemetryWriteError) as ctx:
+                sink.record(smuggled)
+            self.assertIsInstance(ctx.exception.__cause__, (TypeError, ValueError))
+            # Nothing invalid was persisted.
+            path = sink.path_for_run("run-smuggled")
+            self.assertFalse(path.exists() and "NaN" in path.read_text(encoding="utf-8"))
+
+
+def _reject_constant(name: str):
+    """A strict JSON reader rejects ``NaN``/``Infinity`` the way other languages do."""
+    raise AssertionError(f"invalid JSON constant persisted: {name}")
+
+
 class ProductionEntryPointTelemetryTests(unittest.TestCase):
     """J: the real production entry point records durable physical telemetry.
 
@@ -811,8 +1103,8 @@ class CoreIndependenceTests(unittest.TestCase):
             self.assertNotIn(root_module, {"platform", "sqlalchemy", "psycopg", "stripe"})
             self.assertIn(
                 root_module,
-                {"app", "__future__", "json", "os", "re", "dataclasses", "datetime",
-                 "pathlib", "typing"},
+                {"app", "__future__", "json", "math", "os", "re", "dataclasses",
+                 "datetime", "pathlib", "typing"},
                 f"unexpected non-Core import: {module}",
             )
 
