@@ -320,6 +320,9 @@
 -- policy usage_records.usage_records_tenant_select cmd=SELECT roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK None
+-- policy users.users_system_insert cmd=INSERT roles={forge_platform_system}
+--   USING      None
+--   WITH CHECK platform.system_scope_is_declared()
 -- policy users.users_system_select cmd=SELECT roles={forge_platform_system}
 --   USING      platform.system_scope_is_declared()
 --   WITH CHECK None
@@ -329,6 +332,9 @@
      JOIN memberships m_other ON ((m_other.organization_id = m_self.organization_id)))
   WHERE ((m_self.user_id = (NULLIF(current_setting('forge.user_id'::text, true), ''::text))::uuid) AND (m_self.organization_id = platform.current_organization_id()) AND (m_other.user_id = users.id))))))
 --   WITH CHECK None
+-- policy users.users_tenant_update cmd=UPDATE roles={forge_platform_app}
+--   USING      (id = platform.current_user_id())
+--   WITH CHECK (id = platform.current_user_id())
 
 -- ============================================================
 -- Helper functions in schema platform

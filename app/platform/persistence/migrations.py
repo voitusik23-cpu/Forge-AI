@@ -23,10 +23,11 @@ the ledger's parameterised inserts.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import pathlib
 from dataclasses import dataclass
-from typing import Iterable, List, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterable, List, Protocol, Sequence, runtime_checkable
 
 MIGRATIONS_DIR = pathlib.Path(__file__).resolve().parent / "postgres" / "migrations"
 
@@ -155,7 +156,7 @@ async def apply_migrations(
             continue
 
         try:
-            await connection.execute(migration.sql)
+            await _execute_migration(connection, migration)
         except Exception as exc:  # noqa: BLE001 - re-raised with context
             raise MigrationError(f"migration {migration.filename} failed: {exc}") from exc
 
@@ -167,6 +168,40 @@ async def apply_migrations(
         newly_applied.append(migration.filename)
 
     return newly_applied
+
+
+#: `tuple concurrently updated` (SQLSTATE XX000) is what PostgreSQL raises when two
+#: sessions modify the same catalog row at the same moment -- typically both creating
+#: or altering the same role. It is a transient conflict, not a defect in the
+#: migration, and the statement is safe to repeat because the migrations are written
+#: to be idempotent.
+TRANSIENT_CATALOG_CONFLICT = "tuple concurrently updated"
+
+#: How many times a migration statement is retried on a transient catalog conflict.
+#: Bounded, because an unbounded retry would hide a real failure.
+MIGRATION_RETRY_ATTEMPTS = 5
+
+
+async def _execute_migration(connection: Any, migration: Migration) -> None:
+    """Run one migration statement, retrying a transient catalog conflict.
+
+    Two deployments -- or two test processes -- migrating different databases in one
+    cluster at the same moment contend on the shared role catalogue. The loser gets
+    ``tuple concurrently updated`` and nothing else, so it is retried with a short
+    backoff; any other error surfaces immediately.
+    """
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await connection.execute(migration.sql)
+            return
+        except Exception as exc:  # noqa: BLE001 - re-raised by the caller
+            transient = TRANSIENT_CATALOG_CONFLICT in str(exc)
+            if not transient or attempt >= MIGRATION_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(0.2 * attempt)
 
 
 def migration_filenames(migrations: Iterable[Migration]) -> List[str]:

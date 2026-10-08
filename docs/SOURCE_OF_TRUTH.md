@@ -179,6 +179,34 @@ Do not confuse these with the **lifecycle** stages. The distinguishing rules are
 Knowledge does **not** become global because an agent observed it once. Promotion
 requires the governance workflow (candidate -> evaluation -> approved).
 
+### 3.6 Platform (Stage 1)
+
+Stage 1 is being built as ordered steps. Steps 1 through 3 are implemented; the
+remaining steps are not, and nothing below should be read as a claim about them.
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Platform domain contracts (8 records, 8 status enums, stdlib-only, no driver) | **CURRENT / VERIFIED** | `app/platform/models.py`, `app/platform/enums.py` — `tests/test_platform_domain_contracts.py` |
+| PostgreSQL schema with migrations, roles, `FORCE` row-level security, and append-only tables | **CURRENT / VERIFIED** | `app/platform/persistence/postgres/migrations/0001..0014_*.sql`, `postgres/schema.sql` — `tests/test_platform_postgres_schema.py` |
+| Tenant containment, role separation, system-scope containment, append-only usage, membership provenance | **CURRENT / VERIFIED** | migrations `0002`, `0011`–`0014` — `tests/test_platform_postgres_security.py` |
+| Repositories, Unit of Work, three scopes, error normalization, identifier boundary | **CURRENT / VERIFIED** | `app/platform/persistence/{database,repositories,mapper,protocols,errors}.py` — `tests/test_platform_persistence.py` |
+| Platform Application Services over those repositories | **PLANNED / NOT IMPLEMENTED** | no such module exists; `app/platform/persistence/protocols.py` is the interface they will use |
+| Platform HTTP API, authentication, API-key token handling | **PLANNED / NOT IMPLEMENTED** | see O-1 and O-2 in `DECISIONS.md`; no endpoint and no token column exist |
+| Platform -> Core transport (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; see `ROADMAP.md` |
+| Billing (cost records, pricing, wallet, ledger) | **PLANNED / NOT IMPLEMENTED** | Stage 2; no such table and no money column exist |
+
+Two properties of this layer are worth stating explicitly, because a reader will
+otherwise assume the opposite:
+
+- **`forge.system_scope` is not an authorization mechanism.** Any session can set a
+  custom GUC. What gates the system scope is the policy's `TO` clause together with
+  the database role, and a deployment serves tenant and system traffic through two
+  different logins. The persistence layer refuses to build a connection pool when the
+  effective role is a superuser, has `BYPASSRLS`, or owns the Platform tables.
+- **There is no money in the persistence layer.** `usage_records` holds physical
+  measurements only: tokens, timings, counts, and flags. No cost, price, charge,
+  balance, or currency column exists anywhere.
+
 ## 4. Verified limitations
 
 These are current, observed properties of the implementation. They are recorded
@@ -615,6 +643,34 @@ review-engine **нет**; reviewer существует как агент вну
 Знание **не** становится глобальным только потому, что агент однажды его
 наблюдал. Продвижение требует workflow governance (candidate -> evaluation ->
 approved).
+
+### 3.6 Platform (Stage 1) — русская версия
+
+Stage 1 строится упорядоченными шагами. Шаги с 1 по 3 реализованы; остальные — нет,
+и ничто ниже не должно читаться как утверждение о них.
+
+| Область | Статус | Evidence |
+| --- | --- | --- |
+| Доменные контракты Platform (8 записей, 8 enum'ов статусов, только stdlib, без драйвера) | **CURRENT / VERIFIED** | `app/platform/models.py`, `app/platform/enums.py` — `tests/test_platform_domain_contracts.py` |
+| Схема PostgreSQL с миграциями, ролями, `FORCE` row-level security и append-only таблицами | **CURRENT / VERIFIED** | `app/platform/persistence/postgres/migrations/0001..0014_*.sql`, `postgres/schema.sql` — `tests/test_platform_postgres_schema.py` |
+| Изоляция арендаторов, разделение ролей, сдерживание system-скоупа, append-only потребление, происхождение membership | **CURRENT / VERIFIED** | миграции `0002`, `0011`–`0014` — `tests/test_platform_postgres_security.py` |
+| Репозитории, Unit of Work, три скоупа, нормализация ошибок, граница идентификаторов | **CURRENT / VERIFIED** | `app/platform/persistence/{database,repositories,mapper,protocols,errors}.py` — `tests/test_platform_persistence.py` |
+| Прикладные сервисы Platform поверх этих репозиториев | **PLANNED / NOT IMPLEMENTED** | такого модуля не существует; `app/platform/persistence/protocols.py` — интерфейс, которым они будут пользоваться |
+| HTTP API Platform, аутентификация, обработка токенов API-ключей | **PLANNED / NOT IMPLEMENTED** | см. O-1 и O-2 в `DECISIONS.md`; ни эндпоинта, ни колонки токена не существует |
+| Транспорт Platform -> Core (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; см. `ROADMAP.md` |
+| Billing (cost records, ценообразование, кошелёк, леджер) | **PLANNED / NOT IMPLEMENTED** | Stage 2; ни такой таблицы, ни денежной колонки не существует |
+
+Два свойства этого слоя стоит назвать прямо, иначе читатель предположит обратное:
+
+- **`forge.system_scope` не является механизмом авторизации.** Любая сессия может
+  установить пользовательскую GUC. Доступ к system-скоупу даёт клауза `TO` в
+  политике вместе с ролью базы данных, а деплой обслуживает трафик арендатора и
+  system-трафик двумя разными логинами. Слой персистентности отказывается создавать
+  пул соединений, если эффективная роль — суперпользователь, имеет `BYPASSRLS` или
+  владеет таблицами Platform.
+- **В слое персистентности нет денег.** `usage_records` хранит только физические
+  измерения: токены, тайминги, счётчики и флаги. Ни колонки стоимости, цены, списания,
+  баланса или валюты не существует нигде.
 
 ## 4. Проверенные ограничения
 

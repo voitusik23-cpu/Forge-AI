@@ -93,7 +93,14 @@ EXPECTED_POLICIES = {
         "usage_records_tenant_select",
         "usage_records_tenant_insert",
     },
-    "users": {"users_tenant_select", "users_system_select"},
+    # users_system_insert is the bootstrap path: registering an organization and
+    # its first OWNER membership needs the account row to exist first.
+    "users": {
+        "users_tenant_select",
+        "users_tenant_update",
+        "users_system_select",
+        "users_system_insert",
+    },
     "provider_accounts": {
         "provider_accounts_tenant_select",
         "provider_accounts_tenant_insert",
@@ -1004,7 +1011,16 @@ class RowLevelSecurityTests(AsyncTestCase):
                         row["with_check"],
                         f"{row['policyname']} must have WITH CHECK",
                     )
-                    self.assertIn("is_current_organization", row["with_check"])
+                    # Every tenant write is bounded by an explicit containment
+                    # predicate. `users` cannot use the organization predicate -- it
+                    # has no organization_id -- so its UPDATE policy is bounded by
+                    # the subject instead, which is the same kind of rule: a
+                    # predicate the caller cannot widen.
+                    self.assertTrue(
+                        "is_current_organization" in row["with_check"]
+                        or "current_user_id" in row["with_check"],
+                        f"{row['policyname']} has no containment predicate",
+                    )
         run_async(body())
 
     def test_32_users_are_not_tenant_predicated(self):

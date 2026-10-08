@@ -619,6 +619,28 @@ Neither is tenant-owned, so an `organization_id` predicate does not apply.
   organization. A blanket `SELECT` on `users` would be a cross-tenant leak of
   identities, so it is not permitted by this design.
 
+#### I-5.1. Two write rules `users` needed in practice — IMPLEMENTED (Step 3)
+
+Design I-5 named the read rules for `users` and stopped there, while the grants in
+migration `0011` already gave the tenant role `UPDATE` and the system role `INSERT`
+on the table. Implementing Step 3 made the consequence concrete: **a privilege with no
+policy is not a safeguard, it is a silent wrong answer.** An `INSERT` was refused
+outright, and an `UPDATE` matched zero rows and was reported by the repository as a
+missing record.
+
+Both rules are therefore now implemented in migration `0014`:
+
+| Policy | Role | Predicate | Why it exists |
+| --- | --- | --- | --- |
+| `users_system_insert` | `forge_platform_system` | `WITH CHECK platform.system_scope_is_declared()` | registering an organization and its first `OWNER` membership cannot itself be tenant-scoped, and the membership's composite provenance key requires the account row to exist first |
+| `users_tenant_update` | `forge_platform_app` | `USING` and `WITH CHECK` `id = platform.current_user_id()` | a subject may change its own record; one subject must not rewrite another's |
+
+The system role still holds no `UPDATE` policy on `users`, so it cannot change an
+account; the tenant predicate is expressed on the subject rather than on an
+organization, because `users` has no `organization_id` to contain. This does not widen
+any tenant boundary: the tenant policy is bounded by the subject the transaction
+already declared.
+
 ### I-6. Server-only operations — ACCEPTED
 
 RLS is a backstop, not the authorization layer. The following remain
@@ -1586,6 +1608,27 @@ AND organization_id = nullif(current_setting('forge.organization_id', true), '')
 - `users`: субъект может видеть себя, а других пользователей — только через
   общую организацию. Сплошной `SELECT` по `users` был бы кросс-арендаторной
   утечкой идентичностей, поэтому этим дизайном он не разрешён.
+
+#### I-5.1. Два правила записи, которые `users` потребовал на практике — IMPLEMENTED (Шаг 3)
+
+Дизайн I-5 назвал правила чтения для `users` и на этом остановился, тогда как гранты
+в миграции `0011` уже давали tenant-роли `UPDATE`, а system-роли `INSERT` на эту
+таблицу. Реализация Шага 3 сделала следствие конкретным: **привилегия без политики —
+не защита, а тихий неверный ответ.** `INSERT` отвергался outright, а `UPDATE`
+совпадал с нулём строк, и репозиторий сообщал об отсутствующей записи.
+
+Поэтому оба правила теперь реализованы в миграции `0014`:
+
+| Политика | Роль | Предикат | Зачем существует |
+| --- | --- | --- | --- |
+| `users_system_insert` | `forge_platform_system` | `WITH CHECK platform.system_scope_is_declared()` | регистрация организации и её первого `OWNER` membership сама по себе не может быть tenant-scoped, а составной ключ происхождения membership требует, чтобы строка аккаунта существовала раньше |
+| `users_tenant_update` | `forge_platform_app` | `USING` и `WITH CHECK` `id = platform.current_user_id()` | субъект может менять собственную запись; один субъект не должен переписывать запись другого |
+
+System-роль по-прежнему не имеет `UPDATE`-политики на `users`, поэтому не может
+изменить аккаунт; tenant-предикат выражен через субъекта, а не через организацию,
+потому что у `users` нет `organization_id` для containment. Это не расширяет ни одну
+границу арендатора: tenant-политика ограничена субъектом, которого транзакция уже
+объявила.
 
 ### I-6. Server-only операции — ACCEPTED
 

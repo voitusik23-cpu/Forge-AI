@@ -258,7 +258,18 @@ them may be described in the present tense.
 - [ ] **Stage 1 вЂ” Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
   `APIKey`, `ProviderAccount.organization_id`, per-tenant persistence, BYOK
   credential storage. PostgreSQL is the durable store for platform state;
-  Core keeps its file-based execution infrastructure.
+  Core keeps its file-based execution infrastructure. Ordered in
+  [`STAGE-1-ARCHITECTURE-CONTRACT.md`](STAGE-1-ARCHITECTURE-CONTRACT.md) section 17:
+  - [x] Step 1 — domain contracts: eight records, eight status enums, stdlib-only,
+    no driver and no ORM.
+  - [x] Step 2 — PostgreSQL schema, roles, `FORCE` row-level security, append-only
+    usage, membership provenance. Contract in
+    [`STAGE-1-STEP-2-SCHEMA-DESIGN.md`](STAGE-1-STEP-2-SCHEMA-DESIGN.md).
+  - [x] Step 3 — persistence, repositories and Unit of Work, with the three scopes
+    and error normalization. Design in
+    [`STAGE-1-STEP-3-PERSISTENCE-DESIGN.md`](STAGE-1-STEP-3-PERSISTENCE-DESIGN.md).
+  - [ ] Steps 4+ — application services, HTTP API, authentication, and the rest of
+    the contract's implementation order. **Not started.**
 - [ ] **Stage 2 вЂ” Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` with
   version snapshots, `Wallet` with compare-and-swap, immutable
   `CreditTransaction` ledger, prepaid top-up.
@@ -553,7 +564,18 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] **Stage 1 — Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
   `APIKey`, `ProviderAccount.organization_id`, per-tenant персистентность, BYOK-хранилище
   кредов. PostgreSQL — durable-хранилище платформенного состояния; Core
-  сохраняет свою файловую инфраструктуру исполнения.
+  сохраняет свою файловую инфраструктуру исполнения. Порядок задан в
+  [`STAGE-1-ARCHITECTURE-CONTRACT.md`](STAGE-1-ARCHITECTURE-CONTRACT.md), раздел 17:
+  - [x] Шаг 1 — доменные контракты: восемь записей, восемь enum'ов статусов, только
+    stdlib, без драйвера и без ORM.
+  - [x] Шаг 2 — схема PostgreSQL, роли, `FORCE` row-level security, append-only
+    потребление, происхождение membership. Контракт в
+    [`STAGE-1-STEP-2-SCHEMA-DESIGN.md`](STAGE-1-STEP-2-SCHEMA-DESIGN.md).
+  - [x] Шаг 3 — персистентность, репозитории и Unit of Work с тремя скоупами и
+    нормализацией ошибок. Дизайн в
+    [`STAGE-1-STEP-3-PERSISTENCE-DESIGN.md`](STAGE-1-STEP-3-PERSISTENCE-DESIGN.md).
+  - [ ] Шаги 4+ — прикладные сервисы, HTTP API, аутентификация и остальная часть
+    порядка реализации из контракта. **Не начато.**
 - [ ] **Stage 2 — Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` со снимками
   версий, `Wallet` с compare-and-swap, неизменяемый ledger `CreditTransaction`,
   prepaid top-up.

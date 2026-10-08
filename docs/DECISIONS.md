@@ -4582,3 +4582,380 @@ tenant-контекста из разрешённого membership и никог
    репозитория, ни сервиса, ни endpoint'а, ни механизма аутентификации, ни
    разрешения кредилов, ни транспорта Platform -> Core, и Core не получил
    зависимости от базы данных.
+
+
+## Platform persistence, repositories, and Unit of Work (D-PLATFORM-20)
+
+Implements the Platform persistence layer over the frozen Step 2 schema, and records
+a documentation gap found at the start of the step.
+
+### The documentation gap, recorded rather than papered over
+
+The task named `docs/STAGE-1-STEP-3-PERSISTENCE-DESIGN.md` as its architectural
+anchor. **That file did not exist in the repository**: `git log --all` has no history
+for it, no other document carried its content, and no Step 3 persistence design had
+ever been written. Rather than invent a design silently or treat the missing document
+as licence to improvise, the implementation was derived from three sources that do
+exist and are normative: the Step 3 brief itself, Stage 1 Architecture Contract
+sections 17 and 18 (implementation order and required test invariants), and the Step 2
+schema contract. The resulting design is now written down as
+`docs/STAGE-1-STEP-3-PERSISTENCE-DESIGN.md`, marked as written after the fact. **No
+frozen contract was changed** to accommodate the implementation.
+
+### Accepted decisions
+
+- **Layering is one-way and the domain stays stdlib-only.** Application services ->
+  protocols -> Unit of Work -> repositories -> session -> pool -> PostgreSQL. The
+  eight domain records stay frozen dataclasses; `mapper.py` is the only module that
+  knows both a domain record and a physical column; `asyncpg` is imported only inside
+  `database.py`, lazily. Nothing outside `app/platform/` imports the persistence
+  package.
+- **Two database logins, not one.** A deployment must serve tenant traffic and system
+  traffic through different logins, because one login in both roles would let a tenant
+  connection step into the system scope. The pool **refuses to build** when the
+  effective role is a superuser, has `BYPASSRLS`, or owns the Platform tables: all
+  three exempt a session from the policies it must obey.
+- **Three named scopes.** `tenant(organization_id, user_id=...)`,
+  `pre_tenant(user_id=...)`, and `server(role=..., system_scope=...)`. Each opens its
+  own transaction, sets its own role with `SET LOCAL ROLE`, and sets its own context.
+- **`forge.system_scope` is not an authorization mechanism.** Any session can set a
+  custom GUC; what gates the system scope is the policy's `TO` clause plus the role.
+  The flag only narrows the scope further.
+- **Repositories never manage transactions.** The words `begin`, `commit`, and
+  `rollback` do not appear in `repositories.py`. A session refuses statements outside a
+  transaction, so a repository used outside a Unit of Work raises rather than
+  auto-committing.
+- **No tenant-scoped repository takes an organization identifier.** The tenant comes
+  from the Unit of Work, so there is no parameter to pass a foreign tenant and none to
+  forget to validate.
+- **No generic `update(**fields)` anywhere.** Each mutable transition is a named
+  method, so an immutable field has nowhere to be written from.
+- **`UsageRecordRepository` has no update and no delete method**, and the protocol has
+  none either. Append-only is expressed by absence, backed by withheld table
+  privileges and the absence of any policy granting them.
+- **Provider account ownership is two repositories**, not one with a nullable filter.
+  `provider_accounts` is bounded by the session tenant and never uses
+  `organization_id IS NULL` as a lookup; `system_provider_accounts` is bounded to
+  `organization_id IS NULL` and is reachable only from the server scope with the
+  system role. There is no `get_by_organization(None)`.
+- **Identifiers are validated at the persistence boundary.** The domain accepts any
+  opaque non-empty string and storage stores `uuid`; `mapper.as_uuid` converts or
+  raises `InvalidIdentifierError` naming the field, before any SQL is built.
+  `core_run_id` and `task_id` are correlation/text values, not identifiers of this
+  kind, and are not validated as UUIDs.
+- **Uniqueness is the database's, never a pre-check.** Memberships, project slugs,
+  provider accounts, and usage attempts all rely on their constraints; the run claim
+  uses a conditional `UPDATE` whose `status = 'queued'` predicate is part of the
+  statement, so a race cannot be won twice.
+- **An authorization failure is never reported as absence.** A policy denial is a
+  `PermissionDeniedError`; a missing record is an `EntityNotFound`. The SQLSTATE and
+  violated constraint name are preserved so a caller can react to a specific lost race
+  and an operator can read the original message.
+
+### Two Step 2 policy gaps closed
+
+Both are the same shape: **a privilege granted with no policy to match**, which is a
+latent inconsistency rather than a safeguard. Neither was a live tenant escape.
+
+1. The system role held `INSERT` on `users` with no INSERT policy, so the bootstrap
+   path -- creating an organization and its first `OWNER` membership -- could not
+   actually run. Added `users_system_insert`.
+2. The tenant role held `UPDATE` on `users` with no UPDATE policy, so an update matched
+   zero rows and the repository reported a missing record. That is the worst of the
+   three possible outcomes, because it is a silent wrong answer. Added
+   `users_tenant_update`, bounded to the subject's own row
+   (`id = platform.current_user_id()`), so one subject cannot rewrite another's record.
+
+### Rejected alternatives
+
+- **One login holding both platform roles.** Rejected: it collapses the boundary the
+  security work established, and a test fixture using it would prove less than it
+  appears to.
+- **Switching to the system role on the tenant connection at runtime.** Rejected: the
+  role would then be reachable from tenant traffic, and the separation would exist only
+  in application code.
+- **One `ProviderAccountRepository` with a nullable organization filter.** Rejected:
+  `organization_id IS NULL` is the system-owned marker, and a filter that accepts it
+  from a tenant caller is exactly the wildcard D-PLATFORM-16 forbids.
+- **A generic `update(**fields)` per repository.** Rejected: it gives an immutable field
+  a way to be written.
+- **Pre-checking uniqueness before inserting.** Rejected: a check-then-insert still
+  loses a race; the constraint is the authority.
+- **Returning `None` for a policy denial.** Rejected: it makes an authorization failure
+  indistinguishable from absence.
+- **Making `RunRecord.core_run_id` unique while implementing the lookup.** Rejected:
+  K-8 defers retry and resume semantics, and a unique index would freeze them.
+- **Constraining terminal `RunRecord` statuses in the repository.** Rejected: which
+  statuses are terminal is O-7, which remains open.
+- **Importing the driver at module scope in the repositories.** Rejected: it would put a
+  driver in the Platform import graph and make the package unusable without one.
+
+### Consequences
+
+1. **Persistence is implemented and proven against PostgreSQL 17.11**: 88 persistence
+   tests, plus the 65 schema and 35 security tests from Step 2 all still passing, and
+   the 58 domain tests from Step 1.
+2. **The two policy gaps are closed**, so the bootstrap path runs and an identity update
+   either succeeds or fails loudly.
+3. **Application services can be written against `protocols.py`** without knowing that
+   PostgreSQL exists. That is the next step, and it is not part of this one.
+4. **No endpoint, authentication mechanism, authorization engine, Billing record,
+   credential resolver, or Platform -> Core transport was added**, no ORM, SQLAlchemy,
+   Alembic, or migration framework was introduced, `requirements.txt` is unchanged, and
+   Core gained no database dependency.
+5. **Open decisions are unchanged.** O-1 … O-7 remain **open**; O-8 stays resolved at
+   contract level; O-9 stays resolved and implemented; O-10 … O-13 stay deferred.
+
+
+## Персистентность Platform, репозитории и Unit of Work (D-PLATFORM-20) — русская версия
+
+Реализует слой персистентности Platform поверх замороженной схемы Шага 2 и
+фиксирует пробел в документации, обнаруженный в начале шага.
+
+### Пробел в документации — зафиксирован, а не замаскирован
+
+В задании как архитектурный ориентир назван
+`docs/STAGE-1-STEP-3-PERSISTENCE-DESIGN.md`. **Этого файла в репозитории не было**: в
+`git log --all` нет его истории, ни один другой документ не нёс его содержания, и
+дизайн персистентности Шага 3 никогда не был написан. Вместо того, чтобы молча
+выдумать дизайн или счесть отсутствующий документ правом на импровизацию,
+реализация была выведена из трёх существующих нормативных источников: самого
+задания Шага 3, разделов 17 и 18 Architecture Contract Stage 1 (порядок реализации и обязательные
+тестовые инварианты) и контракта схемы Шага 2. Получившийся дизайн теперь
+записан как `docs/STAGE-1-STEP-3-PERSISTENCE-DESIGN.md` с пометкой, что он написан после факта.
+**Ни один замороженный контракт не был изменён** ради реализации.
+
+### Принятые решения
+
+- **Слоистость односторонняя, домен остаётся stdlib-only.** Приложение ->
+  протоколы -> Unit of Work -> репозитории -> сессия -> пул -> PostgreSQL. Восемь доменных
+  записей остаются замороженными dataclass'ами; `mapper.py` — единственный модуль,
+  знающий и доменную запись, и физическую колонку; `asyncpg` импортируется
+  только внутри `database.py` и лениво.
+- **Два логина базы данных, а не один.** Деплой обязан обслуживать трафик
+  арендатора и system-трафик разными логинами. Пул **отказывается создаваться**,
+  если эффективная роль — суперпользователь, имеет `BYPASSRLS` или владеет таблицами.
+- **Три именованных скоупа:** `tenant(...)`, `pre_tenant(...)` и `server(role=..., system_scope=...)`.
+- **`forge.system_scope` не является механизмом авторизации.**
+- **Репозитории никогда не управляют транзакциями**: слов `begin`, `commit`,
+  `rollback` нет в `repositories.py`.
+- **Ни один tenant-scoped репозиторий не принимает идентификатор организации.**
+- **Нет generic `update(**fields)`.**
+- **У `UsageRecordRepository` нет методов update и delete** — append-only выражен
+  отсутствием операции.
+- **Владение провайдерскими аккаунтами — два репозитория**, а не один с
+  nullable-фильтром.
+- **Идентификаторы валидируются на границе персистентности** через
+  `mapper.as_uuid`.
+- **Уникальность принадлежит базе, никогда предпроверке.**
+- **Отказ авторизации никогда не выдаётся за отсутствие.**
+
+### Два пробела в политиках Шага 2, закрытые здесь
+
+Оба одной формы: **привилегия выдана, а политики к ней нет**. Ни одно
+не было живым tenant escape.
+
+1. System-роль имела `INSERT` на `users` без INSERT-политики, поэтому bootstrap-путь
+   фактически не мог выполниться. Добавлена `users_system_insert`.
+2. Tenant-роль имела `UPDATE` на `users` без UPDATE-политики, поэтому обновление
+   совпадало с нулём строк, и репозиторий сообщал об отсутствующей записи —
+   тихий неверный ответ. Добавлена `users_tenant_update`, ограниченная собственной
+   строкой субъекта (`id = platform.current_user_id()`).
+
+### Отклонённые альтернативы
+
+- **Один логин с обеими ролями Platform.** Отклонено: это сворачивает
+  границу, которую установила работа по безопасности.
+- **Переключение в system-роль на тенантном соединении во время работы.**
+  Отклонено: роль стала бы достижимой из тенантного трафика.
+- **Один `ProviderAccountRepository` с nullable-фильтром организации.** Отклонено:
+  `organization_id IS NULL` — маркер system-owned, и фильтр, принимающий его от тенантного
+  вызывающего, — это и есть подстановочный символ, запрещённый
+  D-PLATFORM-16.
+- **Generic `update(**fields)`.** Отклонено: даёт неизменяемому полю способ быть
+  записанным.
+- **Предпроверка уникальности перед вставкой.** Отклонено: проверка-
+  затем-вставка всё равно проигрывает гонку.
+- **Возврат `None` при отказе политики.** Отклонено: делает отказ
+  авторизации неотличимым от отсутствия.
+- **Сделать `core_run_id` уникальным при реализации поиска.** Отклонено: K-8
+  откладывает семантику retry/resume.
+- **Ограничить терминальные статусы `RunRecord` в репозитории.** Отклонено:
+  это O-7, который остаётся открытым.
+- **Импорт драйвера на уровне модуля в репозиториях.** Отклонено: поместило
+  бы драйвер в граф импортов Platform.
+
+### Следствия
+
+1. **Персистентность реализована и доказана на PostgreSQL 17.11**: 88 тестов
+   персистентности, плюс 65 тестов схемы и 35 тестов безопасности из Шага 2, плюс 58
+   доменных тестов из Шага 1.
+2. **Два пробела в политиках закрыты**, поэтому bootstrap-путь работает, а обновление
+   идентичности либо успешно, либо громко падает.
+3. **Прикладные сервисы можно писать против `protocols.py`**, не зная о
+   существовании PostgreSQL. Это следующий шаг, и он не входит в этот.
+4. **Не добавлено ни эндпоинта, ни механизма аутентификации,
+   ни движка авторизации, ни Billing-записи, ни разрешения кредилов, ни
+   транспорта Platform -> Core**; ни ORM, ни SQLAlchemy, ни Alembic, ни фреймворк
+   миграций; `requirements.txt` не изменён, и Core не получил зависимости от
+   базы данных.
+5. **Открытые решения не изменены.** O-1 … O-7 остаются **открытыми**; O-8 —
+   решён на уровне контракта; O-9 — решён и реализован; O-10 … O-13 — отложены.
+
+### Adversarial review of the persistence layer, and what it changed
+
+An independent adversarial review of this step reported findings that the
+implementation's own tests had missed. Each was reproduced before being accepted, and
+each fix carries a regression test that fails against the previous behaviour. The
+findings are recorded because two of them were ways to **defeat the role guard**, and a
+guard that can be defeated is worse than no guard, since it is trusted.
+
+**F1 — the role guard accepted a superuser login (fixed).** The guard asked
+``pg_has_role(current_user, application_role, 'MEMBER')`` and only then read
+``rolsuper``/``rolbypassrls`` — from the *substituted* role. Two independent holes
+followed. First, ``pg_has_role`` returns true for a superuser for **every** role
+without any grant, so the membership gate was vacuous and ``SET ROLE`` succeeded;
+verified directly: a superuser has zero rows in ``pg_auth_members`` for
+``forge_platform_app`` and ``pg_has_role`` still reports true. Second, the login's own
+attributes were never examined when ``application_role`` was set, so a superuser login
+was accepted — exactly the case an inline comment claimed was refused.
+
+*Fix:* the login's attributes are checked before any switch, using both ``rolsuper`` /
+``rolbypassrls`` and ``pg_has_role(role, 'postgres', 'USAGE')``, which also catches
+membership in a privileged role; the substituted role's attributes are checked after
+the switch; membership is proven before ``SET ROLE`` is attempted so a genuine
+non-member gets this layer's ``ConnectionError`` rather than a driver error.
+
+**F1b — one login could hold both scopes (fixed).** After
+``GRANT forge_platform_system TO <tenant login>``, the tenant pool could step into the
+system scope and read another tenant's memberships and organizations.
+
+*Fix:* when the application role is the tenant role, the pool refuses to build if the
+login is a member of the system role. The separation is now enforced by the layer, not
+left to a deployment convention.
+
+**F2 — the ownership check was pinned to schema ``public`` (fixed).** The migrations
+create the tables unqualified, so they live wherever ``search_path`` resolves, and the
+repositories use unqualified names too. A deployment whose search path put them
+elsewhere was accepted, and the owning role could then run
+``ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`` and read every tenant.
+
+*Fix:* the check now looks for a role owning any Platform table in **any** non-system
+schema, reports the schema and table, and also covers partitioned and foreign tables.
+
+**F3 — two organization methods could never succeed (fixed by removal).** No scope can
+update ``organizations``: the system role holds ``SELECT, INSERT`` only and no UPDATE
+policy exists for either role. Under the tenant role the statement was filtered to zero
+rows, so the repository reported a *permission refusal as a missing tenant* — the exact
+inversion the error hierarchy forbids. The capability was removed from the repository
+and the protocol rather than left advertised and unrunnable; a policy-filtered UPDATE
+is indistinguishable from absence, and the honest fix is to stop offering the method.
+
+**F4 — ``memberships.create`` took the tenant from the record (fixed).** It violated the
+layer's own rule that a tenant-scoped repository must never take the tenant from data
+the caller assembled. Containment rested on the policy alone.
+
+*Fix:* the tenant-scoped repository now takes **no** organization parameter and reads the
+tenant from the session, so a caller cannot even express a cross-tenant write. Creating
+the first membership of a brand-new tenant genuinely cannot be tenant-scoped, so it is
+served by a separate `system_memberships` repository on the server-only scope — the
+capability and its scope now match.
+
+**F5 — raw ``TypeError``/``ValueError`` escaped the repository boundary (fixed).**
+``json.dumps`` on unsupported provider metadata raised ``TypeError``, and on a circular
+mapping ``ValueError``; a caller catching ``PersistenceError`` would have missed both.
+
+*Fix:* a single ``metadata_json`` helper converts both into ``PersistenceError``.
+
+**F6 — a bare string became a list of characters (fixed).** ``"keys:read"`` satisfies
+``Sequence[str]``, so ``scopes_to_array`` stored nine single-character scopes — a silent
+corruption of the field that says what an API key may do, with no error anywhere.
+
+*Fix:* ``str`` and ``bytes`` are refused with ``InvalidIdentifierError``.
+
+**F7 — ``find_by_slug`` disagreed with the writer (fixed).** A slug-less project maps to
+``''`` in the domain and ``NULL`` in storage, but the lookup compared ``slug = ''``,
+which cannot match ``NULL``, so an existence check reported a project missing that
+``get`` returned.
+
+*Fix:* ``IS NOT DISTINCT FROM`` against the normalized value. The first attempt at this
+fix used plain equality on the normalized value and was **wrong** — ``slug = NULL`` is
+never true in SQL — which the regression test caught; the episode is recorded because it
+is the reason the test exists.
+
+**F8 — a failed ``COMMIT`` looked successful, and a failed close was silent (fixed).**
+``_in_transaction`` was cleared in a ``finally`` block, so a failed ``COMMIT`` left
+``close()`` believing there was nothing to undo; and ``_exit_error`` was assigned but
+never read, so a rollback failure vanished.
+
+*Fix:* the flag is cleared only on success, the failure path routes through
+``rollback()``, and ``Session.close_error`` exposes a close failure instead of
+suppressing it. No pooled-connection tenant leak was demonstrated — ``asyncpg``
+resets a connection on release and the pool re-runs setup on every acquire — but
+``Session.close()``'s guarantee should not belong to the driver.
+
+**Verified correct by the same review, unchanged:** every tenant-scoped statement is
+bounded by the session tenant; the system-owned provider account repository is
+unreachable from a tenant session in every operation; no SQL injection (only hardcoded
+column constants and validated role names are interpolated; all values are bound);
+transaction and scope handling does not leak a tenant across requests; ``normalize_error``
+is idempotent and maps the documented SQLSTATEs; the mapping layer matches every domain
+record field for field; nothing outside ``app/platform`` imports the persistence package
+or the driver; and no money column exists anywhere.
+
+**One concurrency note, from the same review.** Applying migrations concurrently against
+one cluster raised ``tuple concurrently updated`` (SQLSTATE XX000), a transient conflict
+on the shared role catalogue. The migration runner now retries that specific error a
+bounded number of times, and the test fixture does the same for its role provisioning.
+Any other error still surfaces immediately.
+
+
+### Адверсариальное ревью слоя персистентности и что оно изменило — русская версия
+
+Независимое адверсариальное ревью этого шага сообщило о находках, которые
+собственные тесты реализации пропустили. Каждая была воспроизведена до того, как
+быть принятой, и каждое исправление сопровождается регрессионным тестом, который
+падает на предыдущем поведении. Находки зафиксированы, потому что две из них
+были способами **обойти защиту роли**, а защита, которую можно обойти, хуже отсутствия
+защиты, поскольку ей доверяют.
+
+**F1 — защита роли принимала логин-суперпользователя (исправлено).** Защита
+спрашивала ``pg_has_role(current_user, application_role, 'MEMBER')`` и только затем читала
+``rolsuper``/``rolbypassrls`` — у *подставленной* роли. Отсюда две независимые дыры.
+Во-первых, ``pg_has_role`` возвращает истину для суперпользователя для **любой** роли
+без всякого гранта, поэтому проверка членства была пустой, а ``SET ROLE`` удавался;
+проверено напрямую: у суперпользователя ноль строк в ``pg_auth_members`` для
+``forge_platform_app``, а ``pg_has_role`` всё равно сообщает истину. Во-вторых, собственные
+атрибуты логина никогда не проверялись, когда ``application_role`` была задана.
+
+*Исправление:* атрибуты логина проверяются до любого переключения через
+``rolsuper``/``rolbypassrls`` и ``pg_has_role(role, 'postgres', 'USAGE')``; атрибуты подставленной роли — после
+переключения; членство доказывается до попытки ``SET ROLE``.
+
+**F1b — один логин мог держать оба скоупа (исправлено).** После
+``GRANT forge_platform_system TO <tenant login>`` тенантный пул мог войти в system-скоуп и читать чужие
+memberships и organizations. *Исправление:* когда запрошена tenant-роль, пул отказывается
+строиться, если логин является членом system-роли.
+
+**F2 — проверка владения была привязана к схеме ``public`` (исправлено).** Миграции
+создают таблицы без квалификации, поэтому они лежат там, куда указывает ``search_path``.
+Развёртывание, у которого таблицы оказывались в другой схеме, принималось, и
+владеющая роль могла выполнить ``ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`` и читать всех
+арендаторов. *Исправление:* проверка теперь ищет владение в **любой** несистемной
+схеме и сообщает схему и таблицу.
+
+**F3 — два метода организаций не могли успеть никогда (исправлено удалением).**
+Ни один скоуп не может обновлять ``organizations``. Под tenant-ролью оператор фильтровался до
+нуля строк, поэтому репозиторий сообщал о *отказе в правах как об отсутствующем арендаторе**
+— точно инверсия, которую запрещает иерархия ошибок. Возможность удалена из
+репозитория и протокола.
+
+**F4 — ``memberships.create`` брал арендатора из записи (исправлено).** Это нарушало
+собственное правило слоя. *Исправление:* tenant-scoped репозиторий теперь **не
+принимает** параметра организации; создание первого membership нового арендатора обслуживает
+отдельный репозиторий `system_memberships` на server-скоупе.
+
+**F5–F8 — граничные дефекты (исправлены).** Несериализуемые metadata
+больше не выпускают сырой ``TypeError``/``ValueError``; строка больше не разбивается на символы в
+``scopes``; ``find_by_slug`` согласован с пишущим кодом; неудавшийся ``COMMIT`` больше не выглядит
+успешным, и неудавшееся закрытие видно через ``Session.close_error``.

@@ -1360,12 +1360,36 @@ CREATE POLICY users_tenant_select ON users
     );
 
 -- The system scope needs to resolve a subject BEFORE a tenant context exists.
--- That is a read of identity, and it is granted as a read only: this scope has no
--- INSERT, UPDATE, or DELETE policy on `users`, and no such privilege either. It
--- cannot create an account, change one, or erase one.
+-- That is a read of identity, and it is granted as a read only: this scope cannot
+-- change an account or erase one.
 CREATE POLICY users_system_select ON users
     FOR SELECT TO forge_platform_system
     USING (platform.system_scope_is_declared());
+
+-- It does need to CREATE an account: registering an organization together with its
+-- first OWNER membership is a bootstrap step that cannot itself be tenant-scoped,
+-- and the membership's provenance key requires the user row to exist first.
+--
+-- This closes a real gap: the migration granted INSERT on this table to the system
+-- role without granting a policy to match, so the privilege was unreachable and the
+-- bootstrap path could not actually run. A capability that is granted but not
+-- policied is a latent inconsistency, not a safety feature -- the tests caught it.
+CREATE POLICY users_system_insert ON users
+    FOR INSERT TO forge_platform_system
+    WITH CHECK (platform.system_scope_is_declared());
+
+-- A subject may change its OWN record, and nothing else. The predicate requests the
+-- subject's own id, so the write is bounded to the row the transaction has already
+-- declared it is acting as.
+--
+-- This policy closes a second real gap found the same way as the first: the
+-- migration granted UPDATE on `users` to the tenant role, but with no UPDATE policy
+-- the statement matched zero rows and the repository reported a missing record. An
+-- unreachable privilege is a silent wrong answer, not a safeguard.
+CREATE POLICY users_tenant_update ON users
+    FOR UPDATE TO forge_platform_app
+    USING (id = platform.current_user_id())
+    WITH CHECK (id = platform.current_user_id());
 
 ---------------------------------------------------------------------
 -- provider_accounts
