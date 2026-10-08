@@ -4026,3 +4026,229 @@ execution authority` остаётся неизменным, и видимая с
    остаётся решённым на уровне контракта.
 6. **D-PLATFORM-16 не ослаблен**; nullable tenant-колонка перенесена в схему
    вместе с правилом исключения на пути чтения и в дизайне RLS.
+
+
+## Schema design decisions and the RLS design (D-PLATFORM-18)
+
+Closes the decision gate that `D-PLATFORM-17` left open: the ten schema proposals
+K-1 … K-10 and the RLS design. The operative summary lives in
+[`STAGE-1-STEP-2-SCHEMA-DESIGN.md`](STAGE-1-STEP-2-SCHEMA-DESIGN.md); this record
+states the decisions and their reasons.
+
+Priorities applied, in order: **A** security and tenant containment, **B**
+consistency with the already frozen domain contract, **C** no premature product
+lock-in, **D** simple implementation.
+
+### O-9 — RESOLVED as a design decision
+
+The proposed RLS design is accepted. It is technically sound and requires no new
+product decision:
+
+- **Tenant context is transaction-local.** The server sets
+  `SET LOCAL forge.organization_id`, inside an explicit transaction, from the
+  resolved `authenticated subject -> membership -> organization`. The client never
+  supplies it, and the database policy never sees a client-supplied value.
+- **Fail-closed is stated explicitly.** A missing custom setting returns an empty
+  string rather than `NULL`, so the predicate is written as
+  `nullif(current_setting('forge.organization_id', true), '') IS NOT NULL AND
+  organization_id = nullif(...)::uuid`. Absent or empty context yields no tenant
+  rows and no tenant writes.
+- **All eight tables carry RLS.** The six tenant-owned tables use the containment
+  predicate; `users` and `organizations` get their own rules because they are not
+  tenant-owned.
+- **`USING` for reads and deletes, `WITH CHECK` for inserts and updates.** A
+  `USING`-only policy would filter reads while still allowing a write into another
+  tenant.
+- **`provider_accounts` requires `organization_id IS NOT NULL AND organization_id =
+  current tenant`** for tenant access, so system-owned rows are excluded
+  structurally rather than incidentally.
+- **A system-owned row is reached only through a separate server-only policy on a
+  role the tenant path never uses**, gated by its own explicit session flag. That is
+  a distinct authorization boundary, not an RLS bypass.
+- **RLS is not the only defence against a cross-tenant reference** (K-7 below), and
+  **RLS does not replace application authorization**: `identity != authorization !=
+  execution authority` is unchanged.
+- **Transaction discipline is a hard requirement.** `SET LOCAL` has no scope
+  outside an explicit transaction, and session-level state must never be used
+  because a pooled connection would carry the previous caller's tenant.
+
+**Two verifications are required of the implementing task**, because PostgreSQL is
+not installed in the development environment and these semantics were therefore
+reasoned about rather than executed:
+
+- **V-1** — confirm that `current_setting('forge.organization_id', true)` returns an
+  empty string when unset, and that the predicate denies in that case.
+- **V-2** — confirm that a tenant-scoped read outside an explicit transaction
+  returns no rows rather than unfiltered rows.
+
+O-9 is resolved as a design decision. Implementation and V-1/V-2 remain
+outstanding, and no policy exists in any database.
+
+### K-1 … K-10
+
+| # | Decision | Verdict | Reason |
+| --- | --- | --- | --- |
+| K-1 | Identifiers persisted as `uuid`, application-generated | **ACCEPT** | A storage representation, not a new public API format; the domain's opaque identity semantics are unchanged. Precondition: every persisted identifier must be a UUID string, enforced by the persistence adapter and tested |
+| K-2 | `UNIQUE (organization_id, user_id)` on `memberships` | **ACCEPT** | One user has at most one membership per organization, which is the model's linking intent. Compatible with K-6 because a rejoin reactivates the existing row rather than inserting a second |
+| K-3 | Slug uniqueness scope | **PARTIAL** — per-organization **ACCEPT**, global for organizations **REJECT** | The contract fixes no global slug namespace, and a global unique constraint would leak whether a slug exists in another tenant through an ordinary constraint error. Tenant-owned entities get tenant-scoped uniqueness; organizations keep a non-unique lookup index |
+| K-4 | `provider_accounts` partial unique indexes | **ACCEPT** | Exactly what `D-PLATFORM-16` fixes: one tenant-owned account per provider per organization, at most one system-owned account per provider. The modes are distinguished by `organization_id` nullability, so no additional ownership column is introduced |
+| K-5 | `UNIQUE (key_prefix) WHERE key_prefix IS NOT NULL` | **DEFER** | Prefix uniqueness depends on the key format and on whether authentication looks keys up by prefix, both part of O-1. The column exists unconstrained |
+| K-6 | Delete semantics | **ACCEPT, with every `CASCADE` removed** | A cascade can delete run or usage truth as a side effect. `RESTRICT` wherever the reference is required by the domain; `SET NULL` only for `run_records.initiated_by_user_id`, which is already optional. Retirement is a `status` change; hard delete is an administrative operation |
+| K-7 | Composite foreign keys for tenant containment | **ACCEPT** | The security decision. `UNIQUE (id, organization_id)` on `projects` and `run_records`, with children referencing the pair, makes a cross-tenant reference structurally impossible in the schema. RLS cannot see a cross-table reference, so RLS does not replace this |
+| K-8 | `UNIQUE (core_run_id) WHERE core_run_id IS NOT NULL` | **DEFER** | Uniqueness would freeze retry and resume semantics that are neither implemented nor decided. A **non-unique** lookup index covers the real need; uniqueness can arrive later as a follow-up constraint that fails loudly on existing data |
+| K-9 | `scopes` as `text[]` | **ACCEPT** the representation, **DEFER** the GIN index | Storing a tuple of strings as a text array is a persistence detail, not authority semantics; scope meaning stays open. The index is added only when scope membership actually needs to be queried |
+| K-10 | `updated_at` maintained by the application | **ACCEPT** | No trigger machinery. `created_at` is immutable and set at insert; `updated_at` is set by the server on write. `usage_records` stays immutable and carries no `updated_at`, matching the domain |
+
+### Rejected alternatives
+
+- **A global unique slug on `organizations`.** Rejected: it is not required by the
+  contract and it turns an ordinary constraint error into a cross-tenant existence
+  oracle.
+- **Any `ON DELETE CASCADE`.** Rejected: deleting a parent must not silently destroy
+  execution or usage history.
+- **Making `api_keys.created_by_user_id` nullable to allow `SET NULL`.** Rejected:
+  the domain contract requires the field, and nulling it would weaken key
+  provenance to save a delete rule.
+- **Relying on RLS alone for cross-tenant integrity.** Rejected: a row can satisfy a
+  policy while referencing a parent in another organization, because the policy sees
+  one table.
+- **Freezing `core_run_id` uniqueness now.** Rejected: it would silently decide
+  retry and resume semantics.
+- **A new ownership column on `provider_accounts`.** Rejected: `D-PLATFORM-16`
+  already fixes the two modes, and the nullability of `organization_id` is the
+  discriminator.
+- **PostgreSQL trigger machinery for `updated_at`.** Rejected as unnecessary
+  complexity for a field the application already controls.
+
+### Consequences
+
+1. **Nothing is implemented.** No migration, SQL file, ORM model, repository,
+   connector, or database policy was created, and no database dependency entered
+   Core.
+2. **Step 2 now has no open design choice.** The implementation task can be
+   mechanical, and its checklist is in section M of the schema document.
+3. **Five O-decisions remain open:** O-1 … O-7 minus O-8, which stays resolved at
+   contract level. O-9 is resolved as a design decision; O-10 … O-13 stay deferred.
+4. **Three items are deferred rather than decided:** K-5, K-8, and the K-9 index.
+   Each is blocked on a decision that is genuinely open, not on unfinished analysis.
+5. **`D-PLATFORM-16` is not weakened.** The nullable tenant column survives into the
+   schema with its exclusion rule stated in the policy text itself, in the read-path
+   rule, and in the partial unique indexes of K-4.
+6. **`D-PLATFORM-17` is not superseded.** It recorded the design pass and left these
+   items proposed; this record decides them.
+
+
+## Решения по схеме и дизайн RLS (D-PLATFORM-18) — русская версия
+
+Закрывает decision gate, который `D-PLATFORM-17` оставил открытым: десять
+предложений схемы K-1 … K-10 и дизайн RLS. Оперативная сводка находится в
+[`STAGE-1-STEP-2-SCHEMA-DESIGN.md`](STAGE-1-STEP-2-SCHEMA-DESIGN.md); эта запись фиксирует решения и их
+причины.
+
+Применённые приоритеты в порядке: **A** безопасность и containment арендаторов, **B**
+соответствие уже замороженному доменному контракту, **C** отсутствие
+преждевременного product lock-in, **D** простая реализация.
+
+### O-9 — RESOLVED как дизайн-решение
+
+Предложенный дизайн RLS принят. Он технически корректен и не требует нового
+продуктового решения:
+
+- **Tenant-контекст локален транзакции.** Сервер устанавливает
+  `SET LOCAL forge.organization_id` внутри явной транзакции из разрешённой цепочки
+  `аутентифицированный субъект -> membership -> organization`. Клиент никогда его не
+  поставляет, и политика базы никогда не видит значение от клиента.
+- **Fail-closed сформулирован явно.** Отсутствующая пользовательская
+  настройка возвращает пустую строку, а не `NULL`, поэтому предикат написан как
+  `nullif(current_setting('forge.organization_id', true), '') IS NOT NULL AND
+  organization_id = nullif(...)::uuid`. Отсутствующий или пустой
+  контекст даёт ноль строк и ноль записей в арендаторе.
+- **Все восемь таблиц несут RLS.** Шесть tenant-owned таблиц используют предикат
+  containment; `users` и `organizations` получают собственные правила, потому что они не
+  tenant-owned.
+- **`USING` для чтений и удалений, `WITH CHECK` для вставок и обновлений.** Политика
+  только с `USING` фильтровала бы чтения, но всё ещё позволяла бы запись в
+  другого арендатора.
+- **`provider_accounts` требует `organization_id IS NOT NULL AND organization_id =
+  current tenant`** для tenant-доступа, поэтому system-owned строки
+  исключаются структурно, а не случайно.
+- **System-owned строка достигается только через отдельную server-only
+  политику** на роли, которую tenant-путь никогда не использует, ограниченную
+  собственным явным session-флагом. Это другая граница авторизации, а не
+  RLS bypass.
+- **RLS — не единственная защита от кросс-арендаторной ссылки** (K-7 ниже), и
+  **RLS не заменяет авторизацию приложения**: `identity != authorization !=
+  execution authority` не изменено.
+- **Транзакционная дисциплина — жёсткое требование.** `SET LOCAL` не
+  имеет скоупа вне явной транзакции, а session-level состояние нельзя использовать
+  никогда, потому что соединение из пула перенесло бы арендатора
+  предыдущего вызова.
+
+**От реализующей задачи требуются две проверки**, потому что PostgreSQL не
+установлен в среде разработки и эти семантики были обоснованы, а не выполнены:
+
+- **V-1** — подтвердить, что `current_setting('forge.organization_id', true)`
+  возвращает пустую строку, когда не установлена, и что предикат в таком
+  случае отказывает.
+- **V-2** — подтвердить, что tenant-scoped чтение вне явной транзакции
+  возвращает ноль строк, а не неотфильтрованные строки.
+
+O-9 решён как дизайн-решение. Реализация и V-1/V-2 остаются
+невыполненными, и ни одной политики нет ни в какой базе данных.
+
+### K-1 … K-10
+
+| # | Решение | Вердикт | Причина |
+| --- | --- | --- | --- |
+| K-1 | Идентификаторы персистятся как `uuid`, порождаемые приложением | **ACCEPT** | Представление в хранилище, а не новый публичный формат API; семантика непрозрачной идентичности домена не изменена. Предусловие: каждый персистимый идентификатор обязан быть UUID-строкой, что обеспечивает адаптер персистентности и покрывает тест |
+| K-2 | `UNIQUE (organization_id, user_id)` на `memberships` | **ACCEPT** | У пользователя не более одного membership на организацию — это намерение связывания в модели. Совместимо с K-6, потому что возвращение реактивирует существующую строку, а не вставляет вторую |
+| K-3 | Область уникальности slug | **PARTIAL** — на организацию **ACCEPT**, глобальная для organizations **REJECT** | Контракт не фиксирует глобального пространства имён, а глобальное уникальное ограничение утекало бы сведения о существовании slug в другом арендаторе через обычную ошибку ограничения. Tenant-owned сущности получают уникальность внутри арендатора; organizations сохраняют неуникальный индекс поиска |
+| K-4 | Частичные уникальные индексы `provider_accounts` | **ACCEPT** | Ровно то, что фиксирует `D-PLATFORM-16`: один tenant-owned аккаунт на провайдера на организацию, не более одного system-owned на провайдера. Режимы различаются nullability `organization_id`, поэтому дополнительная колонка владения не вводится |
+| K-5 | `UNIQUE (key_prefix) WHERE key_prefix IS NOT NULL` | **DEFER** | Уникальность префикса зависит от формата ключа и от того, ищет ли аутентификация ключи по префиксу, а и то и другое — часть O-1. Колонка существует без ограничения |
+| K-6 | Семантика удаления | **ACCEPT, но все `CASCADE` убраны** | Cascade может удалить истину о запусках или потреблении как побочный эффект. `RESTRICT` там, где ссылка обязательна в домене; `SET NULL` только для `run_records.initiated_by_user_id`, которое уже опционально. Вывод из эксплуатации — смена `status`; жёсткое удаление — административная операция |
+| K-7 | Составные внешние ключи для containment | **ACCEPT** | Security-решение. `UNIQUE (id, organization_id)` на `projects` и `run_records` вместе со ссылками детей на пару делает кросс-арендаторную ссылку структурно невозможной. RLS не видит межтабличную ссылку, поэтому RLS это не заменяет |
+| K-8 | `UNIQUE (core_run_id) WHERE core_run_id IS NOT NULL` | **DEFER** | Уникальность заморозила бы семантику retry и resume, которые не реализованы и не решены. **Неуникальный** индекс поиска покрывает реальную потребность; уникальность может прийти позже отдельным ограничением, которое громко упадёт на существующих данных |
+| K-9 | `scopes` как `text[]` | **ACCEPT** представление, **DEFER** GIN-индекс | Хранение кортежа строк как text-массива — это деталь персистентности, а не семантика authority; смысл scope остаётся открытым. Индекс добавляется, только когда членство в scope действительно нужно запрашивать |
+| K-10 | `updated_at` поддерживает приложение | **ACCEPT** | Без trigger-механики. `created_at` неизменяем и ставится при вставке; `updated_at` ставит сервер при записи. `usage_records` остаётся неизменяемым и не несёт `updated_at`, что соответствует домену |
+
+### Отклонённые альтернативы
+
+- **Глобальный уникальный slug на `organizations`.** Отклонено: контрактом не
+  требуется, и оно превращает обычную ошибку ограничения в оракул
+  существования между арендаторами.
+- **Любой `ON DELETE CASCADE`.** Отклонено: удаление родителя не должно
+  молча уничтожать историю исполнения или потребления.
+- **Сделать `api_keys.created_by_user_id` nullable ради `SET NULL`.** Отклонено:
+  доменный контракт требует это поле, и его обнуление ослабило бы
+  происхождение ключа ради экономии правила удаления.
+- **Опора только на RLS для кросс-арендаторной целостности.** Отклонено:
+  строка может удовлетворять политике, ссылаясь на родителя в другой
+  организации, потому что политика видит одну таблицу.
+- **Заморозить уникальность `core_run_id` сейчас.** Отклонено: это молча
+  решило бы семантику retry и resume.
+- **Новая колонка владения на `provider_accounts`.** Отклонено: `D-PLATFORM-16` уже
+  фиксирует два режима, и дискриминатором является nullability
+  `organization_id`.
+- **PostgreSQL trigger-механика для `updated_at`.** Отклонено как ненужная
+  сложность для поля, которое приложение уже контролирует.
+
+### Следствия
+
+1. **Ничего не реализовано.** Не создано ни миграции, ни SQL-файла,
+   ни ORM-модели, ни репозитория, ни коннектора, ни политики базы данных,
+   и в Core не попала зависимость от базы данных.
+2. **У Шага 2 больше нет открытого дизайн-выбора.** Задача реализации
+   может быть механической, а её чек-лист находится в разделе M
+   документа схемы.
+3. **Остаются открытыми пять O-решений:** O-1 … O-7 без O-8, который
+   остаётся решённым на уровне контракта. O-9 решён как дизайн-решение;
+   O-10 … O-13 остаются отложенными.
+4. **Три пункта отложены, а не решены:** K-5, K-8 и индекс K-9.
+   Каждый заблокирован действительно открытым решением, а не
+   незавершённым анализом.
+5. **`D-PLATFORM-16` не ослаблен.** Nullable tenant-колонка сохраняется
+   в схеме вместе с правилом исключения, сформулированным в самом тексте
+   политики, в правиле пути чтения и в частичных уникальных
+   индексах K-4.
+6. **`D-PLATFORM-17` не отменяется.** Он записал дизайн-проход и оставил
+   эти пункты предложенными; эта запись их решает.
