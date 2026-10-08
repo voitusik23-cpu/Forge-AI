@@ -122,6 +122,9 @@ class EventType(str, Enum):
     TOOL_EXECUTION_COMPLETED = "tool_execution_completed"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     PERMISSION_CHECKED = "permission_checked"
+    # Verification was refused because the run's task/criterion identity did not
+    # match its frozen binding. No evaluation was performed.
+    VERIFICATION_IDENTITY_FAILED = "verification_identity_failed"
     TOOL_INVOCATION_DENIED = "tool_invocation_denied"
     # The harness's bounded projection of a tool result. Kept distinct from the
     # executor's own terminal event so the run trail records exactly one bounded

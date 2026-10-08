@@ -27,6 +27,11 @@ from app.agent_runtime.revision_decision import (
     RevisionDecision,
     RevisionError,
 )
+from app.agent_runtime.criterion_identity import (
+    CriterionIdentityError,
+    IdentityFailureCode,
+    RunCriterionBinding,
+)
 from app.agent_runtime.tool_execution import (
     AuthorizedToolCall,
     ToolAuthorizationError,
@@ -51,9 +56,38 @@ from app.orchestrator.trace import RunEvent, RunEventCollector, RunTrace
 from app.projects.state import ProjectState, ProjectStateStatus, derive_project_state
 from app.tools.acceptance import AcceptanceGate, AcceptanceResult, AcceptanceStatus
 from app.tools.approval import ApprovalPolicy, ApprovalRequest, ApprovalState
-from app.tools.verification import VerificationExpectation, VerificationResult, WorkspaceVerifier
+from app.tools.verification import (
+    VerificationExpectation,
+    VerificationResult,
+    VerificationStatus,
+    WorkspaceVerifier,
+)
 from app.skills.evaluator import SkillEvaluator
 from app.skills.models import SkillDefinition
+
+
+#: Ordered mapping from a canonical identity failure message fragment to the
+#: closed failure code reported in ``VERIFICATION_IDENTITY_FAILED``. The canonical
+#: binding helper owns the messages; this only classifies them for the event.
+_IDENTITY_MESSAGE_CODES: tuple[tuple[str, "IdentityFailureCode"], ...] = (
+    ("belongs to run", IdentityFailureCode.RUN_ID_MISMATCH),
+    ("belongs to task", IdentityFailureCode.TASK_ID_MISMATCH),
+    ("belongs to another task", IdentityFailureCode.CRITERION_TASK_MISMATCH),
+    ("not bound", IdentityFailureCode.CRITERION_NOT_BOUND),
+    ("no frozen expectation", IdentityFailureCode.CRITERION_NOT_BOUND),
+    ("no verification expectation", IdentityFailureCode.CRITERION_NOT_BOUND),
+    ("acceptance criteria omit", IdentityFailureCode.CRITERION_NOT_BOUND),
+    ("acceptance criteria name", IdentityFailureCode.CRITERION_NOT_BOUND),
+    ("does not match the frozen binding", IdentityFailureCode.CRITERION_FINGERPRINT_MISMATCH),
+)
+
+
+def _classify_identity_error(message: str) -> "IdentityFailureCode":
+    """Map a canonical identity failure message onto the closed taxonomy."""
+    for fragment, code in _IDENTITY_MESSAGE_CODES:
+        if fragment in message:
+            return code
+    return IdentityFailureCode.IDENTITY_MISSING
 
 
 class AgentHarness:
@@ -127,6 +161,67 @@ class AgentHarness:
         # and the tool call itself. The harness only composes the input for it
         # from the run's frozen perimeter.
         self._tool_executor = tool_executor
+        # Criterion-binding fingerprints for the runs this harness instance is
+        # driving. This is deliberately per-instance and bounded: it is not a
+        # process-global registry, so two harnesses never see each other's
+        # bindings, and entries whose run has been released are pruned on the next
+        # call. It records a *binding*, never authority: the frozen ``RunScope``
+        # stays the only authority boundary.
+        self._bindings: dict[str, str] = {}
+
+    def _prune_released_bindings(self) -> None:
+        """Drop bindings whose run scope has been released.
+
+        A finished or released run must not leave an identity claim behind, so the
+        bookkeeping is bounded by the number of runs that are still alive rather
+        than by every run the process has ever driven.
+        """
+        if not self._bindings:
+            return
+        for run_id in [
+            run_id
+            for run_id in self._bindings
+            if RunScope.frozen_scope(run_id) is None
+        ]:
+            del self._bindings[run_id]
+
+    @staticmethod
+    def _event_task_id(request: HarnessRequest) -> str:
+        """Which task a *record* of this run belongs to.
+
+        This is run bookkeeping, not identity: it keeps a durable event
+        attributable to the task record the trusted composition bound the run to.
+        It is the specification's task id when there is one, and otherwise the
+        server-composed ``metadata["task_id"]`` the composition already uses for
+        the run record, so a run's history keeps one consistent task id.
+        """
+        specification = getattr(request, "task_specification", None)
+        task_id = getattr(specification, "task_id", None)
+        if isinstance(task_id, str) and task_id.strip():
+            return task_id.strip()
+        metadata = getattr(request, "metadata", None)
+        if isinstance(metadata, Mapping):
+            value = metadata.get("task_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return request.run_id
+
+    @staticmethod
+    def _identity_task_id(request: HarnessRequest) -> str:
+        """Which task this run's *identity* is about.
+
+        A trusted ``TaskSpecification`` is the only source of task identity, so a
+        task id can never be asserted by a caller, a decision, a plan, a tool
+        result, or a model. Metadata is deliberately **not** consulted here: it is
+        bookkeeping for the run record, not a claim about a task. Without a
+        specification the run has no task identity of its own and falls back to
+        its own ``run_id``, which is an identity rather than a task claim.
+        """
+        specification = getattr(request, "task_specification", None)
+        task_id = getattr(specification, "task_id", None)
+        if isinstance(task_id, str) and task_id.strip():
+            return task_id.strip()
+        return request.run_id
 
     def _enforce_run_scope(self, request: HarnessRequest) -> None:
         """Freeze and enforce the run's security perimeter before any read.
@@ -156,6 +251,28 @@ class AgentHarness:
         if scope.run_id != request.run_id:
             raise RunScopeError("run scope does not belong to this run")
 
+        # Identity binding: a binding frozen for another run or another task is
+        # refused outright, so criteria cannot be replayed across runs or tasks.
+        # The canonical binding check runs first, but nothing is registered yet:
+        # a run that fails its own trusted setup must not leave an identity claim
+        # behind.
+        binding = getattr(request, "task_binding", None)
+        if binding is not None:
+            if not isinstance(binding, RunCriterionBinding):
+                raise RunScopeError("task_binding must be a RunCriterionBinding")
+            self._prune_released_bindings()
+            try:
+                binding.validate_request(
+                    run_id=request.run_id,
+                    task_id=self._identity_task_id(request),
+                    criteria=request.acceptance_criteria,
+                    expectations=request.verification_expectations,
+                )
+            except CriterionIdentityError as exc:
+                raise RunScopeError(
+                    f"criterion identity does not apply: {exc}"
+                ) from exc
+
         scope.validate_workspace(request.workspace)
         scope.validate_command_set(request.allowed_execution_commands)
         scope.validate_acceptance_criteria(request.acceptance_criteria)
@@ -175,6 +292,18 @@ class AgentHarness:
 
         scope.freeze()
         require_active_scope(request.run_id, scope)
+
+        # Only now, after every trusted validation has passed and the perimeter is
+        # frozen, is the binding recorded for this run. A second, different binding
+        # for the same run is still refused, so criteria cannot be swapped while
+        # the run is alive.
+        if binding is not None:
+            existing = self._bindings.get(request.run_id)
+            if existing is not None and existing != binding.fingerprint:
+                raise RunScopeError(
+                    "a different criterion identity is already bound for this run"
+                )
+            self._bindings[request.run_id] = binding.fingerprint
 
     def _planning_goal(self, request: HarnessRequest) -> str:
         """Extract the trusted goal the planner may work from.
@@ -206,7 +335,59 @@ class AgentHarness:
         call it directly. It uses only expectations and criteria carried by the
         request, so neither a decision nor a caller of this method can choose what
         is verified or declare the verdict itself.
+
+        Identity is proved *before* any evaluation. When the run carries a frozen
+        criterion binding, the expectations must be exactly that binding and the
+        task must be the binding's task; a mismatch means verification does not run
+        at all and the run ends as a terminal identity failure. Without a binding
+        the outcome is an honest ``not_evaluated``, never a pass.
         """
+        binding = getattr(request, "task_binding", None)
+
+        if binding is not None:
+            if not isinstance(binding, RunCriterionBinding):
+                failure = (
+                    IdentityFailureCode.IDENTITY_MISSING,
+                    "binding is not a binding",
+                )
+            else:
+                try:
+                    # The canonical binding check is the only identity path: it
+                    # proves bound criteria == request acceptance criteria ==
+                    # verified criteria before anything is evaluated.
+                    binding.validate_request(
+                        run_id=request.run_id,
+                        task_id=self._identity_task_id(request),
+                        criteria=request.acceptance_criteria,
+                        expectations=request.verification_expectations,
+                    )
+                    failure = None
+                except CriterionIdentityError as exc:
+                    failure = (_classify_identity_error(str(exc)), str(exc))
+            if failure is not None:
+                # Fail closed: no verification is performed, and the outcome is a
+                # terminal identity failure rather than a retryable result.
+                code, detail = failure
+                emit(
+                    EventType.VERIFICATION_IDENTITY_FAILED,
+                    {
+                        "run_id": request.run_id,
+                        "failure_code": code.value,
+                        "detail": detail[:200],
+                        **binding.bounded_summary(),
+                    },
+                )
+                results = tuple(
+                    VerificationResult(
+                        verification_id=f"verification-blocked-{criterion_id}",
+                        status=VerificationStatus.NOT_RUN,
+                        code=f"identity_failure:{code.value}",
+                        criterion_id=criterion_id,
+                    )
+                    for criterion_id in sorted(binding.criterion_ids)
+                )
+                return results, None
+
         verified: list[VerificationResult] = []
         for crit_id, exp in request.verification_expectations.items():
             v_res = self._verifier.verify(
@@ -224,10 +405,13 @@ class AgentHarness:
             # pass - a caller must not read this as acceptance.
             return (), None
 
-        v_dict = {
-            (v.criterion_id or f"crit-{idx}"): v
-            for idx, v in enumerate(verified)
-        }
+        # Key by the criterion the result itself declares, never by position, so a
+        # reordered or substituted result set cannot be attributed to the wrong
+        # criterion.
+        v_dict: dict[str, VerificationResult] = {}
+        for idx, result in enumerate(verified):
+            key = result.criterion_id or f"crit-{idx}"
+            v_dict[key] = result
         acceptance = self._acceptance_gate.evaluate(
             criteria=request.acceptance_criteria,
             verifications=v_dict,
@@ -236,7 +420,6 @@ class AgentHarness:
             requirements=request.requirements if request.requirements else None,
         )
         return tuple(verified), acceptance
-
     def run(self, request: HarnessRequest) -> HarnessResult:
         """Execute the controlled, bounded Run Loop according to configured policy."""
         self._enforce_run_scope(request)
@@ -254,13 +437,9 @@ class AgentHarness:
             payload = data or {}
             # Every emitted event carries the same run and task identity, so a
             # discovery, decision, or execution event can never be attributed to
-            # a different run. The identity comes from the task specification when
-            # present, otherwise from the server-side request metadata.
-            task_id = (
-                request.task_specification.task_id
-                if request.task_specification
-                else request.metadata.get("task_id")
-            )
+            # a different run. The identity resolves through one server-side
+            # helper, so every event agrees on which task this run belongs to.
+            task_id = self._event_task_id(request)
             if task_id is not None and "task_id" not in payload:
                 payload = {**payload, "task_id": task_id}
             collector.emit(

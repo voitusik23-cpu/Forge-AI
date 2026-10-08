@@ -2009,3 +2009,198 @@ and `tests/test_tool_execution_production.py`.
 4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, параллельное и
    распределённое исполнение, memory, knowledge, reviewer, idempotency и resume этим
    блоком не изменены.**
+
+## Production Task / Criterion Identity v0.1 (GAP-F closed for harness entry points)
+
+Implemented in the criterion identity block. Verified against the code in
+`app/agent_runtime/criterion_identity.py`, `app/agent_runtime/harness.py`,
+`app/agent_runtime/models.py`, `app/api/service.py`,
+`app/orchestrator/models.py`, and
+`tests/test_criterion_identity_production.py`.
+
+### Accepted decisions
+
+- **Identity is derived, never supplied.** `TaskIdentity` comes from the trusted
+  `TaskSpecification`; each `CriterionIdentity` comes from the operator's
+  `AcceptanceSpec` criterion plus its `VerificationExpectation`. A task id, a
+  criterion id, an acceptance authority, or a verification authority is never
+  accepted from an HTTP request, a task context, an LLM, a plan, a decision, or a
+  tool result.
+- **A criterion cannot exist without its task.** `CriterionIdentity` always carries
+  the owning `task_id`, and `bind_run_criteria` refuses to build a binding unless it
+  is given a trusted specification. Anonymous global criterion text is therefore not
+  representable.
+- **One frozen binding per run.** `RunCriterionBinding` ties the task identity and
+  every criterion identity to exactly one `run_id`, and the harness refuses a
+  second, different binding for the same run. Criteria cannot be swapped after a run
+  starts. The existing single `AcceptanceSpec.bind`/`RunAcceptanceCriteria` path is
+  unchanged and still serves `run_accepted_task`.
+- **Fingerprints are canonical and content-bound.** Both fingerprints are SHA-256
+  over a JSON projection with sorted keys. The criterion fingerprint covers the
+  criterion *and* its verification expectation, so substituting an expectation is
+  detected. Fingerprints contain no command, environment value, credential, or raw
+  output.
+- **Verification proves identity before evaluating, through one canonical check.**
+  `RunCriterionBinding.validate_request` is the only identity path, and it proves
+  `bound criteria == request acceptance criteria == verified criteria`. A missing
+  criterion, an extra criterion, a criterion reusing a bound id with different
+  content, a missing expectation, or an expectation whose path or hash differs is
+  refused. The harness keeps no second, weaker inline check. On a mismatch it emits
+  `VERIFICATION_IDENTITY_FAILED`, runs neither the verifier nor the acceptance
+  gate, and returns `NOT_RUN` results with no acceptance verdict.
+- **A binding is registered only after the run's trusted setup succeeds.** The
+  binding is validated first, then workspace, command, criteria, and tool checks
+  run, then the scope freezes, and only then is the binding recorded, so a run that
+  fails its own setup leaves no identity claim behind.
+- **The binding registry is per harness instance and bounded.** Each
+  `AgentHarness` owns its own map, and entries whose run scope has been released
+  are pruned, so claims are bounded by the runs that are still alive. It is not a
+  process-global registry.
+- **An identity mismatch is terminal, not actionable.** It is a trust failure, so
+  the revision loop must not treat it as a reason to try again and cannot use it to
+  escape the binding.
+- **Absence is honest.** With no binding there is no criterion, so no verification
+  results and no acceptance verdict are produced. Missing identity is never
+  converted into a pass, and nothing is invented to make acceptance look evaluated.
+- **`run_agent_loop` now carries a real criterion identity.** When the operator
+  declared an `AcceptanceSpec` for the declaration, the loop binds those criteria to
+  the run and uses a policy that admits the verification stage, so its verification
+  observations are verdicts rather than `not_evaluated`. Without a declared spec the
+  previous single-action behaviour is unchanged.
+- **Identity is not authorization.** The identity classes contain no command, argv,
+  executable, shell, environment, timeout, scope, approval, capability, tool,
+  workspace, network, or credential field, and the module executes nothing.
+
+### Rejected alternatives (with reasoning)
+
+- **Deriving criteria from a task request, a description, or a category.** Rejected:
+  a client- or model-supplied criterion would let it choose what counts as done.
+  Criteria stay operator-composed.
+- **Keying verification results to criteria by position.** Rejected: it silently
+  attributes a verdict to the wrong criterion when an order changes. Results are keyed
+  by the criterion they declare.
+- **Treating a missing binding as a pass.** Rejected: it would fake the very thing
+  GAP-F is about.
+- **Treating an identity mismatch as an actionable revision failure.** Rejected: it
+  would turn a trust violation into another attempt.
+- **Adding identity fields to `VerificationResult` or `HarnessRequest`.** Rejected
+  for the result: the criterion id plus the run's frozen binding already make a
+  verdict attributable, and growing the public result shape is unnecessary. The
+  request carries the frozen binding, not a mutable criterion list.
+
+### Consequences and open items
+
+1. **Attribution is durable.** `CRITERION_DEFINED` records the run id, task id, task
+   fingerprint, criterion ids, per-criterion fingerprints, the binding fingerprint,
+   and the criteria source. No raw criterion text is stored.
+2. **GAP-F is closed for the harness entry points only.** `run_agent_loop` with a
+   declared `AcceptanceSpec` and `run_accepted_task` carry a real binding;
+   `run_agent_loop` without a spec carries no criterion, and the legacy `run_task`,
+   HTTP task-run, and desktop dispatch paths carry no binding at all and stay
+   `not_evaluated`.
+2. **A run still needs its decision provider to complete.** Verification and
+   acceptance are real and attributed, but reaching `COMPLETED` requires the
+   provider to complete the run after a passing acceptance; otherwise the action
+   bound leaves it `LIMIT_REACHED` with the verdict recorded.
+3. **Remaining entry points.** `run_agent_loop` and `run_accepted_task` carry the
+   binding; routing the other task entry points through it is follow-up work.
+4. **GAP-A, GAP-B, directory-depth, snapshot consistency, advanced dynamic
+   replanning, parallel and distributed execution, advanced retry policy, memory,
+   knowledge, reviewer, idempotency, and resume are unchanged** by this block.
+
+## Production Task / Criterion Identity v0.1 — русская версия (GAP-F закрыт для harness-точек входа)
+
+Реализовано в блоке criterion identity. Проверено по коду в
+`app/agent_runtime/criterion_identity.py`, `app/agent_runtime/harness.py`,
+`app/agent_runtime/models.py`, `app/api/service.py`,
+`app/orchestrator/models.py` и `tests/test_criterion_identity_production.py`.
+
+### Принятые решения
+
+- **Идентичность выводится, а не поставляется.** `TaskIdentity` берётся из
+  доверенного `TaskSpecification`; каждый `CriterionIdentity` — из criterion
+  операторского `AcceptanceSpec` вместе с его `VerificationExpectation`. Ни task id,
+  ни criterion id, ни acceptance authority, ни verification authority никогда не
+  принимаются из HTTP-запроса, контекста задачи, LLM, плана, решения или результата
+  tool.
+- **Criterion не может существовать без своей задачи.** `CriterionIdentity` всегда
+  несёт `task_id` владельца, а `bind_run_criteria` отказывается строить привязку без
+  доверенной спецификации. Безымянный глобальный текст criterion непредставим.
+- **Одна frozen привязка на run.** `RunCriterionBinding` связывает идентичность
+  задачи и каждого criterion ровно с одним `run_id`, и harness отвергает вторую,
+  отличающуюся привязку для того же run. Criteria нельзя подменить после старта run.
+  Существующий путь `AcceptanceSpec.bind`/`RunAcceptanceCriteria` не изменён и
+  по-прежнему обслуживает `run_accepted_task`.
+- **Fingerprint каноничны и привязаны к содержимому.** Оба fingerprint — SHA-256 по
+  JSON-проекции с сортированными ключами. Fingerprint criterion покрывает criterion
+  **и** его verification expectation, поэтому подмена expectation обнаруживается. В
+  fingerprint нет ни команды, ни значения окружения, ни credentials, ни сырого
+  вывода.
+- **Verification доказывает идентичность до оценки, через одну каноническую
+  проверку.** `RunCriterionBinding.validate_request` — единственный путь
+  идентичности, и он доказывает `bound criteria == request acceptance criteria ==
+  verified criteria`. Отсутствующий criterion, лишний criterion, criterion с тем же
+  id, но другим содержимым, отсутствующий expectation и expectation с другим path или
+  hash — всё отвергается. Второй, более слабой инлайн-проверки в harness нет. При
+  несовпадении он испускает `VERIFICATION_IDENTITY_FAILED`, не запускает ни verifier,
+  ни acceptance gate и возвращает результаты `NOT_RUN` без вердикта acceptance.
+- **Привязка регистрируется только после успешного доверенного setup run.** Сначала
+  валидируется привязка, затем проходят проверки workspace, команд, criteria и tools,
+  затем scope замораживается, и только после этого привязка фиксируется, поэтому run,
+  чей setup провалился, не оставляет identity-претензии.
+- **Реестр привязок — per harness instance и ограничен.** Каждый `AgentHarness`
+  владеет своей картой, и записи, чей run scope освобождён, вычищаются, поэтому
+  претензии ограничены живыми runs. Это не process-global реестр.
+- **Несовпадение идентичности терминально, а не actionable.** Это trust-сбой,
+  поэтому revision loop не должен считать его поводом повторить попытку и не может
+  использовать его для выхода из привязки.
+- **Отсутствие честно.** Без привязки нет criterion, поэтому нет ни результатов
+  verification, ни вердикта acceptance. Отсутствующая идентичность никогда не
+  превращается в прохождение, и ничего не выдумывается, чтобы acceptance выглядел
+  оценённым.
+- **`run_agent_loop` теперь несёт настоящую идентичность criterion.** Когда оператор
+  объявил `AcceptanceSpec` для декларации, loop привязывает эти criteria к run и
+  использует политику, допускающую стадию verification, поэтому его наблюдения
+  verification — вердикты, а не `not_evaluated`. Без объявленного spec прежнее
+  одно-действенное поведение не изменено.
+- **Идентичность — не authorization.** В классах идентичности нет ни команды, ни
+  argv, ни executable, ни shell, ни окружения, ни timeout, ни scope, ни approval, ни
+  capability, ни tool, ни workspace, ни сети, ни credentials, а модуль ничего не
+  исполняет.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Выводить criteria из запроса задачи, описания или категории.** Отклонено:
+  критерий, поставляемый клиентом или моделью, позволил бы им выбирать, что считать
+  выполненным. Criteria остаются композицией оператора.
+- **Связывать результаты verification с criteria по позиции.** Отклонено: при
+  изменении порядка это молча приписывает вердикт не тому criterion. Результаты
+  связываются по criterion, который они сами объявляют.
+- **Считать отсутствие привязки прохождением.** Отклонено: это подделало бы ровно то,
+  о чём GAP-F.
+- **Считать несовпадение идентичности actionable-сбоем revision.** Отклонено: это
+  превратило бы нарушение доверия в ещё одну попытку.
+- **Добавлять поля идентичности в `VerificationResult` или `HarnessRequest`.**
+  Отклонено для результата: criterion id вместе с frozen привязкой run уже делают
+  вердикт атрибутируемым, а расширение публичной формы результата не нужно. Запрос
+  несёт frozen привязку, а не изменяемый список criteria.
+
+### Следствия и открытые пункты
+
+1. **Атрибуция долговечна.** `CRITERION_DEFINED` записывает run id, task id,
+   fingerprint задачи, идентификаторы criteria, fingerprint каждого criterion,
+   fingerprint привязки и источник criteria. Сырой текст criterion не сохраняется.
+2. **GAP-F закрыт только для harness-точек входа.** `run_agent_loop` с объявленным
+   `AcceptanceSpec` и `run_accepted_task` несут настоящую привязку; `run_agent_loop`
+   без spec не несёт criterion, а legacy-пути `run_task`, HTTP task run и desktop
+   dispatch вообще не несут привязки и остаются `not_evaluated`.
+2. **Run всё ещё нуждается в своём провайдере решений для завершения.** Verification
+   и acceptance настоящие и атрибутированные, но достижение `COMPLETED` требует,
+   чтобы провайдер завершил run после пройденного acceptance; иначе граница действий
+   оставляет run в `LIMIT_REACHED` с записанным вердиктом.
+3. **Остальные точки входа.** `run_agent_loop` и `run_accepted_task` несут привязку;
+   перевод остальных task-точек входа на неё — последующая работа.
+4. **GAP-A, GAP-B, directory-depth, snapshot consistency, продвинутое динамическое
+   перепланирование, параллельное и распределённое исполнение, продвинутая
+   retry-политика, memory, knowledge, reviewer, idempotency и resume этим блоком не
+   изменены.**

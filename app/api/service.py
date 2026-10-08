@@ -24,6 +24,7 @@ from app.agent_runtime.acceptance_spec import (
     AcceptanceSpecError,
     RunAcceptanceCriteria,
 )
+from app.agent_runtime.criterion_identity import bind_run_criteria
 from app.agent_runtime.tool_execution import ToolIntent
 from app.agent_runtime.models import HarnessRequest
 from app.agent_runtime.policy import AgentHarnessPolicy
@@ -38,7 +39,7 @@ from app.execution.declaration import (
 from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import ExecutionOutcomeStatus
 from app.fabric.fabric import CapabilityFabric
-from app.orchestrator.models import RunState, Task, TaskCategory
+from app.orchestrator.models import EventType, RunState, Task, TaskCategory
 from app.orchestrator.run import RunExecutor
 from app.runtime.bootstrap import (
     create_agent_harness,
@@ -120,6 +121,20 @@ SINGLE_ACTION_LOOP_POLICY = AgentHarnessPolicy(
 # frozen by the operator composition, and the decision provider cannot add,
 # remove, or replace them.
 ACCEPTANCE_LOOP_POLICY = AgentHarnessPolicy(
+    max_iterations=3,
+    max_actions=2,
+    max_execution_attempts=1,
+    max_revision_attempts=1,
+)
+
+
+# Bounds for a loop run whose criteria are the operator's own. Like the
+# acceptance slice it needs one action to execute and one to verify, so the
+# budget must admit the verification stage that follows the action. It grants no
+# extra authority: the criteria, their expectations, and the command all come
+# from the operator composition, and the decision provider can neither add,
+# remove, nor replace any of them.
+IDENTITY_LOOP_POLICY = AgentHarnessPolicy(
     max_iterations=3,
     max_actions=2,
     max_execution_attempts=1,
@@ -335,11 +350,29 @@ class ForgeApiService:
                 self._effective_tool_ids() if self._tool_intents else frozenset()
             ),
             allowed_execution_commands=frozenset({declaration.executable}),
-            acceptance_criteria=(API_RUN_CRITERION,),
+            # The frozen acceptance set must match what the run will actually be
+            # judged by. When the operator declared acceptance criteria for this
+            # declaration those criteria are the task's criteria; otherwise the
+            # run keeps the API's own terminal-state criterion.
+            acceptance_criteria=self._criteria_for(declaration),
         )
         scope.freeze()
         require_active_scope(run_id, scope)
         return scope
+
+    def _criteria_for(
+        self, declaration: ExecutionDeclaration
+    ) -> tuple[AcceptanceCriterion, ...]:
+        """The operator's criteria for one declaration, server-side only.
+
+        Criteria come from the operator's acceptance declaration and nowhere else.
+        A request, a decision, a plan, a tool result, or a model cannot contribute
+        to this set.
+        """
+        spec = self._acceptance_specs.get(declaration.declaration_id)
+        if spec is None:
+            return (API_RUN_CRITERION,)
+        return tuple(spec.criteria)
 
     def _build_declared_verification_factory(
         self, run_id: str, declaration: ExecutionDeclaration
@@ -612,31 +645,67 @@ class ForgeApiService:
           loop's own authorization step and the coordinator both re-check the
           same operator-granted set.
 
-        ``verification_expectations`` is left empty: criterion identity is GAP-F
-        and is deliberately not invented here, so the acceptance stage stays
-        deferred rather than pretending a successful process is task acceptance.
+        When the operator has declared an ``AcceptanceSpec`` for this
+        declaration, the run also receives its frozen task/criterion identity
+        binding: the criteria, their expectations, and a fingerprint over each,
+        bound to this ``run_id`` and this task. That identity is what lets
+        verification run against a real criterion instead of ``not_evaluated``,
+        and what lets a later revision prove it is judged by the same criteria.
+        Without a declared spec nothing is invented: there is no criterion to
+        verify, so the acceptance stage stays honestly deferred.
         """
         # The planning goal is the operator's declared intent, delivered as a
         # TaskSpecification so the planner has a trusted goal and the loop keeps
         # one task identity. It is descriptive text, never authority. With no
         # declared intent there is no goal, and the planning stage is skipped
         # rather than given a fabricated one.
-        specification = (
-            TaskSpecification(
+        #
+        # The specification is also the trusted task identity, so it is created
+        # whenever the operator declared either an intent or an acceptance spec.
+        # It carries no authority: only the task id and its descriptive text.
+        acceptance_spec = self._acceptance_specs.get(declaration.declaration_id)
+        # The specification is created whenever the operator declared either an
+        # intent or an acceptance spec, because it is also the trusted task
+        # identity the criterion binding is built from. It carries no authority.
+        specification = None
+        if declaration.intent or acceptance_spec is not None:
+            specification = TaskSpecification(
                 task_id=task_id,
                 title=declaration.declaration_id,
                 description=declaration.intent,
                 requirements=(),
-                acceptance_criteria=(API_RUN_CRITERION,),
+                acceptance_criteria=(
+                    acceptance_spec.criteria
+                    if acceptance_spec is not None
+                    else (API_RUN_CRITERION,)
+                ),
             )
-            if declaration.intent
-            else None
-        )
+
+        # Trusted criterion identity. Only the operator's own acceptance
+        # declaration can produce criteria; a request, a decision, a plan, a tool
+        # result, and a model all contribute nothing here.
+        task_binding = None
+        if acceptance_spec is not None:
+            task_binding = bind_run_criteria(
+                run_id=run_id,
+                specification=specification,
+                criteria=acceptance_spec.criteria,
+                expectations=acceptance_spec.expectations,
+                source=acceptance_spec.source,
+            )
+            task_binding.assert_belongs_to(run_id, specification.task_id)
+            metadata_extra: dict[str, object] = {
+                "criterion_ids": list(task_binding.criterion_ids),
+                "criterion_source": task_binding.source,
+            }
+        else:
+            metadata_extra = {}
 
         return HarnessRequest(
             run_id=run_id,
             workspace=self._workspace,
             task_specification=specification,
+            task_binding=task_binding,
             tool_requests=self._declared_tool_intents(),
             execution_requests=(
                 to_execution_request(
@@ -646,7 +715,14 @@ class ForgeApiService:
                 ),
             ),
             allowed_execution_commands=tuple(scope.allowed_execution_commands),
-            acceptance_criteria=(API_RUN_CRITERION,),
+            acceptance_criteria=(
+                acceptance_spec.criteria
+                if acceptance_spec is not None
+                else (API_RUN_CRITERION,)
+            ),
+            verification_expectations=(
+                acceptance_spec.expectations if acceptance_spec is not None else {}
+            ),
             approval_policy=self._approval_policy,
             approval_resolver=self._approval_resolver,
             run_scope=scope,
@@ -655,6 +731,7 @@ class ForgeApiService:
             metadata={
                 "declaration_id": declaration.declaration_id,
                 "task_id": task_id,
+                **metadata_extra,
             },
         )
 
@@ -725,15 +802,40 @@ class ForgeApiService:
         request = self._build_harness_request(
             run_id, declaration, scope, task_id
         )
+
+        # The frozen criterion identity, recorded before the loop runs so the
+        # durable history can answer "which task, which criterion, which run?".
+        # Only bounded identity metadata is stored - never raw criterion text.
+        binding = getattr(request, "task_binding", None)
+        if binding is not None:
+            self._emit_acceptance_event(
+                loop_store,
+                run_id,
+                task_id,
+                EventType.CRITERION_DEFINED,
+                {
+                    "declaration_id": declaration.declaration_id,
+                    "criteria_source": binding.source,
+                    "expectation_count": len(binding.criterion_ids),
+                    **binding.bounded_summary(),
+                },
+            )
+
         # Built by the same composition factory that supplies the runtime's
         # canonical harness, differing only in the narrowed bounds of this slice.
         # No second loop implementation and no second authority object exist.
+        # A run judged by the operator's own criteria needs the same budget as the
+        # acceptance slice: one action to execute and one to verify.
         # The production ToolExecutor is supplied explicitly. With no declared
         # tool intents and no allow-listed tools nothing reaches it, so the safe
         # default is unchanged; when a tool is authorized the executor keeps
         # owning its permission check and approval.
         harness = self._harness_factory(
-            policy=SINGLE_ACTION_LOOP_POLICY,
+            policy=(
+                IDENTITY_LOOP_POLICY
+                if binding is not None
+                else SINGLE_ACTION_LOOP_POLICY
+            ),
             tool_executor=self._tool_executor,
         )
         t0 = time.perf_counter()
@@ -885,9 +987,33 @@ class ForgeApiService:
             )
 
         run_id = f"run-accept-{uuid.uuid4().hex[:8]}"
+        # `spec.bind` here is the existing per-run criterion binding. The run's
+        # task id is derived server-side from the operator's declaration, and the
+        # specification below carries that very same id, so the criterion binding
+        # and the trusted task identity always agree.
         task_id = f"task-accept-{declaration.declaration_id}"
         criteria = spec.bind(run_id=run_id, task_id=task_id)
         criteria.assert_belongs_to(run_id, task_id)
+
+        # Trusted task/criterion identity for this run. The task identity comes
+        # from the operator's own declaration, and the criteria from the operator's
+        # acceptance spec; nothing here is reachable from the caller, a decision, a
+        # plan, a tool result, or a model.
+        task_specification = TaskSpecification(
+            task_id=task_id,
+            title=declaration.declaration_id,
+            description=declaration.intent,
+            requirements=(),
+            acceptance_criteria=criteria.criteria,
+        )
+        task_binding = bind_run_criteria(
+            run_id=run_id,
+            specification=task_specification,
+            criteria=criteria.criteria,
+            expectations=criteria.expectations,
+            source=criteria.source,
+        )
+        task_binding.assert_belongs_to(run_id, task_id)
 
         scope = RunScope(
             run_id=run_id,
@@ -935,6 +1061,9 @@ class ForgeApiService:
         request = HarnessRequest(
             run_id=run_id,
             workspace=self._workspace,
+            # The trusted task identity the criterion binding was derived from, so
+            # the harness proves the very same task id the binding carries.
+            task_specification=task_specification,
             execution_requests=(
                 to_execution_request(
                     declaration,
@@ -943,6 +1072,10 @@ class ForgeApiService:
                 ),
             ),
             allowed_execution_commands=tuple(scope.allowed_execution_commands),
+            # The same frozen task/criterion identity the acceptance binding was
+            # built from, so the harness proves before verifying that the task and
+            # every criterion fingerprint still match.
+            task_binding=task_binding,
             # Frozen server-side criteria and their expectations. A decision
             # cannot add, drop, or replace any of them.
             acceptance_criteria=criteria.criteria,
@@ -954,6 +1087,7 @@ class ForgeApiService:
                 "declaration_id": declaration.declaration_id,
                 "task_id": task_id,
                 "criterion_ids": list(criteria.criterion_ids),
+                "binding_fingerprint": task_binding.fingerprint,
             },
         )
 

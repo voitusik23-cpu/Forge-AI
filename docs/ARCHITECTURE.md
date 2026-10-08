@@ -910,6 +910,102 @@ trusted task
 `AgentHarness` remains the only production orchestration loop; discovery adds a
 stage to it and no new coordinator, agent, or loop.
 
+**Task and criterion identity: one task, one criterion, one run.**
+`app/agent_runtime/criterion_identity.py` is the criterion-identity boundary. It
+makes a verdict attributable instead of anonymous:
+
+```text
+trusted TaskSpecification          operator AcceptanceSpec
+        |                                   |
+        v                                   v
+   TaskIdentity                     CriterionIdentity (one per criterion,
+   task_id + fingerprint             carrying criterion_id, task_id, and a
+        |                            fingerprint over the criterion AND its
+        |                            verification expectation)
+        +---------------+-------------------+
+                        v
+              RunCriterionBinding   (one frozen binding per run)
+              run_id + task + every criterion + the frozen expectations
+```
+
+* **Identity is created server-side, from trusted content only.** `TaskIdentity`
+  is derived from the trusted `TaskSpecification`; each `CriterionIdentity` from
+  the operator's `AcceptanceSpec` criterion together with its
+  `VerificationExpectation`. A task id, a criterion id, an acceptance authority,
+  or a verification authority is never accepted from an HTTP request, a task
+  context, an LLM, a plan, a decision, or a tool result.
+* **Fingerprints are canonical and deterministic.** Both fingerprints are SHA-256
+  over a JSON projection with sorted keys, so the same trusted content always
+  yields the same digest and any substitution changes it. They never include a
+  command, an environment value, a credential, or a raw output.
+* **The binding is frozen per run.** `bind_run_criteria` is the only way a
+  production binding exists. It requires a trusted specification, so a criterion
+  cannot exist without the task that owns it, and it refuses a criterion that has
+  no expectation. The harness refuses a second, different binding for the same
+  run, so criteria cannot be swapped after a run starts.
+* **One canonical identity check, and it proves set equality.** Every verification
+  attempt goes through `RunCriterionBinding.validate_request`, which proves
+  `bound criteria == request acceptance criteria == verified criteria`. A missing
+  criterion, an extra criterion, a criterion that reuses a bound id but carries
+  different content, a missing expectation, and an expectation whose path or hash
+  differs are all refused. There is exactly one identity path: the harness has no
+  second, weaker inline check. On any mismatch it emits
+  `VERIFICATION_IDENTITY_FAILED`, runs neither the verifier nor the acceptance
+  gate, and returns `NOT_RUN` results with no acceptance verdict - so an incomplete
+  criterion set can never receive a verdict. A missing binding stays an honest
+  `not_evaluated`; it is never converted into a pass.
+* **A binding is recorded only after the run's whole trusted setup succeeds.** The
+  binding is validated first, then the workspace, command, criteria, and tool
+  checks run, then the scope freezes, and only then is the binding registered. A
+  run that fails its own setup leaves no identity claim behind.
+* **The binding registry is per harness instance and bounded.** Each
+  `AgentHarness` keeps its own `_bindings` map, and entries whose run scope has
+  been released are pruned on the next call, so identity claims are bounded by the
+  runs that are still alive. It is not a process-global registry, and two
+  harnesses never see each other's bindings. A binding is still refused if it
+  disagrees with an existing one for the same live run.
+* **Identity is not authorization.** A task or criterion identity grants no
+  execution, tool, workspace, network, credential, or approval authority. It
+  cannot reach `RunScope`, `AuthorizedExecution`, or a subprocess, and the
+  identity module executes nothing.
+* **Revision keeps the identity.** A revision may change the plan, the attempt,
+  and the tool or execution it performs, never the task or the criteria it is
+  judged by. Enforcement is the binding registry plus the canonical
+  `validate_request` check that runs on every verification attempt: a second,
+  different binding for the same live run is refused, and every attempt re-proves
+  the same task and criterion fingerprints. `assert_same_identity` remains the
+  reusable invariant for callers that hold two bindings; it is not the production
+  enforcement path.
+* **Attribution in the durable trail.** `CRITERION_DEFINED` records the run id,
+  task id, task fingerprint, criterion ids, per-criterion fingerprints, the
+  binding fingerprint, and the criteria source, so history can answer "which
+  task, which criterion, which run, and which verdict". No raw criterion text is
+  stored.
+
+**GAP-F scope.** Task/criterion identity is closed for the harness entry points
+below; it is **not** closed for the legacy task paths, which do not carry a
+binding at all:
+
+| entry point | task identity | criterion identity | verification bound |
+| --- | --- | --- | --- |
+| `run_agent_loop` with a declared `AcceptanceSpec` | yes | yes | real verdict |
+| `run_accepted_task` | yes | yes | real verdict |
+| `run_agent_loop` without a declared `AcceptanceSpec` | specification only | none | `not_evaluated` |
+| `run_task` / HTTP task run / desktop dispatch | none | none | `not_evaluated` |
+
+`run_agent_loop` carries a trusted task/criterion identity whenever the operator
+declared an `AcceptanceSpec` for its declaration, and its verification
+observations are real verdicts rather than `not_evaluated`. Without a declared
+spec nothing is invented: there is no criterion, so acceptance stays honestly
+deferred, and the legacy `run_task` path is untouched and stays
+execution-disabled by default.
+
+Declared verification and acceptance still cover one action plus its verification.
+A run is only recorded as `COMPLETED` when the decision provider completes it after
+a passing acceptance; reaching the action bound first leaves the run
+`LIMIT_REACHED` with a real, attributed acceptance verdict in its history. Routing
+the remaining task entry points through the same binding is follow-up work.
+
 **Tool execution: a declared intent, authorized server-side, bounded on the way out.**
 Tool execution is a stage of the one orchestration loop. `AgentHarness` composes
 an invocation from the run's own perimeter and hands it to the existing
@@ -1310,6 +1406,102 @@ loop. Он выполняется внутри `AgentHarness.run` до перв�
 
 `AgentHarness` остаётся единственным production-orchestration loop; discovery
 добавляет стадию в него, а не новый координатор, агент или loop.
+
+**Идентичность task и criterion: одна задача, один criterion, один run.**
+`app/agent_runtime/criterion_identity.py` — это граница идентичности criterion.
+Она делает вердикт атрибутируемым вместо безымянного:
+
+```text
+доверенный TaskSpecification        операторский AcceptanceSpec
+        |                                   |
+        v                                   v
+   TaskIdentity                     CriterionIdentity (по одному на criterion,
+   task_id + fingerprint             несёт criterion_id, task_id и fingerprint
+        |                            по criterion И его expectation)
+        +---------------+-------------------+
+                        v
+              RunCriterionBinding   (одна frozen привязка на run)
+              run_id + task + все criteria + замороженные expectations
+```
+
+* **Идентичность создаётся server-side и только из доверенного содержимого.**
+  `TaskIdentity` выводится из доверенного `TaskSpecification`; каждый
+  `CriterionIdentity` — из criterion операторского `AcceptanceSpec` вместе с его
+  `VerificationExpectation`. Ни task id, ни criterion id, ни acceptance authority,
+  ни verification authority никогда не принимаются из HTTP-запроса, контекста
+  задачи, LLM, плана, решения или результата tool.
+* **Fingerprint каноничны и детерминированы.** Оба fingerprint — это SHA-256 по
+  JSON-проекции с сортированными ключами, поэтому одно и то же доверенное
+  содержимое всегда даёт один дайджест, а любая подмена его меняет. В них никогда
+  не входят команда, значение окружения, credentials или сырой вывод.
+* **Привязка замораживается на run.** `bind_run_criteria` — единственный способ
+  существования production-привязки. Он требует доверенной спецификации, поэтому
+  criterion не может существовать без владеющей им задачи, и отвергает criterion
+  без expectation. Harness отвергает вторую, отличающуюся привязку для того же run,
+  поэтому criteria нельзя подменить после старта run.
+* **Одна каноническая проверка идентичности, и она доказывает равенство множеств.**
+  Каждая попытка verification проходит через `RunCriterionBinding.validate_request`,
+  который доказывает `bound criteria == request acceptance criteria == verified
+  criteria`. Отсутствующий criterion, лишний criterion, criterion с тем же id, но
+  другим содержимым, отсутствующий expectation и expectation с другим path или hash —
+  всё отвергается. Путь идентичности ровно один: второй, более слабой инлайн-проверки
+  в harness нет. При любом несовпадении он испускает
+  `VERIFICATION_IDENTITY_FAILED`, не запускает ни verifier, ни acceptance gate и
+  возвращает результаты `NOT_RUN` без вердикта acceptance — поэтому неполный набор
+  criteria никогда не может получить вердикт. Отсутствие привязки остаётся честным
+  `not_evaluated` и никогда не превращается в прохождение.
+* **Привязка фиксируется только после успешного доверенного setup всего run.**
+  Сначала валидируется привязка, затем проходят проверки workspace, команд, criteria
+  и tools, затем scope замораживается, и только после этого привязка регистрируется.
+  Run, чей собственный setup провалился, не оставляет после себя identity-претензии.
+* **Реестр привязок — per harness instance и ограничен.** Каждый `AgentHarness`
+  держит собственную карту `_bindings`, и записи, чей run scope освобождён,
+  вычищаются при следующем вызове, поэтому identity-претензии ограничены живыми
+  runs. Это не process-global реестр, и два harness никогда не видят привязки друг
+  друга. Привязка по-прежнему отвергается, если расходится с уже существующей для
+  того же живого run.
+* **Идентичность — не authorization.** Идентичность task или criterion не даёт
+  никаких прав на execution, tools, workspace, сеть, credentials или approval. Она
+  не может достичь `RunScope`, `AuthorizedExecution` или subprocess, а модуль
+  идентичности ничего не исполняет.
+* **Revision сохраняет идентичность.** Revision может изменить план, попытку и
+  выполняемое действие, но никогда — task или criteria, по которым его судят.
+  Enforcement — это реестр привязок плюс каноническая проверка `validate_request`,
+  которая выполняется на каждой попытке verification: вторая, отличающаяся привязка
+  для того же живого run отвергается, а каждая попытка заново доказывает те же
+  fingerprint задачи и criteria. `assert_same_identity` остаётся переиспользуемым
+  инвариантом для вызывающих, у которых есть две привязки; это не production-путь
+  enforcement.
+* **Атрибуция в durable trail.** `CRITERION_DEFINED` записывает run id, task id,
+  fingerprint задачи, идентификаторы criteria, fingerprint каждого criterion,
+  fingerprint привязки и источник criteria, поэтому история может ответить: «какая
+  задача, какой criterion, какой run и какой вердикт». Сырой текст criterion не
+  сохраняется.
+
+**Границы GAP-F.** Идентичность task/criterion закрыта для перечисленных ниже
+harness-точек входа; она **не** закрыта для legacy-путей задач, которые вообще не
+несут привязку:
+
+| точка входа | идентичность task | идентичность criterion | verification привязан |
+| --- | --- | --- | --- |
+| `run_agent_loop` с объявленным `AcceptanceSpec` | да | да | настоящий вердикт |
+| `run_accepted_task` | да | да | настоящий вердикт |
+| `run_agent_loop` без объявленного `AcceptanceSpec` | только specification | нет | `not_evaluated` |
+| `run_task` / HTTP task run / desktop dispatch | нет | нет | `not_evaluated` |
+
+`run_agent_loop` несёт доверенную идентичность task/criterion всякий раз, когда
+оператор объявил `AcceptanceSpec` для своей декларации, и его наблюдения
+verification — это настоящие вердикты, а не `not_evaluated`. Без объявленного spec
+ничего не выдумывается: criterion нет, поэтому acceptance остаётся честно
+отложенным, а legacy-путь `run_task` не тронут и по-прежнему отключён для
+исполнения по умолчанию.
+
+Declared verification и acceptance по-прежнему покрывают одно действие и его
+verification. Run записывается как `COMPLETED` только когда провайдер решений
+завершает его после пройденного acceptance; достижение границы действий первым
+оставляет run в `LIMIT_REACHED` с настоящим, атрибутированным вердиктом acceptance
+в истории. Перевод остальных task-точек входа на ту же привязку — последующая
+работа.
 
 **Исполнение tools: объявленное намерение, server-side авторизация, ограниченный результат.**
 Исполнение tools — стадия единственного orchestration loop. `AgentHarness`

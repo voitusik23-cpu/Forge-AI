@@ -134,6 +134,11 @@ class HarnessRequest:
     # stage. Like the snapshot it is produced inside the run loop, is bound to
     # this run and task, and carries no execution authority.
     execution_plan: object | None = None
+    # The frozen task/criterion identity binding for this run, created only by
+    # trusted server-side composition. Identity is not authority: it makes a
+    # verdict attributable and lets verification refuse a substituted criterion,
+    # but it grants no execution, tool, workspace, network, or approval authority.
+    task_binding: object | None = None
     # Declared tool intents this run may invoke, composed server-side exactly like
     # ``execution_requests``. A ToolIntent is data - a tool identity plus bounded
     # arguments - and grants nothing: the harness authorizes each invocation
