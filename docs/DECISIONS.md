@@ -3799,3 +3799,230 @@ contract level; O-10..O-13 remain deferred. No RLS implementation is chosen.
 O-1, O-2, O-3, O-4, O-5, O-6, O-7 и O-9 остаются **открытыми**; O-8 остаётся
 решённым на уровне контракта; O-10..O-13 остаются отложенными. Никакая
 реализация RLS не выбрана.
+
+
+## Stage 1 PostgreSQL schema design and proposed RLS design (D-PLATFORM-17)
+
+Records the schema-design pass for Stage 1 / Step 2. The design itself lives in
+[`STAGE-1-STEP-2-SCHEMA-DESIGN.md`](STAGE-1-STEP-2-SCHEMA-DESIGN.md); this decision
+records what it fixes, what it proposes, and what it deliberately leaves open.
+
+### Accepted decisions
+
+- **The persistence boundary is fixed.** PostgreSQL holds Platform state only:
+  `users`, `organizations`, `memberships`, `projects`, `provider_accounts`,
+  `api_keys`, `run_records`, `usage_records`. Core keeps its local file-based
+  execution persistence and gains no database dependency. The two stores are joined
+  by exactly one value, the Core correlation id.
+- **No Billing table and no financial column is created.** `wallets`,
+  `credit_transactions`, `cost_records`, `pricing_plans`, `price_rules`, and
+  `payments` are out of scope, and no column in the eight tables can hold money.
+- **Tenant containment is a schema invariant.** `organization_id` is `NOT NULL` on
+  every tenant-owned table. `organizations` carries no `organization_id` because it
+  *is* the tenant boundary; `users` carries none because a user is a global
+  identity. These two absences are deliberate, not omissions.
+- **D-PLATFORM-16 is persisted exactly.** `provider_accounts.organization_id` is the
+  only nullable tenant column: non-null means tenant-owned, `NULL` means
+  system-owned / Forge-managed. A `NULL` is never a wildcard, a tenant-scoped query
+  excludes such rows structurally, a client cannot manufacture system ownership by
+  sending a null, and system ownership grants no execution authority.
+- **`UsageRecord` keeps three identities and no fourth.** `run_record_id`,
+  `core_run_id`, and `attempt_number` are separate columns; there is no `run_id`
+  column. `UNIQUE (run_record_id, attempt_number)` is the only contract-level
+  uniqueness, and any further dimension requires a separate decision.
+- **`RunRecord` keeps two identities.** `id` is the Platform identity and
+  `core_run_id` is the Core correlation identity, typed `text` because Core mints
+  non-UUID correlation values. The lifecycle checks the schema enforces are exactly
+  the ones the domain contract already fixes; anything that depends on O-7 is left
+  unconstrained so that deciding O-7 needs no data migration.
+- **`APIKey` stores neither a token nor a hash.** The safe-representation algorithm
+  is O-1, so creating a field for it now would close O-1 silently.
+- **`secret_ref` and `workspace_ref` stay opaque.** No column encodes a reference
+  grammar, a backend, a filesystem path, or a topology.
+- **Enumerations are `text` plus `CHECK ... IN (...)`**, not PostgreSQL `enum`
+  types, so that a member change is an ordinary migration while O-7 is open.
+- **Identifiers are `uuid`** and `core_run_id` is `text`, matching what each layer
+  actually produces.
+
+### PROPOSED — not yet accepted
+
+Recorded in the design as K-1 … K-10 and requiring an explicit decision before
+implementation: the schema's identifier representation; membership pair
+uniqueness; slug uniqueness scope; `provider_accounts` partial unique indexes;
+API-key prefix uniqueness; delete semantics; the composite-key mechanism that makes
+cross-tenant references structurally impossible; `core_run_id` uniqueness;
+`scopes` representation; and the mutability contract for `updated_at`.
+
+### Proposed RLS design — O-9 remains OPEN
+
+The design in section I of the schema document is a **PROPOSED** design, not an
+accepted one:
+
+- tenant context is conveyed out of band through a transaction-scoped session
+  setting that the server populates from the authenticated subject's membership,
+  never from request data;
+- every tenant-owned table carries a policy applying the containment predicate to
+  `USING` for reads and deletes and to `WITH CHECK` for inserts and updates, so a
+  row cannot be written into or moved between tenants;
+- a missing tenant context denies, stated explicitly rather than relying on
+  three-valued logic;
+- `provider_accounts` tenant policies **exclude** system-owned rows rather than
+  including them, and system-owned rows are reachable only through a separate
+  server-only path if one is ever defined;
+- patterns that treat `NULL` as "all tenants" are named as forbidden.
+
+**O-9 is not closed by this record.** Adopting this design is a separate decision
+requiring approval, and the design states plainly that RLS does not replace
+application authorization: `identity != authorization != execution authority`
+remains intact, and a visible row is not a permission.
+
+### Rejected alternatives
+
+- **Freezing a token or hash column now.** Rejected: it closes O-1 without a
+  decision.
+- **A `NOT NULL` `organization_id` on `provider_accounts`.** Rejected: it would
+  contradict D-PLATFORM-16 and remove the Forge-managed case.
+- **Relying on foreign keys alone for tenant containment.** Rejected: a foreign key
+  proves a parent exists, not that two parents agree on the tenant. The composite-key
+  mechanism is proposed precisely because of that gap.
+- **Treating `NULL` as a tenant wildcard.** Rejected: it is the classic way a tenant
+  filter stops filtering.
+- **PostgreSQL `enum` types for status.** Rejected while O-7 is open, because
+  changing an enum type on a live table is a heavier migration than changing a
+  `CHECK` constraint.
+- **Deciding Billing tables now.** Rejected: Billing needs its own gate.
+
+### Consequences
+
+1. **Nothing is implemented.** No migration, ORM model, repository, connector, or
+   database policy was created, and no database dependency entered Core.
+2. **Step 2 has a design contract to implement against**, including an explicit
+   checklist and the constraints and indexes it must add.
+3. **K-1 … K-10 must be accepted or amended before implementation**, so no proposal
+   becomes a silent decision.
+4. **O-9 remains open**, with a proposed design that must be approved rather than
+   assumed.
+5. **O-1 … O-7 remain open**, and O-10 … O-13 remain deferred. O-8 stays resolved at
+   contract level.
+6. **D-PLATFORM-16 is not weakened**; the nullable tenant column is carried into the
+   schema with its exclusion rule stated on the read path and in the RLS design.
+
+
+## Дизайн схемы PostgreSQL и предложенный дизайн RLS Stage 1 (D-PLATFORM-17) — русская версия
+
+Фиксирует schema-design проход для Stage 1 / Шага 2. Сам дизайн находится в
+[`STAGE-1-STEP-2-SCHEMA-DESIGN.md`](STAGE-1-STEP-2-SCHEMA-DESIGN.md); это решение фиксирует, что он
+закрепляет, что предлагает и что намеренно оставляет открытым.
+
+### Принятые решения
+
+- **Граница персистентности зафиксирована.** PostgreSQL хранит только
+  состояние Platform: `users`, `organizations`, `memberships`, `projects`,
+  `provider_accounts`, `api_keys`, `run_records`, `usage_records`. Core сохраняет свою
+  локальную файловую персистентность исполнения и не получает
+  зависимости от базы данных. Два хранилища соединены ровно одним
+  значением — корреляционной идентичностью Core.
+- **Ни одна Billing-таблица и ни одна финансовая колонка не
+  создаются.** `wallets`, `credit_transactions`, `cost_records`, `pricing_plans`,
+  `price_rules` и `payments` вне области, и ни одна колонка в восьми таблицах
+  не может хранить деньги.
+- **Containment арендаторов — инвариант схемы.** `organization_id` — `NOT NULL` во
+  всех tenant-owned таблицах. `organizations` не несёт `organization_id`, потому что она
+  *и есть* граница арендатора; `users` не несёт, потому что пользователь —
+  глобальная идентичность. Эти два отсутствия намеренны, а не являются
+  пропущенными местами.
+- **D-PLATFORM-16 персистится точно.** `provider_accounts.organization_id` —
+  единственная nullable tenant-колонка: non-null означает tenant-owned, `NULL`
+  означает system-owned / Forge-managed. `NULL` никогда не является подстановочным
+  символом, tenant-scoped запрос структурно исключает такие строки, клиент не
+  может создать системное владение, отправив null, и системное владение не
+  даёт execution authority.
+- **`UsageRecord` сохраняет три идентичности и ни одной четвёртой.**
+  `run_record_id`, `core_run_id` и `attempt_number` — отдельные колонки;
+  колонки `run_id` нет. `UNIQUE (run_record_id, attempt_number)` — единственная
+  уникальность уровня контракта, и любое дополнительное измерение требует
+  отдельного решения.
+- **`RunRecord` сохраняет две идентичности.** `id` — идентичность
+  Platform, `core_run_id` — корреляционная идентичность Core, типа `text`, потому что Core
+  порождает не-UUID значения. Проверки жизненного цикла, которые обеспечивает
+  схема, — ровно те, что уже фиксирует доменный контракт; всё, что зависит от
+  O-7, оставлено неограниченным, чтобы решение O-7 не требовало миграции данных.
+- **`APIKey` не хранит ни токен, ни хэш.** Алгоритм
+  безопасного представления — это O-1, поэтому создание для него поля сейчас молча
+  закрыло бы O-1.
+- **`secret_ref` и `workspace_ref` остаются непрозрачными.** Ни одна
+  колонка не кодирует грамматику ссылки, бэкенд, путь файловой системы или
+  топологию.
+- **Перечисления — это `text` плюс `CHECK ... IN (...)`,** а не типы PostgreSQL
+  `enum`, чтобы изменение члена было обычной миграцией, пока O-7 открыт.
+- **Идентификаторы — `uuid`,** а `core_run_id` — `text`, что соответствует тому,
+  что фактически порождает каждый слой.
+
+### PROPOSED — ещё не принято
+
+Записаны в дизайне как K-1 … K-10 и требуют явного решения до реализации:
+представление идентификаторов в схеме; уникальность пары membership; область
+уникальности slug; частичные уникальные индексы `provider_accounts`;
+уникальность префикса API-ключа; семантика удаления; механизм
+составных ключей, делающий кросс-арендаторные ссылки структурно
+невозможными; уникальность `core_run_id`; представление `scopes`; и контракт
+изменяемости для `updated_at`.
+
+### Предложенный дизайн RLS — O-9 остаётся OPEN
+
+Дизайн в разделе I документа схемы — это **PROPOSED** дизайн, а не
+принятое решение:
+
+- tenant-контекст передаётся внеполосно через ограниченную транзакцией
+  настройку сессии, которую сервер заполняет из membership
+  аутентифицированного субъекта, никогда из данных запроса;
+- каждая tenant-owned таблица несёт политику, применяющую предикат containment
+  к `USING` для чтений и удалений и к `WITH CHECK` для вставок и обновлений, чтобы строку
+  нельзя было записать в другого арендатора или переместить между ними;
+- отсутствующий tenant-контекст отказывает, и это сформулировано явно, а не
+  через расчёт на трёхзначную логику;
+- tenant-политики `provider_accounts` **исключают** system-owned строки, а не
+  включают их, и system-owned строки доступны только через отдельный
+  server-only путь, если он когда-\u043bибо будет определён;
+- шаблоны, трактующие `NULL` как «все арендаторы», названы запрещёнными.
+
+**O-9 не закрывается этой записью.** Принятие этого дизайна — отдельное
+решение, требующее утверждения, и дизайн прямо говорит, что RLS не
+заменяет авторизацию приложения: `identity != authorization !=
+execution authority` остаётся неизменным, и видимая строка не является
+разрешением.
+
+### Отклонённые альтернативы
+
+- **Заморозить колонку токена или хэша сейчас.** Отклонено: это
+  закрывает O-1 без решения.
+- **`NOT NULL` `organization_id` на `provider_accounts`.** Отклонено: это
+  противоречило бы D-PLATFORM-16 и убрало бы кейс Forge-managed.
+- **Опора только на внешние ключи для containment арендаторов.**
+  Отклонено: внешний ключ доказывает существование родителя, а не
+  согласие двух родителей по арендатору. Механизм составных ключей
+  предложен именно из-за этого пробела.
+- **Трактовка `NULL` как подстановочного символа арендатора.**
+  Отклонено: это классический способ, которым фильтр по арендатору
+  перестаёт фильтровать.
+- **Типы PostgreSQL `enum` для статусов.** Отклонено, пока O-7
+  открыт, потому что изменение типа enum на живой таблице — более
+  тяжёлая миграция, чем изменение ограничения `CHECK`.
+- **Решение о Billing-таблицах сейчас.** Отклонено: Billing требует
+  собственного gate.
+
+### Следствия
+
+1. **Ничего не реализовано.** Не создано ни миграции, ни ORM-модели,
+   ни репозитория, ни коннектора, ни политики базы данных, и в Core не
+   попала зависимость от базы данных.
+2. **У Шага 2 есть дизайн-контракт для реализации**, включая явный
+   чек-лист и ограничения и индексы, которые она обязана добавить.
+3. **K-1 … K-10 должны быть приняты или изменены до реализации**,
+   чтобы ни одно предложение не стало молчаливым решением.
+4. **O-9 остаётся открытым**, с предложенным дизайном, который
+   должен быть утверждён, а не предположен.
+5. **O-1 … O-7 остаются открытыми**, а O-10 … O-13 остаются отложенными. O-8
+   остаётся решённым на уровне контракта.
+6. **D-PLATFORM-16 не ослаблен**; nullable tenant-колонка перенесена в схему
+   вместе с правилом исключения на пути чтения и в дизайне RLS.
