@@ -2658,8 +2658,349 @@ Implemented in the idempotency and resume block. Verified against the code in
    журналом; run защищает только run-level claim.
 6. **Подсистема PARTIAL по каждому измерению** — run idempotency, resume, execution
    idempotency, tool idempotency и concurrency — а интеграция журнала NOT WIRED.
-4. **Resume валидируется, но пока не вызывается точкой входа.** Контракт реализован и
+7. **Resume валидируется, но пока не вызывается точкой входа.** Контракт реализован и
    протестирован; подключение операторского вызова resume — последующая работа,
    намеренно не протащенная в этот блок.
-5. **`RunStore` остаётся observation sink и не изменён**, поэтому история run
+8. **`RunStore` остаётся observation sink и не изменён**, поэтому история run
    сохраняет прежний смысл и прежние тесты.
+
+
+## Forge Platform Stage 0 — Architecture Decisions (D-PLATFORM-01..12)
+
+Frozen before any Platform implementation begins. Baseline `0161d24`. These
+decisions are **architectural direction**, not implementation claims: nothing in
+them is built yet, and the existing status of any component is unchanged by this
+record. Each decision states what exists today so the direction cannot be misread
+as delivered behaviour.
+
+### Accepted decisions
+
+- **D-PLATFORM-01 — Hybrid persistence.** Platform uses PostgreSQL for durable
+  platform state: users, organizations, memberships, projects, API keys, provider
+  account metadata, `RunRecord`, `UsageRecord`, and future billing entities. Core
+  keeps its autonomy and keeps using its local workspace, snapshots, `RunStore`,
+  the local execution event log, and the local execution/idempotency
+  infrastructure. **Core must not import PostgreSQL, SQLAlchemy, psycopg, Alembic,
+  Stripe, or any Platform module.** Verified today: `sqlite3`, `sqlalchemy`,
+  `psycopg`, and `alembic` have **zero** imports in `app/` and `tests/`.
+- **D-PLATFORM-02 — `Run` vs `RunRecord`.** `Run`
+  (`app/orchestrator/models.py`) stays the mutable in-memory runtime object of
+  Core. `RunRecord` is the durable Platform record of the outer lifecycle. They
+  share exactly one stable correlation identity: the Core `run_id`. Platform never
+  mutates a Core `Run`; Core never reads a Platform `RunRecord` to make an
+  execution decision.
+- **D-PLATFORM-03 — Execution state ownership.** Core owns the internal execution
+  flow and the `AgentHarness` phases. Platform owns the outer lifecycle
+  (`QUEUED`/`RUNNING`/terminal). **No second source of truth for the same state.**
+  `RunStore` remains Core execution observation and audit infrastructure; it does
+  not become a Platform database and does not become an authorization engine. This
+  preserves the invariant `RunStore` already documents about itself: it is
+  deliberately not an execution authority and not a resume engine.
+- **D-PLATFORM-04 — Organization-first.** A `User` never directly owns a
+  `Project`. Registration atomically creates a `User`, a **Personal
+  Organization**, and an `OWNER` `Membership`. `Project` and `Wallet` belong to the
+  `Organization`. Rationale: `project_id` is already threaded through more than ten
+  call sites as a free-form string, so choosing `Project -> User` now would force a
+  rewrite of every one of them at the first B2B requirement.
+- **D-PLATFORM-05 — Tenant authority separation.** A client-supplied `project_id`
+  or `organization_id` is **never** proof of ownership and **never** execution
+  authority. The only permitted derivation is:
+
+  ```
+  authenticated identity -> Membership -> Organization -> Project
+      -> server-derived Workspace -> RunScope -> execution
+  ```
+
+  `request.project_id -> Workspace` is forbidden: it would become cross-tenant file
+  access at the first transition to a per-project workspace. `AI decision !=
+  authorization`, and `authorization != execution authority`. Note the current
+  reality this guards: `TaskRunRequest.project_id` is supplied by the caller, and
+  today it is harmless **only** because `RunScope` has no `project_id` field and
+  `ForgeApiService` holds one constant workspace. That accident must not be relied
+  on.
+- **D-PLATFORM-06 — Physical usage vs financial data.** Core is responsible for
+  physical telemetry only. The minimum `Usage` contract is: `run_id`,
+  `attempt_number`, `provider_name`, `model_name`, `input_tokens`,
+  `output_tokens`, `cached_tokens`, `duration`, `request_count`, plus
+  success/error/fallback metadata where needed. **Core must not compute retail
+  price, charge, or wallet balance.** All of those fields already exist today
+  except `tool_call_count`, and they live inside `AttemptUsageRecord` /
+  `RunAccountingRecord`.
+- **D-PLATFORM-07 — Usage / Cost / Price / Charge / Ledger separation.** `Usage` is
+  physical measurement. `Cost` is Forge COGS. `Price` is the retail pricing rule.
+  `Charge` is the customer financial obligation. `Ledger` is the immutable
+  accounting record. These five concepts must never be merged. Today
+  `AttemptUsageRecord` carries both physical fields and `estimated_cost` /
+  `provider_reported_cost`, so this separation is a **split of an existing object**,
+  not an addition on top of it.
+- **D-PLATFORM-08 — Money representation.** Financial fields **must not** use
+  `float`. The internal representation is fixed as **integer minor units /
+  micro-credits**. The external JSON/API representation is left as a separate
+  implementation decision and is not needed yet. This is a hard constraint because
+  the existing cost fields are `Optional[float]` and are `round(..., 6)`-ed today.
+- **D-PLATFORM-09 — `ProviderAccount`.** Do not create a duplicate
+  `ProviderCredential` entity. The existing
+  `app/agents/providers/models.py::ProviderAccount` remains the canonical provider
+  account model. `secret_ref` stays a **reference value**, and its future contract
+  must support an abstract secret-reference scheme (for example `env:` / `vault:` /
+  `kms:`), extending the current environment-variable-name validation rather than
+  replacing the field. **Open provider secrets are never part of durable Platform
+  records.** Today `secret_ref` is validated as an uppercase environment variable
+  name, and that is already a reference model, not a value store.
+- **D-PLATFORM-10 — Core independence.** Core must remain runnable without
+  Platform, without PostgreSQL, without Stripe, without mandatory network, and
+  without authentication. Platform may **refuse** a run; Platform may **not**
+  widen Core execution authority. This preserves `AuthorizedExecution` as the only
+  execution authority.
+- **D-PLATFORM-11 — Future billing boundary.** Billing is **not** implemented now.
+  The architectural direction is fixed as:
+
+  ```
+  Usage -> CostRecord -> Pricing -> Charge -> immutable Ledger
+  ```
+
+  `Wallet`, compare-and-swap, pre-authorization, and payment remain future stages.
+- **D-PLATFORM-12 — Deferred scope.** Not implemented at this stage: Stripe;
+  subscriptions; invoices; partner payouts; reseller; distributor; MLM;
+  KeyCore-Hub dependency; and migration of Core artifacts/snapshots into
+  PostgreSQL. Note that `partner`, `reseller`, `affiliate`, `referral`, and
+  `commission` have **zero** mentions in `app/` today, so declining them removes
+  nothing that exists.
+
+### Rejected alternatives
+
+- **Platform-owned execution authority.** Rejected: it would create a second
+  authority beside `AuthorizedExecution` and break `identity != authorization !=
+  execution authority`.
+- **`Project` owned by `User`.** Rejected: forces a full schema, billing, and
+  authorization rewrite at the first team/B2B requirement.
+- **Storing retail or charged amounts in Core.** Rejected: Core cannot know a
+  tariff, a margin, or a wallet, and a price change would retroactively alter
+  immutable telemetry.
+- **A second `ProviderCredential` entity.** Rejected: duplicates the existing
+  `ProviderAccount` and splits credential ownership in two.
+- **PostgreSQL for Core state.** Rejected: Core must stay runnable as a library
+  with no database. The existing file-based `RunStore` and `IdempotencyLedger`
+  already write outside the source checkout and keep Core autonomous.
+- **Migrating Core artifacts and snapshots into PostgreSQL now.** Rejected: it
+  gives Platform ownership of Core observability before the boundary is proven.
+- **Floating-point money.** Rejected: the existing cost fields are already floats;
+  adding a ledger on top of them would make rounding divergence permanent and
+  unauditable.
+
+### Stage 0 implementation gate
+
+Stage 0.1 must not begin until all of the following are documented and agreed:
+
+1. Architecture boundary documented (Core / Platform / Billing / API).
+2. Persistence model documented, including the hybrid split and its rationale.
+3. `Run` vs `RunRecord` documented, including the single correlation identity.
+4. Authority boundary documented, including the tenant derivation chain.
+5. `Usage` / `Cost` / `Price` / `Charge` / `Ledger` boundary documented.
+6. Money representation documented (integer minor units / micro-credits, no float).
+7. `ProviderAccount` / `secret_ref` migration direction documented.
+8. Core independence invariant documented.
+
+Status of this gate at the time of writing: **all eight items are documented by
+this record.** The gate is a documentation precondition only; it does not assert
+that any Platform component exists.
+
+### Consequences and open items
+
+1. **Nothing in D-PLATFORM-01..12 is implemented.** The Platform layer, PostgreSQL
+   persistence, tenant identity, `RunRecord`, `UsageRecord`, and billing do not
+   exist in this repository. This record fixes direction, not delivery.
+2. **Three existing Core constructs carry Platform or financial semantics and will
+   need a split before billing is possible.** `AttemptUsageRecord` mixes physical
+   telemetry with `estimated_cost` / `provider_reported_cost`;
+   `RunAccountingRecord` carries `project_id`, a Platform ownership concept; and
+   `app/dashboard/` plus `app/dashboard/provider_health.py` are customer-facing
+   analytics and provider-balance operations rather than Core.
+3. **Usage currently survives only in memory.** `CapabilityFabric._run_usage` is a
+   `defaultdict(list)`. `RunStateSnapshot` has an `accounting` field that no
+   production path populates, so the record is discarded with the process. Durable
+   physical telemetry is therefore the first prerequisite for anything financial.
+4. **`provider_reported_cost` is currently a misleading name.**
+   `app/orchestrator/dispatcher.py` assigns it from the model's own
+   `estimated_cost`. It is not provider-confirmed cost and must not be used as the
+   basis of a charge.
+5. **`tool_call_count` is required by D-PLATFORM-06 and does not exist yet**
+   (zero occurrences in `app/`). It is a Core-side measurement addition.
+6. **`allow_paid_providers` is a process-global flag** in `RuntimeSettings` and
+   `FabricRequest`. It has no owner, so it cannot express a per-tenant policy and
+   will have to move or be superseded.
+7. **These decisions do not change any current behaviour.** No code, no test, and
+   no runtime path is modified by this record.
+
+
+## Forge Platform Stage 0 — архитектурные решения (D-PLATFORM-01..12) — русская версия
+
+Зафиксировано до начала любой реализации Platform. Базовая точка — `0161d24`. Эти
+решения задают **архитектурное направление**, а не заявляют реализацию: ничего из
+перечисленного ещё не построено, и текущий статус любого компонента этим документом
+не меняется. Каждое решение отдельно указывает, что существует сегодня, чтобы
+направление нельзя было прочитать как уже поставленное поведение.
+
+### Принятые решения
+
+- **D-PLATFORM-01 — гибридная персистентность.** Platform использует PostgreSQL для
+  durable platform state: users, organizations, memberships, projects, API keys,
+  метаданные провайдерских аккаунтов, `RunRecord`, `UsageRecord` и будущие
+  billing-сущности. Core сохраняет автономность и продолжает использовать локальный
+  workspace, snapshots, `RunStore`, локальный журнал событий исполнения и локальную
+  инфраструктуру execution/idempotency. **Core не должен импортировать PostgreSQL,
+  SQLAlchemy, psycopg, Alembic, Stripe или любой модуль Platform.** Проверено
+  сегодня: `sqlite3`, `sqlalchemy`, `psycopg` и `alembic` имеют **ноль** импортов в
+  `app/` и `tests/`.
+- **D-PLATFORM-02 — `Run` против `RunRecord`.** `Run`
+  (`app/orchestrator/models.py`) остаётся mutable in-memory runtime-объектом Core.
+  `RunRecord` — durable-запись Platform о внешнем жизненном цикле запуска. У них
+  ровно одна стабильная корреляционная идентичность: Core `run_id`. Platform никогда
+  не мутирует Core `Run`; Core никогда не читает Platform `RunRecord` для принятия
+  execution-решений.
+- **D-PLATFORM-03 — владение состоянием исполнения.** Core владеет внутренним потоком
+  исполнения и фазами `AgentHarness`. Platform владеет внешним жизненным циклом
+  (`QUEUED`/`RUNNING`/terminal). **Не создавать второй источник истины для одного и
+  того же состояния.** `RunStore` остаётся инфраструктурой наблюдения и аудита
+  исполнения Core; он не становится базой данных Platform и не становится движком
+  авторизации. Это сохраняет инвариант, который `RunStore` уже заявляет о себе: он
+  намеренно не является execution authority и не является resume-движком.
+- **D-PLATFORM-04 — Organization-first.** `User` никогда напрямую не владеет
+  `Project`. Регистрация атомарно создаёт `User`, **Personal Organization** и
+  `OWNER` `Membership`. `Project` и `Wallet` принадлежат `Organization`. Обоснование:
+  `project_id` уже протянут более чем через десять мест как свободная строка, и выбор
+  `Project -> User` сейчас потребовал бы переписать каждое из них при первом же
+  B2B-требовании.
+- **D-PLATFORM-05 — разделение tenant authority.** Клиентский `project_id` или
+  `organization_id` **никогда** не является доказательством владения и **никогда** не
+  является execution authority. Единственно допустимый вывод:
+
+  ```
+  аутентифицированная идентичность -> Membership -> Organization -> Project
+      -> server-derived Workspace -> RunScope -> исполнение
+  ```
+
+  `request.project_id -> Workspace` запрещено: при первом же переходе к
+  per-project workspace это стало бы межарендаторным доступом к файлам.
+  `AI decision != authorization`, а `authorization != execution authority`. Отметим
+  сегодняшнюю реальность, которую это защищает: `TaskRunRequest.project_id`
+  поставляет вызывающий, и сегодня это безвредно **только** потому, что у `RunScope`
+  нет поля `project_id`, а `ForgeApiService` держит один постоянный workspace. На эту
+  случайность нельзя опираться.
+- **D-PLATFORM-06 — физическое потребление против финансовых данных.** Core отвечает
+  только за physical telemetry. Минимальный контракт `Usage`: `run_id`,
+  `attempt_number`, `provider_name`, `model_name`, `input_tokens`, `output_tokens`,
+  `cached_tokens`, `duration`, `request_count`, плюс метаданные success/error/fallback
+  при необходимости. **Core не должен считать retail price, charge или wallet
+  balance.** Все эти поля, кроме `tool_call_count`, существуют сегодня и живут внутри
+  `AttemptUsageRecord` / `RunAccountingRecord`.
+- **D-PLATFORM-07 — разделение Usage / Cost / Price / Charge / Ledger.** `Usage` —
+  физическое измерение. `Cost` — себестоимость Forge (COGS). `Price` — правило
+  розничного ценообразования. `Charge` — финансовое обязательство клиента.
+  `Ledger` — неизменяемая бухгалтерская запись. Эти пять понятий нельзя смешивать
+  никогда. Сегодня `AttemptUsageRecord` несёт одновременно физические поля и
+  `estimated_cost` / `provider_reported_cost`, поэтому это разделение — **разрезание
+  существующего объекта**, а не добавление поверх него.
+- **D-PLATFORM-08 — представление денег.** Финансовые поля **не должны** использовать
+  `float`. Внутреннее представление фиксируется как **целые минорные единицы /
+  micro-credits**. Внешнее представление JSON/API остаётся отдельным
+  implementation-решением и пока не требуется. Это жёсткое ограничение, потому что
+  существующие cost-поля — `Optional[float]` и сегодня округляются через
+  `round(..., 6)`.
+- **D-PLATFORM-09 — `ProviderAccount`.** Не создавать сущность-дубль
+  `ProviderCredential`. Существующий
+  `app/agents/providers/models.py::ProviderAccount` остаётся канонической моделью
+  провайдерского аккаунта. `secret_ref` остаётся **ссылочным значением**, и его
+  будущий контракт должен поддерживать абстрактную схему secret reference (например
+  `env:` / `vault:` / `kms:`), расширяя текущую валидацию имени переменной окружения,
+  а не заменяя поле. **Открытые провайдерские секреты никогда не являются частью
+  durable-записей Platform.** Сегодня `secret_ref` валидируется как имя переменной
+  окружения в верхнем регистре, и это уже ссылочная модель, а не хранилище значений.
+- **D-PLATFORM-10 — независимость Core.** Core должен оставаться запускаемым без
+  Platform, без PostgreSQL, без Stripe, без обязательной сети и без аутентификации.
+  Platform может **отказать** в запуске; Platform **не может** расширить execution
+  authority Core. Это сохраняет `AuthorizedExecution` единственной execution
+  authority.
+- **D-PLATFORM-11 — будущая граница биллинга.** Billing **сейчас не реализуется**.
+  Архитектурное направление фиксируется так:
+
+  ```
+  Usage -> CostRecord -> Pricing -> Charge -> immutable Ledger
+  ```
+
+  `Wallet`, compare-and-swap, pre-authorization и платежи остаются будущими этапами.
+- **D-PLATFORM-12 — отложенная область.** На текущем этапе не реализуется: Stripe;
+  подписки; инвойсы; выплаты партнёрам; reseller; distributor; MLM; зависимость от
+  KeyCore-Hub; перенос Core artifacts/snapshots в PostgreSQL. Отметим, что `partner`,
+  `reseller`, `affiliate`, `referral` и `commission` сегодня имеют **ноль** упоминаний
+  в `app/`, поэтому отказ от них не удаляет ничего существующего.
+
+### Отклонённые альтернативы
+
+- **Execution authority, принадлежащая Platform.** Отклонено: это создало бы вторую
+  authority рядом с `AuthorizedExecution` и сломало бы
+  `identity != authorization != execution authority`.
+- **`Project`, принадлежащий `User`.** Отклонено: вынуждает полную переписку схемы,
+  биллинга и авторизации при первом же требовании командной работы/B2B.
+- **Хранение retail- или списанных сумм в Core.** Отклонено: Core не может знать
+  тариф, маржу или кошелёк, а изменение цены задним числом изменило бы неизменяемую
+  телеметрию.
+- **Вторая сущность `ProviderCredential`.** Отклонено: дублирует существующий
+  `ProviderAccount` и расщепляет владение кредами на две части.
+- **PostgreSQL для состояния Core.** Отклонено: Core должен оставаться запускаемым как
+  библиотека без базы данных. Существующие файловые `RunStore` и `IdempotencyLedger`
+  уже пишут вне исходного checkout и сохраняют автономность Core.
+- **Перенос Core artifacts и snapshots в PostgreSQL сейчас.** Отклонено: это отдаёт
+  Platform владение наблюдаемостью Core до того, как граница доказана.
+- **Деньги с плавающей точкой.** Отклонено: существующие cost-поля уже float;
+  добавление ledger поверх них сделало бы расхождения округления постоянными и
+  неаудируемыми.
+
+### Stage 0 implementation gate
+
+Stage 0.1 не должен начинаться, пока всё перечисленное не задокументировано и
+согласовано:
+
+1. Граница архитектуры задокументирована (Core / Platform / Billing / API).
+2. Модель персистентности задокументирована, включая гибридное разделение и его
+   обоснование.
+3. `Run` против `RunRecord` задокументировано, включая единую корреляционную
+   идентичность.
+4. Граница authority задокументирована, включая цепочку вывода tenant'а.
+5. Граница `Usage` / `Cost` / `Price` / `Charge` / `Ledger` задокументирована.
+6. Представление денег задокументировано (целые минорные единицы / micro-credits, без
+   float).
+7. Направление миграции `ProviderAccount` / `secret_ref` задокументировано.
+8. Инвариант независимости Core задокументирован.
+
+Состояние этого gate на момент написания: **все восемь пунктов задокументированы этой
+записью.** Gate — это только документационное предусловие; он не утверждает, что
+какой-либо компонент Platform существует.
+
+### Следствия и открытые пункты
+
+1. **Ничто из D-PLATFORM-01..12 не реализовано.** Слоя Platform, персистентности
+   PostgreSQL, tenant-идентичности, `RunRecord`, `UsageRecord` и биллинга в этом
+   репозитории не существует. Эта запись фиксирует направление, а не поставку.
+2. **Три существующих конструкции Core несут платформенную или финансовую семантику,
+   и до биллинга их потребуется разрезать.** `AttemptUsageRecord` смешивает
+   физическую телеметрию с `estimated_cost` / `provider_reported_cost`;
+   `RunAccountingRecord` несёт `project_id` — платформенную концепцию владения; а
+   `app/dashboard/` и `app/dashboard/provider_health.py` — это customer-facing
+   аналитика и операции с балансом провайдера, а не Core.
+3. **Сегодня Usage существует только в памяти.** `CapabilityFabric._run_usage` — это
+   `defaultdict(list)`. У `RunStateSnapshot` есть поле `accounting`, которое не
+   заполняет ни один production-путь, поэтому запись исчезает вместе с процессом.
+   Следовательно, durable physical telemetry — первое предусловие для всего
+   финансового.
+4. **`provider_reported_cost` сегодня — вводящее в заблуждение имя.**
+   `app/orchestrator/dispatcher.py` присваивает ему собственную `estimated_cost`
+   модели. Это не подтверждённая провайдером себестоимость, и это нельзя использовать
+   как основу списания.
+5. **`tool_call_count` требуется D-PLATFORM-06 и пока не существует** (ноль
+   вхождений в `app/`). Это добавление измерения на стороне Core.
+6. **`allow_paid_providers` — процесс-глобальный флаг** в `RuntimeSettings` и
+   `FabricRequest`. У него нет владельца, поэтому он не может выражать политику
+   отдельного арендатора и должен быть перемещён или заменён.
+7. **Эти решения не меняют текущее поведение.** Ни код, ни тесты, ни один
+   runtime-путь этой записью не изменяются.

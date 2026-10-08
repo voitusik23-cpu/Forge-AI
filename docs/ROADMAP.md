@@ -231,6 +231,45 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Subsystem status: run idempotency **PARTIAL**, resume **PARTIAL**, execution idempotency **PARTIAL**, tool idempotency **PARTIAL**, side-effect journal integration **NOT WIRED**, concurrency **PARTIAL**.
 - [ ] Durable, resumable task queues
 
+## Phase 7 вЂ” Forge Platform (frozen direction, not implemented)
+
+Architecture decisions `D-PLATFORM-01..12` are frozen in
+[`DECISIONS.md`](DECISIONS.md) and the Stage 0 gate is satisfied. **Nothing in this
+phase exists in the repository yet**; the entries below are direction, and none of
+them may be described in the present tense.
+
+- [ ] **Stage 0.1 вЂ” durable physical telemetry in Core.** Nothing financial can be
+  built first: today `CapabilityFabric._run_usage` is in-memory only, and the
+  `accounting` field of `RunStateSnapshot` is never populated, so usage is
+  discarded with the process.
+- [ ] **Stage 0.2 вЂ” trusted execution port.** `TrustedExecutionRequest` in,
+  `PhysicalTelemetry` out, with the six audit fields carried as data and never as
+  authority.
+- [ ] **Stage 1 вЂ” Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
+  `APIKey`, `ProviderAccount.organization_id`, per-tenant persistence, BYOK
+  credential storage. PostgreSQL is the durable store for platform state;
+  Core keeps its file-based execution infrastructure.
+- [ ] **Stage 2 вЂ” Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` with
+  version snapshots, `Wallet` with compare-and-swap, immutable
+  `CreditTransaction` ledger, prepaid top-up.
+- [ ] **Stage 3 вЂ” public Forge API.** Authenticated REST surface, API keys,
+  rate limiting, webhooks.
+- [ ] **Stage 4 вЂ” partner / affiliate.** One-level referral only.
+- [ ] **Stage 5 вЂ” reseller / B2B wholesale.** Deferred until Stage 2 is stable.
+- [ ] Split of existing Core constructs that carry Platform or financial semantics:
+  `AttemptUsageRecord` (physical vs cost fields), `RunAccountingRecord.project_id`,
+  and `app/dashboard/` plus `app/dashboard/provider_health.py`.
+- [ ] `tool_call_count` as a Core-side measurement (required by `D-PLATFORM-06`,
+  absent today).
+- [ ] `ProviderAccount.secret_ref` extended to an abstract secret-reference scheme
+  (`env:` / `vault:` / `kms:`).
+- [ ] `allow_paid_providers` moved out of process-global settings into per-tenant
+  policy.
+
+Not in scope for this phase, explicitly: Stripe, subscriptions, invoices, partner
+payouts, reseller, distributor, MLM, KeyCore-Hub as a dependency, and migration of
+Core artifacts or snapshots into PostgreSQL (`D-PLATFORM-12`).
+
 Technology candidates under evaluation are tracked in
 [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md). Nothing there is approved.
 
@@ -472,6 +511,46 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Конкурентные обновления одного ключа могут потерять обновление, а Windows может выдать `PermissionError` при конкурентной замене. Это ограничение liveness/восстановления, а не расширение authority.
 - [ ] Статус подсистемы: run idempotency **PARTIAL**, resume **PARTIAL**, execution idempotency **PARTIAL**, tool idempotency **PARTIAL**, интеграция журнала side effects **NOT WIRED**, concurrency **PARTIAL**.
 - [ ] Долговременные возобновляемые очереди задач
+
+## Фаза 7 — Forge Platform (направление заморожено, не реализовано)
+
+Архитектурные решения `D-PLATFORM-01..12` заморожены в
+[`DECISIONS.md`](DECISIONS.md), и gate Stage 0 выполнен. **Ничего из этой фазы
+в репозитории пока не существует**; пункты ниже — это направление, и ни один
+из них нельзя описывать в настоящем времени.
+
+- [ ] **Stage 0.1 — durable physical telemetry в Core.** Ничто финансовое нельзя
+  построить раньше: сегодня `CapabilityFabric._run_usage` существует только в
+  памяти, а поле `accounting` у `RunStateSnapshot` не заполняется никогда, поэтому
+  потребление исчезает вместе с процессом.
+- [ ] **Stage 0.2 — trusted execution port.** `TrustedExecutionRequest` на входе,
+  `PhysicalTelemetry` на выходе, шесть audit-полей передаются как данные и
+  никогда как authority.
+- [ ] **Stage 1 — Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
+  `APIKey`, `ProviderAccount.organization_id`, per-tenant персистентность, BYOK-хранилище
+  кредов. PostgreSQL — durable-хранилище платформенного состояния; Core
+  сохраняет свою файловую инфраструктуру исполнения.
+- [ ] **Stage 2 — Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` со снимками
+  версий, `Wallet` с compare-and-swap, неизменяемый ledger `CreditTransaction`,
+  prepaid top-up.
+- [ ] **Stage 3 — публичный Forge API.** Аутентифицированный REST-интерфейс, API keys,
+  rate limiting, webhooks.
+- [ ] **Stage 4 — partner / affiliate.** Только одноуровневая реферальная модель.
+- [ ] **Stage 5 — reseller / B2B wholesale.** Отложено до стабилизации Stage 2.
+- [ ] Разрезание существующих конструкций Core, несущих платформенную или
+  финансовую семантику: `AttemptUsageRecord` (физика против cost-полей),
+  `RunAccountingRecord.project_id`, а также `app/dashboard/` и
+  `app/dashboard/provider_health.py`.
+- [ ] `tool_call_count` как измерение на стороне Core (требуется
+  `D-PLATFORM-06`, сегодня отсутствует).
+- [ ] `ProviderAccount.secret_ref`, расширенный до абстрактной схемы
+  ссылок на секрет (`env:` / `vault:` / `kms:`).
+- [ ] `allow_paid_providers`, вынесенный из процесс-глобальных
+  настроек в политику отдельного арендатора.
+
+Явно вне области этой фазы: Stripe, подписки, инвойсы, выплаты
+партнёрам, reseller, distributor, MLM, KeyCore-Hub как зависимость, и перенос Core artifacts
+или snapshots в PostgreSQL (`D-PLATFORM-12`).
 
 Технологические кандидаты на рассмотрении отслеживаются в
 [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md). Ничто там не одобрено.
