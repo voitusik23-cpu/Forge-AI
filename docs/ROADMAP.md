@@ -238,13 +238,23 @@ Architecture decisions `D-PLATFORM-01..12` are frozen in
 phase exists in the repository yet**; the entries below are direction, and none of
 them may be described in the present tense.
 
-- [ ] **Stage 0.1 вЂ” durable physical telemetry in Core.** Nothing financial can be
-  built first: today `CapabilityFabric._run_usage` is in-memory only, and the
-  `accounting` field of `RunStateSnapshot` is never populated, so usage is
-  discarded with the process.
+- [x] **Stage 0.1 вЂ” durable physical telemetry in Core.** Implemented. `PhysicalTelemetry`
+  (`app/agent_runtime/physical_telemetry.py`) is the physical contract, and
+  `FileTelemetrySink` is the transitional append-only local sink, one JSON line per
+  terminal attempt, rooted outside the source checkout. The `AgentHarness` builds
+  the measurement for a genuinely terminal attempt (`COMPLETED`, `FAILED`,
+  `LIMIT_REACHED`) and persists it; a run still running, waiting for approval, or
+  raising is never recorded. Persistence is idempotent per attempt identity
+  (`<run_id>#attempt-<n>`, the existing `AttemptIdentity` convention) and survives a
+  process restart. No financial field is present, and no missing measurement is
+  replaced with an estimate. See `D-PLATFORM-13`.
+  *Still open from this stage:* the legacy in-memory
+  `CapabilityFabric._run_usage` and the unused `RunStateSnapshot.accounting` field
+  remain; provider token measurements are only populated when the decision provider
+  actually reports a `Usage`, which the default deterministic provider does not.
 - [ ] **Stage 0.2 вЂ” trusted execution port.** `TrustedExecutionRequest` in,
   `PhysicalTelemetry` out, with the six audit fields carried as data and never as
-  authority.
+  authority. `PhysicalTelemetry` exists; the request half does not.
 - [ ] **Stage 1 вЂ” Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
   `APIKey`, `ProviderAccount.organization_id`, per-tenant persistence, BYOK
   credential storage. PostgreSQL is the durable store for platform state;
@@ -259,8 +269,10 @@ them may be described in the present tense.
 - [ ] Split of existing Core constructs that carry Platform or financial semantics:
   `AttemptUsageRecord` (physical vs cost fields), `RunAccountingRecord.project_id`,
   and `app/dashboard/` plus `app/dashboard/provider_health.py`.
-- [ ] `tool_call_count` as a Core-side measurement (required by `D-PLATFORM-06`,
-  absent today).
+- [x] `tool_call_count` as a Core-side measurement (required by `D-PLATFORM-06`).
+  Implemented as a measured count of tool invocations the attempt actually recorded
+  a bounded result for. It is `0` when no tool ran, which is a measurement rather
+  than a placeholder.
 - [ ] `ProviderAccount.secret_ref` extended to an abstract secret-reference scheme
   (`env:` / `vault:` / `kms:`).
 - [ ] `allow_paid_providers` moved out of process-global settings into per-tenant
@@ -519,13 +531,25 @@ workflow review/ревизии. Выполнение плана, управле�
 в репозитории пока не существует**; пункты ниже — это направление, и ни один
 из них нельзя описывать в настоящем времени.
 
-- [ ] **Stage 0.1 — durable physical telemetry в Core.** Ничто финансовое нельзя
-  построить раньше: сегодня `CapabilityFabric._run_usage` существует только в
-  памяти, а поле `accounting` у `RunStateSnapshot` не заполняется никогда, поэтому
-  потребление исчезает вместе с процессом.
+- [x] **Stage 0.1 — durable physical telemetry в Core.** Реализовано. `PhysicalTelemetry`
+  (`app/agent_runtime/physical_telemetry.py`) — физический контракт, а `FileTelemetrySink` —
+  переходный append-only локальный sink, одна JSON-строка на терминальную
+  попытку, с корнем вне исходного checkout. `AgentHarness` строит измерение для
+  действительно терминальной попытки (`COMPLETED`, `FAILED`, `LIMIT_REACHED`) и
+  сохраняет его; run, который ещё выполняется, ждёт одобрения или
+  завершается исключением, не записывается никогда. Запись
+  идемпотентна по идентичности попытки (`<run_id>#attempt-<n>`, существующая конвенция
+  `AttemptIdentity`) и переживает перезапуск процесса. Ни одно финансовое поле не
+  присутствует, и ни одно отсутствующее измерение не заменяется
+  оценкой. См. `D-PLATFORM-13`.
+  *Остаётся открытым на этом этапе:* наследные in-memory
+  `CapabilityFabric._run_usage` и неиспользуемое поле `RunStateSnapshot.accounting`
+  остаются; измерения токенов провайдера заполняются только
+  тогда, когда decision provider действительно сообщает `Usage`, чего
+  детерминированный провайдер по умолчанию не делает.
 - [ ] **Stage 0.2 — trusted execution port.** `TrustedExecutionRequest` на входе,
-  `PhysicalTelemetry` на выходе, шесть audit-полей передаются как данные и
-  никогда как authority.
+  `PhysicalTelemetry` на выходе; шесть audit-полей передаются как данные и
+  никогда как authority. `PhysicalTelemetry` существует; входной части нет.
 - [ ] **Stage 1 — Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
   `APIKey`, `ProviderAccount.organization_id`, per-tenant персистентность, BYOK-хранилище
   кредов. PostgreSQL — durable-хранилище платформенного состояния; Core
@@ -541,8 +565,11 @@ workflow review/ревизии. Выполнение плана, управле�
   финансовую семантику: `AttemptUsageRecord` (физика против cost-полей),
   `RunAccountingRecord.project_id`, а также `app/dashboard/` и
   `app/dashboard/provider_health.py`.
-- [ ] `tool_call_count` как измерение на стороне Core (требуется
-  `D-PLATFORM-06`, сегодня отсутствует).
+- [x] `tool_call_count` как измерение на стороне Core (требуется
+  `D-PLATFORM-06`). Реализовано как измеренное число вызовов инструментов, для
+  которых попытка действительно записала bounded-результат. Значение `0`
+  означает, что ни один инструмент не выполнялся, — это измерение, а не
+  заглушка.
 - [ ] `ProviderAccount.secret_ref`, расширенный до абстрактной схемы
   ссылок на секрет (`env:` / `vault:` / `kms:`).
 - [ ] `allow_paid_providers`, вынесенный из процесс-глобальных

@@ -22,6 +22,7 @@ from app.agents.providers.base import (
     ProviderError,
     ProviderRequest,
     ProviderResponse,
+    Usage,
 )
 from app.agents.providers.openai import OpenAIProvider
 from app.decision.models import (
@@ -63,6 +64,13 @@ class AIDecisionProvider:
         self._validator = validator or validate_decision
         self._strict_validation = strict_validation
         self.last_validation_report: DecisionValidationReport | None = None
+        # Physical measurement of the most recent provider call. It is recorded
+        # so the run loop can measure the attempt; it carries no authority and no
+        # money. It stays ``None`` when no provider call produced a response, and
+        # a missing measurement is never replaced with a guessed value.
+        self.last_usage: Usage | None = None
+        self.last_provider_name: str = ""
+        self.last_model_name: str = ""
 
     @property
     def provider_name(self) -> str:
@@ -173,6 +181,12 @@ class AIDecisionProvider:
         prompt = self.build_prompt(request)
         provider_req = ProviderRequest(prompt=prompt, model_name=self._model_name)
 
+        # Each decision is one physical provider call. Clear the previous
+        # measurement first so a failure never reports the earlier call's tokens.
+        self.last_usage = None
+        self.last_provider_name = ""
+        self.last_model_name = ""
+
         try:
             provider_res = self._provider.generate(provider_req)
         except Exception as exc:
@@ -182,6 +196,14 @@ class AIDecisionProvider:
                 rationale="Model provider execution failed safely",
                 error_type=type(exc).__name__,
             )
+
+        self.last_usage = getattr(provider_res, "usage", None)
+        self.last_provider_name = str(
+            getattr(provider_res, "provider_name", "") or self.provider_name
+        )
+        self.last_model_name = str(
+            getattr(provider_res, "model_name", "") or self.model_name
+        )
 
         output_text = getattr(provider_res, "output", "")
         if not isinstance(output_text, str) or not output_text.strip():

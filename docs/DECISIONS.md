@@ -3004,3 +3004,237 @@ Stage 0.1 не должен начинаться, пока всё перечис
    отдельного арендатора и должен быть перемещён или заменён.
 7. **Эти решения не меняют текущее поведение.** Ни код, ни тесты, ни один
    runtime-путь этой записью не изменяются.
+
+
+## Physical Execution Telemetry v0.1 (D-PLATFORM-13)
+
+Implements the first half of the Stage 0.1 boundary frozen in `D-PLATFORM-06` and
+`D-PLATFORM-07`, at baseline `0161d24`.
+
+### Accepted decisions
+
+- **The physical contract is separate from the accounting record.**
+  `app/agent_runtime/physical_telemetry.py::PhysicalTelemetry` is a frozen value
+  carrying identity and measurement only: `run_id`, `attempt_number`,
+  `provider_name`, `model_name`, `input_tokens`, `output_tokens`, `cached_tokens`,
+  `duration_seconds`, `success`, `fallback`, `tool_call_count`, `completed_at`,
+  `error_type`, and a derived `attempt_id`. It has no `to_dict` passthrough, so a
+  caller cannot smuggle an extra field into the durable record. The existing
+  `AttemptUsageRecord` / `RunAccountingRecord` are **not** deleted: they keep
+  serving runtime reporting and the dashboard. The new durable path simply does
+  not depend on their financial fields.
+- **There is one attempt identity, and it is the existing one.**
+  `PhysicalTelemetry.identity` returns `<run_id>#attempt-<n>`, which is exactly
+  `AttemptIdentity.attempt_id`. No second identity format was introduced.
+- **The sink is a port with a transitional local adapter.**
+  `PhysicalTelemetrySink` is a one-method protocol (`record` -> `bool`, raising on
+  failure). `FileTelemetrySink` writes one JSON line per terminal attempt to
+  `<root>/<run_id>.jsonl`, append-only, UTF-8, `sort_keys=True`, explicit bounded
+  serialization, no unsafe object serialization, no dynamic evaluation. The root
+  follows the existing `RunStore` convention and its own
+  `FORGE_TELEMETRY_ROOT`, and never lands inside the source checkout or the user's
+  workspace. This file is explicitly transitional infrastructure until a Platform
+  persistence layer exists.
+- **Terminal attempts only.** A measurement is written when an attempt reaches a
+  genuinely finished outcome: `COMPLETED`, `FAILED`, or `LIMIT_REACHED`.
+  `WAITING_FOR_APPROVAL` is terminal for the run loop but the attempt is not
+  finished, and a run that raises is not recorded at all. Writing either would
+  assert an outcome that did not happen.
+- **Idempotent per attempt, including across a restart.** The sink refuses a second
+  record for an identity it has already written, and it seeds that knowledge from
+  the file, so re-persisting after a process restart is still a no-op. There is no
+  distributed compare-and-set, no lease, and no database uniqueness: local file
+  idempotency follows the existing durability primitives of this project.
+- **A missing measurement is never invented.** Tokens are accumulated only from a
+  `Usage` the decision provider actually reports. A provider that reports nothing
+  contributes nothing and is recorded as measured zero, not as an estimate.
+  `tool_call_count` is the measured number of tool invocations the attempt
+  recorded a bounded result for; a measured zero means no tool ran.
+- **A write failure is reported, and it does not abort the run.** A failing sink
+  raises `TelemetryWriteError`; the harness reports it as a
+  `physical_telemetry_write_failed` event and keeps the run's own outcome. A
+  dropped record is never silent.
+- **The measurement carries no authority.** The `AgentHarness` builds it from
+  counts and durations it already holds. Nothing in `decision -> authorization ->
+  execution` changed: `AuthorizedExecution` stays the only execution authority,
+  the `RunScope` is untouched, the sandbox and network policy are untouched, and
+  approval semantics are untouched. Supplying a sink cannot widen what a run may
+  do.
+- **The sink is a composition dependency, like the run store and the idempotency
+  guard.** `create_agent_harness` supplies a default `FileTelemetrySink`, and
+  `ForgeApiService` accepts an explicit `telemetry_sink` and passes it to the
+  harness factory it uses for both the agent-loop and acceptance slices. An
+  embedding composition therefore records into its own storage rather than the
+  process default.
+- **Where the measurement comes from.** `AIDecisionProvider` is the only decision
+  provider in this repository that performs a real provider call, so it now retains
+  the response's physical measurement (`last_usage`, `last_provider_name`,
+  `last_model_name`) instead of discarding it. The harness accumulates it per
+  attempt and measures the attempt once, at the terminal boundary. Nothing else in
+  that class changed: it remains advisory and holds no authority.
+
+### Rejected alternatives
+
+- **Writing telemetry at decision time.** Rejected: the decision is not the
+  terminal outcome of the attempt, so a record written there would claim a result
+  that had not happened.
+- **Reusing `RunAccountingRecord` as the durable record.** Rejected: it carries
+  `estimated_cost`, `provider_reported_cost`, `effective_cost`, and `project_id`,
+  so persisting it would put money and ownership into the physical path. That is a
+  direct `D-PLATFORM-06` / `D-PLATFORM-07` violation.
+- **Deleting the financial fields from `AttemptUsageRecord` now.** Rejected for
+  this block: the dashboard and runtime reporting still consume them, so removing
+  them would be a refactor with its own compatibility risk. The split was achieved
+  by giving the durable path its own contract instead.
+- **A second telemetry stream beside the harness's events.** Rejected: the
+  measurement is emitted through the harness's existing collector, so there is one
+  event stream and one measurement, not two competing records of the same attempt.
+- **Recording a run that raised.** Rejected: an exception is not a terminal
+  outcome, and a fabricated failure record would be worse than no record.
+- **Defaulting missing tokens to an estimate.** Rejected: a guessed token count is
+  a false physical measurement, and the whole point of this boundary is that the
+  physical record is trustworthy.
+
+### Consequences and open items
+
+1. **Stage 0.2 is not done.** The trusted execution *port* is only half present:
+   `PhysicalTelemetry` is the output half, and there is no
+   `TrustedExecutionRequest` input half.
+2. **The legacy accounting path is still live and still in memory.**
+   `CapabilityFabric._run_usage` remains a `defaultdict(list)`, and the `accounting`
+   field of `RunStateSnapshot` is still never populated. This record adds a
+   durable physical path; it does not migrate the legacy one.
+3. **`provider_reported_cost` is still misleading.**
+   `app/orchestrator/dispatcher.py` continues to assign it from the model's own
+   `estimated_cost`. That is unchanged by this block and remains a `D-PLATFORM-07`
+   open item.
+4. **Token measurements are only as good as the decision provider.** The default
+   deterministic provider makes no provider call, so a production run using it
+   records an honest measured zero. A real AI decision provider records real
+   tokens, which
+   `tests/test_physical_telemetry.py::ProductionEntryPointTelemetryTests` proves
+   end to end through `ForgeApiService.run_agent_loop`.
+5. **This is transitional file persistence.** `FileTelemetrySink` is a local
+   append-only JSONL adapter behind a port. A Platform persistence layer replaces
+   the adapter without touching Core.
+6. **No financial semantics were added and none were moved.** Cost, price, charge,
+   wallet, credits, billing account, project ownership, organization ownership, and
+   user identity are absent from the contract and asserted absent by tests.
+
+
+## Physical Execution Telemetry v0.1 (D-PLATFORM-13) — русская версия
+
+Реализует первую половину границы Stage 0.1, замороженной в `D-PLATFORM-06` и
+`D-PLATFORM-07`, на базовой точке `0161d24`.
+
+### Принятые решения
+
+- **Физический контракт отделён от бухгалтерской записи.**
+  `app/agent_runtime/physical_telemetry.py::PhysicalTelemetry` — неизменяемое
+  значение, несущее только идентичность и измерение: `run_id`, `attempt_number`,
+  `provider_name`, `model_name`, `input_tokens`, `output_tokens`, `cached_tokens`,
+  `duration_seconds`, `success`, `fallback`, `tool_call_count`, `completed_at`,
+  `error_type` и производный `attempt_id`. У него нет passthrough в `to_dict`,
+  поэтому вызывающий не может протащить лишнее поле в durable-запись. Существующие
+  `AttemptUsageRecord` / `RunAccountingRecord` **не удаляются**: они продолжают
+  обслуживать runtime-отчётность и dashboard. Новый durable-путь просто не зависит
+  от их финансовых полей.
+- **Идентичность попытки одна, и она существующая.**
+  `PhysicalTelemetry.identity` возвращает `<run_id>#attempt-<n>`, что в точности
+  равно `AttemptIdentity.attempt_id`. Второй формат идентичности не вводился.
+- **Sink — это порт с переходным локальным адаптером.** `PhysicalTelemetrySink` —
+  протокол из одного метода (`record` -> `bool`, с исключением при сбое).
+  `FileTelemetrySink` пишет одну JSON-строку на терминальную попытку в
+  `<root>/<run_id>.jsonl`: append-only, UTF-8, `sort_keys=True`, явная
+  ограниченная сериализация, без небезопасной объектной сериализации, без
+  динамического вычисления. Корень следует существующей конвенции `RunStore` и
+  собственной переменной `FORGE_TELEMETRY_ROOT` и никогда не попадает внутрь
+  исходного checkout или в пользовательский workspace. Этот файл — явно переходная
+  инфраструктура до появления слоя персистентности Platform.
+- **Только терминальные попытки.** Измерение записывается, когда попытка достигает
+  действительно завершённого исхода: `COMPLETED`, `FAILED` или `LIMIT_REACHED`.
+  `WAITING_FOR_APPROVAL` терминально для цикла run, но попытка не завершена, а run,
+  завершившийся исключением, не записывается вовсе. Запись любого из них
+  утверждала бы исход, которого не было.
+- **Идемпотентность по попытке, включая перезапуск.** Sink отказывается писать
+  вторую запись для уже записанной идентичности и берёт это знание из файла,
+  поэтому повторная запись после перезапуска процесса по-прежнему no-op.
+  Распределённого compare-and-set, lease и уникальности в базе данных нет: локальная
+  файловая идемпотентность следует существующим примитивам durability этого проекта.
+- **Отсутствующее измерение никогда не выдумывается.** Токены накапливаются только
+  из `Usage`, которое decision provider действительно сообщает. Провайдер, который
+  ничего не сообщает, не даёт ничего и записывается как измеренный ноль, а не как
+  оценка. `tool_call_count` — измеренное число вызовов инструментов, для которых
+  попытка записала bounded-результат; измеренный ноль означает, что ни один
+  инструмент не выполнялся.
+- **Сбой записи сообщается и не прерывает run.** Падающий sink поднимает
+  `TelemetryWriteError`; harness сообщает об этом событием
+  `physical_telemetry_write_failed` и сохраняет собственный исход run. Потерянная
+  запись никогда не бывает беззвучной.
+- **Измерение не несёт authority.** `AgentHarness` строит его из счётчиков и
+  длительностей, которые у него уже есть. В цепочке `decision -> authorization ->
+  execution` ничего не изменилось: `AuthorizedExecution` остаётся единственной
+  execution authority, `RunScope` не тронут, политика sandbox и сети не тронута,
+  семантика одобрения не тронута. Передача sink не может расширить то, что run
+  может делать.
+- **Sink — это зависимость композиции, как run store и idempotency guard.**
+  `create_agent_harness` поставляет `FileTelemetrySink` по умолчанию, а
+  `ForgeApiService` принимает явный `telemetry_sink` и передаёт его в фабрику
+  harness, которую использует и для agent-loop, и для acceptance slice. Поэтому
+  встраивающая композиция пишет в собственное хранилище, а не в процессный дефолт.
+- **Откуда берётся измерение.** `AIDecisionProvider` — единственный decision
+  provider в этом репозитории, выполняющий реальный вызов провайдера, поэтому теперь
+  он сохраняет физическое измерение ответа (`last_usage`, `last_provider_name`,
+  `last_model_name`) вместо того, чтобы его отбрасывать. Harness накапливает его по
+  попытке и измеряет попытку один раз, на терминальной границе. Больше в этом классе
+  ничего не изменилось: он остаётся рекомендательным и не несёт authority.
+
+### Отклонённые альтернативы
+
+- **Запись телеметрии в момент решения.** Отклонено: решение не является
+  терминальным исходом попытки, поэтому запись там утверждала бы результат, которого
+  не было.
+- **Использование `RunAccountingRecord` как durable-записи.** Отклонено: он несёт
+  `estimated_cost`, `provider_reported_cost`, `effective_cost` и `project_id`,
+  поэтому его сохранение поместило бы деньги и владение в физический путь. Это прямое
+  нарушение `D-PLATFORM-06` / `D-PLATFORM-07`.
+- **Удаление финансовых полей из `AttemptUsageRecord` сейчас.** Отклонено для этого
+  блока: dashboard и runtime-отчётность всё ещё их потребляют, поэтому удаление было
+  бы рефактором с собственным риском совместимости. Разделение достигнуто тем, что
+  durable-путь получил собственный контракт.
+- **Второй поток телеметрии рядом с событиями harness.** Отклонено: измерение
+  испускается через существующий коллектор harness, поэтому есть один поток событий и
+  одно измерение, а не две конкурирующие записи об одной попытке.
+- **Запись run, завершившегося исключением.** Отклонено: исключение не является
+  терминальным исходом, и сфабрикованная запись о сбое была бы хуже отсутствия
+  записи.
+- **Подстановка оценки вместо отсутствующих токенов.** Отклонено: угаданное число
+  токенов — ложное физическое измерение, а весь смысл этой границы в том, что
+  физическая запись достоверна.
+
+### Следствия и открытые пункты
+
+1. **Stage 0.2 не выполнен.** Trusted execution *port* присутствует лишь наполовину:
+   `PhysicalTelemetry` — выходная половина, а входной половины
+   `TrustedExecutionRequest` нет.
+2. **Наследный accounting-путь всё ещё живой и всё ещё в памяти.**
+   `CapabilityFabric._run_usage` остаётся `defaultdict(list)`, а поле `accounting` у
+   `RunStateSnapshot` по-прежнему не заполняется. Эта запись добавляет durable
+   физический путь; она не мигрирует наследный.
+3. **`provider_reported_cost` по-прежнему вводит в заблуждение.**
+   `app/orchestrator/dispatcher.py` продолжает присваивать ему собственную
+   `estimated_cost` модели. Это не изменено этим блоком и остаётся открытым пунктом
+   `D-PLATFORM-07`.
+4. **Измерения токенов настолько хороши, насколько хорош decision provider.**
+   Дефолтный детерминированный провайдер не делает вызовов провайдера, поэтому
+   production-run с ним записывает честный измеренный ноль. Реальный AI decision
+   provider записывает реальные токены, что доказывает end-to-end
+   `tests/test_physical_telemetry.py::ProductionEntryPointTelemetryTests` через
+   `ForgeApiService.run_agent_loop`.
+5. **Это переходная файловая персистентность.** `FileTelemetrySink` — локальный
+   append-only JSONL-адаптер за портом. Слой персистентности Platform заменяет
+   адаптер, не трогая Core.
+6. **Никакой финансовой семантики не добавлено и не перенесено.** Cost, price,
+   charge, wallet, credits, billing account, project ownership, organization
+   ownership и user identity отсутствуют в контракте, и тесты утверждают их
+   отсутствие.

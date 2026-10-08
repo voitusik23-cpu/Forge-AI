@@ -107,6 +107,20 @@ def create_loop_coordinator(isolate_workspace: bool = True) -> "ExecutionCoordin
     )
 
 
+def _default_telemetry_sink() -> object:
+    """Build the composition's default durable physical-telemetry sink.
+
+    Imported lazily so composition does not pay for the telemetry module unless a
+    harness is actually built, and so the sink stays replaceable through the same
+    injected port. The root follows the existing per-user storage convention:
+    ``FORGE_TELEMETRY_ROOT`` when set, otherwise a per-user location outside the
+    source checkout. It is never the user's workspace.
+    """
+    from app.agent_runtime.physical_telemetry import FileTelemetrySink
+
+    return FileTelemetrySink()
+
+
 def create_agent_harness(
     *,
     decision_provider: object | None = None,
@@ -119,6 +133,7 @@ def create_agent_harness(
     revision_budget: object | None = None,
     tool_executor: object | None = None,
     tool_registry: object | None = None,
+    telemetry_sink: object | None = None,
 ) -> "AgentHarness":
     """Build the canonical production orchestration loop.
 
@@ -184,6 +199,14 @@ def create_agent_harness(
             tool_executor
             if tool_executor is not None
             else ToolExecutor(build_default_tool_registry(tool_registry))
+        ),
+        # Durable physical telemetry (Stage 0.1). The composition supplies the
+        # local append-only sink, using the same per-user storage convention as
+        # the run store; a caller may inject another sink implementing the same
+        # port. It measures a terminal attempt and grants no authority, so it can
+        # neither widen a run nor change what a run may execute.
+        "telemetry_sink": (
+            telemetry_sink if telemetry_sink is not None else _default_telemetry_sink()
         ),
     }
     resolved_coordinator = coordinator

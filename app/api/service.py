@@ -188,6 +188,10 @@ class ForgeApiService:
         ] = None,
         harness_factory: Callable[..., object] | None = None,
         idempotency_guard: object | None = None,
+        # Composition-supplied durable sink for physical execution telemetry
+        # (Stage 0.1). It measures a terminal attempt and grants no authority, so
+        # supplying one cannot widen what a run may do.
+        telemetry_sink: object | None = None,
         # Operator-supplied, server-side tool intents for this run. Each is a
         # ToolIntent: a tool identity plus bounded data arguments. A ToolIntent
         # grants nothing on its own - the run's frozen allowed_tool_ids decides
@@ -220,6 +224,12 @@ class ForgeApiService:
         # implementation; the service only asks it for a harness with the narrowed
         # bounds of the first vertical slice.
         self._harness_factory = harness_factory or create_agent_harness
+        # Composition-time durable sink for the physical measurement of a terminal
+        # attempt (Stage 0.1). It is supplied by the composition - exactly like the
+        # run store and the idempotency guard - so a service written by an
+        # embedding caller records into its own storage rather than the process
+        # default. It measures; it grants no authority.
+        self._telemetry_sink = telemetry_sink
         # The idempotency decision seam. Injected explicitly by tests and by
         # any composition that wants its own ledger; otherwise the lazy
         # process-wide guard is used. It decides whether a second execution
@@ -1079,6 +1089,7 @@ class ForgeApiService:
                 else SINGLE_ACTION_LOOP_POLICY
             ),
             tool_executor=self._tool_executor,
+            telemetry_sink=self._telemetry_sink,
         )
         t0 = time.perf_counter()
         result = harness.run(request)
@@ -1396,6 +1407,7 @@ class ForgeApiService:
             policy=ACCEPTANCE_LOOP_POLICY,
             coordinator=self._acceptance_coordinator(),
             tool_executor=self._tool_executor,
+            telemetry_sink=self._telemetry_sink,
         )
         t0 = time.perf_counter()
         result = harness.run(request)

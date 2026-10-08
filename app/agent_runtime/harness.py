@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -17,6 +18,11 @@ from app.agent_runtime.models import (
     StructuredObservation,
 )
 from app.agent_runtime.policy import AgentHarnessPolicy
+from app.agent_runtime.physical_telemetry import (
+    PhysicalTelemetry,
+    PhysicalTelemetrySink,
+    TelemetryWriteError,
+)
 from app.context.assembler import DecisionContextAssembler
 from app.decision.models import Decision, DecisionAction, DecisionRequest, DecisionType
 from app.decision.provider import DecisionProvider, DeterministicDecisionProvider
@@ -126,6 +132,7 @@ class AgentHarness:
         project_planner: Any | None = None,
         revision_budget: RevisionBudget | None = None,
         tool_executor: ToolExecutor | None = None,
+        telemetry_sink: PhysicalTelemetrySink | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -161,6 +168,12 @@ class AgentHarness:
         # and the tool call itself. The harness only composes the input for it
         # from the run's frozen perimeter.
         self._tool_executor = tool_executor
+        # Optional durable sink for the physical measurement of a terminal
+        # attempt. It receives counts and durations only: it is a measurement
+        # boundary, not an authority boundary, so supplying a sink can never
+        # widen what a run may do. When no sink is supplied no physical
+        # telemetry is persisted, and nothing is fabricated to fill the gap.
+        self._telemetry_sink = telemetry_sink
         # Criterion-binding fingerprints for the runs this harness instance is
         # driving. This is deliberately per-instance and bounded: it is not a
         # process-global registry, so two harnesses never see each other's
@@ -168,6 +181,157 @@ class AgentHarness:
         # call. It records a *binding*, never authority: the frozen ``RunScope``
         # stays the only authority boundary.
         self._bindings: dict[str, str] = {}
+
+    # ------------------------------------------------------------------ #
+    # physical telemetry (Stage 0.1)
+    # ------------------------------------------------------------------ #
+
+    def _reset_provider_measurements(self) -> None:
+        """Start a fresh physical measurement for one attempt.
+
+        Accumulated only while a run loop is executing, and cleared at the start
+        of every attempt, so one attempt can never inherit the previous attempt's
+        measured tokens.
+        """
+        self._last_telemetry: PhysicalTelemetry | None = None
+        self._attempt_input_tokens = 0
+        self._attempt_output_tokens = 0
+        self._attempt_cached_tokens = 0
+        self._attempt_provider_name = ""
+        self._attempt_model_name = ""
+        self._attempt_error_type = ""
+
+    def _accumulate_provider_measurement(self, decision: object | None = None) -> None:
+        """Add the decision provider's physical measurement for one call.
+
+        The provider is asked for its *own* measurement only when it exposes one.
+        A provider that reports nothing contributes nothing: a missing
+        measurement is never replaced by an estimate, because a fabricated token
+        count would be a false physical record.
+        """
+        usage = getattr(self._decision_provider, "last_usage", None)
+        if usage is not None:
+            self._attempt_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+            self._attempt_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+            self._attempt_cached_tokens += int(getattr(usage, "cached_tokens", 0) or 0)
+        provider_name = str(getattr(self._decision_provider, "last_provider_name", "") or "")
+        model_name = str(getattr(self._decision_provider, "last_model_name", "") or "")
+        if provider_name:
+            self._attempt_provider_name = provider_name
+        if model_name:
+            self._attempt_model_name = model_name
+        # A provider that failed produced a measurable call without a usable
+        # measurement. The failure reason is recorded as the outcome annotation;
+        # no tokens are invented for it.
+        reason_code = str(getattr(decision, "reason_code", "") or "")
+        if reason_code in ("provider_failure", "empty_model_output"):
+            self._attempt_error_type = reason_code
+
+    def _build_attempt_telemetry(
+        self,
+        request: HarnessRequest,
+        result: HarnessResult,
+        *,
+        duration_seconds: float,
+        tool_call_count: int,
+    ) -> PhysicalTelemetry:
+        """Build the physical measurement for one terminal attempt.
+
+        Only values that were actually observed are used. A run that made no
+        measurable provider call reports zero tokens rather than an estimate, and
+        the record says nothing about money, ownership, or authority.
+        """
+        status = getattr(getattr(result, "final_state", None), "status", None)
+        status_name = status.value if hasattr(status, "value") else str(status or "")
+        terminal_ok = status_name in (
+            HarnessStatus.COMPLETED.value,
+            HarnessStatus.LIMIT_REACHED.value,
+        )
+        metadata = getattr(getattr(result, "final_state", None), "metadata", None) or {}
+        reason = str(metadata.get("reason", "")) if isinstance(metadata, Mapping) else ""
+        error_type = getattr(self, "_attempt_error_type", "")
+        if not error_type and not terminal_ok:
+            error_type = reason or status_name
+        attempt_number = int(getattr(request, "attempt_number", 0) or 0)
+        return PhysicalTelemetry(
+            run_id=request.run_id,
+            attempt_number=attempt_number,
+            provider_name=getattr(self, "_attempt_provider_name", ""),
+            model_name=getattr(self, "_attempt_model_name", ""),
+            input_tokens=getattr(self, "_attempt_input_tokens", 0),
+            output_tokens=getattr(self, "_attempt_output_tokens", 0),
+            cached_tokens=getattr(self, "_attempt_cached_tokens", 0),
+            duration_seconds=duration_seconds,
+            success=terminal_ok,
+            # The harness reports a fallback only when a provider-level fallback
+            # actually happened; nothing here infers one from an attempt number.
+            fallback=False,
+            tool_call_count=max(0, int(tool_call_count)),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            error_type=error_type,
+        )
+
+    def _record_attempt_telemetry(
+        self,
+        request: HarnessRequest,
+        result: HarnessResult,
+        *,
+        duration_seconds: float,
+        tool_call_count: int,
+    ) -> PhysicalTelemetry | None:
+        """Persist the physical measurement of one terminal attempt.
+
+        Returns the measurement that was built, or ``None`` when no sink is
+        configured. A sink failure is raised to the caller, which reports it as an
+        observable event: a durable boundary that dropped a record silently would
+        not be a boundary.
+        """
+        telemetry = self._build_attempt_telemetry(
+            request,
+            result,
+            duration_seconds=duration_seconds,
+            tool_call_count=tool_call_count,
+        )
+        self._last_telemetry = telemetry
+        if self._telemetry_sink is None:
+            return telemetry
+        self._telemetry_sink.record(telemetry)
+        return telemetry
+
+    def _record_telemetry_or_report(
+        self,
+        request: HarnessRequest,
+        result: HarnessResult,
+        *,
+        duration_seconds: float,
+        tool_call_count: int,
+        emit: Callable[[EventType, Mapping[str, object] | None], None],
+    ) -> None:
+        """Record terminal telemetry, reporting a write failure instead of hiding it.
+
+        A failing durable sink must never abort a completed run, and it must never
+        be silent either: a dropped record would make the durable boundary
+        untrustworthy. The failure is reported as an observable event, and the run
+        keeps its own outcome.
+        """
+        try:
+            telemetry = self._record_attempt_telemetry(
+                request,
+                result,
+                duration_seconds=duration_seconds,
+                tool_call_count=tool_call_count,
+            )
+        except TelemetryWriteError as exc:
+            emit(
+                EventType.HARNESS_FAILED,
+                {
+                    "reason": "physical_telemetry_write_failed",
+                    "failure_category": type(exc).__name__,
+                },
+            )
+            return
+        if telemetry is not None and self._telemetry_sink is not None:
+            emit(EventType.HARNESS_OBSERVATION_RECORDED, telemetry.bounded_summary())
 
     def _prune_released_bindings(self) -> None:
         """Drop bindings whose run scope has been released.
@@ -457,6 +621,10 @@ class AgentHarness:
                     pass
 
         emit(EventType.HARNESS_STARTED, {"policy": repr(self.policy)})
+        # Physical measurement for this attempt starts here and is cleared per
+        # attempt, so measured tokens are never inherited across attempts.
+        self._reset_provider_measurements()
+        attempt_started_at = time.perf_counter()
         iterations_history: list[HarnessState] = []
         observations: list[StructuredObservation] = []
         decisions: list[Decision] = []
@@ -558,7 +726,7 @@ class AgentHarness:
                         "failure_category": outcome.failure_category,
                     },
                 )
-                return HarnessResult(
+                failed_result = HarnessResult(
                     run_id=request.run_id,
                     final_state=final_state,
                     iterations=(final_state,),
@@ -570,6 +738,14 @@ class AgentHarness:
                     final_project_state=current_project_state,
                     events=tuple(collector.events),
                 )
+                self._record_telemetry_or_report(
+                    request,
+                    failed_result,
+                    duration_seconds=time.perf_counter() - attempt_started_at,
+                    tool_call_count=0,
+                    emit=emit,
+                )
+                return failed_result
 
 
 
@@ -858,6 +1034,7 @@ class AgentHarness:
                 {"decision_id": dec_req.decision_id, "iteration": current_state.iteration},
             )
             decision = self._decision_provider.decide(dec_req)
+            self._accumulate_provider_measurement(decision)
             emit(
                 EventType.DECISION_MADE,
                 {
@@ -1440,6 +1617,44 @@ class AgentHarness:
                 phase=HarnessPhase.OBSERVE,
             )
 
+        # Physical telemetry is durable only for a genuinely terminal attempt.
+        # ``WAITING_FOR_APPROVAL`` is terminal for this run loop but the attempt is
+        # not finished, and a run that raises is not recorded at all: writing a
+        # measurement for either would assert an outcome that did not happen. This
+        # runs before the result is built so a reported telemetry-write failure is
+        # part of the run's own event history.
+        status = getattr(current_state, "status", None)
+        status_name = status.value if hasattr(status, "value") else str(status or "")
+        # The tool call count is a measured count, not a guess: every tool
+        # invocation this attempt actually recorded a bounded result for. A
+        # measured zero means no tool ran, which is a real measurement.
+        measured_tool_calls = len(tool_results)
+        if status_name in (
+            HarnessStatus.COMPLETED.value,
+            HarnessStatus.FAILED.value,
+            HarnessStatus.LIMIT_REACHED.value,
+        ):
+            self._record_telemetry_or_report(
+                request,
+                HarnessResult(
+                    run_id=request.run_id,
+                    final_state=current_state,
+                    iterations=tuple(iterations_history),
+                    observations=tuple(observations),
+                    decisions=tuple(decisions),
+                    execution_results=tuple(execution_results),
+                    verification_results=tuple(verification_results),
+                    final_acceptance=acceptance_result,
+                    final_project_state=current_project_state,
+                    events=(),
+                ),
+                duration_seconds=time.perf_counter() - attempt_started_at,
+                tool_call_count=measured_tool_calls,
+                emit=emit,
+            )
+
+        # The events are read after the telemetry boundary, so a reported write
+        # failure is included in this run's history rather than dropped.
         return HarnessResult(
             run_id=request.run_id,
             final_state=current_state,
