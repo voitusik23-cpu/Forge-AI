@@ -112,6 +112,8 @@ def create_agent_harness(
     decision_provider: object | None = None,
     coordinator: object | None = None,
     policy: object | None = None,
+    project_discovery: object | None = None,
+    with_discovery: bool = True,
 ) -> "AgentHarness":
     """Build the canonical production orchestration loop.
 
@@ -121,12 +123,18 @@ def create_agent_harness(
     authority is supplied here, so a harness built by composition cannot execute
     anything on its own.
 
+    The production loop enables the bounded server-side discovery stage by
+    default, so a decision is taken on an actual observation of the trusted
+    workspace. Discovery holds no authority: it reads through the existing bounded
+    scanner and can neither widen the perimeter nor choose its own root.
+
     Defaults are the deterministic decision provider and a coordinator over a
     local adapter, matching the historical behaviour; callers may inject a bounded
     policy (for example the one-action policy of the first vertical slice).
     """
     from app.agent_runtime.harness import AgentHarness
     from app.agent_runtime.policy import AgentHarnessPolicy
+    from app.agent_runtime.project_discovery import ProjectDiscovery
     from app.decision.provider import DeterministicDecisionProvider
     from app.execution.adapter import LocalExecutionAdapter
     from app.execution.authorizer import ExecutionCoordinator
@@ -134,6 +142,13 @@ def create_agent_harness(
     kwargs = {
         "decision_provider": decision_provider or DeterministicDecisionProvider(),
         "policy": policy or AgentHarnessPolicy(),
+        # Server-side observation layer, created at composition time with
+        # composition-owned limits. Nothing per-run can replace it.
+        "project_discovery": (
+            project_discovery
+            if project_discovery is not None
+            else (ProjectDiscovery() if with_discovery else None)
+        ),
     }
     resolved_coordinator = coordinator
     if resolved_coordinator is None:

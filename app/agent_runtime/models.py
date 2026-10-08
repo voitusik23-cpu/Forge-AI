@@ -126,6 +126,10 @@ class HarnessRequest:
     available_skills: tuple[SkillDefinition, ...] = ()
     available_capabilities: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+    # Per-run bounded project observation produced by the harness's discovery
+    # stage. It is populated inside the run loop, never supplied by a caller, a
+    # decision, or an LLM, and it carries no authority.
+    understanding_snapshot: object | None = None
     # Immutable security perimeter for this run. When present it binds the
     # authority-relevant inputs and is validated before any context, memory,
     # knowledge, or provider output is read.

@@ -1299,3 +1299,182 @@ and `tests/test_acceptance_production.py`.
    артефакты сборки) потребовали бы собственного детерминированного verifier и
    собственного решения.
 4. **GAP-A, GAP-B и идемпотентность этим блоком не изменены.**
+
+## Production Project Discovery v0.1
+
+Implemented in the project discovery block. Verified against the code in
+`app/agent_runtime/project_discovery.py`, `app/agent_runtime/harness.py`,
+`app/api/service.py`, `app/runtime/bootstrap.py`, `app/orchestrator/models.py`,
+and `tests/test_project_discovery_production.py`.
+
+### Accepted decisions
+
+- **Discovery is a server-side observation layer inside the existing loop.** It
+  runs as a stage of `AgentHarness.run`, before the first context assembly.
+  `AgentHarness` stays the only production orchestration loop; no
+  `ProjectAgent`, `DiscoveryAgent`, `ContextAgent`, second coordinator, or second
+  loop was created.
+- **The existing bounded scanner is the trust boundary.** `BoundedProjectScanner`
+  already enforces file count, per-file size, total bytes, ignored directories,
+  symlink handling, secret-file exclusion, and binary handling. Those policies are
+  reused verbatim; nothing is re-implemented and there is no second discovery
+  system.
+- **The existing snapshot model is reused.** `UnderstandingSnapshotter` produces
+  the frozen `UnderstandingSnapshot` with its deterministic
+  `workspace_fingerprint`. No new snapshot type, database, or event store was
+  introduced.
+- **The root is composition-owned.** `ProjectDiscovery.observe` accepts only a
+  `Workspace`, and the service supplies its own through `HarnessRequest`. No task
+  request, decision, or LLM can choose a root, choose a scanner, change limits, or
+  disable a boundary. `TaskRunRequest` gained no field.
+- **Discovery is bounded, not a filesystem dump.** A snapshot carries paths,
+  fingerprints, bounded structural facts, manifests, topology, and warnings. The
+  context receives only the bounded `summarize_snapshot` counts, not the file
+  inventory, so secret paths never reach the decision.
+- **Discovery is not authority.** A snapshot cannot widen a `RunScope` or add a
+  command, tool, profile, environment value, or timeout; the decision provider
+  receives no scope, workspace, approval policy, scanner, or filesystem handle.
+  Discovery never executes anything: no subprocess, no shell, no coordinator, no
+  adapter.
+- **One run, one snapshot.** The snapshot is produced fresh at the start of each
+  run, is immutable, and is never reused across runs. A later run observes the
+  current workspace; unchanged content yields the same bounded fingerprint.
+- **Failure fails closed.** A discovery failure yields no snapshot, no context
+  item, and no decision: the run terminates as `FAILED` with reason
+  `project_discovery_failed`. A raising discovery implementation is classified as
+  a failure rather than aborting the loop with an untyped exception. There is no
+  silent fallback to unrestricted filesystem access, and a partial observation is
+  never presented as complete.
+- **Two purpose-named events, sanitized metadata.** `PROJECT_DISCOVERY_STARTED`
+  and `PROJECT_DISCOVERY_COMPLETED` were added. They record run id, task id,
+  bounded counts, workspace fingerprint, snapshot id, duration, and a safe failure
+  category. `SNAPSHOT_CREATED` was deliberately not reused because it already
+  means a project file snapshot for change tracking, which is a different concept.
+- **Every event carries one identity.** Harness events take their task id from the
+  task specification or from server-side request metadata, so discovery, decision,
+  execution, verification, and acceptance can never be attributed to different
+  runs or tasks.
+
+### Rejected alternatives (with rationale)
+
+- **Passing a snapshot in from the caller.** Rejected: it would let the caller
+  choose what the decision observes, and a stale or forged snapshot would be
+  indistinguishable from a fresh one.
+- **Letting the decision provider or LLM drive discovery.** Rejected: the decision
+  is a replaceable component and must not control the observation boundary.
+- **A new discovery scanner or snapshot type.** Rejected: the bounded scanner and
+  the frozen snapshot already exist and are tested.
+- **Reusing `SNAPSHOT_CREATED`.** Rejected: that event belongs to the project
+  file-snapshot mechanism used for change tracking.
+- **Continuing the run after a discovery failure with an empty snapshot.**
+  Rejected: an unusable observation presented as a complete one is exactly the
+  silent downgrade the block forbids.
+- **Freezing or locking the filesystem between discovery and execution.**
+  Deferred: the snapshot describes the workspace as of discovery, and execution
+  and verification keep their existing authority and semantics. Locking is a
+  separate concern.
+
+### Consequences and open items
+
+1. **Snapshot consistency is point-in-time only.** The workspace may change after
+   discovery. No locking, no distributed cache, and no resume were added; the
+   snapshot documents the workspace at the moment it was taken.
+2. **`max_depth` is not bounded by the existing scanner.** It bounds file count,
+   per-file size, and total bytes, but not directory depth. Adding a depth bound
+   would be a change to the scanner's own contract and is left as a separate item.
+3. **One observation per run.** Discovery runs once, before the first context
+   assembly; there is no re-observation mid-run.
+4. **GAP-A, GAP-B, GAP-F (task-driven criteria), planning, revision loop, tool
+   execution through the harness, memory, knowledge, reviewer, and
+   idempotency/resume are unchanged** by this block.
+
+## Production Project Discovery v0.1 — русская версия
+
+Реализовано в блоке project discovery. Проверено по коду в
+`app/agent_runtime/project_discovery.py`, `app/agent_runtime/harness.py`,
+`app/api/service.py`, `app/runtime/bootstrap.py`, `app/orchestrator/models.py`
+и `tests/test_project_discovery_production.py`.
+
+### Принятые решения
+
+- **Discovery — server-side слой наблюдения внутри существующего loop.** Он
+  выполняется как стадия `AgentHarness.run`, до первой сборки контекста.
+  `AgentHarness` остаётся единственным production-orchestration loop; ни
+  `ProjectAgent`, ни `DiscoveryAgent`, ни `ContextAgent`, ни второй координатор,
+  ни второй loop не создавались.
+- **Существующий bounded scanner — это trust boundary.** `BoundedProjectScanner`
+  уже обеспечивает лимит файлов, размер файла, общий объём байт, игнорируемые
+  каталоги, обработку symlink, исключение секретных файлов и обработку бинарных
+  файлов. Эти политики переиспользованы как есть; ничего не переписывалось, второй
+  системы discovery нет.
+- **Существующая модель snapshot переиспользована.** `UnderstandingSnapshotter`
+  создаёт замороженный `UnderstandingSnapshot` с детерминированным
+  `workspace_fingerprint`. Новый тип snapshot, база данных или event store не
+  вводились.
+- **Root принадлежит композиции.** `ProjectDiscovery.observe` принимает только
+  `Workspace`, а сервис передаёт собственный через `HarnessRequest`. Ни запрос
+  задачи, ни decision, ни LLM не могут выбрать root, выбрать scanner, изменить
+  лимиты или отключить границу. `TaskRunRequest` не получил новых полей.
+- **Discovery ограничен, а не дамп файловой системы.** Snapshot несёт пути,
+  отпечатки, ограниченные структурные факты, манифесты, топологию и
+  предупреждения. В контекст попадают только ограниченные счётчики
+  `summarize_snapshot`, а не инвентарь файлов, поэтому пути секретов не достигают
+  decision.
+- **Discovery — не authority.** Snapshot не может расширить `RunScope` или
+  добавить команду, tool, профиль, значение окружения или timeout; decision
+  provider не получает ни scope, ни workspace, ни approval-политику, ни scanner,
+  ни filesystem handle. Discovery ничего не исполняет: ни subprocess, ни shell, ни
+  координатор, ни adapter.
+- **Один run — один snapshot.** Snapshot создаётся заново в начале каждого run,
+  неизменяем и никогда не переиспользуется между run. Следующий run наблюдает
+  текущий workspace; неизменное содержимое даёт тот же bounded fingerprint.
+- **Сбой — fail closed.** Сбой discovery не даёт ни snapshot, ни элемента
+  контекста, ни решения: run завершается как `FAILED` с причиной
+  `project_discovery_failed`. Реализация discovery, бросающая исключение,
+  классифицируется как сбой, а не прерывает loop нетипизированным исключением.
+  Молчаливого отката к неограниченному доступу к файловой системе нет, и частичное
+  наблюдение никогда не выдаётся за полное.
+- **Два события с целевыми именами и санитизированными метаданными.**
+  Добавлены `PROJECT_DISCOVERY_STARTED` и `PROJECT_DISCOVERY_COMPLETED`. Они
+  записывают run id, task id, ограниченные счётчики, отпечаток workspace, snapshot
+  id, длительность и безопасную категорию сбоя. `SNAPSHOT_CREATED` намеренно не
+  переиспользован, поскольку он уже означает project file snapshot для
+  отслеживания изменений — это другое понятие.
+- **Каждое событие несёт одну идентичность.** События harness берут task id из
+  task specification или из server-side метаданных запроса, поэтому discovery,
+  decision, execution, verification и acceptance не могут быть отнесены к разным
+  run или task.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Передавать snapshot от вызывающего.** Отклонено: это позволило бы
+  вызывающему выбирать, что наблюдает decision, а устаревший или подделанный
+  snapshot был бы неотличим от свежего.
+- **Позволять decision provider или LLM управлять discovery.** Отклонено:
+  decision — заменяемый компонент и не должен управлять границей наблюдения.
+- **Новый scanner discovery или новый тип snapshot.** Отклонено: bounded scanner
+  и замороженный snapshot уже существуют и покрыты тестами.
+- **Переиспользовать `SNAPSHOT_CREATED`.** Отклонено: это событие принадлежит
+  механизму project file snapshot для отслеживания изменений.
+- **Продолжать run после сбоя discovery с пустым snapshot.** Отклонено:
+  непригодное наблюдение, выданное за полное, — ровно тот молчаливый downgrade,
+  который блок запрещает.
+- **Замораживать или блокировать файловую систему между discovery и
+  исполнением.** Отложено: snapshot описывает workspace на момент discovery, а
+  исполнение и verification сохраняют существующие authority и семантику.
+  Блокировка — отдельная задача.
+
+### Следствия и открытые пункты
+
+1. **Согласованность snapshot — только на момент времени.** Workspace может
+   измениться после discovery. Блокировки, распределённый кэш и resume не
+   добавлялись; snapshot документирует workspace в момент его снятия.
+2. **`max_depth` существующим scanner'ом не ограничен.** Он ограничивает число
+   файлов, размер файла и общий объём байт, но не глубину каталогов. Добавление
+   ограничения глубины было бы изменением контракта самого scanner'а и оставлено
+   отдельным пунктом.
+3. **Одно наблюдение на run.** Discovery выполняется один раз, до первой сборки
+   контекста; повторного наблюдения в середине run нет.
+4. **GAP-A, GAP-B, GAP-F (task-driven критерии), planning, revision loop,
+   исполнение tools через harness, memory, knowledge, reviewer и
+   idempotency/resume этим блоком не изменены.**

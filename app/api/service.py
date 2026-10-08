@@ -559,6 +559,7 @@ class ForgeApiService:
         run_id: str,
         declaration: ExecutionDeclaration,
         scope: RunScope,
+        task_id: str,
     ) -> HarnessRequest:
         """Assemble the per-run input for the canonical orchestration loop.
 
@@ -591,7 +592,12 @@ class ForgeApiService:
             approval_policy=self._approval_policy,
             approval_resolver=self._approval_resolver,
             run_scope=scope,
-            metadata={"declaration_id": declaration.declaration_id},
+            # Server-side identity for the loop's own events, so discovery,
+            # decision, and execution share one task identity with the run record.
+            metadata={
+                "declaration_id": declaration.declaration_id,
+                "task_id": task_id,
+            },
         )
 
     def run_agent_loop(
@@ -658,7 +664,9 @@ class ForgeApiService:
             except Exception:  # noqa: BLE001 - persistence must not block a run
                 pass
 
-        request = self._build_harness_request(run_id, declaration, scope)
+        request = self._build_harness_request(
+            run_id, declaration, scope, task_id
+        )
         # Built by the same composition factory that supplies the runtime's
         # canonical harness, differing only in the narrowed bounds of this slice.
         # No second loop implementation and no second authority object exist.
@@ -879,6 +887,7 @@ class ForgeApiService:
             run_scope=scope,
             metadata={
                 "declaration_id": declaration.declaration_id,
+                "task_id": task_id,
                 "criterion_ids": list(criteria.criterion_ids),
             },
         )

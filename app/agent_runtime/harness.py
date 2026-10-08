@@ -67,6 +67,7 @@ class AgentHarness:
         skill_evaluator: SkillEvaluator | None = None,
         memory_store: Any | None = None,
         observer: Callable[[EventType, Mapping[str, object]], None] | None = None,
+        project_discovery: Any | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -83,6 +84,9 @@ class AgentHarness:
         # never a second event stream - so a production caller can persist the
         # loop's observable stages without changing the run loop.
         self._observer = observer
+        # Optional server-side observation layer. It holds no authority: it reads
+        # the workspace the request carries and returns a bounded snapshot.
+        self._project_discovery = project_discovery
 
     def _enforce_run_scope(self, request: HarnessRequest) -> None:
         """Freeze and enforce the run's security perimeter before any read.
@@ -178,10 +182,21 @@ class AgentHarness:
 
         def emit(event_type: EventType, data: Mapping[str, object] | None = None) -> None:
             payload = data or {}
+            # Every emitted event carries the same run and task identity, so a
+            # discovery, decision, or execution event can never be attributed to
+            # a different run. The identity comes from the task specification when
+            # present, otherwise from the server-side request metadata.
+            task_id = (
+                request.task_specification.task_id
+                if request.task_specification
+                else request.metadata.get("task_id")
+            )
+            if task_id is not None and "task_id" not in payload:
+                payload = {**payload, "task_id": task_id}
             collector.emit(
                 event_type,
                 attempt_number=current_state.attempt_number,
-                task_id=request.task_specification.task_id if request.task_specification else None,
+                task_id=task_id,
                 metadata=payload,
             )
             if self._observer is not None:
@@ -210,6 +225,71 @@ class AgentHarness:
             attempt_number=request.attempt_number,
             task_id=request.task_specification.task_id if request.task_specification else "",
         )
+
+        # Bounded, server-side project observation for this run. It is produced
+        # once, before the first context assembly, from the request's trusted
+        # workspace. A discovery failure is never silently downgraded: the run
+        # fails closed and terminally rather than deciding on a fabricated or
+        # partial picture of the project.
+        understanding_snapshot: object | None = None
+        discovery_failed = False
+        if self._project_discovery is not None and request.workspace is not None:
+            emit(
+                EventType.PROJECT_DISCOVERY_STARTED,
+                {"run_id": request.run_id},
+            )
+            try:
+                outcome = self._project_discovery.observe(
+                    request.workspace, run_id=request.run_id
+                )
+            except Exception as exc:  # noqa: BLE001 - a broken observer is a failure
+                # Discovery is observation only, so a raising implementation is
+                # reported as a discovery failure rather than being allowed to
+                # abort the loop with an untyped exception.
+                from app.agent_runtime.project_discovery import DiscoveryOutcome
+
+                outcome = DiscoveryOutcome(
+                    run_id=request.run_id,
+                    snapshot=None,
+                    duration_seconds=0.0,
+                    failure_category=type(exc).__name__,
+                )
+            understanding_snapshot = outcome.snapshot
+            discovery_failed = not outcome.succeeded
+            emit(EventType.PROJECT_DISCOVERY_COMPLETED, outcome.event_metadata())
+            if discovery_failed:
+                # Fail closed and terminally. A run whose observation could not be
+                # trusted must not proceed to decide or act on a fabricated or
+                # partial picture of the project, and it must not report a wait
+                # state that implies it could continue.
+                emit(
+                    EventType.HARNESS_FAILED,
+                    {"reason": "project_discovery_failed", "stage": "discover"},
+                )
+                final_state = replace(
+                    current_state,
+                    phase=HarnessPhase.FAILED,
+                    status=HarnessStatus.FAILED,
+                    terminal=True,
+                    metadata={
+                        "reason": "project_discovery_failed",
+                        "failure_category": outcome.failure_category,
+                    },
+                )
+                return HarnessResult(
+                    run_id=request.run_id,
+                    final_state=final_state,
+                    iterations=(final_state,),
+                    observations=(),
+                    decisions=(),
+                    execution_results=(),
+                    verification_results=(),
+                    final_acceptance=None,
+                    final_project_state=current_project_state,
+                    events=tuple(collector.events),
+                )
+
+
 
         while not current_state.terminal:
             # 0. Check bounds
@@ -264,6 +344,10 @@ class AgentHarness:
                 conditions.append("approval_pending")
             if revision_count >= self.policy.max_revision_attempts:
                 conditions.append("revision_limit_reached")
+            if discovery_failed:
+                # Discovery could not produce a trustworthy observation, so the
+                # decision must not proceed as though the context were complete.
+                conditions.append("discovery_failed")
             for res in execution_results:
                 if res.outcome_status == ExecutionOutcomeStatus.PERMISSION_DENIED:
                     conditions.append("permission_denied")
@@ -342,7 +426,7 @@ class AgentHarness:
                     acceptance_criteria=request.acceptance_criteria,
                     skills=applicable_skills,
                     project_memory=project_memory,
-                    understanding_snapshot=getattr(request, "understanding_snapshot", None),
+                    understanding_snapshot=understanding_snapshot,
                     model_info=model_info,
                     budget_policy=getattr(request, "budget_policy", None),
                 )

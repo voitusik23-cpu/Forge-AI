@@ -197,6 +197,9 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 ### FUTURE
 
 - [ ] Discovery intelligence, evidence and unknowns ([`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md) В§21)
+- [x] Wire production **project discovery** into the agent loop: `ProjectDiscovery` observes the workspace through the existing `BoundedProjectScanner`/`UnderstandingSnapshotter` before the first context assembly, and the immutable snapshot reaches the decision as `PROJECT_UNDERSTANDING` context via the existing `DecisionContextAssembler`. Bounded, per-run, non-authoritative, fail-closed.
+- [ ] Directory-depth bound for the project scanner: the existing bounds cover file count, per-file size, and total bytes, but not depth. Adding one changes the scanner's own contract and needs its own decision.
+- [ ] Re-observation mid-run and snapshot-consistency mechanism: discovery currently runs once per run and the workspace may change afterwards; locking or re-observation is deferred.
 - [ ] Project classification and capability selection (В§22)
 - [ ] Project Brief, Architecture and Technical Specification generation for target projects
 - [ ] Ready-to-run project generation
@@ -416,6 +419,9 @@ workflow review/ревизии. Выполнение плана, управле�
 ### FUTURE
 
 - [ ] Discovery intelligence, свидетельства и неизвестные ([`TECHNICAL_SPECIFICATION.md`](TECHNICAL_SPECIFICATION.md) §21)
+- [x] Подключить production **project discovery** к agent loop: `ProjectDiscovery` наблюдает workspace через существующие `BoundedProjectScanner`/`UnderstandingSnapshotter` до первой сборки контекста, и неизменяемый snapshot достигает decision как контекст `PROJECT_UNDERSTANDING` через существующий `DecisionContextAssembler`. Bounded, per-run, без authority, fail-closed.
+- [ ] Ограничение глубины каталогов для сканера проекта: существующие границы покрывают число файлов, размер файла и общий объём байт, но не глубину. Его добавление меняет контракт самого сканера и требует отдельного решения.
+- [ ] Повторное наблюдение в середине run и механизм согласованности snapshot: сейчас discovery выполняется один раз на run, и workspace может измениться после него; блокировка или повторное наблюдение отложены.
 - [ ] Классификация проектов и выбор capabilities (§22)
 - [ ] Генерация Project Brief, Architecture и Technical Specification для целевых проектов
 - [ ] Генерация готового к запуску проекта

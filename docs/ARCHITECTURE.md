@@ -860,6 +860,56 @@ bound into the frozen `RunScope`. `TaskRunRequest` carries no authority field, s
 a request, its context, its description, its category, or a task id cannot grant a
 tool. The empty default remains fail-closed.
 
+**Project discovery: bounded observation before the decision.**
+`ProjectDiscovery` (`app/agent_runtime/project_discovery.py`) is the observation
+layer of the loop. It runs inside `AgentHarness.run` before the first context
+assembly and produces one immutable `UnderstandingSnapshot` for the run:
+
+```text
+trusted task
+  -> ProjectDiscovery.observe(workspace)     (server-side composition only)
+  -> BoundedProjectScanner                   (existing bounded trust boundary)
+  -> UnderstandingSnapshotter                (existing immutable snapshot model)
+  -> UnderstandingSnapshot                   (immutable, per run)
+  -> DecisionContextAssembler                (existing canonical assembler)
+  -> ContextItem source_type=PROJECT_UNDERSTANDING
+  -> DecisionProvider
+  -> authorized execution / verification / acceptance
+```
+
+* **The root is composition-owned.** `ProjectDiscovery.observe` accepts only a
+  `Workspace` and rejects anything else, so no task request, decision, or LLM can
+  choose the root, choose a scanner, change scan limits, or disable a boundary.
+  The service passes its own `Workspace` through `HarnessRequest`.
+* **Bounds and redaction are the existing scanner's.** File count, per-file size,
+  total bytes, ignored directories, symlink handling, secret-file exclusion, and
+  binary handling all come from `BoundedProjectScanner`. Nothing is re-implemented
+  in the discovery layer, and there is no second discovery system.
+* **Bounded inventory, not a filesystem dump.** A snapshot carries paths and
+  fingerprints plus bounded structural facts, manifests, topology, and warnings.
+  It never carries file contents, and the assembler passes only the bounded
+  `summarize_snapshot` counts into context - not the file inventory.
+* **Discovery is not authority.** A snapshot cannot widen a `RunScope` or add a
+  command, tool, profile, environment value, or timeout, and the decision provider
+  receives context only - never the scope, the workspace, approval policy, or a
+  filesystem handle. Discovery never executes anything: no subprocess, no shell,
+  no coordinator, no adapter.
+* **One run, one snapshot.** The snapshot is created fresh at the start of each
+  run and never reused, so a later run observes the current workspace. Its
+  `workspace_fingerprint` is deterministic for unchanged content.
+* **Failure fails closed.** A discovery failure produces no snapshot, no context
+  item, and no decision: the run terminates as `FAILED` with reason
+  `project_discovery_failed`. There is no silent fallback to unrestricted
+  filesystem access, and a partial observation is never presented as a complete
+  one.
+* **Observability.** `PROJECT_DISCOVERY_STARTED` and
+  `PROJECT_DISCOVERY_COMPLETED` are recorded with sanitized metadata: run id, task
+  id, bounded counts, the workspace fingerprint, snapshot id, duration, and a safe
+  failure category. No file contents, secret paths, or raw environment are stored.
+
+`AgentHarness` remains the only production orchestration loop; discovery adds a
+stage to it and no new coordinator, agent, or loop.
+
 **Acceptance slice: criterion, verification, and verdict.**
 `ForgeApiService.run_accepted_task(declaration_id)` is the production acceptance
 entry point. It is trusted in-process code whose only input is a declaration id.
@@ -1052,6 +1102,57 @@ server-side вход для первого вертикального среза
 связывается в замороженный `RunScope`. `TaskRunRequest` не несёт authority-полей,
 поэтому запрос, его context, description, category или task id не могут выдать
 tool. Пустой default остаётся fail-closed.
+
+**Обнаружение проекта: bounded-наблюдение перед решением.**
+`ProjectDiscovery` (`app/agent_runtime/project_discovery.py`) — слой наблюдения в
+loop. Он выполняется внутри `AgentHarness.run` до первой сборки контекста и
+создаёт один неизменяемый `UnderstandingSnapshot` для run:
+
+```text
+доверенная задача
+  -> ProjectDiscovery.observe(workspace)     (только server-side композиция)
+  -> BoundedProjectScanner                   (существующая bounded trust boundary)
+  -> UnderstandingSnapshotter                (существующая immutable-модель)
+  -> UnderstandingSnapshot                   (immutable, per run)
+  -> DecisionContextAssembler                (существующий канонический assembler)
+  -> ContextItem source_type=PROJECT_UNDERSTANDING
+  -> DecisionProvider
+  -> авторизованное исполнение / verification / acceptance
+```
+
+* **Root принадлежит композиции.** `ProjectDiscovery.observe` принимает только
+  `Workspace` и отвергает всё остальное, поэтому ни запрос задачи, ни decision, ни
+  LLM не могут выбрать root, выбрать scanner, изменить лимиты сканирования или
+  отключить границу. Сервис передаёт собственный `Workspace` через
+  `HarnessRequest`.
+* **Bounds и redaction — существующего scanner'а.** Лимит файлов, размер файла,
+  общий объём байт, игнорируемые каталоги, обработка symlink, исключение секретных
+  файлов и обработка бинарных файлов берутся из `BoundedProjectScanner`. В слое
+  discovery ничего не переписывается, второй системы discovery нет.
+* **Bounded inventory, а не дамп файловой системы.** Snapshot несёт пути и
+  отпечатки плюс ограниченные структурные факты, манифесты, топологию и
+  предупреждения. Содержимое файлов в него не попадает, а assembler передаёт в
+  контекст только ограниченные счётчики `summarize_snapshot`, но не инвентарь
+  файлов.
+* **Discovery — не authority.** Snapshot не может расширить `RunScope` или
+  добавить команду, tool, профиль, значение окружения или timeout, а decision
+  provider получает только контекст — никогда scope, workspace, approval-политику
+  или filesystem handle. Discovery ничего не исполняет: ни subprocess, ни shell,
+  ни координатор, ни adapter.
+* **Один run — один snapshot.** Snapshot создаётся заново в начале каждого run и
+  никогда не переиспользуется, поэтому следующий run наблюдает текущий workspace.
+  Его `workspace_fingerprint` детерминирован для неизменного содержимого.
+* **Сбой — fail closed.** Сбой discovery не даёт ни snapshot, ни элемента
+  контекста, ни решения: run завершается как `FAILED` с причиной
+  `project_discovery_failed`. Молчаливого отката к неограниченному доступу к
+  файловой системе нет, и частичное наблюдение никогда не выдаётся за полное.
+* **Наблюдаемость.** `PROJECT_DISCOVERY_STARTED` и `PROJECT_DISCOVERY_COMPLETED`
+  записываются с санитизированными метаданными: run id, task id, ограниченные
+  счётчики, отпечаток workspace, snapshot id, длительность и безопасная категория
+  сбоя. Содержимое файлов, пути секретов и сырое окружение не сохраняются.
+
+`AgentHarness` остаётся единственным production-orchestration loop; discovery
+добавляет стадию в него, а не новый координатор, агент или loop.
 
 **Срез acceptance: criterion, verification и вердикт.**
 `ForgeApiService.run_accepted_task(declaration_id)` — production-вход acceptance.
