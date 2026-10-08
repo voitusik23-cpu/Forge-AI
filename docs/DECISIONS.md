@@ -2454,6 +2454,26 @@ Implemented in the idempotency and resume block. Verified against the code in
 - **The guard is injectable.** `ForgeApiService` accepts an explicit
   `idempotency_guard` instead of reading a process-wide singleton, so a test or an
   embedding composition cannot touch state outside its own ledger.
+- **Idempotency sits at the entry point, and the claim precedes every durable
+  write.** The three trusted in-process entry points
+  (`run_agent_loop`, `run_accepted_task`, `run_declared_verification`) claim their
+  operation after the trusted identity exists and before the frozen scope, the
+  `RunStore` binding, and the first durable event. A duplicate therefore writes no
+  `RUN_STARTED` and freezes no scope. Putting the boundary higher would place it
+  where identity is still untrusted; putting it lower would place it after an
+  effect has already happened.
+- **One operation class per entry point.** Each entry point claims under its own
+  `OperationClass`, so one key can never let an agent-loop operation satisfy an
+  accepted task or a declared verification. This is identity isolation, not
+  authority: the classes decide which record a key addresses, never what may run.
+- **`run_task` and its HTTP/desktop callers are deliberately excluded.** Their
+  `task_id` is supplied by the caller, so there is no trusted task identity to
+  bind a key to. Binding one there would let a caller choose the operation
+  identity, and would let two callers collide on one key. They need a
+  server-derived operation identity first, which is separate work.
+- **`purpose_run_id` stays correlation-only.** It is recorded as sanitized
+  metadata and is never part of the operation identity, so presenting a different
+  one cannot buy a second verification execution under the same key.
 
 ### Rejected alternatives
 
@@ -2476,9 +2496,9 @@ Implemented in the idempotency and resume block. Verified against the code in
 
 ### Consequences and open items
 
-1. **Idempotency covers `run_agent_loop` only when a key is supplied.** Without a
-   key the call keeps its previous semantics exactly, which is what preserves
-   legacy behaviour.
+1. **Idempotency covers the three trusted in-process entry points, and only when
+   a key is supplied.** Without a key each call keeps its previous semantics
+   exactly, which is what preserves legacy behaviour.
 2. **`run_accepted_task`, `run_declared_verification`, `run_task`, the HTTP
    task-run path, and desktop dispatch do not yet consult the ledger.** They are
    unaffected rather than protected; routing them through the same identity model
@@ -2568,6 +2588,27 @@ Implemented in the idempotency and resume block. Verified against the code in
 - **Guard инъектируется.** `ForgeApiService` принимает явный `idempotency_guard`
   вместо чтения process-wide singleton, поэтому тест или встраивающая композиция не
   может затронуть состояние вне своего журнала.
+- **Идемпотентность стоит на точке входа, и claim предшествует любой durable-записи.**
+  Три доверенные in-process точки входа (`run_agent_loop`, `run_accepted_task`,
+  `run_declared_verification`) заявляют операцию после появления доверенной
+  идентичности и до frozen scope, привязки `RunStore` и первого durable-события.
+  Поэтому повторная доставка не пишет `RUN_STARTED` и не фризит scope. Выше граница
+  оказалась бы там, где идентичность ещё недоверенная; ниже — там, где эффект уже
+  произошёл.
+- **Один класс операции на точку входа.** Каждая точка входа заявляет операцию под
+  своим `OperationClass`, поэтому один ключ никогда не позволит операции agent loop
+  закрыть accepted task или declared verification. Это изоляция идентичности, а не
+  authority: классы решают, к какой записи обращается ключ, и никогда — что можно
+  исполнять.
+- **`run_task` и его HTTP/desktop-вызывающие намеренно исключены.** Их `task_id`
+  поставляет вызывающий, поэтому доверенной идентичности задачи для привязки ключа
+  нет. Привязка там позволила бы вызывающему выбирать идентичность операции и
+  позволила бы двум вызывающим столкнуться на одном ключе. Сначала им нужна
+  server-derived идентичность операции — это отдельная работа.
+- **`purpose_run_id` остаётся только correlation.** Он записывается как
+  санитизированные метаданные и никогда не входит в идентичность операции, поэтому
+  другой `purpose_run_id` не может купить второе исполнение verification под тем же
+  ключом.
 
 ### Отклонённые альтернативы
 
@@ -2591,9 +2632,9 @@ Implemented in the idempotency and resume block. Verified against the code in
 
 ### Следствия и открытые пункты
 
-1. **Идемпотентность покрывает `run_agent_loop` только при переданном ключе.** Без
-   ключа вызов сохраняет прежнюю семантику ровно, и именно это сохраняет legacy
-   поведение.
+1. **Идемпотентность покрывает три доверенные in-process точки входа и только при
+   переданном ключе.** Без ключа каждый вызов сохраняет прежнюю семантику ровно, и
+   именно это сохраняет legacy поведение.
 2. **`run_accepted_task`, `run_declared_verification`, `run_task`, HTTP-путь task run
    и desktop dispatch пока не обращаются к журналу.** Они не защищены, а не
    затронуты; перевод их на ту же модель идентичности — последующая работа.

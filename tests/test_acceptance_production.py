@@ -277,11 +277,16 @@ class TrustedCriteriaTests(AcceptanceSliceTestCase):
             service.run_accepted_task("not.declared")
 
     def test_caller_cannot_pass_criteria_or_expectations(self) -> None:
-        """A: no authority parameter exists on the entry point."""
+        """A: no authority parameter exists on the entry point.
+
+        ``idempotency_key`` is admitted by a later block; it selects a durable
+        operation record and confers nothing, so it is listed below among the
+        names that must never appear rather than being an exception to the rule.
+        """
         parameters = list(
             inspect.signature(ForgeApiService.run_accepted_task).parameters
         )
-        self.assertEqual(parameters, ["self", "declaration_id"])
+        self.assertEqual(parameters, ["self", "declaration_id", "idempotency_key"])
         service = self._service()
         for kwargs in (
             {"criterion_id": "forged"},
@@ -290,6 +295,11 @@ class TrustedCriteriaTests(AcceptanceSliceTestCase):
             {"command": ("rm", "-rf", "/")},
             {"workspace": self.workspace},
             {"acceptance_spec": None},
+            # The idempotency key is not an authority input: it cannot carry a
+            # command, a criterion, a workspace, or an approval.
+            {"run_scope": None},
+            {"authorized_execution": None},
+            {"allowed_tool_ids": frozenset()},
         ):
             with self.assertRaises(TypeError):
                 service.run_accepted_task(DECLARATION_ID, **kwargs)

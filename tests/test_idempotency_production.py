@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 
+from app.agent_runtime.acceptance_spec import AcceptanceSpec
 from app.agent_runtime.criterion_identity import CriterionIdentity, TaskIdentity
 from app.agent_runtime.idempotency import (
     AttemptIdentity,
@@ -60,6 +61,7 @@ from app.tasks.specification import Requirement, TaskSpecification
 from app.tools.acceptance import AcceptanceCriterion
 from app.tools.approval import ApprovalPolicy
 from app.tools.registry import build_default_tool_registry
+from app.tools.verification import VerificationExpectation
 from app.tools.workspace import Workspace
 from app.execution.capabilities import ExecutionCapability
 
@@ -1188,6 +1190,419 @@ class AgentLoopIdempotencyTests(unittest.TestCase):
         guard_at = source.index("default_idempotency_guard()")
         scope_at = source.index("def _build_declared_verification_scope")
         self.assertGreater(guard_at, scope_at)
+
+
+# --------------------------------------------------------------------------- #
+# SIBLING TRUSTED ENTRY POINTS: run_accepted_task / run_declared_verification
+# --------------------------------------------------------------------------- #
+
+ARTIFACT = "artifact.txt"
+ACCEPT_CRITERION = "artifact-present"
+OTHER_DECLARATION = "verify.idempotency.other"
+
+
+def acceptance_criterion():
+    return AcceptanceCriterion(
+        criterion_id=ACCEPT_CRITERION, description="artifact exists"
+    )
+
+
+class SiblingEntryPointTestCase(unittest.TestCase):
+    """Shared plumbing for the two trusted sibling entry points."""
+
+    def setUp(self) -> None:
+        RunScope.release_all()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "a.txt").write_text("x", encoding="utf-8")
+        self.workspace = Workspace(self.root)
+        self._ledger_dir = tempfile.TemporaryDirectory()
+        self.guard = integration.RunIdempotencyGuard.create(
+            ledger_root=self._ledger_dir.name
+        )
+
+    def tearDown(self) -> None:
+        RunScope.release_all()
+        self._ledger_dir.cleanup()
+        self._tmp.cleanup()
+
+    @staticmethod
+    def produce_artifact(extra: str = "") -> tuple[str, ...]:
+        script = (
+            "import pathlib;"
+            f"pathlib.Path({ARTIFACT!r}).write_text('made{extra}');"
+            "print('artifact-written')"
+        )
+        return (EXECUTABLE, "-c", script)
+
+    def _service(self, *, command=None, with_spec=True, second_declaration=False):
+        declarations = {
+            DECLARATION_ID: declaration(command=command or self.produce_artifact()),
+        }
+        specs = {}
+        if with_spec:
+            specs[DECLARATION_ID] = AcceptanceSpec(
+                declaration_id=DECLARATION_ID,
+                criteria=(acceptance_criterion(),),
+                expectations={
+                    ACCEPT_CRITERION: VerificationExpectation(ARTIFACT, True)
+                },
+            )
+        if second_declaration:
+            declarations[OTHER_DECLARATION] = declaration(
+                declaration_id=OTHER_DECLARATION,
+                command=self.produce_artifact(extra="-other"),
+            )
+            if with_spec:
+                specs[OTHER_DECLARATION] = AcceptanceSpec(
+                    declaration_id=OTHER_DECLARATION,
+                    criteria=(acceptance_criterion(),),
+                    expectations={
+                        ACCEPT_CRITERION: VerificationExpectation(ARTIFACT, True)
+                    },
+                )
+        return ForgeApiService(
+            runtime=_runtime(),
+            workspace=self.workspace,
+            tool_registry=build_default_tool_registry(self.root),
+            execution_profile=api_profile(),
+            declarations=declarations,
+            acceptance_specs=specs,
+            approval_policy=ApprovalPolicy(),
+            idempotency_guard=self.guard,
+        )
+
+
+class AcceptedTaskIdempotencyTests(SiblingEntryPointTestCase):
+    def _spy(self, service):
+        """Count real harness executions for this service."""
+        runs: list[str] = []
+        real_factory = service._harness_factory
+
+        def factory(*args, **kwargs):
+            harness = real_factory(*args, **kwargs)
+            real_run = harness.run
+
+            def spy(request):
+                runs.append(request.run_id)
+                return real_run(request)
+
+            harness.run = spy  # type: ignore[method-assign]
+            return harness
+
+        service._harness_factory = factory  # type: ignore[method-assign]
+        return runs
+
+    def test_first_delivery_runs_and_records_the_operation(self) -> None:
+        service = self._service()
+        response = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        self.assertTrue(response.run_id.startswith("run-accept-"), response.run_id)
+        self.assertEqual(len(self.guard.engine.ledger.list_keys()), 1)
+
+    def test_second_delivery_does_not_execute_the_harness_again(self) -> None:
+        service = self._service()
+        first = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        runs = self._spy(service)
+        second = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        self.assertEqual(runs, [], "the harness must not run a second time")
+        self.assertFalse(second.success)
+        self.assertIn(second.state, {"DENIED", "REPLAYED"})
+        self.assertEqual(second.output, "")
+        self.assertEqual(second.run_id, first.run_id)
+
+    def test_no_harness_execution_and_no_new_run_on_replay(self) -> None:
+        service = self._service()
+        first = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        before = set(service._run_store.list_run_ids())
+        service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        after = set(service._run_store.list_run_ids())
+        self.assertEqual(before, after, "a replay must not create a new run record")
+        self.assertIn(first.run_id, after)
+
+    def test_same_key_for_a_different_declaration_is_a_conflict(self) -> None:
+        service = self._service(second_declaration=True)
+        service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        runs = self._spy(service)
+        second = service.run_accepted_task(OTHER_DECLARATION, idempotency_key=KEY)
+        self.assertEqual(runs, [], "a conflicting key must not execute")
+        self.assertFalse(second.success)
+        self.assertIn(second.state, {"DENIED", "REPLAYED"})
+
+    def test_legacy_behaviour_without_a_key_is_unchanged(self) -> None:
+        service = self._service()
+        response = service.run_accepted_task(DECLARATION_ID)
+        self.assertTrue(response.run_id.startswith("run-accept-"))
+        self.assertEqual(
+            self.guard.engine.ledger.list_keys(), (), "no key means no ledger write"
+        )
+
+    def test_a_new_key_runs_again_deliberately(self) -> None:
+        service = self._service()
+        first = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        second = service.run_accepted_task(
+            DECLARATION_ID, idempotency_key="idem-key-000000002"
+        )
+        self.assertNotEqual(second.run_id, first.run_id)
+        self.assertEqual(len(self.guard.engine.ledger.list_keys()), 2)
+
+    def _production_identity(self, service, declaration_id=DECLARATION_ID):
+        """Rebuild the exact identity the entry point composes."""
+        from app.agent_runtime.idempotency import OperationClass
+        from app.agent_runtime.idempotency_integration import (
+            operation_identity_from_binding,
+        )
+
+        decl = service._declarations[declaration_id]
+        task_id = f"task-accept-{decl.declaration_id}"
+        specification, binding = service._build_trusted_specification_and_binding(
+            "run-identity-probe", decl, task_id
+        )
+        return operation_identity_from_binding(
+            operation_class=OperationClass.ACCEPTED_TASK,
+            idempotency_key=KEY,
+            declaration_id=decl.declaration_id,
+            task_identity=(
+                binding.task_identity
+                if binding is not None
+                else TaskIdentity.from_specification(specification)
+            ),
+            criterion_identities=(
+                binding.criterion_identities if binding is not None else ()
+            ),
+        )
+
+    def test_security_terminal_record_refuses_execution_resume_and_decide(self) -> None:
+        """A terminal security failure stops every later path for that operation.
+
+        The record is terminalised through the same production guard and identity
+        the entry point uses, so the sequence under test is exactly the one a real
+        authority denial would produce.
+        """
+        from app.agent_runtime.idempotency import (
+            IdempotencyEngine,
+            ResumeContract,
+            RunLifecycleState,
+            classify_outcome_labels,
+        )
+
+        service = self._service()
+        identity = self._production_identity(service)
+
+        # Establish the operation exactly as the entry point does.
+        guard = self.guard
+        decision = guard.begin(identity, requested_run_id="run-terminal")
+        self.assertIs(decision.verdict, IdempotencyVerdict.START)
+
+        # An authority denial classifies as a terminal security failure.
+        for label in (
+            "PERMISSION_DENIED", "POLICY_DENIED", "APPROVAL_REJECTED",
+            "sandbox_violation", "network_denied",
+        ):
+            self.assertIs(
+                classify_outcome_labels((label,)),
+                RunLifecycleState.SECURITY_FAILURE,
+                label,
+            )
+
+        guard.finish(
+            identity,
+            lifecycle=RunLifecycleState.SECURITY_FAILURE,
+            outcome_labels=("PERMISSION_DENIED",),
+        )
+        ledger = guard.engine.ledger
+        self.assertIs(
+            ledger.read(identity.idempotency_key).state.lifecycle,
+            RunLifecycleState.SECURITY_FAILURE,
+        )
+
+        # Terminal cannot be reopened, in either direction.
+        with self.assertRaises(IdempotencyError):
+            ledger.update(
+                identity, lifecycle=RunLifecycleState.INTERRUPTED, attempt_number=0
+            )
+        with self.assertRaises(IdempotencyError):
+            ledger.update(
+                identity, lifecycle=RunLifecycleState.COMPLETED, attempt_number=0
+            )
+
+        # Resume and decide both refuse, and no attempt identity is created.
+        resumed = ResumeContract(ledger).validate(identity)
+        self.assertIs(resumed.outcome, ResumeOutcome.REFUSED)
+        self.assertIsNone(resumed.attempt)
+        decision = IdempotencyEngine(ledger).decide(
+            identity, requested_run_id="run-again"
+        )
+        self.assertIs(decision.verdict, IdempotencyVerdict.REFUSE)
+        self.assertFalse(decision.may_execute)
+
+        # The production call refuses too, without reaching the harness.
+        runs = self._spy(service)
+        response = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        self.assertEqual(runs, [], "a terminal denial must not execute")
+        self.assertFalse(response.success)
+        self.assertEqual(response.output, "")
+
+class DeclaredVerificationIdempotencyTests(SiblingEntryPointTestCase):
+    def _spy(self, service):
+        runs: list[str] = []
+        real_execute = service._runtime.run_executor.execute
+
+        def spy(**kwargs):
+            runs.append(kwargs.get("run_id", ""))
+            return real_execute(**kwargs)
+
+        service._runtime.run_executor.execute = spy  # type: ignore[method-assign]
+        return runs
+
+    def test_first_delivery_runs_and_records_the_operation(self) -> None:
+        service = self._service(with_spec=False)
+        response = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY
+        )
+        self.assertTrue(response.run_id.startswith("run-verify-"), response.run_id)
+        self.assertEqual(len(self.guard.engine.ledger.list_keys()), 1)
+
+    def test_second_delivery_does_not_execute_again(self) -> None:
+        service = self._service(with_spec=False)
+        first = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY
+        )
+        runs = self._spy(service)
+        second = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY
+        )
+        self.assertEqual(runs, [], "no second verification execution")
+        self.assertFalse(second.success)
+        self.assertIn(second.state, {"DENIED", "REPLAYED"})
+        self.assertEqual(second.output, "")
+        self.assertEqual(second.run_id, first.run_id)
+
+    def test_purpose_run_id_cannot_buy_a_second_execution(self) -> None:
+        """Correlation input must not change the operation identity."""
+        service = self._service(with_spec=False)
+        service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY, purpose_run_id="run-origin"
+        )
+        runs = self._spy(service)
+        second = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY, purpose_run_id="run-different"
+        )
+        self.assertEqual(runs, [], "a different purpose_run_id is still the same operation")
+        self.assertFalse(second.success)
+
+    def test_same_key_for_a_different_declaration_is_a_conflict(self) -> None:
+        service = self._service(with_spec=False, second_declaration=True)
+        service.run_declared_verification(DECLARATION_ID, idempotency_key=KEY)
+        runs = self._spy(service)
+        second = service.run_declared_verification(
+            OTHER_DECLARATION, idempotency_key=KEY
+        )
+        self.assertEqual(runs, [], "a conflicting key must not execute")
+        self.assertFalse(second.success)
+
+    def test_legacy_behaviour_without_a_key_is_unchanged(self) -> None:
+        service = self._service(with_spec=False)
+        response = service.run_declared_verification(DECLARATION_ID)
+        self.assertTrue(response.run_id.startswith("run-verify-"))
+        self.assertEqual(self.guard.engine.ledger.list_keys(), ())
+
+    def test_a_new_key_runs_again_deliberately(self) -> None:
+        service = self._service(with_spec=False)
+        first = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY
+        )
+        second = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key="idem-key-000000003"
+        )
+        self.assertNotEqual(second.run_id, first.run_id)
+        self.assertEqual(len(self.guard.engine.ledger.list_keys()), 2)
+
+
+class OperationClassIsolationTests(SiblingEntryPointTestCase):
+    """One key must never mix operations of different classes."""
+
+    def test_accepted_task_then_declared_verification_conflicts(self) -> None:
+        service = self._service()
+        service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        response = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY
+        )
+        self.assertFalse(response.success)
+        self.assertIn(response.state, {"DENIED", "REPLAYED"})
+
+    def test_declared_verification_then_accepted_task_conflicts(self) -> None:
+        service = self._service()
+        service.run_declared_verification(DECLARATION_ID, idempotency_key=KEY)
+        response = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        self.assertFalse(response.success)
+        self.assertIn(response.state, {"DENIED", "REPLAYED"})
+
+    def test_accepted_task_then_agent_loop_conflicts(self) -> None:
+        service = self._service()
+        service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        response = service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        self.assertFalse(response.success)
+        self.assertIn(response.state, {"DENIED", "REPLAYED"})
+
+    def test_declared_verification_then_agent_loop_conflicts(self) -> None:
+        service = self._service()
+        service.run_declared_verification(DECLARATION_ID, idempotency_key=KEY)
+        response = service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        self.assertFalse(response.success)
+        self.assertIn(response.state, {"DENIED", "REPLAYED"})
+
+    def test_agent_loop_then_accepted_task_conflicts(self) -> None:
+        service = self._service()
+        service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        response = service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        self.assertFalse(response.success)
+
+    def test_agent_loop_then_declared_verification_conflicts(self) -> None:
+        service = self._service()
+        service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        response = service.run_declared_verification(
+            DECLARATION_ID, idempotency_key=KEY
+        )
+        self.assertFalse(response.success)
+
+    def test_each_class_has_its_own_key_and_they_do_not_collide(self) -> None:
+        service = self._service()
+        service.run_accepted_task(DECLARATION_ID, idempotency_key=KEY)
+        service.run_declared_verification(
+            DECLARATION_ID, idempotency_key="idem-key-000000004"
+        )
+        service.run_agent_loop(DECLARATION_ID, idempotency_key="idem-key-000000005")
+        self.assertEqual(len(self.guard.engine.ledger.list_keys()), 3)
+
+
+class CanonicalOrderingTests(SiblingEntryPointTestCase):
+    """The claim must precede the first durable event."""
+
+    def test_duplicate_delivery_adds_no_second_run_started(self) -> None:
+        service = self._service()
+        first = service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        record = service._run_store.load(first.run_id)
+        started = [
+            e for e in record.events if e.event_type.name == "RUN_STARTED"
+        ]
+        self.assertEqual(len(started), 1)
+
+        service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        record_after = service._run_store.load(first.run_id)
+        started_after = [
+            e for e in record_after.events if e.event_type.name == "RUN_STARTED"
+        ]
+        self.assertEqual(
+            len(started_after), 1, "a duplicate must not add a second RUN_STARTED"
+        )
+
+    def test_duplicate_does_not_write_any_new_run_directory(self) -> None:
+        service = self._service()
+        first = service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        before = set(service._run_store.list_run_ids())
+        service.run_agent_loop(DECLARATION_ID, idempotency_key=KEY)
+        self.assertEqual(set(service._run_store.list_run_ids()), before)
+        self.assertIn(first.run_id, before)
 
 
 # --------------------------------------------------------------------------- #

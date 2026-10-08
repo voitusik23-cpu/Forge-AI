@@ -1027,12 +1027,38 @@ the ToolExecutor does not consult it). Side-effect journal integration: NOT WIRE
 Concurrency: PARTIAL (atomic claim only). None of these is "exactly once", "zero
 duplicate execution", or "crash proof".
 
-*Entry-point coverage.* Idempotency applies to `run_agent_loop` when the operator
-supplies a key; without a key the call keeps its previous semantics exactly.
-`run_accepted_task`, `run_declared_verification`, `run_task`, the HTTP task-run
-path, and desktop dispatch do **not** yet consult the ledger. They are unaffected
-rather than protected, and routing them through the same identity model is
-recorded as follow-up work.
+*Canonical order.* The claim is taken after the trusted identity exists and
+**before** anything durable is written:
+
+```
+trusted declaration
+  -> trusted TaskSpecification / criterion binding
+  -> OperationIdentity          (class + trusted key + task/criterion fingerprints)
+  -> idempotency claim          <-- here
+  -> RunScope freeze
+  -> RunStore bind + RUN_STARTED
+  -> harness / RunExecutor
+  -> durable outcome recorded
+```
+
+A duplicate delivery therefore writes no `RUN_STARTED`, freezes no scope, and
+starts no run: it is answered from the recorded position instead.
+
+*Entry-point coverage.* Idempotency applies to the three trusted in-process entry
+points when the operator supplies a key, each with its own operation class so one
+key can never mix them:
+
+| entry point | operation class | with a key | without a key |
+| --- | --- | --- | --- |
+| `run_agent_loop` | `AGENT_LOOP` | claims, replays, or refuses | previous semantics exactly |
+| `run_accepted_task` | `ACCEPTED_TASK` | claims, replays, or refuses | previous semantics exactly |
+| `run_declared_verification` | `DECLARED_VERIFICATION` | claims, replays, or refuses | previous semantics exactly |
+
+`run_task`, the HTTP task-run path, and desktop dispatch do **not** consult the
+ledger: they carry no trusted task identity to bind a key to, because their
+`task_id` is supplied by the caller. They are unaffected rather than protected,
+and giving them idempotency requires a server-derived operation identity first.
+This is deliberately not "all entry points protected".
 
 **Execution filesystem boundary and network policy (GAP-A / GAP-B).**
 `app/execution/sandbox.py` owns the filesystem boundary of one execution, and the
@@ -1763,11 +1789,38 @@ ToolExecutor к нему не обращается). Интеграция жур
 Concurrency: PARTIAL (только атомарный claim). Ничто из этого не «exactly once», не
 «zero duplicate execution» и не «crash proof».
 
-*Покрытие точек входа.* Идемпотентность применяется к `run_agent_loop`, когда
-оператор передал ключ; без ключа вызов сохраняет прежнюю семантику ровно.
-`run_accepted_task`, `run_declared_verification`, `run_task`, HTTP-путь task run и
-desktop dispatch пока **не** обращаются к журналу. Они не защищены, а не затронуты,
-и перевод их на ту же модель идентичности записан как последующая работа.
+*Канонический порядок.* Claim берётся после того, как доверенная идентичность
+существует, и **до** любой durable-записи:
+
+```
+доверенная декларация
+  -> доверенный TaskSpecification / привязка criterion
+  -> OperationIdentity          (класс + доверенный ключ + fingerprint'ы task/criterion)
+  -> idempotency claim          <-- здесь
+  -> freeze RunScope
+  -> RunStore bind + RUN_STARTED
+  -> harness / RunExecutor
+  -> запись durable-исхода
+```
+
+Поэтому повторная доставка не пишет `RUN_STARTED`, не фризит scope и не запускает
+run: ответ берётся из записанной позиции.
+
+*Покрытие точек входа.* Идемпотентность применяется к трём доверенным in-process
+точкам входа, когда оператор передал ключ, и у каждой свой класс операции, поэтому
+один ключ не может их смешать:
+
+| точка входа | класс операции | с ключом | без ключа |
+| --- | --- | --- | --- |
+| `run_agent_loop` | `AGENT_LOOP` | claim, replay или отказ | прежняя семантика ровно |
+| `run_accepted_task` | `ACCEPTED_TASK` | claim, replay или отказ | прежняя семантика ровно |
+| `run_declared_verification` | `DECLARED_VERIFICATION` | claim, replay или отказ | прежняя семантика ровно |
+
+`run_task`, HTTP-путь task run и desktop dispatch **не** обращаются к журналу: у них
+нет доверенной идентичности задачи, к которой можно привязать ключ, потому что их
+`task_id` поставляет вызывающий. Они не защищены, а не затронуты, и для их
+идемпотентности сначала нужна server-derived идентичность операции. Это намеренно
+**не** «все точки входа защищены».
 
 **Файловая граница исполнения и сетевая политика (GAP-A / GAP-B).**
 `app/execution/sandbox.py` владеет файловой границей одного исполнения, а сетевая

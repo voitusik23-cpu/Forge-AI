@@ -32,7 +32,12 @@ from app.agent_runtime.idempotency import (
     OperationClass,
     RunLifecycleState,
 )
+from app.agent_runtime.idempotency import (
+    OperationIdentity,
+    canonical_idempotency_key,
+)
 from app.agent_runtime.idempotency_integration import (
+    RunIdempotencyGuard,
     default_idempotency_guard,
     operation_identity_from_binding,
 )
@@ -643,6 +648,48 @@ class ForgeApiService:
                 )
         return agents
 
+    def _build_trusted_specification_and_binding(
+        self, run_id: str, declaration: ExecutionDeclaration, task_id: str
+    ) -> tuple[object | None, object | None]:
+        """Derive the trusted task specification and criterion binding.
+
+        One server-side construction, used both by the harness request builder
+        and by the idempotency claim so the two can never disagree about the
+        identity of a run. It is created whenever the operator declared either an
+        intent or an acceptance spec, because it is also the trusted task
+        identity the criterion binding is built from. It carries no authority:
+        only the task id and the operator's own descriptive text and criteria.
+        """
+        acceptance_spec = self._acceptance_specs.get(declaration.declaration_id)
+        specification = None
+        if declaration.intent or acceptance_spec is not None:
+            specification = TaskSpecification(
+                task_id=task_id,
+                title=declaration.declaration_id,
+                description=declaration.intent,
+                requirements=(),
+                acceptance_criteria=(
+                    acceptance_spec.criteria
+                    if acceptance_spec is not None
+                    else (API_RUN_CRITERION,)
+                ),
+            )
+
+        # Trusted criterion identity. Only the operator's own acceptance
+        # declaration can produce criteria; a request, a decision, a plan, a tool
+        # result, and a model all contribute nothing here.
+        task_binding = None
+        if acceptance_spec is not None:
+            task_binding = bind_run_criteria(
+                run_id=run_id,
+                specification=specification,
+                criteria=acceptance_spec.criteria,
+                expectations=acceptance_spec.expectations,
+                source=acceptance_spec.source,
+            )
+            task_binding.assert_belongs_to(run_id, specification.task_id)
+        return specification, task_binding
+
     def _build_harness_request(
         self,
         run_id: str,
@@ -680,37 +727,10 @@ class ForgeApiService:
         # The specification is also the trusted task identity, so it is created
         # whenever the operator declared either an intent or an acceptance spec.
         # It carries no authority: only the task id and its descriptive text.
-        acceptance_spec = self._acceptance_specs.get(declaration.declaration_id)
-        # The specification is created whenever the operator declared either an
-        # intent or an acceptance spec, because it is also the trusted task
-        # identity the criterion binding is built from. It carries no authority.
-        specification = None
-        if declaration.intent or acceptance_spec is not None:
-            specification = TaskSpecification(
-                task_id=task_id,
-                title=declaration.declaration_id,
-                description=declaration.intent,
-                requirements=(),
-                acceptance_criteria=(
-                    acceptance_spec.criteria
-                    if acceptance_spec is not None
-                    else (API_RUN_CRITERION,)
-                ),
-            )
-
-        # Trusted criterion identity. Only the operator's own acceptance
-        # declaration can produce criteria; a request, a decision, a plan, a tool
-        # result, and a model all contribute nothing here.
-        task_binding = None
-        if acceptance_spec is not None:
-            task_binding = bind_run_criteria(
-                run_id=run_id,
-                specification=specification,
-                criteria=acceptance_spec.criteria,
-                expectations=acceptance_spec.expectations,
-                source=acceptance_spec.source,
-            )
-            task_binding.assert_belongs_to(run_id, specification.task_id)
+        specification, task_binding = self._build_trusted_specification_and_binding(
+            run_id, declaration, task_id
+        )
+        if task_binding is not None:
             metadata_extra: dict[str, object] = {
                 "criterion_ids": list(task_binding.criterion_ids),
                 "criterion_source": task_binding.source,
@@ -733,12 +753,14 @@ class ForgeApiService:
             ),
             allowed_execution_commands=tuple(scope.allowed_execution_commands),
             acceptance_criteria=(
-                acceptance_spec.criteria
-                if acceptance_spec is not None
+                specification.acceptance_criteria
+                if specification is not None
                 else (API_RUN_CRITERION,)
             ),
             verification_expectations=(
-                acceptance_spec.expectations if acceptance_spec is not None else {}
+                self._acceptance_specs[declaration.declaration_id].expectations
+                if declaration.declaration_id in self._acceptance_specs
+                else {}
             ),
             approval_policy=self._approval_policy,
             approval_resolver=self._approval_resolver,
@@ -751,6 +773,14 @@ class ForgeApiService:
                 **metadata_extra,
             },
         )
+
+    @staticmethod
+    @staticmethod
+    def _idempotent_lifecycle_labels(labels: tuple[str, ...]) -> RunLifecycleState:
+        """Map recorded outcome labels onto the durable idempotency lifecycle."""
+        from app.agent_runtime.idempotency import classify_outcome_labels
+
+        return classify_outcome_labels(labels)
 
     @staticmethod
     def _idempotent_lifecycle(result: object, execution_result: object) -> RunLifecycleState:
@@ -772,6 +802,95 @@ class ForgeApiService:
 
         return classify_outcome_labels(tuple(labels))
 
+    def _build_run_task_specification(
+        self, declaration: ExecutionDeclaration
+    ) -> TaskSpecification:
+        """Build the trusted task specification for one declaration.
+
+        One server-side construction shared by every idempotent entry point, so
+        three paths cannot drift into three different identities for the same
+        declaration. Nothing here is read from a caller, a decision, a plan, or
+        metadata; the declaration id is the task id, exactly as the sibling
+        entry points derive their stored task ids from the declaration.
+        """
+        return TaskSpecification(
+            task_id=declaration.declaration_id,
+            title=declaration.declaration_id,
+            description=declaration.intent,
+            requirements=(),
+            acceptance_criteria=self._criteria_for(declaration),
+        )
+
+    def _begin_run_operation(
+        self,
+        declaration: ExecutionDeclaration,
+        operation_class: OperationClass,
+        idempotency_key: Optional[str],
+        run_id: str,
+        *,
+        task_identity: object | None = None,
+        criterion_identities: object = (),
+    ) -> tuple[
+        Optional[RunIdempotencyGuard],
+        Optional[OperationIdentity],
+        object | None,
+    ]:
+        """Claim this operation before anything durable is written.
+
+        Returns ``(guard, identity, decision)``. With no key all three are None
+        and the caller keeps its previous behaviour exactly. With a key the claim
+        happens here, which is deliberately *before* the frozen scope, the
+        ``RunStore`` binding, and the first durable event: a duplicate delivery
+        must not write a run-start event for a run it is not allowed to perform.
+
+        The identity is composed from the operator's declaration and, when the
+        path has one, the frozen task/criterion binding. This helper grants no
+        authority: it cannot build a command, a scope, a profile, an approval, or
+        an ``AuthorizedExecution``.
+        """
+        if idempotency_key is None:
+            return None, None, None
+        guard = self._idempotency_guard or default_idempotency_guard()
+        identity = operation_identity_from_binding(
+            operation_class=operation_class,
+            idempotency_key=canonical_idempotency_key(idempotency_key),
+            declaration_id=declaration.declaration_id,
+            task_identity=(
+                task_identity
+                if task_identity is not None
+                else TaskIdentity.from_specification(
+                    self._build_run_task_specification(declaration)
+                )
+            ),
+            criterion_identities=criterion_identities,
+        )
+        decision = guard.begin(identity, requested_run_id=run_id)
+        return guard, identity, decision
+
+    def _finish_run_operation(
+        self,
+        guard: Optional[RunIdempotencyGuard],
+        identity: Optional[OperationIdentity],
+        *,
+        lifecycle: RunLifecycleState,
+        outcome_labels: tuple[str, ...] = (),
+    ) -> IdempotencyError | None:
+        """Record the durable outcome, returning the error instead of raising.
+
+        Callers must surface a returned error as an unrecorded outcome rather
+        than a success: if the position could not be recorded, a later delivery
+        would read an earlier state and could be admitted again.
+        """
+        if guard is None or identity is None:
+            return None
+        try:
+            guard.finish(
+                identity, lifecycle=lifecycle, outcome_labels=outcome_labels
+            )
+            return None
+        except IdempotencyError as exc:
+            return exc
+
     def _idempotent_response(
         self,
         *,
@@ -791,6 +910,15 @@ class ForgeApiService:
         code = getattr(getattr(decision, "failure_code", None), "value", "")
         reason = str(getattr(decision, "reason", "") or "")
         recorded_run_id = str(getattr(decision, "run_id", "") or run_id) or run_id
+        # Record the refusal against the run that already owns this operation,
+        # not against the run id this delivery generated. A duplicate must leave
+        # the durable history of a run it is not allowed to perform untouched, so
+        # the event lands on the recorded run when one exists.
+        if loop_store is None and recorded_run_id:
+            try:
+                loop_store = self._run_store.bind_run(recorded_run_id)
+            except Exception:  # noqa: BLE001 - persistence must not block a run
+                loop_store = None
         self._emit_acceptance_event(
             loop_store,
             recorded_run_id,
@@ -866,8 +994,38 @@ class ForgeApiService:
             )
 
         run_id = f"run-loop-{uuid.uuid4().hex[:8]}"
-        scope = self._build_declared_verification_scope(run_id, declaration)
         task_id = f"task-loop-{declaration.declaration_id}"
+
+        # Trusted identity first, and nothing durable before it. The claim below
+        # must precede the frozen scope, the RunStore binding, and the first
+        # durable event: a duplicate delivery must not write a run-start event
+        # for a run it is not allowed to perform.
+        specification, binding = self._build_trusted_specification_and_binding(
+            run_id, declaration, task_id
+        )
+        guard, guard_identity, guard_decision = self._begin_run_operation(
+            declaration,
+            OperationClass.AGENT_LOOP,
+            idempotency_key,
+            run_id,
+            task_identity=(
+                binding.task_identity if binding is not None else None
+            ),
+            criterion_identities=(
+                binding.criterion_identities if binding is not None else ()
+            ),
+        )
+        if guard_decision is not None and (
+            guard_decision.verdict is not IdempotencyVerdict.START
+        ):
+            return self._idempotent_response(
+                run_id=guard_decision.run_id or run_id,
+                declaration=declaration,
+                decision=guard_decision,
+                loop_store=None,
+            )
+
+        scope = self._build_declared_verification_scope(run_id, declaration)
 
         loop_store: Optional[RunStore] = None
         try:
@@ -891,7 +1049,6 @@ class ForgeApiService:
         # The frozen criterion identity, recorded before the loop runs so the
         # durable history can answer "which task, which criterion, which run?".
         # Only bounded identity metadata is stored - never raw criterion text.
-        binding = getattr(request, "task_binding", None)
         if binding is not None:
             self._emit_acceptance_event(
                 loop_store,
@@ -905,47 +1062,6 @@ class ForgeApiService:
                     **binding.bounded_summary(),
                 },
             )
-
-        # Server-side idempotency. The key is operator-supplied input; the
-        # identity it binds to is composed from the trusted declaration and the
-        # frozen task/criterion binding, so a key cannot be reused for different
-        # work and no caller can declare its own operation idempotent. This only
-        # decides whether a second execution may start: it grants no command, no
-        # workspace, no tool, no approval, and no network authority.
-        guard = None
-        guard_identity = None
-        if idempotency_key is not None:
-            guard = self._idempotency_guard or default_idempotency_guard()
-            task_identity = (
-                binding.task_identity
-                if binding is not None
-                else TaskIdentity.from_specification(
-                    TaskSpecification(
-                        task_id=task_id,
-                        title=declaration.declaration_id,
-                        description=declaration.intent,
-                        requirements=(),
-                        acceptance_criteria=self._criteria_for(declaration),
-                    )
-                )
-            )
-            guard_identity = operation_identity_from_binding(
-                operation_class=OperationClass.AGENT_LOOP,
-                idempotency_key=idempotency_key,
-                declaration_id=declaration.declaration_id,
-                task_identity=task_identity,
-                criterion_identities=(
-                    binding.criterion_identities if binding is not None else ()
-                ),
-            )
-            guard_decision = guard.begin(guard_identity, requested_run_id=run_id)
-            if guard_decision.verdict is not IdempotencyVerdict.START:
-                return self._idempotent_response(
-                    run_id=guard_decision.run_id or run_id,
-                    declaration=declaration,
-                    decision=guard_decision,
-                    loop_store=loop_store,
-                )
 
         # Built by the same composition factory that supplies the runtime's
         # canonical harness, differing only in the narrowed bounds of this slice.
@@ -985,23 +1101,23 @@ class ForgeApiService:
             # recorded, a later delivery would read an earlier state and could be
             # admitted to run again, so the run is reported as unrecorded rather
             # than as a success this code cannot stand behind.
-            try:
-                guard.finish(
-                    guard_identity,
-                    lifecycle=self._idempotent_lifecycle(result, execution_result),
-                    outcome_labels=(result.final_state.status.value,),
-                )
-            except IdempotencyError as exc:
+            failure = self._finish_run_operation(
+                guard,
+                guard_identity,
+                lifecycle=self._idempotent_lifecycle(result, execution_result),
+                outcome_labels=(result.final_state.status.value,),
+            )
+            if failure is not None:
                 return self._idempotent_response(
                     run_id=run_id,
                     declaration=declaration,
                     decision=IdempotencyDecision(
                         verdict=IdempotencyVerdict.REFUSE,
                         run_id=run_id,
-                        failure_code=exc.code,
+                        failure_code=failure.code,
                         reason=(
                             "the durable idempotency outcome could not be "
-                            f"recorded ({exc.code.value}), so this run is not "
+                            f"recorded ({failure.code.value}), so this run is not "
                             "reported as successful"
                         ),
                     ),
@@ -1097,7 +1213,12 @@ class ForgeApiService:
         except Exception:  # noqa: BLE001 - persistence must not block a run
             pass
 
-    def run_accepted_task(self, declaration_id: str) -> TaskRunResponse:
+    def run_accepted_task(
+        self,
+        declaration_id: str,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> TaskRunResponse:
         """Run one authorized action and decide real task acceptance.
 
         This is the production acceptance entry point. It is trusted in-process
@@ -1173,6 +1294,27 @@ class ForgeApiService:
             source=criteria.source,
         )
         task_binding.assert_belongs_to(run_id, task_id)
+
+        # Server-side idempotency, claimed before the scope is frozen and before
+        # any durable write. Without a key every value below is None and this
+        # path keeps its previous behaviour exactly.
+        guard, guard_identity, guard_decision = self._begin_run_operation(
+            declaration,
+            OperationClass.ACCEPTED_TASK,
+            idempotency_key,
+            run_id,
+            task_identity=task_binding.task_identity,
+            criterion_identities=task_binding.criterion_identities,
+        )
+        if guard_decision is not None and (
+            guard_decision.verdict is not IdempotencyVerdict.START
+        ):
+            return self._idempotent_response(
+                run_id=guard_decision.run_id or run_id,
+                declaration=declaration,
+                decision=guard_decision,
+                loop_store=None,
+            )
 
         scope = RunScope(
             run_id=run_id,
@@ -1323,6 +1465,29 @@ class ForgeApiService:
             except Exception:  # noqa: BLE001 - persistence must not block a run
                 pass
 
+        failure = self._finish_run_operation(
+            guard,
+            guard_identity,
+            lifecycle=self._idempotent_lifecycle(result, execution_result),
+            outcome_labels=(result.final_state.status.value,),
+        )
+        if failure is not None:
+            return self._idempotent_response(
+                run_id=run_id,
+                declaration=declaration,
+                decision=IdempotencyDecision(
+                    verdict=IdempotencyVerdict.REFUSE,
+                    run_id=run_id,
+                    failure_code=failure.code,
+                    reason=(
+                        "the durable idempotency outcome could not be recorded "
+                        f"({failure.code.value}), so this run is not reported as "
+                        "successful"
+                    ),
+                ),
+                loop_store=record_store,
+            )
+
         output = (execution_result.stdout if execution_result else "") or ""
         error: Optional[str] = None
         if execution_result is None:
@@ -1412,6 +1577,7 @@ class ForgeApiService:
         declaration_id: str,
         *,
         purpose_run_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> TaskRunResponse:
         """Run one operator-declared verification execution.
 
@@ -1460,6 +1626,25 @@ class ForgeApiService:
             )
 
         run_id = f"run-verify-{uuid.uuid4().hex[:8]}"
+
+        # Server-side idempotency, claimed before the scope is frozen and before
+        # any durable write. ``purpose_run_id`` stays correlation metadata and is
+        # never part of the operation identity, so it cannot be used to obtain a
+        # second execution of the same declaration under one key. Without a key
+        # every value below is None and this path keeps its previous behaviour.
+        guard, guard_identity, guard_decision = self._begin_run_operation(
+            declaration, OperationClass.DECLARED_VERIFICATION, idempotency_key, run_id
+        )
+        if guard_decision is not None and (
+            guard_decision.verdict is not IdempotencyVerdict.START
+        ):
+            return self._idempotent_response(
+                run_id=guard_decision.run_id or run_id,
+                declaration=declaration,
+                decision=guard_decision,
+                loop_store=None,
+            )
+
         scope = self._build_declared_verification_scope(run_id, declaration)
 
         # One canonical task identity for this run. It is derived from the
@@ -1525,6 +1710,36 @@ class ForgeApiService:
                 pass
 
         result = run.execution_results[0] if run.execution_results else None
+
+        # Record the durable position. A denial classifies as a terminal security
+        # failure through the existing lifecycle mapper, so a later delivery can
+        # never retry a denied verification.
+        verification_labels = [str(run.state.value)]
+        if result is not None and result.outcome_status != ExecutionOutcomeStatus.EXECUTION_SUCCESS:
+            verification_labels.append(str(getattr(result.outcome_status, "value", "")))
+        failure = self._finish_run_operation(
+            guard,
+            guard_identity,
+            lifecycle=self._idempotent_lifecycle_labels(tuple(verification_labels)),
+            outcome_labels=tuple(verification_labels),
+        )
+        if failure is not None:
+            return self._idempotent_response(
+                run_id=run_id,
+                declaration=declaration,
+                decision=IdempotencyDecision(
+                    verdict=IdempotencyVerdict.REFUSE,
+                    run_id=run_id,
+                    failure_code=failure.code,
+                    reason=(
+                        "the durable idempotency outcome could not be recorded "
+                        f"({failure.code.value}), so this run is not reported as "
+                        "successful"
+                    ),
+                ),
+                loop_store=verification_store,
+            )
+
         output = ""
         error = None
         if result is not None:

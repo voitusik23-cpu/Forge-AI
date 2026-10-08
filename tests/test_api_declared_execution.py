@@ -830,16 +830,27 @@ class DeclaredVerificationEntryPointTests(DeclaredExecutionTestCase):
         self.assertIn("disabled", str(ctx.exception))
 
     def test_entry_point_accepts_no_authority_parameters(self) -> None:
-        """D-H: the signature admits no command, workspace, env, or timeout."""
+        """D-H: the signature admits no command, workspace, env, or timeout.
+
+        ``idempotency_key`` is admitted by a later block; it selects a durable
+        operation record and confers nothing, and ``purpose_run_id`` stays
+        correlation-only. Both are listed below among the names that must never
+        widen authority rather than being exceptions to the rule.
+        """
         import inspect
 
         signature = inspect.signature(ForgeApiService.run_declared_verification)
         parameters = list(signature.parameters)
-        self.assertEqual(parameters, ["self", "declaration_id", "purpose_run_id"])
+        self.assertEqual(
+            parameters,
+            ["self", "declaration_id", "purpose_run_id", "idempotency_key"],
+        )
         for banned in (
             "command", "workspace", "execution_profile", "environment_variables",
             "timeout_seconds", "allowed_execution_commands", "approval_required",
             "task", "context", "category", "description", "task_id", "profile",
+            "run_scope", "authorized_execution", "allowed_tool_ids",
+            "network_access", "capabilities",
         ):
             self.assertNotIn(banned, parameters)
 
