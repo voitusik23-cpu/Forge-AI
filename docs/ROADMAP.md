@@ -204,6 +204,9 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [x] Production **revision loop** inside `AgentHarness`: a bounded, objective retry after a real verification failure. `RevisionBudget` is server-side, every revision produces a new immutable plan that is validated again, security/authority/validation/no-progress failures are terminal, and a revision that repeats the same ordered intentions stops the run.
 - [ ] Advanced dynamic replanning and plan revision history: the first slice revises once per objective failure and keeps no revision history.
 - [ ] Richer retry policy and parallel/distributed execution of planned steps: the revision loop is sequential and bounded.
+- [x] Production **tool execution through `AgentHarness`**: a `ToolIntent` (tool identity plus bounded arguments) is authorized server-side from the run's frozen `RunScope.allowed_tool_ids`, composed into an invocation, and executed by the existing production `ToolExecutor`, which keeps owning the permission check and approval. Results are bounded before they reach the event trail, and a denial is terminal.
+- [ ] A tool sandbox and any tool-level network enforcement: tool execution reuses the existing in-process trust model and does not close GAP-A or GAP-B.
+- [ ] Multiple tool actions per run and tool-driven planning: the first slice offers a single tool action per run.
 - [ ] Parallel execution and retries of planned steps: the first slice is a deterministic sequential DAG.
 - [ ] Project classification and capability selection (В§22)
 - [ ] Project Brief, Architecture and Technical Specification generation for target projects
@@ -431,6 +434,9 @@ workflow review/ревизии. Выполнение плана, управле�
 - [x] Production **revision loop** внутри `AgentHarness`: ограниченный, объективный повтор после реального сбоя verification. `RevisionBudget` на стороне сервера, каждая revision создаёт новый неизменяемый план, который валидируется заново, сбои security/authority/validation/no-progress терминальны, а revision, повторяющая те же намерения, останавливает run.
 - [ ] Продвинутое динамическое перепланирование и история ревизий плана: первый срез делает revision один раз на объективный сбой и не хранит историю ревизий.
 - [ ] Более богатая retry-политика и параллельное/распределённое исполнение шагов плана: revision loop последователен и ограничен.
+- [x] Production **исполнение tools через `AgentHarness`**: `ToolIntent` (идентичность tool плюс ограниченные аргументы) авторизуется server-side из frozen `RunScope.allowed_tool_ids` run, компонуется в invocation и исполняется существующим production `ToolExecutor`, который по-прежнему владеет проверкой permission и approval. Результаты ограничиваются до попадания в event trail, а отказ терминален.
+- [ ] Sandbox для tools и любое сетевое ограничение на уровне tools: исполнение tools переиспользует существующую in-process trust model и не закрывает GAP-A или GAP-B.
+- [ ] Несколько tool-действий на run и планирование от tools: первый срез предлагает одно tool-действие на run.
 - [ ] Параллельное исполнение и retries шагов плана: первый срез — детерминированный последовательный DAG.
 - [ ] Классификация проектов и выбор capabilities (§22)
 - [ ] Генерация Project Brief, Architecture и Technical Specification для целевых проектов

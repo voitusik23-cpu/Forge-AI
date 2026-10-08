@@ -910,6 +910,56 @@ trusted task
 `AgentHarness` remains the only production orchestration loop; discovery adds a
 stage to it and no new coordinator, agent, or loop.
 
+**Tool execution: a declared intent, authorized server-side, bounded on the way out.**
+Tool execution is a stage of the one orchestration loop. `AgentHarness` composes
+an invocation from the run's own perimeter and hands it to the existing
+production `ToolExecutor`, which keeps owning the permission check, the approval
+flow, and the tool call:
+
+```text
+Decision (selects an index)
+  -> ToolIntent (identity + bounded arguments, data only)
+  -> authorize_tool_intent (server-side composition from the frozen RunScope)
+  -> ToolExecutor.execute  (PermissionPolicy + ApprovalPolicy + tool call)
+  -> BoundedToolResult     (digest, size, capped preview, allow-listed metadata)
+  -> harness continuation and the durable run event trail
+```
+
+* **The decision never supplies authority.** `DecisionAction.INVOKE_TOOL` selects
+  an index into the run's declared intents. It cannot name a tool, an argument, an
+  executable, an argv, a shell, an environment, a workspace, a timeout, a
+  capability, an approval, a `RunScope`, or an `AuthorizedExecution`. The action is
+  offered to a decision only when the run actually authorizes tools, has declared
+  an intent, has a registered executor, and has not already used its single tool
+  action.
+* **A `ToolIntent` is data.** It carries a tool identity and bounded arguments,
+  and nothing else. A key that names execution authority is refused at
+  construction rather than ignored, so an intent that names `command`, `argv`,
+  `environment`, `timeout`, `run_scope`, `allowed_tool_ids`, or a credential can
+  never reach the executor.
+* **The trusted tool authority is the frozen `RunScope`.** Its `allowed_tool_ids`
+  is the perimeter: `authorize_tool_intent` mints the invocation and the
+  `ToolExecutionContext` only from the run's own perimeter, and the harness refuses
+  a request whose declared intents exceed that perimeter before anything is planned
+  or decided. A fresh invocation identity is minted per attempt, so a previous
+  attempt's result is never reusable as authority.
+* **The existing executor is reused, not duplicated.** There is no second registry,
+  permission policy, approval policy, or executor. `app/tools/runner` machinery is
+  unchanged; the harness adds composition, not a parallel tool system.
+* **Results are bounded before they are durable.** `bound_tool_result`
+  (`app/tools/bounded.py`) stores a digest, a byte count, a capped preview, a
+  truncated error, and allow-listed structural metadata only. Raw stdout, stderr,
+  environment, credentials, and arbitrary file content never enter the run trail,
+  and a denial is a terminal `FAILED` run rather than a retried one.
+* **One event source per fact.** `TOOL_INVOCATION_REQUESTED`, `PERMISSION_CHECKED`
+  (the authorizing record), `TOOL_INVOCATION_DENIED`, `TOOL_EXECUTION_STARTED`, and
+  the executor's terminal tool event come from the executor; the harness adds
+  exactly one `TOOL_RESULT_BOUNDED` record per invocation with its sanitized
+  projection.
+
+Tool execution does not close GAP-A, GAP-B, or GAP-F, and it does not provide a
+sandbox: a tool still runs in-process under the same trust model as before.
+
 **Revision loop: bounded, objective, and inside the one orchestration loop.**
 `AgentHarness` owns the revision loop; there is no `RevisionAgentLoop`,
 `RevisionCoordinator`, or second harness. A revision runs only after a real
@@ -1260,6 +1310,56 @@ loop. Он выполняется внутри `AgentHarness.run` до перв�
 
 `AgentHarness` остаётся единственным production-orchestration loop; discovery
 добавляет стадию в него, а не новый координатор, агент или loop.
+
+**Исполнение tools: объявленное намерение, server-side авторизация, ограниченный результат.**
+Исполнение tools — стадия единственного orchestration loop. `AgentHarness`
+компонует invocation из собственного периметра run и передаёт его существующему
+production `ToolExecutor`, который по-прежнему владеет проверкой permission,
+процессом approval и самим вызовом tool:
+
+```text
+Decision (выбирает индекс)
+  -> ToolIntent (идентичность + ограниченные аргументы, только данные)
+  -> authorize_tool_intent (server-side композиция из frozen RunScope)
+  -> ToolExecutor.execute  (PermissionPolicy + ApprovalPolicy + вызов tool)
+  -> BoundedToolResult     (дайджест, размер, ограниченный preview, allow-list метаданных)
+  -> продолжение harness и durable event trail run
+```
+
+* **Решение никогда не поставляет authority.** `DecisionAction.INVOKE_TOOL`
+  выбирает индекс в объявленных intents run. Оно не может назвать tool, аргумент,
+  executable, argv, shell, окружение, workspace, timeout, capability, approval,
+  `RunScope` или `AuthorizedExecution`. Действие предлагается решению только когда
+  run действительно авторизует tools, объявил intent, имеет зарегистрированный
+  executor и ещё не использовал своё единственное tool-действие.
+* **`ToolIntent` — это данные.** Он несёт идентичность tool и ограниченные
+  аргументы, и больше ничего. Ключ, называющий execution authority, отвергается при
+  создании, а не игнорируется, поэтому intent с `command`, `argv`, `environment`,
+  `timeout`, `run_scope`, `allowed_tool_ids` или credentials никогда не достигнет
+  executor'а.
+* **Доверенный tool authority — это frozen `RunScope`.** `authorize_tool_intent`
+  создаёт invocation и `ToolExecutionContext` только из собственного периметра run,
+  а harness отвергает запрос, объявленные intents которого выходят за этот периметр,
+  ещё до планирования и решения. Свежая идентичность invocation создаётся на каждую
+  попытку, поэтому результат предыдущей попытки никогда не переиспользуется как
+  authority.
+* **Существующий executor переиспользуется, а не дублируется.** Второго registry,
+  permission policy, approval policy или executor нет; механизм в `app/tools/`
+  не изменён — harness добавляет композицию, а не параллельную tool-систему.
+* **Результаты ограничиваются до сохранения.** `bound_tool_result`
+  (`app/tools/bounded.py`) сохраняет только дайджест, размер в байтах,
+  ограниченный preview, усечённую ошибку и структурные метаданные из allow-list.
+  Сырые stdout, stderr, окружение, credentials и произвольное содержимое файлов
+  никогда не попадают в trail run, а отказ — это терминальный `FAILED` run, а не
+  повторяемый.
+* **Один источник событий на факт.** `TOOL_INVOCATION_REQUESTED`,
+  `PERMISSION_CHECKED` (авторизующая запись), `TOOL_INVOCATION_DENIED`,
+  `TOOL_EXECUTION_STARTED` и терминальное событие tool приходят от executor'а;
+  harness добавляет ровно одну запись `TOOL_RESULT_BOUNDED` на invocation со своей
+  санитизированной проекцией.
+
+Исполнение tools не закрывает GAP-A, GAP-B и GAP-F и не даёт sandbox: tool
+по-прежнему исполняется в процессе под той же trust model, что и раньше.
 
 **Revision loop: ограниченный, объективный и внутри единственного orchestration loop.**
 `AgentHarness` владеет revision loop; `RevisionAgentLoop`, `RevisionCoordinator`

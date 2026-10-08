@@ -27,6 +27,15 @@ from app.agent_runtime.revision_decision import (
     RevisionDecision,
     RevisionError,
 )
+from app.agent_runtime.tool_execution import (
+    AuthorizedToolCall,
+    ToolAuthorizationError,
+    ToolIntent,
+    authorize_tool_intent,
+)
+from app.tools.bounded import BoundedToolResult, bound_tool_result
+from app.tools.contracts import ToolStatus
+from app.tools.executor import ToolExecutor
 from app.agent_runtime.revision_policy import (
     RevisionEligibility,
     evaluate_revision,
@@ -82,6 +91,7 @@ class AgentHarness:
         project_discovery: Any | None = None,
         project_planner: Any | None = None,
         revision_budget: RevisionBudget | None = None,
+        tool_executor: ToolExecutor | None = None,
     ) -> None:
         self._context_assembler = context_assembler or DecisionContextAssembler()
         self._decision_provider = decision_provider or DeterministicDecisionProvider()
@@ -113,6 +123,10 @@ class AgentHarness:
         )
         if not isinstance(self._revision_budget, RevisionBudget):
             raise RevisionError("revision_budget must be a RevisionBudget")
+        # The existing production ToolExecutor owns permission checks, approval,
+        # and the tool call itself. The harness only composes the input for it
+        # from the run's frozen perimeter.
+        self._tool_executor = tool_executor
 
     def _enforce_run_scope(self, request: HarnessRequest) -> None:
         """Freeze and enforce the run's security perimeter before any read.
@@ -146,6 +160,18 @@ class AgentHarness:
         scope.validate_command_set(request.allowed_execution_commands)
         scope.validate_acceptance_criteria(request.acceptance_criteria)
         scope.validate_tool_set(getattr(request, "allowed_tool_ids", None))
+        # Declared tool intents may only narrow the frozen tool perimeter. A
+        # request that declares an intent for a tool the run does not authorize is
+        # rejected before anything is planned, decided, or executed.
+        declared_tool_ids = {
+            str(getattr(intent, "tool_id", ""))
+            for intent in (getattr(request, "tool_requests", ()) or ())
+        }
+        declared_tool_ids.discard("")
+        if declared_tool_ids - set(scope.allowed_tool_ids):
+            raise RunScopeError(
+                "declared tool intents exceed the frozen run tool set"
+            )
 
         scope.freeze()
         require_active_scope(request.run_id, scope)
@@ -263,6 +289,27 @@ class AgentHarness:
         execution_count = 0
         revision_count = 0
         exec_index = 0
+
+        # Tool stage bookkeeping. The trusted tool set comes from the run's frozen
+        # scope, never from the request, a decision, or a model.
+        tool_results: list[BoundedToolResult] = []
+        tool_index = 0
+        tool_count = 0
+        tool_requests = tuple(getattr(request, "tool_requests", ()) or ())
+        scope_for_tools = request.run_scope
+        allowed_tool_ids = (
+            frozenset(getattr(scope_for_tools, "allowed_tool_ids", frozenset()) or ())
+            if scope_for_tools is not None
+            else frozenset()
+        )
+        # A tool stage exists only when the run truly authorizes tools and has a
+        # registered executor. Otherwise the action is never offered.
+        tools_available = bool(
+            tool_requests and allowed_tool_ids and self._tool_executor is not None
+        )
+        authorized_tool_call: AuthorizedToolCall | None = None
+        tool_denial_reason = ""
+        last_tool_outcome = ""
 
         # Revision loop bookkeeping. Every value here is server-side; nothing
         # per-run can change the budget, the counter, or the no-progress history.
@@ -618,6 +665,14 @@ class AgentHarness:
                 context_id=context_envelope.context_id,
                 context_fingerprint=context_envelope.context_fingerprint,
                 context_envelope=context_envelope,
+                # Only a run whose frozen scope authorizes tools, that declared a
+                # tool intent, and that has a registered executor may be offered
+                # the tool action. A single tool action is offered per run.
+                available_actions=(
+                    (DecisionAction.INVOKE_TOOL,)
+                    if tools_available and tool_count == 0
+                    else ()
+                ),
             )
             emit(
                 EventType.DECISION_REQUESTED,
@@ -700,6 +755,50 @@ class AgentHarness:
             elif action == DecisionAction.RUN_VERIFICATION:
                 verification_attempted = True
                 authorized = True
+
+            elif action == DecisionAction.INVOKE_TOOL:
+                # A tool action is authorized here, server-side, from the run's
+                # frozen tool perimeter. The decision selects an index; it never
+                # supplies a tool identity, an argument, or any authority.
+                authorized_tool_call = None
+                tool_denial_reason = ""
+                if self._tool_executor is None:
+                    tool_denial_reason = "no_tool_executor"
+                elif not allowed_tool_ids:
+                    tool_denial_reason = "no_tools_authorized"
+                elif tool_count > 0:
+                    # One tool action per run keeps the loop bounded and stops a
+                    # decision from driving repeated invocations.
+                    tool_denial_reason = "tool_limit_reached"
+                elif tool_index >= len(tool_requests):
+                    tool_denial_reason = "no_tool_request"
+                else:
+                    intent = tool_requests[tool_index]
+                    if not isinstance(intent, ToolIntent):
+                        tool_denial_reason = "invalid_tool_intent"
+                    elif intent.tool_id not in allowed_tool_ids:
+                        # An intent is never self-authorizing.
+                        tool_denial_reason = "tool_not_allowed"
+                    else:
+                        try:
+                            authorized_tool_call = authorize_tool_intent(
+                                intent,
+                                run_id=request.run_id,
+                                task_id=(
+                                    request.metadata.get("task_id") or request.run_id
+                                ),
+                                allowed_tool_ids=allowed_tool_ids,
+                                context_fingerprint=context_envelope.context_fingerprint,
+                                workspace=request.workspace,
+                                run_scope=request.run_scope,
+                                round_number=tool_count,
+                                attempt_number=current_state.attempt_number,
+                            )
+                        except ToolAuthorizationError as exc:
+                            tool_denial_reason = f"tool_authorization_failed:{type(exc).__name__}"
+                authorized = authorized_tool_call is not None
+                if not authorized:
+                    auth_denial_reason = tool_denial_reason or "tool_not_authorized"
 
             elif action == DecisionAction.REQUEST_REVISION:
                 # A revision is never granted merely because a decision asked for
@@ -922,6 +1021,71 @@ class AgentHarness:
                             {"reason": "revision_no_progress"},
                         )
                     revision_decision = None
+
+                elif action == DecisionAction.INVOKE_TOOL:
+                    assert authorized_tool_call is not None
+                    tool_count += 1
+                    tool_index += 1
+                    action_outcome = "tool_requested"
+                    # No extra request event is emitted here: the existing
+                    # ToolExecutor already emits TOOL_INVOCATION_REQUESTED,
+                    # PERMISSION_CHECKED (the authorizing record), and the terminal
+                    # tool event, so the trail keeps exactly one source.
+                    try:
+                        # The existing production ToolExecutor owns the permission
+                        # check, the approval flow, and the tool call itself. The
+                        # harness supplies only the server-composed invocation and
+                        # the context derived from the frozen scope.
+                        raw_result = self._tool_executor.execute(
+                            authorized_tool_call.invocation,
+                            context=authorized_tool_call.context,
+                            observer=lambda event_type, data: emit(event_type, dict(data)),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - a raising tool is a failure
+                        raw_result = None
+                        last_tool_outcome = f"tool_executor_error:{type(exc).__name__}"
+
+                    bounded = bound_tool_result(
+                        raw_result, tool_id=authorized_tool_call.tool_id
+                    )
+                    if not last_tool_outcome:
+                        last_tool_outcome = bounded.status.value
+                    tool_results.append(bounded)
+                    # The executor already recorded the tool's own terminal event.
+                    # This is the harness's bounded projection of the result: one
+                    # sanitized record per invocation, never the raw output.
+                    emit(
+                        EventType.TOOL_RESULT_BOUNDED,
+                        {
+                            **authorized_tool_call.event_metadata(),
+                            **bounded.bounded_summary(),
+                            "revision_number": revision_number,
+                        },
+                    )
+                    if bounded.status == ToolStatus.DENIED:
+                        # A denial is a policy/security outcome: it ends the run
+                        # rather than being retried or worked around.
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.FAILED,
+                            status=HarnessStatus.FAILED,
+                            terminal=True,
+                            metadata={"reason": "tool_denied"},
+                        )
+                        emit(EventType.HARNESS_FAILED, {"reason": "tool_denied"})
+                    elif bounded.status == ToolStatus.WAITING_FOR_APPROVAL:
+                        current_state = replace(
+                            current_state,
+                            phase=HarnessPhase.WAITING,
+                            status=HarnessStatus.WAITING_FOR_APPROVAL,
+                            terminal=True,
+                            metadata={"reason": "tool_approval_waiting"},
+                        )
+                        emit(
+                            EventType.HARNESS_PHASE_CHANGED,
+                            {"phase": HarnessPhase.WAITING.value},
+                        )
+                    authorized_tool_call = None
 
                 elif action == DecisionAction.EXECUTE:
                     execution_count += 1

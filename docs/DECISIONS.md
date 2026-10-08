@@ -1837,3 +1837,175 @@ Implemented in the revision block. Verified against the code in
    распределённое исполнение, более богатые retry-политики, исполнение tools через
    harness, memory, knowledge, reviewer, idempotency и resume этим блоком не
    изменены.**
+
+## Production Tool Execution v0.1
+
+Implemented in the tool execution block. Verified against the code in
+`app/agent_runtime/tool_execution.py`, `app/tools/bounded.py`,
+`app/agent_runtime/harness.py`, `app/agent_runtime/models.py`,
+`app/decision/models.py`, `app/decision/validator.py`,
+`app/orchestrator/models.py`, `app/runtime/bootstrap.py`, `app/api/service.py`,
+and `tests/test_tool_execution_production.py`.
+
+### Accepted decisions
+
+- **The existing `ToolExecutor` was reused, not duplicated.** There is no second
+  registry, permission policy, approval policy, executor, or tool loop. The
+  harness composes an invocation and a `ToolExecutionContext`; the executor keeps
+  owning the permission check, the approval flow, and the tool call.
+- **`ToolIntent` is data.** It carries a tool identity and bounded arguments and
+  nothing else. A key that names execution authority (`command`, `argv`,
+  `executable`, `shell`, `environment`, `timeout`, `run_scope`,
+  `authorized_execution`, `approval*`, `allowed_execution_commands`,
+  `allowed_tool_ids`, `capabilities`, `workspace`, `network_access`, credentials)
+  is refused at construction rather than ignored.
+- **The trusted tool authority is the run's frozen `RunScope`.** The harness reads
+  `RunScope.allowed_tool_ids` as the perimeter and refuses a request whose declared
+  intents exceed it before anything is planned or decided. `HarnessRequest` gained
+  no `allowed_tool_ids` field, so a request can never assert its own tool authority.
+- **A decision selects an index, never a tool.** `DecisionAction.INVOKE_TOOL` and
+  `DecisionType.INVOKE_TOOL` are distinct from `EXECUTE`, and the validator rejects
+  a decision that mixes them. The action is offered only when the run authorizes
+  tools, has a declared intent, has a registered executor, and has not already used
+  its single tool action.
+- **Every invocation is re-authorized and freshly identified.**
+  `authorize_tool_intent` mints a new invocation identity per attempt and derives
+  the whole context from the run's perimeter, so a previous attempt's identity or
+  result can never be reused as authority.
+- **Results are bounded before they are durable.** `BoundedToolResult` and
+  `bound_tool_result` (`app/tools/bounded.py`) keep a digest, a byte count, a
+  capped preview, a truncated error, and allow-listed structural metadata only. Raw
+  stdout, stderr, environment, credentials, and arbitrary file content never enter
+  the run trail. The ceilings are module constants, not parameters.
+- **Denial is terminal.** A permission or approval denial ends the run as `FAILED`;
+  it is never turned into a revision, because a revision must not become a way
+  around a tool boundary. The bounded tool limit is enforced the same way.
+- **One event source per fact.** The executor emits
+  `TOOL_INVOCATION_REQUESTED`, `PERMISSION_CHECKED`, `TOOL_INVOCATION_DENIED`,
+  `TOOL_EXECUTION_STARTED`, and its terminal tool event. The harness adds exactly
+  one new event, `TOOL_RESULT_BOUNDED`, carrying its sanitized projection.
+- **Composition stays deny-by-default.** `ForgeApiService` takes an optional
+  `tool_intents` parameter that defaults to empty, and its tool perimeter is derived
+  exactly as before. With no declared intents no tool action is ever offered, and
+  the service path still requires the operator's `allowed_tool_ids` for any tool to
+  pass the executor's permission check.
+
+### Rejected alternatives (with rationale)
+
+- **Letting a decision or a model name the tool and its arguments directly.**
+  Rejected: that makes the model the source of tool authority, which is exactly the
+  bypass this boundary exists to prevent.
+- **Adding `allowed_tool_ids` to `HarnessRequest` for convenience.** Rejected: it
+  would let a request assert its own tool authority instead of inheriting the frozen
+  scope.
+- **Building a second tool registry or executor inside the harness.** Rejected: the
+  production `ToolExecutor` already owns permission, approval, and the call, and a
+  second one would create a parallel security path.
+- **Storing raw tool output in the run trail.** Rejected: tool output can contain
+  file content or credentials, and the trail is durable.
+- **Treating a tool denial as a revision trigger.** Rejected: it would let the
+  revision loop retry around a permission or approval decision.
+- **Adding a tool action per iteration.** Rejected: one bounded tool action per run
+  keeps the loop bounded and prevents a provider from driving repeated invocations.
+
+### Consequences and open items
+
+1. **One tool action per run.** Following an invocation with a second one requires
+   lifting the single-action bound, which is deferred.
+2. **No sandbox.** A tool runs in-process under the existing trust model, so this
+   block does not close GAP-A or GAP-B.
+3. **Tool execution is reachable on the declared-verification path** when the
+   operator declares both the intent and the allowlist. On `run_agent_loop`
+   verification observations remain `not_evaluated` because criterion identity there
+   is GAP-F; nothing about that gap was changed or faked.
+4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, parallel and
+   distributed execution, memory, knowledge, reviewer, idempotency, and resume are
+   unchanged** by this block.
+
+## Production Tool Execution v0.1 — русская версия
+
+Реализовано в блоке tool execution. Проверено по коду в
+`app/agent_runtime/tool_execution.py`, `app/tools/bounded.py`,
+`app/agent_runtime/harness.py`, `app/agent_runtime/models.py`,
+`app/decision/models.py`, `app/decision/validator.py`,
+`app/orchestrator/models.py`, `app/runtime/bootstrap.py`, `app/api/service.py` и
+`tests/test_tool_execution_production.py`.
+
+### Принятые решения
+
+- **Существующий `ToolExecutor` переиспользован, а не продублирован.** Второго
+  registry, permission policy, approval policy, executor'а или tool-loop нет.
+  Harness компонует invocation и `ToolExecutionContext`; executor по-прежнему
+  владеет проверкой permission, процессом approval и самим вызовом tool.
+- **`ToolIntent` — это данные.** Он несёт идентичность tool и ограниченные
+  аргументы, и больше ничего. Ключ, называющий execution authority (`command`,
+  `argv`, `executable`, `shell`, `environment`, `timeout`, `run_scope`,
+  `authorized_execution`, `approval*`, `allowed_execution_commands`,
+  `allowed_tool_ids`, `capabilities`, `workspace`, `network_access`, credentials),
+  отвергается при создании, а не игнорируется.
+- **Доверенный tool authority — это frozen `RunScope` run.** Harness читает
+  `RunScope.allowed_tool_ids` как периметр и отвергает запрос, объявленные intents
+  которого выходят за него, ещё до планирования и решения. `HarnessRequest` не
+  получил поля `allowed_tool_ids`, поэтому запрос никогда не может сам объявить свой
+  tool authority.
+- **Решение выбирает индекс, а не tool.** `DecisionAction.INVOKE_TOOL` и
+  `DecisionType.INVOKE_TOOL` отличны от `EXECUTE`, и валидатор отвергает решение,
+  смешивающее их. Действие предлагается только когда run авторизует tools, объявил
+  intent, имеет зарегистрированный executor и ещё не использовал своё единственное
+  tool-действие.
+- **Каждый invocation авторизуется заново и получает свежую идентичность.**
+  `authorize_tool_intent` создаёт новую идентичность invocation на каждую попытку и
+  выводит весь контекст из периметра run, поэтому идентичность или результат
+  предыдущей попытки никогда не переиспользуется как authority.
+- **Результаты ограничиваются до сохранения.** `BoundedToolResult` и
+  `bound_tool_result` (`app/tools/bounded.py`) сохраняют только дайджест, размер в
+  байтах, ограниченный preview, усечённую ошибку и структурные метаданные из
+  allow-list. Сырые stdout, stderr, окружение, credentials и произвольное содержимое
+  файлов никогда не попадают в trail run. Границы — это константы модуля, а не
+  параметры.
+- **Отказ терминален.** Отказ permission или approval завершает run как `FAILED`; он
+  никогда не превращается в revision, поскольку revision не должен становиться
+  способом обойти границу tool. Ограничение на число tool-действий обеспечивается
+  так же.
+- **Один источник событий на факт.** Executor испускает
+  `TOOL_INVOCATION_REQUESTED`, `PERMISSION_CHECKED`, `TOOL_INVOCATION_DENIED`,
+  `TOOL_EXECUTION_STARTED` и своё терминальное событие tool. Harness добавляет ровно
+  одно новое событие, `TOOL_RESULT_BOUNDED`, со своей санитизированной проекцией.
+- **Композиция остаётся deny-by-default.** `ForgeApiService` принимает
+  необязательный параметр `tool_intents` со значением по умолчанию — пустым, и его
+  tool-периметр выводится ровно как раньше. Без объявленных intents ни одно
+  tool-действие не предлагается, а сервисный путь по-прежнему требует операторского
+  `allowed_tool_ids`, чтобы хоть один tool прошёл проверку permission у executor'а.
+
+### Отклонённые альтернативы (с обоснованием)
+
+- **Позволять решению или модели напрямую называть tool и его аргументы.**
+  Отклонено: это делает модель источником tool authority — ровно тот обход, который
+  обязана предотвращать эта граница.
+- **Добавить `allowed_tool_ids` в `HarnessRequest` для удобства.** Отклонено: это
+  позволило бы запросу объявлять собственный tool authority вместо наследования
+  frozen scope.
+- **Построить второй tool registry или executor внутри harness.** Отклонено:
+  production `ToolExecutor` уже владеет permission, approval и вызовом, а второй
+  создал бы параллельный security path.
+- **Хранить сырой вывод tool в trail run.** Отклонено: вывод tool может содержать
+  содержимое файлов или credentials, а trail долговечен.
+- **Считать отказ tool триггером revision.** Отклонено: это позволило бы revision
+  loop повторять попытки в обход решения permission или approval.
+- **Добавлять tool-действие на каждую итерацию.** Отклонено: одно ограниченное
+  tool-действие на run сохраняет loop ограниченным и не даёт провайдеру инициировать
+  повторные вызовы.
+
+### Следствия и открытые пункты
+
+1. **Одно tool-действие на run.** Второй вызов после invocation требует снятия
+   ограничения на одно действие; это отложено.
+2. **Sandbox отсутствует.** Tool исполняется в процессе под существующей trust
+   model, поэтому этот блок не закрывает GAP-A и GAP-B.
+3. **Исполнение tools достижимо на пути declared-verification**, когда оператор
+   объявляет и intent, и allowlist. На пути `run_agent_loop` наблюдения verification
+   остаются `not_evaluated`, поскольку идентичность критериев там — GAP-F; в этом
+   блоке ничего в этом разрыве не изменено и не подделано.
+4. **GAP-A, GAP-B, GAP-F, directory-depth, snapshot consistency, параллельное и
+   распределённое исполнение, memory, knowledge, reviewer, idempotency и resume этим
+   блоком не изменены.**

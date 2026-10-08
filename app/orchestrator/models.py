@@ -123,6 +123,10 @@ class EventType(str, Enum):
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     PERMISSION_CHECKED = "permission_checked"
     TOOL_INVOCATION_DENIED = "tool_invocation_denied"
+    # The harness's bounded projection of a tool result. Kept distinct from the
+    # executor's own terminal event so the run trail records exactly one bounded
+    # result per invocation without duplicating the tool event.
+    TOOL_RESULT_BOUNDED = "tool_result_bounded"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_RESOLVED = "approval_resolved"
     VERIFICATION_REQUESTED = "verification_requested"

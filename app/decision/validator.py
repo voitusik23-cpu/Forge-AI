@@ -19,6 +19,9 @@ DECISION_TO_ACTION_COMPATIBILITY: dict[DecisionType, tuple[DecisionAction, ...]]
     ),
     DecisionType.WAIT: (DecisionAction.WAIT_FOR_APPROVAL,),
     DecisionType.CONTINUE: (DecisionAction.EXECUTE,),
+    # A tool invocation is a distinct decision from a host execution: it selects a
+    # declared tool intent, never a command.
+    DecisionType.INVOKE_TOOL: (DecisionAction.INVOKE_TOOL,),
     DecisionType.FAIL: (DecisionAction.FAIL_RUN,),
 }
 

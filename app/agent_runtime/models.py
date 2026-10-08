@@ -134,6 +134,12 @@ class HarnessRequest:
     # stage. Like the snapshot it is produced inside the run loop, is bound to
     # this run and task, and carries no execution authority.
     execution_plan: object | None = None
+    # Declared tool intents this run may invoke, composed server-side exactly like
+    # ``execution_requests``. A ToolIntent is data - a tool identity plus bounded
+    # arguments - and grants nothing: the harness authorizes each invocation
+    # against the run's frozen ``allowed_tool_ids``, and the existing
+    # ``ToolExecutor`` performs the permission check and approval.
+    tool_requests: tuple[object, ...] = ()
     # Immutable security perimeter for this run. When present it binds the
     # authority-relevant inputs and is validated before any context, memory,
     # knowledge, or provider output is read.
@@ -156,6 +162,8 @@ class HarnessRequest:
             object.__setattr__(self, "acceptance_criteria", tuple(self.acceptance_criteria))
         if isinstance(self.requirements, list):
             object.__setattr__(self, "requirements", tuple(self.requirements))
+        if isinstance(self.tool_requests, list):
+            object.__setattr__(self, "tool_requests", tuple(self.tool_requests))
         if isinstance(self.available_skills, (list, tuple)):
             for s in self.available_skills:
                 if not isinstance(s, SkillDefinition):

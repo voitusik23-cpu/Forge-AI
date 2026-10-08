@@ -24,6 +24,7 @@ from app.agent_runtime.acceptance_spec import (
     AcceptanceSpecError,
     RunAcceptanceCriteria,
 )
+from app.agent_runtime.tool_execution import ToolIntent
 from app.agent_runtime.models import HarnessRequest
 from app.agent_runtime.policy import AgentHarnessPolicy
 from app.execution.capabilities import ExecutionCapability
@@ -155,6 +156,12 @@ class ForgeApiService:
             Callable[[Task, ProjectExecutionProfile], str | None]
         ] = None,
         harness_factory: Callable[..., object] | None = None,
+        # Operator-supplied, server-side tool intents for this run. Each is a
+        # ToolIntent: a tool identity plus bounded data arguments. A ToolIntent
+        # grants nothing on its own - the run's frozen allowed_tool_ids decides
+        # whether it may be invoked. With no declared intents no tool action is
+        # ever offered.
+        tool_intents: Sequence["ToolIntent"] = (),
     ) -> None:
         self._workspace = workspace or Workspace(Path.cwd())
 
@@ -218,6 +225,7 @@ class ForgeApiService:
         # Reuses the canonical registry, permission policy, and approval policy.
         # No resolver is invented: write tools therefore stay WAITING_FOR_APPROVAL.
         self._approval_resolver = approval_resolver
+        self._tool_intents: tuple[object, ...] = tuple(tool_intents or ())
         self._tool_executor = ToolExecutor(
             self._tool_registry,
             approval_resolver=approval_resolver,
@@ -257,6 +265,27 @@ class ForgeApiService:
         """
         registered = {definition.id for definition in self._tool_registry.list_tools()}
         return frozenset(self._allowed_tool_ids & registered)
+
+    def _declared_tool_intents(self) -> tuple[object, ...]:
+        """Return the declared tool intents whose tools this run truly authorizes.
+
+        Two independent conditions must hold: the operator declared the intent,
+        and the run's own tool perimeter authorizes that tool. An intent for a
+        tool outside ``_effective_tool_ids()`` is dropped here rather than being
+        offered to a decision, so a declaration can never widen the perimeter.
+        """
+        if not self._tool_intents:
+            return ()
+        authorizable = self._effective_tool_ids()
+        declared: list[object] = []
+        seen: set[str] = set()
+        for intent in self._tool_intents:
+            tool_id = str(getattr(intent, "tool_id", "") or "")
+            if not tool_id or tool_id in seen or tool_id not in authorizable:
+                continue
+            seen.add(tool_id)
+            declared.append(intent)
+        return tuple(declared)
 
     def _resolve_declaration_id(self, task: Task) -> str | None:
         """Resolve the declaration for one task using server-side inputs only.
@@ -298,8 +327,13 @@ class ForgeApiService:
             run_id=run_id,
             workspace=self._workspace,
             execution_profile=self._execution_profile,
-            # A declared verification run is a host process run, not a tool run.
-            allowed_tool_ids=frozenset(),
+            # Declared verification is primarily a host process run. Its tool
+            # perimeter stays empty unless the operator actually declared tool
+            # intents for this service, in which case it is exactly the operator
+            # allowlist intersected with the registry - never anything wider.
+            allowed_tool_ids=(
+                self._effective_tool_ids() if self._tool_intents else frozenset()
+            ),
             allowed_execution_commands=frozenset({declaration.executable}),
             acceptance_criteria=(API_RUN_CRITERION,),
         )
@@ -404,6 +438,10 @@ class ForgeApiService:
             run_id=run_id,
             workspace=self._workspace,
             execution_profile=self._execution_profile,
+            # The frozen tool perimeter mirrors the operator allowlist intersected
+            # with the registry. It is an outer boundary only: the harness still
+            # authorizes each invocation against the run's own declared intents, so
+            # a wider perimeter never by itself authorizes a tool call.
             allowed_tool_ids=self._effective_tool_ids(),
             # Derived from the resolved declaration, never from an independently
             # configured list. An empty set means no host process is reachable
@@ -599,6 +637,7 @@ class ForgeApiService:
             run_id=run_id,
             workspace=self._workspace,
             task_specification=specification,
+            tool_requests=self._declared_tool_intents(),
             execution_requests=(
                 to_execution_request(
                     declaration,
@@ -689,7 +728,14 @@ class ForgeApiService:
         # Built by the same composition factory that supplies the runtime's
         # canonical harness, differing only in the narrowed bounds of this slice.
         # No second loop implementation and no second authority object exist.
-        harness = self._harness_factory(policy=SINGLE_ACTION_LOOP_POLICY)
+        # The production ToolExecutor is supplied explicitly. With no declared
+        # tool intents and no allow-listed tools nothing reaches it, so the safe
+        # default is unchanged; when a tool is authorized the executor keeps
+        # owning its permission check and approval.
+        harness = self._harness_factory(
+            policy=SINGLE_ACTION_LOOP_POLICY,
+            tool_executor=self._tool_executor,
+        )
         t0 = time.perf_counter()
         result = harness.run(request)
         duration = time.perf_counter() - t0
@@ -914,6 +960,7 @@ class ForgeApiService:
         harness = self._harness_factory(
             policy=ACCEPTANCE_LOOP_POLICY,
             coordinator=self._acceptance_coordinator(),
+            tool_executor=self._tool_executor,
         )
         t0 = time.perf_counter()
         result = harness.run(request)

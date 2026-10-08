@@ -117,6 +117,8 @@ def create_agent_harness(
     project_planner: object | None = None,
     with_planning: bool = True,
     revision_budget: object | None = None,
+    tool_executor: object | None = None,
+    tool_registry: object | None = None,
 ) -> "AgentHarness":
     """Build the canonical production orchestration loop.
 
@@ -144,6 +146,8 @@ def create_agent_harness(
     from app.agent_runtime.harness import AgentHarness
     from app.agent_runtime.policy import AgentHarnessPolicy
     from app.agent_runtime.project_discovery import ProjectDiscovery
+    from app.tools.executor import ToolExecutor
+    from app.tools.registry import build_default_tool_registry
     from app.decision.provider import DeterministicDecisionProvider
     from app.planning.planner import Planner
     from app.execution.adapter import LocalExecutionAdapter
@@ -172,6 +176,14 @@ def create_agent_harness(
             {"revision_budget": revision_budget}
             if revision_budget is not None
             else {}
+        ),
+        # The existing production ToolExecutor. The harness supplies it with a
+        # server-composed invocation and a context derived from the frozen run
+        # scope; the executor keeps owning permission checks and approval.
+        "tool_executor": (
+            tool_executor
+            if tool_executor is not None
+            else ToolExecutor(build_default_tool_registry(tool_registry))
         ),
     }
     resolved_coordinator = coordinator
