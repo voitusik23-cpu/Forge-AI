@@ -2393,3 +2393,232 @@ in `app/execution/sandbox.py`, `app/execution/adapter.py`,
 4. **Реальное принятие задачи по-прежнему уважает границу.** Workspace и каждый
    artifact target проверяются на границе authority, поэтому run не может быть
    принят на основании пути, которого ему никогда не разрешали касаться.
+
+## Run Idempotency and Recoverable Resume v0.1 (GAP-I / GAP-R)
+
+Implemented in the idempotency and resume block. Verified against the code in
+`app/agent_runtime/idempotency.py`, `app/agent_runtime/idempotency_integration.py`,
+`app/api/service.py`, and `tests/test_idempotency_production.py`.
+
+### Accepted decisions
+
+- **Four identities, never one.** `TaskIdentity` -> `OperationIdentity` ->
+  `RunIdentity` -> `AttemptIdentity`, with a separate action identity per side
+  effect. Collapsing these into one id is exactly how a duplicate execution
+  becomes invisible, so the hierarchy is explicit and each level has its own
+  fingerprint.
+- **The idempotency key is input, never authority.** It is canonicalized and
+  refused when malformed rather than coerced, and it is bound to a fingerprint
+  covering the operation class, the key, the task fingerprint, and every
+  criterion fingerprint. A key can therefore never be reused for different work.
+- **The ledger is separate from `RunStore`.** `RunStore` documents itself as an
+  observation sink that is "not a resume engine"; extending it into a decision
+  engine would have contradicted the existing architecture. The ledger is a new,
+  focused component, and this block does not write run history through it.
+- **Claiming a key is atomic through `O_EXCL`.** This is the strongest primitive
+  the repository's storage actually offers. Two simultaneous deliveries of one key
+  cannot both win; the loser reads the winner's record.
+- **No compare-and-set and no lease.** Stealing a stale claim would require
+  guessing whether the previous writer is dead, which is unprovable. A `CREATED`
+  or `RUNNING` record is therefore refused by plain resume rather than assumed
+  interrupted.
+- **`STARTED` is written before the effect; `UNKNOWN_AFTER_CRASH` is derived.**
+  A completion record is never fabricated, and a caller cannot assert an unknown
+  state. Reading reports what is on disk; recovery is a separate explicit step.
+  This is what makes the crash window honest instead of guessed.
+- **Only workspace writes are replay-safe.** Host processes, provider calls, and
+  network calls are not, because repeating them can duplicate an irreversible
+  action.
+- **An authority failure is terminal - and the ledger enforces it.** Permission,
+  policy, approval, identity, sandbox, and network denials classify as
+  `SECURITY_FAILURE`, which dominates every other recorded label, and neither
+  replay nor resume is available. Crucially this is enforced by
+  `validate_lifecycle_transition` inside `IdempotencyLedger.update`, not merely
+  documented: a terminal state cannot be rewritten to any other state, a refused
+  write leaves the durable record byte-identical, and an unprovable side effect
+  cannot be moved into a state a resume would accept. A security review found the
+  earlier code accepted `SECURITY_FAILURE -> INTERRUPTED`, after which the run
+  resumed; the guard exists so the invariant cannot regress.
+- **A refused write is never reported as success.** `RunIdempotencyGuard.finish`
+  re-raises instead of swallowing, and `run_agent_loop` answers with an explicit
+  unrecorded-outcome refusal. If the durable position cannot be recorded, a later
+  delivery would read an earlier state and could be admitted again, so the run is
+  not reported as a success the code cannot stand behind.
+- **A further attempt needs a new operation identity, not a rewritten record.**
+  `FAILED` and `LIMIT_REACHED` are terminal for the same reason as
+  `SECURITY_FAILURE`: the honest way to retry is a new idempotency key, which is
+  an explicit operator decision, rather than reopening a record.
+- **Resume restores position, never permission.** The recorded operation
+  fingerprint must be reproduced by the current authority ceiling or the resume is
+  refused.
+- **The guard is injectable.** `ForgeApiService` accepts an explicit
+  `idempotency_guard` instead of reading a process-wide singleton, so a test or an
+  embedding composition cannot touch state outside its own ledger.
+
+### Rejected alternatives
+
+- **"Exactly once".** Rejected: it cannot be proven here, and claiming it would be
+  false. The honest ceiling is at-most-once per idempotency key.
+- **Treating an unreadable ledger as "no record".** Rejected: that is precisely
+  how a duplicate execution happens. A ledger that cannot be consulted produces a
+  refusal, not a silent start.
+- **Using `run_id` as the idempotency identity.** Rejected: production generates a
+  fresh `run_id` per call (`run-loop-<uuid>`, `run-accept-<uuid>`, and so on), so
+  binding idempotency to it would have made every duplicate look new.
+- **Letting a task or a request declare that an operation is idempotent.**
+  Rejected: that would hand authority-shaped meaning to untrusted input. Only the
+  trusted declaration plus the frozen binding compose the identity.
+- **Persisting the operation so it can be replayed directly.** Rejected: no
+  pickle, no serialized authority, no command, no workspace, no environment. A
+  resume rebuilds `AuthorizedExecution` from the current trusted `RunScope`.
+- **Extending `RunStore` into a resume engine.** Rejected: it would turn the
+  observation sink into a second decision path.
+
+### Consequences and open items
+
+1. **Idempotency covers `run_agent_loop` only when a key is supplied.** Without a
+   key the call keeps its previous semantics exactly, which is what preserves
+   legacy behaviour.
+2. **`run_accepted_task`, `run_declared_verification`, `run_task`, the HTTP
+   task-run path, and desktop dispatch do not yet consult the ledger.** They are
+   unaffected rather than protected; routing them through the same identity model
+   is follow-up work.
+3. **Concurrency is bounded, not complete.** The atomic claim is guaranteed; a
+   lease, compare-and-set, or multi-process coordination is not, and is recorded
+   as a limitation rather than simulated. Updates use atomic file replacement but
+   are not CAS-protected read-modify-write, so concurrent updates for one key can
+   lose an update, and Windows can surface `PermissionError` during a concurrent
+   replacement. These are liveness and recovery limitations, not authority
+   expansions.
+4. **The unknown-effect interlock is key-scoped.** Same key plus an unprovable
+   effect is refused for both resume and a fresh start; a different key for the
+   same task is a new operation identity and is currently admitted. Changing the
+   key is an operator-level decision, and the implementation provides no global
+   action-level suppression across keys. A new key does not make the previous
+   unknown effect safe - it makes it unmanaged. Action-level identity and
+   suppression is follow-up work.
+5. **The side-effect journal is not wired into production.** Two-phase recording
+   and `UNKNOWN_AFTER_CRASH` are implemented, tested, and unreachable from the
+   current production run path. Until they are wired, a crash inside a side effect
+   is not managed by the ledger; only the run-level claim protects a run.
+6. **The subsystem is PARTIAL in every dimension** - run idempotency, resume,
+   execution idempotency, tool idempotency, and concurrency - and the journal
+   integration is NOT WIRED.
+4. **Resume is validated but not yet driven by an entry point.** The contract is
+   implemented and tested; wiring an operator-facing resume call is follow-up
+   work, deliberately not smuggled into this block.
+5. **`RunStore` remains an observation sink and is unchanged**, so run history
+   keeps its existing meaning and its existing tests.
+
+## Идемпотентность запусков и восстановимый resume v0.1 — русская версия (GAP-I / GAP-R)
+
+Реализовано в блоке idempotency и resume. Проверено по коду в
+`app/agent_runtime/idempotency.py`, `app/agent_runtime/idempotency_integration.py`,
+`app/api/service.py` и `tests/test_idempotency_production.py`.
+
+### Принятые решения
+
+- **Четыре идентичности, никогда одна.** `TaskIdentity` -> `OperationIdentity` ->
+  `RunIdentity` -> `AttemptIdentity`, плюс отдельная action identity на каждый side
+  effect. Схлопывание их в один id — это ровно то, из-за чего дублирующее исполнение
+  становится незаметным, поэтому иерархия явная и у каждого уровня свой fingerprint.
+- **Ключ идемпотентности — вход, никогда не authority.** Он каноникализируется и при
+  неверном формате отвергается, а не приводится, и привязывается к fingerprint,
+  покрывающему класс операции, ключ, fingerprint задачи и каждый fingerprint
+  criterion. Поэтому ключ никогда нельзя переиспользовать для другой работы.
+- **Журнал отделён от `RunStore`.** `RunStore` описывает себя как observation sink,
+  который «не является resume-движком»; превращение его в движок решений
+  противоречило бы существующей архитектуре. Журнал — новый сфокусированный
+  компонент, и этот блок не пишет через него историю run.
+- **Захват ключа атомарен через `O_EXCL`.** Это самый сильный примитив, который
+  реально предлагает хранилище репозитория. Две одновременные доставки одного ключа
+  не могут обе победить; проигравший читает запись победителя.
+- **Нет compare-and-set и нет lease.** Отобрать устаревший claim означало бы угадывать,
+  мёртв ли предыдущий писатель, а это недоказуемо. Поэтому запись `CREATED` или
+  `RUNNING` отклоняется обычным resume, а не считается прерванной.
+- **`STARTED` пишется до эффекта; `UNKNOWN_AFTER_CRASH` выводится.** Запись о
+  завершении никогда не выдумывается, и вызывающий не может объявить неизвестное
+  состояние. Чтение отдаёт то, что на диске; восстановление — отдельный явный шаг.
+  Именно это делает окно краха честным, а не угаданным.
+- **Replay-safe только записи в workspace.** Host-процессы, вызовы провайдера и
+  сетевые вызовы — нет, потому что их повтор может продублировать необратимое
+  действие.
+- **Отказ authority терминален — и журнал это обеспечивает.** Отказы permission,
+  policy, approval, identity, sandbox и network классифицируются как
+  `SECURITY_FAILURE`, что доминирует над любой другой записанной меткой, и ни
+  replay, ни resume недоступны. Принципиально, что это обеспечивается
+  `validate_lifecycle_transition` внутри `IdempotencyLedger.update`, а не только
+  документируется: терминальное состояние нельзя перезаписать в любое другое,
+  отклонённая запись оставляет durable-запись побайтово неизменной, а недоказуемый
+  side effect нельзя перевести в состояние, которое примет resume. Security review
+  обнаружил, что прежний код принимал `SECURITY_FAILURE -> INTERRUPTED`, после чего
+  run восстанавливался; guard существует, чтобы инвариант не регрессировал.
+- **Отклонённая запись никогда не выдаётся за успех.**
+  `RunIdempotencyGuard.finish` пробрасывает ошибку вместо проглатывания, а
+  `run_agent_loop` отвечает явным отказом о незаписанном исходе. Если durable-позицию
+  нельзя записать, последующая доставка прочитает более раннее состояние и может быть
+  снова допущена, поэтому run не выдаётся за успех, за который код не может отвечать.
+- **Следующая попытка требует новой идентичности операции, а не перезаписи записи.**
+  `FAILED` и `LIMIT_REACHED` терминальны по той же причине, что и
+  `SECURITY_FAILURE`: честный способ повторить — новый ключ идемпотентности, то есть
+  явное решение оператора, а не переоткрытие записи.
+- **Resume восстанавливает позицию, никогда разрешение.** Записанный fingerprint
+  операции должен быть воспроизведён текущим authority ceiling, иначе resume
+  отклоняется.
+- **Guard инъектируется.** `ForgeApiService` принимает явный `idempotency_guard`
+  вместо чтения process-wide singleton, поэтому тест или встраивающая композиция не
+  может затронуть состояние вне своего журнала.
+
+### Отклонённые альтернативы
+
+- **«Exactly once».** Отклонено: здесь это недоказуемо, и заявлять это было бы ложью.
+  Честный потолок — at-most-once на ключ идемпотентности.
+- **Считать нечитаемый журнал «записи нет».** Отклонено: это ровно то, из-за чего
+  происходит дублирующее исполнение. Журнал, к которому нельзя обратиться, даёт
+  отказ, а не молчаливый старт.
+- **Использовать `run_id` как идентичность идемпотентности.** Отклонено: production
+  генерирует новый `run_id` на каждый вызов (`run-loop-<uuid>`,
+  `run-accept-<uuid>` и так далее), поэтому привязка идемпотентности к нему делала бы
+  каждый дубликат «новым».
+- **Позволить задаче или запросу объявлять операцию идемпотентной.** Отклонено: это
+  передало бы authority-образный смысл недоверенному входу. Идентичность составляют
+  только доверенная декларация плюс frozen привязка.
+- **Сохранять операцию, чтобы переигрывать её напрямую.** Отклонено: никакого pickle,
+  сериализованного authority, команды, workspace или окружения. Resume пересобирает
+  `AuthorizedExecution` из текущего доверенного `RunScope`.
+- **Расширить `RunStore` до resume-движка.** Отклонено: это превратило бы observation
+  sink во второй путь принятия решений.
+
+### Следствия и открытые пункты
+
+1. **Идемпотентность покрывает `run_agent_loop` только при переданном ключе.** Без
+   ключа вызов сохраняет прежнюю семантику ровно, и именно это сохраняет legacy
+   поведение.
+2. **`run_accepted_task`, `run_declared_verification`, `run_task`, HTTP-путь task run
+   и desktop dispatch пока не обращаются к журналу.** Они не защищены, а не
+   затронуты; перевод их на ту же модель идентичности — последующая работа.
+3. **Concurrency ограничена, а не полна.** Атомарный claim гарантирован; lease,
+   compare-and-set и межпроцессная координация — нет, и это зафиксировано как
+   ограничение, а не сымитировано. Обновления используют атомарную замену файла, но
+   это не защищённый CAS read-modify-write, поэтому конкурентные обновления одного
+   ключа могут потерять обновление, а Windows может выдать `PermissionError` при
+   конкурентной замене. Это ограничения liveness и восстановления, а не расширение
+   authority.
+4. **Interlock неизвестного эффекта привязан к ключу.** Тот же ключ плюс
+   недоказуемый эффект отклоняется и для resume, и для нового старта; другой ключ для
+   той же задачи — новая идентичность операции, и сейчас он допускается. Смена ключа —
+   решение уровня оператора, и реализация не даёт глобального подавления на уровне
+   действия между ключами. Новый ключ не делает предыдущий неизвестный эффект
+   безопасным — он делает его неуправляемым. Идентичность уровня действия и подавление
+   — последующая работа.
+5. **Журнал side effects не подключён к production.** Двухфазная запись и
+   `UNKNOWN_AFTER_CRASH` реализованы, протестированы и недостижимы из текущего
+   production-пути run. Пока они не подключены, крах внутри side effect не управляется
+   журналом; run защищает только run-level claim.
+6. **Подсистема PARTIAL по каждому измерению** — run idempotency, resume, execution
+   idempotency, tool idempotency и concurrency — а интеграция журнала NOT WIRED.
+4. **Resume валидируется, но пока не вызывается точкой входа.** Контракт реализован и
+   протестирован; подключение операторского вызова resume — последующая работа,
+   намеренно не протащенная в этот блок.
+5. **`RunStore` остаётся observation sink и не изменён**, поэтому история run
+   сохраняет прежний смысл и прежние тесты.

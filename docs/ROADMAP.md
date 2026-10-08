@@ -219,7 +219,16 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [x] Durable run history / checkpoint persistence (append-only event log + state snapshot, `GET /api/runs/{run_id}`)
 - [x] Capability / tool discovery (`GET /api/capabilities`, `GET /api/tools`; one shared `ToolRegistry` for execution and discovery)
 - [ ] Host environment discovery (executables, runtimes, git, Docker, shell, filesystem capabilities) — separate architectural stage with its own trust boundary
-- [ ] Automatic resume of interrupted runs (deferred pending side-effect idempotency design)
+- [~] **GAP-I PARTIAL** - run idempotency for the agent loop: a trusted idempotency key bound to the operation identity, an atomic durable claim, and at-most-once execution per key. Applies to `run_agent_loop` when a key is supplied; other entry points are unaffected rather than protected.
+- [~] **GAP-R PARTIAL** - recoverable resume: a durable lifecycle state machine, a two-phase side-effect ledger with an explicit `UNKNOWN_AFTER_CRASH`, and a resume contract that restores position subject to the current authority ceiling. The contract is implemented and tested; no entry point drives it yet.
+- [x] Terminal-state protection: the durable lifecycle machine rejects every transition out of `COMPLETED`, `FAILED`, `LIMIT_REACHED`, `DENIED`, and `SECURITY_FAILURE`, and rejects moving a run with an unprovable side effect into a recoverable state. A refused write leaves the durable record untouched.
+- [ ] Automatic resume of interrupted runs (the contract exists; wiring an operator-facing resume call remains)
+- [ ] Idempotency and resume for `run_accepted_task`, `run_declared_verification`, `run_task`, and the HTTP/desktop compatibility paths: they do not consult the ledger yet.
+- [ ] Compare-and-set or a lease for cross-process coordination: the ledger claims atomically through `O_EXCL` but deliberately offers neither, because stealing a stale claim would require an unprovable guess.
+- [ ] Wire the side-effect journal into production execution and tool paths. Two-phase recording and the derived `UNKNOWN_AFTER_CRASH` are implemented and tested but **not wired**, so `UNKNOWN_AFTER_CRASH` is not reachable from the current production run path.
+- [ ] Global action-level suppression across idempotency keys. The unknown-effect interlock is scoped to one durable record, so a **different** key for the same task is currently admitted as a new operation. Changing the key is an operator-level decision; a new key does not make a previous unknown effect safe.
+- [ ] Concurrent updates for one key can lose an update, and Windows can surface `PermissionError` during a concurrent replacement. This is a liveness/recovery limitation, not an authority expansion.
+- [ ] Subsystem status: run idempotency **PARTIAL**, resume **PARTIAL**, execution idempotency **PARTIAL**, tool idempotency **PARTIAL**, side-effect journal integration **NOT WIRED**, concurrency **PARTIAL**.
 - [ ] Durable, resumable task queues
 
 Technology candidates under evaluation are tracked in
@@ -452,7 +461,16 @@ workflow review/ревизии. Выполнение плана, управле�
 - [x] Durable run history / checkpoint persistence (append-only event log + state snapshot, `GET /api/runs/{run_id}`)
 - [x] Capability / tool discovery (`GET /api/capabilities`, `GET /api/tools`; единый `ToolRegistry` для выполнения и discovery)
 - [ ] Host environment discovery (исполняемые файлы, runtime'ы, git, Docker, shell, возможности файловой системы) — отдельный архитектурный этап со своей границей доверия
-- [ ] Автоматическое возобновление прерванных запусков (отложено до проектирования идемпотентности side effects)
+- [~] **GAP-I PARTIAL** — идемпотентность запусков для agent loop: доверенный ключ идемпотентности, привязанный к идентичности операции, атомарный durable claim и at-most-once исполнение на ключ. Применяется к `run_agent_loop` при переданном ключе; остальные точки входа не защищены, а не затронуты.
+- [~] **GAP-R PARTIAL** — восстановимый resume: durable state machine жизненного цикла, двухфазный журнал side effects с явным `UNKNOWN_AFTER_CRASH` и контракт resume, восстанавливающий позицию с учётом текущего authority ceiling. Контракт реализован и протестирован; ни одна точка входа пока его не вызывает.
+- [x] Защита терминальных состояний: durable state machine отвергает любой переход из `COMPLETED`, `FAILED`, `LIMIT_REACHED`, `DENIED` и `SECURITY_FAILURE`, а также перевод run с недоказуемым side effect в recoverable-состояние. Отклонённая запись оставляет durable-запись нетронутой.
+- [ ] Автоматическое возобновление прерванных запусков (контракт есть; остаётся подключение операторского вызова resume)
+- [ ] Идемпотентность и resume для `run_accepted_task`, `run_declared_verification`, `run_task` и HTTP/desktop-путей совместимости: они пока не обращаются к журналу.
+- [ ] Compare-and-set или lease для межпроцессной координации: журнал захватывает ключ атомарно через `O_EXCL`, но намеренно не даёт ни того, ни другого, потому что отбор устаревшего claim требовал бы недоказуемого предположения.
+- [ ] Подключить журнал side effects к production-путям исполнения и tools. Двухфазная запись и производный `UNKNOWN_AFTER_CRASH` реализованы и протестированы, но **не подключены**, поэтому `UNKNOWN_AFTER_CRASH` недостижим из текущего production-пути run.
+- [ ] Глобальное подавление на уровне действия между ключами идемпотентности. Interlock неизвестного эффекта привязан к одной durable-записи, поэтому **другой** ключ для той же задачи сейчас допускается как новая операция. Смена ключа — решение уровня оператора; новый ключ не делает предыдущий неизвестный эффект безопасным.
+- [ ] Конкурентные обновления одного ключа могут потерять обновление, а Windows может выдать `PermissionError` при конкурентной замене. Это ограничение liveness/восстановления, а не расширение authority.
+- [ ] Статус подсистемы: run idempotency **PARTIAL**, resume **PARTIAL**, execution idempotency **PARTIAL**, tool idempotency **PARTIAL**, интеграция журнала side effects **NOT WIRED**, concurrency **PARTIAL**.
 - [ ] Долговременные возобновляемые очереди задач
 
 Технологические кандидаты на рассмотрении отслеживаются в

@@ -195,14 +195,23 @@ class TrustedRootTests(DiscoveryTestCase):
                 discovery.observe(self.workspace, run_id=bogus)  # type: ignore[arg-type]
 
     def test_caller_cannot_choose_the_root(self) -> None:
-        """A: no entry point accepts a root, limits, or a scanner."""
+        """A: no entry point accepts a root, limits, or a scanner.
+
+        `idempotency_key` is admitted by a later block; it selects a durable
+        operation record and confers nothing, so it is listed below among the
+        names that must never appear rather than being an exception to the rule.
+        """
         import inspect
 
         for method in (ForgeApiService.run_agent_loop,):
             parameters = list(inspect.signature(method).parameters)
-            self.assertEqual(parameters, ["self", "declaration_id", "purpose_run_id"])
+            self.assertEqual(
+                parameters,
+                ["self", "declaration_id", "purpose_run_id", "idempotency_key"],
+            )
             for banned in ("workspace", "root", "limits", "scanner",
-                           "scan_limits", "discovery"):
+                           "scan_limits", "discovery", "run_scope",
+                           "authorized_execution", "allowed_tool_ids"):
                 self.assertNotIn(banned, parameters)
 
     def test_taskrunrequest_carries_no_discovery_input(self) -> None:

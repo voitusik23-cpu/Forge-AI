@@ -24,7 +24,18 @@ from app.agent_runtime.acceptance_spec import (
     AcceptanceSpecError,
     RunAcceptanceCriteria,
 )
-from app.agent_runtime.criterion_identity import bind_run_criteria
+from app.agent_runtime.criterion_identity import TaskIdentity, bind_run_criteria
+from app.agent_runtime.idempotency import (
+    IdempotencyDecision,
+    IdempotencyError,
+    IdempotencyVerdict,
+    OperationClass,
+    RunLifecycleState,
+)
+from app.agent_runtime.idempotency_integration import (
+    default_idempotency_guard,
+    operation_identity_from_binding,
+)
 from app.agent_runtime.tool_execution import ToolIntent
 from app.agent_runtime.models import HarnessRequest
 from app.agent_runtime.policy import AgentHarnessPolicy
@@ -171,6 +182,7 @@ class ForgeApiService:
             Callable[[Task, ProjectExecutionProfile], str | None]
         ] = None,
         harness_factory: Callable[..., object] | None = None,
+        idempotency_guard: object | None = None,
         # Operator-supplied, server-side tool intents for this run. Each is a
         # ToolIntent: a tool identity plus bounded data arguments. A ToolIntent
         # grants nothing on its own - the run's frozen allowed_tool_ids decides
@@ -203,6 +215,11 @@ class ForgeApiService:
         # implementation; the service only asks it for a harness with the narrowed
         # bounds of the first vertical slice.
         self._harness_factory = harness_factory or create_agent_harness
+        # The idempotency decision seam. Injected explicitly by tests and by
+        # any composition that wants its own ledger; otherwise the lazy
+        # process-wide guard is used. It decides whether a second execution
+        # may start and grants no authority of any kind.
+        self._idempotency_guard = idempotency_guard
 
         # Operator-declared execution intents. Declarations are data, never a
         # gate: an unmatched declaration simply cannot run.
@@ -735,11 +752,79 @@ class ForgeApiService:
             },
         )
 
+    @staticmethod
+    def _idempotent_lifecycle(result: object, execution_result: object) -> RunLifecycleState:
+        """Map one harness outcome onto the durable idempotency lifecycle.
+
+        An authority or approval denial becomes a terminal security failure, so a
+        later delivery can never retry a denied action. Everything else maps onto
+        the ordinary terminal/recoverable set.
+        """
+        status = ""
+        final_state = getattr(result, "final_state", None)
+        if final_state is not None:
+            status = str(getattr(getattr(final_state, "status", None), "value", "") or "")
+        labels = {status.lower()}
+        if execution_result is not None:
+            outcome = getattr(execution_result, "outcome_status", None)
+            labels.add(str(getattr(outcome, "value", "") or "").lower())
+        from app.agent_runtime.idempotency import classify_outcome_labels
+
+        return classify_outcome_labels(tuple(labels))
+
+    def _idempotent_response(
+        self,
+        *,
+        run_id: str,
+        declaration: ExecutionDeclaration,
+        decision: object,
+        loop_store: Optional[RunStore],
+    ) -> TaskRunResponse:
+        """Report a refusal or a replay instead of executing a second time.
+
+        No action, no execution, and no tool is attempted on this path. The
+        response carries the recorded verdict and the run identity that owns the
+        operation, so an operator can inspect the original run rather than
+        trigger a duplicate.
+        """
+        verdict = getattr(getattr(decision, "verdict", None), "value", "")
+        code = getattr(getattr(decision, "failure_code", None), "value", "")
+        reason = str(getattr(decision, "reason", "") or "")
+        recorded_run_id = str(getattr(decision, "run_id", "") or run_id) or run_id
+        self._emit_acceptance_event(
+            loop_store,
+            recorded_run_id,
+            f"task-loop-{declaration.declaration_id}",
+            EventType.EXECUTION_DENIED,
+            {
+                "denial_reason": f"idempotent_{verdict}" if verdict else "idempotent",
+                "idempotency_verdict": verdict,
+                "idempotency_failure_code": code,
+                "declaration_id": declaration.declaration_id,
+                "recorded_run_id": recorded_run_id,
+            },
+        )
+        return TaskRunResponse(
+            run_id=recorded_run_id,
+            task_id=f"task-loop-{declaration.declaration_id}",
+            project_id=self._active_project_id,
+            state="DENIED" if verdict in {"conflict", "refuse"} else "REPLAYED",
+            # No execution happened on this path, so it is not a success and the
+            # zeroed telemetry is real rather than a placeholder.
+            success=False,
+            output="",
+            error=reason or f"idempotency verdict: {verdict}",
+            tokens=0,
+            cost=0.0,
+            duration_seconds=0.0,
+        )
+
     def run_agent_loop(
         self,
         declaration_id: str,
         *,
         purpose_run_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> TaskRunResponse:
         """Run the canonical agent loop once through the production harness.
 
@@ -821,6 +906,47 @@ class ForgeApiService:
                 },
             )
 
+        # Server-side idempotency. The key is operator-supplied input; the
+        # identity it binds to is composed from the trusted declaration and the
+        # frozen task/criterion binding, so a key cannot be reused for different
+        # work and no caller can declare its own operation idempotent. This only
+        # decides whether a second execution may start: it grants no command, no
+        # workspace, no tool, no approval, and no network authority.
+        guard = None
+        guard_identity = None
+        if idempotency_key is not None:
+            guard = self._idempotency_guard or default_idempotency_guard()
+            task_identity = (
+                binding.task_identity
+                if binding is not None
+                else TaskIdentity.from_specification(
+                    TaskSpecification(
+                        task_id=task_id,
+                        title=declaration.declaration_id,
+                        description=declaration.intent,
+                        requirements=(),
+                        acceptance_criteria=self._criteria_for(declaration),
+                    )
+                )
+            )
+            guard_identity = operation_identity_from_binding(
+                operation_class=OperationClass.AGENT_LOOP,
+                idempotency_key=idempotency_key,
+                declaration_id=declaration.declaration_id,
+                task_identity=task_identity,
+                criterion_identities=(
+                    binding.criterion_identities if binding is not None else ()
+                ),
+            )
+            guard_decision = guard.begin(guard_identity, requested_run_id=run_id)
+            if guard_decision.verdict is not IdempotencyVerdict.START:
+                return self._idempotent_response(
+                    run_id=guard_decision.run_id or run_id,
+                    declaration=declaration,
+                    decision=guard_decision,
+                    loop_store=loop_store,
+                )
+
         # Built by the same composition factory that supplies the runtime's
         # canonical harness, differing only in the narrowed bounds of this slice.
         # No second loop implementation and no second authority object exist.
@@ -849,6 +975,39 @@ class ForgeApiService:
         execution_result = (
             result.execution_results[0] if result.execution_results else None
         )
+
+        if guard is not None and guard_identity is not None:
+            # Record the durable position so the next delivery replays instead of
+            # re-executing. An authority failure is recorded as terminal, which is
+            # what stops a later delivery from retrying a denied action.
+            #
+            # A refusal here is not swallowed: if the position could not be
+            # recorded, a later delivery would read an earlier state and could be
+            # admitted to run again, so the run is reported as unrecorded rather
+            # than as a success this code cannot stand behind.
+            try:
+                guard.finish(
+                    guard_identity,
+                    lifecycle=self._idempotent_lifecycle(result, execution_result),
+                    outcome_labels=(result.final_state.status.value,),
+                )
+            except IdempotencyError as exc:
+                return self._idempotent_response(
+                    run_id=run_id,
+                    declaration=declaration,
+                    decision=IdempotencyDecision(
+                        verdict=IdempotencyVerdict.REFUSE,
+                        run_id=run_id,
+                        failure_code=exc.code,
+                        reason=(
+                            "the durable idempotency outcome could not be "
+                            f"recorded ({exc.code.value}), so this run is not "
+                            "reported as successful"
+                        ),
+                    ),
+                    loop_store=loop_store,
+                )
+
         output = (execution_result.stdout if execution_result else "") or ""
         error: Optional[str] = None
         if execution_result is None:

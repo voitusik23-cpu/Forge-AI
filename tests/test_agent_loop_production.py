@@ -214,15 +214,25 @@ class ProductionLoopTests(AgentLoopSliceTestCase):
         self.assertIn("harness", str(ctx.exception))
 
     def test_loop_entry_point_accepts_no_authority_parameters(self) -> None:
-        """H-adjacent: the loop admits no command, workspace, or tool parameter."""
+        """H-adjacent: the loop admits no command, workspace, or tool parameter.
+
+        ``idempotency_key`` is admitted deliberately: it selects which durable
+        operation record a delivery belongs to and grants nothing. It is listed
+        below among the names that must never widen authority, so the invariant
+        that grew this parameter is the same one that pins it.
+        """
         parameters = list(
             inspect.signature(ForgeApiService.run_agent_loop).parameters
         )
-        self.assertEqual(parameters, ["self", "declaration_id", "purpose_run_id"])
+        self.assertEqual(
+            parameters,
+            ["self", "declaration_id", "purpose_run_id", "idempotency_key"],
+        )
         for banned in (
             "command", "workspace", "execution_profile", "environment_variables",
             "timeout_seconds", "allowed_execution_commands", "allowed_tool_ids",
             "approval_required", "task", "context", "category", "task_id",
+            "network_access", "capabilities", "run_scope", "authorized_execution",
         ):
             self.assertNotIn(banned, parameters)
 
