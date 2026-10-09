@@ -110,6 +110,18 @@ def normalize_error(exc: BaseException) -> PersistenceError:
     return PersistenceError(message)
 
 
+#: The statement that repairs an aborted transaction. PostgreSQL accepts only
+#: savepoint commands while a transaction is aborted, so recognising this one is not a
+#: loophole: there is nothing else the server would run.
+SAVEPOINT_ROLLBACK_PREFIX = "rollback to savepoint"
+
+
+def is_savepoint_rollback(sql: str) -> bool:
+    """True when ``sql`` is a ``ROLLBACK TO SAVEPOINT`` statement."""
+
+    return sql.strip().lower().startswith(SAVEPOINT_ROLLBACK_PREFIX)
+
+
 # --------------------------------------------------------------------------- #
 # session
 # --------------------------------------------------------------------------- #
@@ -143,6 +155,19 @@ class Session:
         # caller's real exception. It must still be observable, though, because a
         # connection whose reset failed is not known to be clean.
         self._close_error: Optional[BaseException] = None
+        # True once a statement has failed inside this transaction. PostgreSQL then
+        # refuses every later statement and COMMIT *rolls back* while reporting
+        # success, so this flag is the difference between an honest failure and a
+        # silent data loss. It is set by the statement methods, never cleared except
+        # by beginning or ending a transaction.
+        self._failed = False
+        # The error that aborted the transaction, kept so the eventual commit failure
+        # can name the original cause instead of only saying "aborted".
+        self._failure_reason: Optional[BaseException] = None
+        # The subject this transaction declared. The discovery policies read the same
+        # value from the transaction, so remembering it here lets a discovery read
+        # refuse to address anyone else.
+        self._user_id: Optional[str] = None
 
     # -- state ------------------------------------------------------------- #
     @property
@@ -154,21 +179,86 @@ class Session:
         return self._in_transaction and not self._closed
 
     @property
+    def transaction_failed(self) -> bool:
+        """True when a statement failed and the transaction is now aborted.
+
+        A caller that catches a repository error and keeps going cannot make the
+        transaction usable again: PostgreSQL refuses further statements, and a
+        ``COMMIT`` would roll back. Everything below is written so that state is
+        reported rather than hidden.
+        """
+
+        return self._failed and self._in_transaction and not self._closed
+
+    @property
+    def failure_reason(self) -> Optional[BaseException]:
+        """The error that aborted the current transaction, if any."""
+
+        return self._failure_reason
+
+    @property
     def organization_id(self) -> Optional[str]:
         """The tenant this transaction is scoped to, if any."""
 
         return self._organization_id
 
-    def require_transaction(self) -> None:
-        """Fail loudly when a statement is attempted outside a transaction."""
+    def require_transaction(self, sql: str = "") -> None:
+        """Fail loudly when a statement cannot be run on this session.
+
+        Three refusals, in order: the session is closed, the transaction is aborted
+        by an earlier failure, or there is no transaction at all. The aborted case is
+        separate because it is the one a caller is most likely to get wrong -- the
+        failure was already reported once, so continuing looks harmless while every
+        later statement is refused by PostgreSQL and the eventual COMMIT discards
+        everything.
+
+        ``ROLLBACK TO SAVEPOINT`` is exempt from the aborted check on purpose: it is
+        the statement that repairs an aborted transaction, so refusing it would make
+        recovery impossible. It is not a general exemption -- the server accepts only
+        savepoint commands on an aborted transaction, so nothing else can be smuggled
+        through this branch.
+        """
 
         if self._closed:
             raise TransactionError("session is closed")
+        if self._failed and not is_savepoint_rollback(sql):
+            raise TransactionError(
+                "the transaction is aborted by an earlier failure, so no further "
+                "statement can run in it. Use a savepoint and ROLLBACK TO SAVEPOINT "
+                "to recover, or end the transaction. Original failure: "
+                f"{self._failure_reason}"
+            )
         if not self._in_transaction and not self._allow_untransacted:
             raise TransactionError(
                 "no active transaction: open a Unit of Work before using a "
                 "repository"
             )
+
+    def _record_failure(self, exc: BaseException) -> None:
+        """Mark the transaction aborted by a failed statement.
+
+        Called only while a transaction is open. Non-transactional work (migrations,
+        schema statements in autocommit mode) must not poison anything, because there
+        is no transaction to be aborted.
+        """
+
+        if self._in_transaction:
+            self._failed = True
+            if self._failure_reason is None:
+                self._failure_reason = exc
+
+    def clear_failure(self) -> None:
+        """Return the transaction to a usable state after a savepoint rollback.
+
+        ``ROLLBACK TO SAVEPOINT`` is the documented way to recover from a failed
+        statement without discarding the whole transaction, so a caller that used a
+        savepoint must be able to say so. :meth:`execute` calls this automatically for
+        a savepoint rollback, which is the common case; this method exists for a
+        caller that knows it recovered by some other means.
+        """
+
+        self._failed = False
+        self._failure_reason = None
 
     # -- lifecycle --------------------------------------------------------- #
     async def begin(self) -> None:
@@ -181,6 +271,8 @@ class Session:
         except Exception as exc:  # noqa: BLE001 - normalized at the boundary
             raise normalize_error(exc) from exc
         self._in_transaction = True
+        self._failed = False
+        self._failure_reason = None
 
     async def set_tenant(self, organization_id: str) -> None:
         """Set the transaction-local tenant context, parameterized.
@@ -214,6 +306,31 @@ class Session:
             )
         except Exception as exc:  # noqa: BLE001
             raise normalize_error(exc) from exc
+        self._user_id = None if user_id is None else str(user_id)
+
+    @property
+    def subject_id(self) -> Optional[str]:
+        """The subject this transaction declared, if any."""
+
+        return self._user_id
+
+    def require_subject(self, user_id: str) -> None:
+        """Bind this transaction to ``user_id``, or refuse a different subject.
+
+        A discovery read takes the subject as an argument while the policies are
+        bounded by the value the transaction declares. Silently overwriting a subject
+        the transaction already declared would let one call re-point the session at
+        somebody else, so a disagreement is an error instead.
+        """
+
+        if self._user_id is None:
+            return
+        if str(user_id) != str(self._user_id):
+            raise TransactionError(
+                f"this transaction is bound to subject {self._user_id!r} and cannot "
+                f"discover for {user_id!r}; discovery addresses one subject per "
+                "transaction"
+            )
 
     async def set_system_scope(self, declared: bool) -> None:
         """Declare, or withdraw, the server-only system scope for this transaction.
@@ -235,25 +352,71 @@ class Session:
             raise normalize_error(exc) from exc
 
     async def commit(self) -> None:
-        """Commit the transaction, or do nothing if it has already ended.
+        """Commit, or fail loudly. Never reports success for a transaction that lost its work.
 
-        Idempotent on purpose: a caller may roll the transaction back explicitly
-        (``UnitOfWork.rollback()``) and then leave the context manager normally. The
-        exit path must not turn that into an error, and it must not silently open a
-        second transaction either.
+        Three cases, and only the first is a success:
+
+        1. the transaction is healthy -- ``COMMIT`` is sent and its status is checked;
+        2. the transaction is **aborted** by an earlier statement failure --
+           PostgreSQL would accept ``COMMIT`` and *roll back*, reporting the status
+           string ``ROLLBACK`` rather than raising. That is a silent data loss if this
+           method returns normally, so it is refused instead: the transaction is
+           rolled back and a :class:`TransactionError` naming the original cause is
+           raised;
+        3. ``COMMIT`` itself fails (a deferred constraint, a serialization failure, a
+           lost connection) -- also raised, after the transaction is ended.
+
+        The status string is checked as well as the flag, because the flag protects
+        against a failure this session saw, while the status string is what the server
+        actually did. Both are needed: neither alone covers a failure the other misses.
+
+        Still idempotent when the transaction has already ended, so an explicit
+        ``rollback()`` followed by a normal exit is not an error.
         """
 
         if not self._in_transaction:
             return
+
+        if self._failed:
+            reason = self._failure_reason
+            await self._end_transaction()
+            raise TransactionError(
+                "refusing to commit a transaction that is aborted by an earlier "
+                "failure; PostgreSQL would roll it back while reporting success, so "
+                f"all work in it is discarded. Original failure: {reason}"
+            )
+
         try:
-            await self._connection.execute("COMMIT")
+            status = await self._connection.execute("COMMIT")
         except Exception as exc:  # noqa: BLE001
+            await self._end_transaction()
             raise normalize_error(exc) from exc
-        finally:
-            self._in_transaction = False
-            self._organization_id = None
+
+        await self._end_transaction()
+        if status != "COMMIT":
+            # Defensive: the flag above should have caught this first. If a status
+            # other than COMMIT ever reaches here, the work was not saved and saying
+            # nothing would be the worst possible answer.
+            raise TransactionError(
+                f"COMMIT reported {status!r} instead of 'COMMIT', so the transaction "
+                "was not saved"
+            )
+
+    async def _end_transaction(self) -> None:
+        """Forget the transaction state without sending a statement.
+
+        Used by the paths that have already ended the transaction, so ``close`` does
+        not later send a second ``ROLLBACK``.
+        """
+
+        self._in_transaction = False
+        self._organization_id = None
+        self._failed = False
+        self._user_id = None
 
     async def rollback(self) -> None:
+        """End the transaction, discarding it. Also clears the aborted state."""
+
         if not self._in_transaction:
             return
         try:
@@ -261,8 +424,8 @@ class Session:
         except Exception as exc:  # noqa: BLE001
             raise normalize_error(exc) from exc
         finally:
-            self._in_transaction = False
-            self._organization_id = None
+            await self._end_transaction()
+            self._failure_reason = None
 
     async def close(self) -> None:
         """End the transaction if any, reset the role, and mark the session closed.
@@ -295,6 +458,8 @@ class Session:
             except Exception as exc:  # noqa: BLE001
                 self._close_error = exc
             self._in_transaction = False
+            self._failed = False
+            self._user_id = None
         try:
             await self._connection.execute("RESET ROLE")
         except Exception as exc:  # noqa: BLE001
@@ -314,32 +479,43 @@ class Session:
 
     # -- statements -------------------------------------------------------- #
     async def fetch(self, sql: str, *args: object) -> Sequence[Any]:
-        self.require_transaction()
+        self.require_transaction(sql)
         try:
             return await self._connection.fetch(sql, *args)
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
             raise normalize_error(exc) from exc
 
     async def fetchrow(self, sql: str, *args: object) -> Optional[Any]:
-        self.require_transaction()
+        self.require_transaction(sql)
         try:
             return await self._connection.fetchrow(sql, *args)
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
             raise normalize_error(exc) from exc
 
     async def fetchval(self, sql: str, *args: object) -> Any:
-        self.require_transaction()
+        self.require_transaction(sql)
         try:
             return await self._connection.fetchval(sql, *args)
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
             raise normalize_error(exc) from exc
 
     async def execute(self, sql: str, *args: object) -> str:
-        self.require_transaction()
+        self.require_transaction(sql)
         try:
-            return await self._connection.execute(sql, *args)
+            status = await self._connection.execute(sql, *args)
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
             raise normalize_error(exc) from exc
+        # A savepoint rollback restores the transaction, so the aborted state ends
+        # with it. Detected here rather than left to the caller because the caller
+        # would otherwise have to know that a failed statement poisoned the session
+        # and that a savepoint is what repairs it.
+        if is_savepoint_rollback(sql):
+            self.clear_failure()
+        return status
 
 
 # --------------------------------------------------------------------------- #
@@ -410,6 +586,17 @@ class UnitOfWork:
         return self._repository("organizations")
 
     @property
+    def system_users(self) -> Any:
+        """Server-side account administration.
+
+        The counterpart of :attr:users, holding the server-controlled columns
+        (`status`, `email`) that the tenant scope is not granted. Reachable only
+        from the server scope with the system role.
+        """
+
+        return self._repository("system_users")
+
+    @property
     def memberships(self) -> Any:
         """Tenant-scoped membership access. The tenant comes from this transaction."""
 
@@ -469,6 +656,8 @@ class UnitOfWork:
 
         self._repositories = {
             "users": repo_module.PostgresUserRepository(self._session),
+            "system_users":
+                repo_module.PostgresSystemUserRepository(self._session),
             "organizations": repo_module.PostgresOrganizationRepository(self._session),
             "memberships": repo_module.PostgresMembershipRepository(self._session),
             "system_memberships":
@@ -525,11 +714,22 @@ class PlatformDatabase:
         self,
         dsn: str,
         *,
-        application_role: Optional[str] = APP_ROLE,
+        application_role: str = APP_ROLE,
         min_size: int = 1,
         max_size: int = 10,
         command_timeout: Optional[float] = 30.0,
     ) -> None:
+        # `application_role=None` used to mean "do not step down". It is refused now,
+        # and refused here rather than at connect time, because a pool built that way
+        # is one whose row-level security may simply not apply. There is no use for
+        # it: schema work goes through `direct_session`, which borrows a connection
+        # without a pool and validates nothing about roles.
+        if application_role is None:
+            raise ValueError(
+                "application_role is required: a pool must step down to a role that "
+                f"row-level security applies to, either {APP_ROLE!r} or "
+                f"{SYSTEM_ROLE!r}"
+            )
         self._dsn = dsn
         self._application_role = application_role
         self._min_size = min_size
@@ -538,94 +738,91 @@ class PlatformDatabase:
         self._pool: Any = None
 
     @property
-    def application_role(self) -> Optional[str]:
+    def application_role(self) -> str:
+        """The role every connection in this pool steps down to."""
+
         return self._application_role
 
     # -- pool -------------------------------------------------------------- #
     async def _setup_connection(self, connection: Any) -> None:
         """Switch to the application role and prove the switch is safe.
 
-        The question this answers is **"is the role that will actually run the
-        statements subject to row-level security"**, and three situations make the
-        policies decorative. Each is refused rather than logged:
+        The question is **"is the role that will actually run the statements subject
+        to row-level security, and can it reach the other scope"**. Four situations
+        make the policies decorative, and each is refused rather than logged:
 
-        * a superuser or a ``BYPASSRLS`` role, whether it is the login or the
-          substituted role, because ``pg_has_role`` reports a superuser as holding
-          every role -- so a membership check alone is vacuous for one;
-        * a role that owns a Platform table, because an owner is exempt from its own
+        * the login or the effective role is a superuser or has ``BYPASSRLS``;
+        * either role owns a Platform table, because an owner is exempt from its own
           policies even when the table is marked ``FORCE``;
-        * a login that is a member of the *system* role while the tenant role is
-          requested, because that login could step into the system scope and the
-          separation Step 2 established would exist only in the policy text.
+        * the login is **not** an explicit member of the role it is asked to step
+          down to;
+        * the login is an explicit member of the *other* Platform role, because then
+          it can cross the boundary and the separation exists only in the policy
+          text.
+
+        Two details matter and were both wrong in an earlier version:
+
+        * membership is read from ``pg_auth_members`` with the grantor, not from
+          ``pg_has_role``. ``pg_has_role`` is **vacuously true for a superuser for
+          every role**, so a membership gate built on it accepts a superuser login,
+          and it also reports inherited membership, which ``NOINHERIT`` deliberately
+          does not exercise;
+        * the login's own attributes are read before the switch, because afterwards
+          ``current_user`` no longer names the login.
+
+        No superuser name is named anywhere. Privilege is read as an attribute of the
+        role (``rolsuper``, ``rolbypassrls``) or derived from the catalogue, so this
+        check holds on a cluster whose superuser is called something else.
 
         Every role name is validated against the two role constants before it is
-        interpolated into ``SET ROLE``, so this method cannot be a place where an
-        unvalidated value reaches SQL.
+        interpolated into ``SET ROLE``, which accepts no placeholder.
         """
 
-        if self._application_role is not None:
-            self._require_known_role(self._application_role)
+        self._require_known_role(self._application_role)
 
         current = await connection.fetchrow(
             "SELECT current_user AS current_user, session_user AS session_user"
         )
         if current is None:
             raise ConnectionError("could not determine the current database role")
-        current_user = current["current_user"]
         session_user = current["session_user"]
 
-        # The LOGIN's own attributes. Checked before any switch, because after the
-        # switch `current_user` no longer names the login.
+        # The login's own privilege, before any switch.
         await self._require_not_privileged(connection, session_user, "session role")
 
-        if self._application_role == APP_ROLE:
-            # A login that may become the system role must never serve tenant
-            # traffic: the pool is a tenant pool, and one login holding both scopes
-            # is exactly the configuration the schema forbids.
-            reaches_system = await connection.fetchval(
-                "SELECT pg_has_role($1, $2, 'MEMBER')",
-                session_user,
-                SYSTEM_ROLE,
+        # The login must reach the requested role and must not reach the other one.
+        # Both are answered from the explicit grant records.
+        expected = (APP_ROLE, SYSTEM_ROLE) if self._application_role == APP_ROLE \
+            else (SYSTEM_ROLE, APP_ROLE)
+        reaches = await self._explicit_membership(connection, session_user, expected[0])
+        crosses = await self._explicit_membership(connection, session_user, expected[1])
+        if crosses:
+            raise ConnectionError(
+                f"the login {session_user!r} is an explicit member of both "
+                f"{APP_ROLE!r} and {SYSTEM_ROLE!r}. Tenant traffic and system traffic "
+                "must be served by different logins: one login holding both scopes "
+                "makes the role boundary decorative, and NOINHERIT does not prevent it "
+                "because SET ROLE is the same command the boundary relies on"
             )
-            if reaches_system:
-                raise ConnectionError(
-                    f"the login {session_user!r} is a member of {SYSTEM_ROLE!r} as well "
-                    f"as {APP_ROLE!r}; tenant traffic and system traffic must be served "
-                    "by different logins, because one login holding both scopes makes "
-                    "the role boundary decorative"
-                )
+        if not reaches:
+            raise ConnectionError(
+                f"the login {session_user!r} is not an explicit member of "
+                f"{self._application_role!r}; the Platform schema grants no capability "
+                "to a login outside the two role groups"
+            )
 
-        if self._application_role is not None and current_user != self._application_role:
-            # The switch is proven possible before it is attempted, so an insufficient
-            # privilege is reported as this layer's own ConnectionError rather than as
-            # a raw driver error a caller would have to know how to interpret.
-            #
-            # `pg_has_role(..., 'MEMBER')` is NOT sufficient on its own -- it is
-            # vacuously true for a superuser, which is why the login's attributes are
-            # checked first -- but for a role that is genuinely not a member it is
-            # exactly the right question.
-            is_member = await connection.fetchval(
-                "SELECT pg_has_role($1, $2, 'MEMBER')", session_user,
-                self._application_role,
-            )
-            if not is_member:
-                raise ConnectionError(
-                    f"the login {session_user!r} is not a member of "
-                    f"{self._application_role!r}; the Platform repositories require the "
-                    "role boundary the migrations establish"
-                )
-            await connection.execute(f'SET ROLE "{self._application_role}"')
-            current_user = self._application_role
+        # The switch is proven possible before it is attempted, so an insufficient
+        # privilege is this layer's own error rather than a raw driver error.
+        await connection.execute(f'SET ROLE "{self._application_role}"')
 
         # The attributes are checked on the EFFECTIVE role, whichever way it was
         # reached. An earlier version checked them only when no substitution was
-        # requested, which accepted a superuser login -- exactly the case this check
-        # exists to refuse.
+        # requested, which accepted a superuser login.
         await self._require_not_privileged(
-            connection, current_user, "effective role"
+            connection, self._application_role, "effective role"
         )
 
-        await self._require_no_owned_tables(connection, current_user)
+        await self._require_no_owned_tables(connection, self._application_role)
 
     @staticmethod
     def _require_known_role(role: str) -> None:
@@ -643,23 +840,57 @@ class PlatformDatabase:
             )
 
     @staticmethod
+    async def _explicit_membership(connection: Any, login: str, group: str) -> bool:
+        """True when ``login`` holds an explicit grant of ``group``.
+
+        Read from ``pg_auth_members`` rather than ``pg_has_role`` on purpose:
+
+        * ``pg_has_role`` returns true for a superuser for **every** role, whatever
+          the catalogue says, so it cannot answer "was this granted";
+        * ``pg_has_role(..., 'MEMBER')`` also follows the membership chain, while
+          this check wants the direct grant the deployment actually issued;
+        * ``pg_auth_members`` is the catalogue a ``GRANT`` writes to, so this is the
+          same fact an operator can see with ``\\du``.
+
+        The predicate uses ``pg_has_role`` only for the attribute-like question "is
+        this login privileged", never for the membership question.
+        """
+
+        return await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_auth_members m
+                JOIN pg_roles granted ON granted.oid = m.roleid
+                JOIN pg_roles grantee ON grantee.oid = m.member
+                WHERE granted.rolname = $1
+                  AND grantee.rolname = $2
+            )
+            """,
+            group,
+            login,
+        )
+
+    @staticmethod
     async def _require_not_privileged(
         connection: Any, role: str, label: str
     ) -> None:
-        """Refuse a role that is a superuser or bypasses row-level security."""
+        """Refuse a role that is a superuser or bypasses row-level security.
+
+        Both facts are role attributes, so no particular superuser name is assumed.
+        """
 
         row = await connection.fetchrow(
-            "SELECT rolsuper, rolbypassrls, "
-            "pg_has_role(rolname, 'postgres', 'USAGE') AS super_like "
-            "FROM pg_roles WHERE rolname = $1",
+            "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1",
             role,
         )
         if row is None:
             raise ConnectionError(f"could not read the attributes of {label} {role!r}")
-        if row["rolsuper"] or row["rolbypassrls"] or row["super_like"]:
+        if row["rolsuper"] or row["rolbypassrls"]:
             raise ConnectionError(
-                f"{label} {role!r} is a superuser or bypasses row-level security; "
-                "refusing to build a pool whose row-level security would not apply"
+                f"{label} {role!r} is a superuser or bypasses row-level security "
+                "(rolsuper/rolbypassrls); refusing to build a pool whose row-level "
+                "security would not apply"
             )
 
     @staticmethod
@@ -809,6 +1040,13 @@ class PlatformDatabase:
 
         The result of this path is the set of tenants a subject may choose between.
         The choice is an application decision; this layer only retrieves candidates.
+
+        ``user_id`` is required for the discovery reads to return anything: the
+        policies are bounded by the declared subject, so a session declaring none
+        resolves nobody. That is deliberate -- the fail-closed state is "no subject,
+        no rows" rather than "no subject, everyone". The subject setting is not
+        authentication; it is the value the policies are bounded by, and the trusted
+        decision about who the subject is belongs above this layer.
         """
 
         from app.platform.persistence.mapper import as_uuid

@@ -241,15 +241,15 @@
 -- policy api_keys.api_keys_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK platform.is_current_organization(organization_id)
+-- policy memberships.memberships_discovery_select cmd=SELECT roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK None
 -- policy memberships.memberships_system_delete cmd=DELETE roles={forge_platform_system}
 --   USING      platform.system_scope_is_declared()
 --   WITH CHECK None
 -- policy memberships.memberships_system_insert cmd=INSERT roles={forge_platform_system}
 --   USING      None
 --   WITH CHECK platform.system_scope_is_declared()
--- policy memberships.memberships_system_select cmd=SELECT roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
---   WITH CHECK None
 -- policy memberships.memberships_system_update cmd=UPDATE roles={forge_platform_system}
 --   USING      platform.system_scope_is_declared()
 --   WITH CHECK platform.system_scope_is_declared()
@@ -267,12 +267,12 @@
 -- policy memberships.memberships_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK platform.is_current_organization(organization_id)
+-- policy organizations.organizations_discovery_select cmd=SELECT roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK None
 -- policy organizations.organizations_system_insert cmd=INSERT roles={forge_platform_system}
 --   USING      None
 --   WITH CHECK platform.system_scope_is_declared()
--- policy organizations.organizations_system_select cmd=SELECT roles={forge_platform_system}
---   USING      platform.system_scope_is_declared()
---   WITH CHECK None
 -- policy organizations.organizations_tenant_select cmd=SELECT roles={forge_platform_app}
 --   USING      ((platform.current_organization_id() IS NOT NULL) AND ((id = platform.current_organization_id()) OR (EXISTS ( SELECT 1
    FROM memberships m
@@ -305,6 +305,9 @@
 -- policy provider_accounts.provider_accounts_tenant_update cmd=UPDATE roles={forge_platform_app}
 --   USING      ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
 --   WITH CHECK ((organization_id IS NOT NULL) AND platform.is_current_organization(organization_id))
+-- policy run_records.run_records_system_select cmd=SELECT roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK None
 -- policy run_records.run_records_tenant_insert cmd=INSERT roles={forge_platform_app}
 --   USING      None
 --   WITH CHECK platform.is_current_organization(organization_id)
@@ -320,12 +323,15 @@
 -- policy usage_records.usage_records_tenant_select cmd=SELECT roles={forge_platform_app}
 --   USING      platform.is_current_organization(organization_id)
 --   WITH CHECK None
+-- policy users.users_discovery_select cmd=SELECT roles={forge_platform_system}
+--   USING      platform.system_scope_is_declared()
+--   WITH CHECK None
 -- policy users.users_system_insert cmd=INSERT roles={forge_platform_system}
 --   USING      None
 --   WITH CHECK platform.system_scope_is_declared()
--- policy users.users_system_select cmd=SELECT roles={forge_platform_system}
+-- policy users.users_system_update cmd=UPDATE roles={forge_platform_system}
 --   USING      platform.system_scope_is_declared()
---   WITH CHECK None
+--   WITH CHECK platform.system_scope_is_declared()
 -- policy users.users_tenant_select cmd=SELECT roles={forge_platform_app}
 --   USING      ((id = (NULLIF(current_setting('forge.user_id'::text, true), ''::text))::uuid) OR ((platform.current_organization_id() IS NOT NULL) AND (EXISTS ( SELECT 1
    FROM (memberships m_self

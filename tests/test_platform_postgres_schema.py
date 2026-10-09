@@ -55,7 +55,7 @@ TABLES = (
 EXPECTED_POLICIES = {
     "organizations": {
         "organizations_tenant_select",
-        "organizations_system_select",
+        "organizations_discovery_select",
         "organizations_system_insert",
     },
     "memberships": {
@@ -63,7 +63,7 @@ EXPECTED_POLICIES = {
         "memberships_tenant_insert",
         "memberships_tenant_update",
         "memberships_tenant_delete",
-        "memberships_system_select",
+        "memberships_discovery_select",
         "memberships_system_insert",
         "memberships_system_update",
         "memberships_system_delete",
@@ -82,11 +82,14 @@ EXPECTED_POLICIES = {
         "api_keys_tenant_update",
         "api_keys_tenant_delete",
     },
-    # No DELETE policy: execution history is retired by status, not deleted.
+    # No DELETE policy: execution history is retired by status, not deleted. The
+    # system scope gains SELECT so a compare-and-set lifecycle update can read the
+    # state it is guarding; it still has no INSERT and no DELETE.
     "run_records": {
         "run_records_tenant_select",
         "run_records_tenant_insert",
         "run_records_tenant_update",
+        "run_records_system_select",
     },
     # Append-only: SELECT and INSERT only.
     "usage_records": {
@@ -95,11 +98,15 @@ EXPECTED_POLICIES = {
     },
     # users_system_insert is the bootstrap path: registering an organization and
     # its first OWNER membership needs the account row to exist first.
+    # users_system_update is the server-side account-administration path, and it is
+    # column-limited to the server-controlled columns; the tenant scope keeps its own
+    # column-limited UPDATE for display_name. The two are disjoint.
     "users": {
         "users_tenant_select",
         "users_tenant_update",
-        "users_system_select",
+        "users_discovery_select",
         "users_system_insert",
+        "users_system_update",
     },
     "provider_accounts": {
         "provider_accounts_tenant_select",
@@ -307,7 +314,7 @@ class MigrationAndSchemaTests(AsyncTestCase):
         async def body():
             async with LiveDatabase() as db:
                 applied = await db.apply_migrations()
-                self.assertEqual(len(applied), 14)
+                self.assertEqual(len(applied), 15)
                 self.assertEqual(applied[0], "0001_users.sql")
 
                 ledger = await db.connection.fetch(

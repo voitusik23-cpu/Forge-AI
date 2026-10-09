@@ -190,6 +190,11 @@ remaining steps are not, and nothing below should be read as a claim about them.
 | PostgreSQL schema with migrations, roles, `FORCE` row-level security, and append-only tables | **CURRENT / VERIFIED** | `app/platform/persistence/postgres/migrations/0001..0014_*.sql`, `postgres/schema.sql` — `tests/test_platform_postgres_schema.py` |
 | Tenant containment, role separation, system-scope containment, append-only usage, membership provenance | **CURRENT / VERIFIED** | migrations `0002`, `0011`–`0014` — `tests/test_platform_postgres_security.py` |
 | Repositories, Unit of Work, three scopes, error normalization, identifier boundary | **CURRENT / VERIFIED** | `app/platform/persistence/{database,repositories,mapper,protocols,errors}.py` — `tests/test_platform_persistence.py` |
+| Two logins, one scope each, proven from the role catalogue rather than by convention | **CURRENT / VERIFIED** | `app/platform/persistence/database.py` — `tests/test_platform_persistence.py` |
+| Aborted-transaction detection: a caught statement failure cannot be committed silently | **CURRENT / VERIFIED** | `app/platform/persistence/database.py` — `tests/test_platform_persistence.py` |
+| Subject-bound discovery, one subject per transaction | **CURRENT / VERIFIED** | migration `0015`, `app/platform/persistence/database.py` — `tests/test_platform_persistence.py`, `tests/test_platform_postgres_security.py` |
+| Column-limited identity writes: disjoint capabilities per scope | **CURRENT / VERIFIED** | migration `0015` — `tests/test_platform_persistence.py`, `tests/test_platform_postgres_security.py` |
+| Compare-and-set run lifecycle transitions | **CURRENT / VERIFIED** | `app/platform/persistence/repositories.py` — `tests/test_platform_persistence.py` |
 | Platform Application Services over those repositories | **PLANNED / NOT IMPLEMENTED** | no such module exists; `app/platform/persistence/protocols.py` is the interface they will use |
 | Platform HTTP API, authentication, API-key token handling | **PLANNED / NOT IMPLEMENTED** | see O-1 and O-2 in `DECISIONS.md`; no endpoint and no token column exist |
 | Platform -> Core transport (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; see `ROADMAP.md` |
@@ -655,6 +660,11 @@ Stage 1 строится упорядоченными шагами. Шаги с 
 | Схема PostgreSQL с миграциями, ролями, `FORCE` row-level security и append-only таблицами | **CURRENT / VERIFIED** | `app/platform/persistence/postgres/migrations/0001..0014_*.sql`, `postgres/schema.sql` — `tests/test_platform_postgres_schema.py` |
 | Изоляция арендаторов, разделение ролей, сдерживание system-скоупа, append-only потребление, происхождение membership | **CURRENT / VERIFIED** | миграции `0002`, `0011`–`0014` — `tests/test_platform_postgres_security.py` |
 | Репозитории, Unit of Work, три скоупа, нормализация ошибок, граница идентификаторов | **CURRENT / VERIFIED** | `app/platform/persistence/{database,repositories,mapper,protocols,errors}.py` — `tests/test_platform_persistence.py` |
+| Два логина, по одному скоупу на каждый, доказанные по каталогу ролей, а не по договорённости | **CURRENT / VERIFIED** | `app/platform/persistence/database.py` — `tests/test_platform_persistence.py` |
+| Обнаружение aborted-транзакции: перехваченная ошибка не может быть закоммичена молча | **CURRENT / VERIFIED** | `app/platform/persistence/database.py` — `tests/test_platform_persistence.py` |
+| Discovery, привязанный к субъекту, один субъект на транзакцию | **CURRENT / VERIFIED** | миграция `0015`, `app/platform/persistence/database.py` — `tests/test_platform_persistence.py`, `tests/test_platform_postgres_security.py` |
+| Колоночно-ограниченная запись идентичностей: непересекающиеся права на скоуп | **CURRENT / VERIFIED** | миграция `0015` — `tests/test_platform_persistence.py`, `tests/test_platform_postgres_security.py` |
+| Compare-and-set переходы жизненного цикла запуска | **CURRENT / VERIFIED** | `app/platform/persistence/repositories.py` — `tests/test_platform_persistence.py` |
 | Прикладные сервисы Platform поверх этих репозиториев | **PLANNED / NOT IMPLEMENTED** | такого модуля не существует; `app/platform/persistence/protocols.py` — интерфейс, которым они будут пользоваться |
 | HTTP API Platform, аутентификация, обработка токенов API-ключей | **PLANNED / NOT IMPLEMENTED** | см. O-1 и O-2 в `DECISIONS.md`; ни эндпоинта, ни колонки токена не существует |
 | Транспорт Platform -> Core (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; см. `ROADMAP.md` |

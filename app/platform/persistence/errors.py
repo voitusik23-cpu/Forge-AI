@@ -23,6 +23,11 @@ be able to act differently:
   replace them, and these errors are how a lost race is surfaced.
 * :class:`PermissionDeniedError` -- row-level security, a table privilege, or a
   role boundary refused the operation.
+* :class:`ConcurrentModificationError` -- a compare-and-set lifecycle update matched
+  no row because another writer moved the record first, or because the record was not
+  in the state the caller expected. Distinct from :class:`EntityNotFound` on purpose:
+  the row usually exists, and reporting "not found" for a lost race would send a
+  caller looking for the wrong problem.
 * :class:`TransactionError` -- the transaction could not be started, committed, or
   used coherently. Also covers a repository call made outside an active
   transaction, which is a programming error this layer must make loud rather than
@@ -42,6 +47,7 @@ __all__ = [
     "ForeignKeyViolationError",
     "CheckViolationError",
     "PermissionDeniedError",
+    "ConcurrentModificationError",
     "TransactionError",
     "ConnectionError",
 ]
@@ -112,6 +118,30 @@ class PermissionDeniedError(PersistenceError):
     """Row-level security, a privilege, or a role boundary refused the operation."""
 
     def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class ConcurrentModificationError(PersistenceError):
+    """A compare-and-set update matched no row.
+
+    A lifecycle transition carries the state it expects as part of the ``UPDATE``, so
+    two writers racing for the same record cannot both succeed; the loser sees this
+    instead of a successful-looking write. It is also what a caller gets when the
+    record was not in the state it named, which is why the message carries the
+    expectation rather than only the identifier.
+    """
+
+    def __init__(
+        self, entity: str, identifier: Optional[str] = None, detail: str = ""
+    ) -> None:
+        self.entity = entity
+        self.identifier = identifier
+        self.detail = detail
+        message = f"{entity} was modified concurrently or was not in the expected state"
+        if identifier is not None:
+            message += f": {identifier}"
+        if detail:
+            message += f" ({detail})"
         super().__init__(message)
 
 

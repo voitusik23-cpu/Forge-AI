@@ -363,24 +363,39 @@ class SystemScopeContainmentTests(SecurityTestCase):
                 await db.apply_migrations()
                 conn = db.connection
                 for table in OPERATIONAL_TABLES:
-                    privileges = await conn.fetch(
-                        "SELECT privilege_type FROM information_schema."
-                        "role_table_grants WHERE table_name = $1 AND grantee = $2",
-                        table, SYSTEM_ROLE,
-                    )
-                    self.assertEqual(
-                        [r["privilege_type"] for r in privileges], [],
-                        f"{SYSTEM_ROLE} holds a privilege on {table}",
-                    )
-                    policies = await conn.fetch(
-                        "SELECT policyname FROM pg_policies WHERE schemaname = "
-                        "'public' AND tablename = $1 AND roles::text LIKE $2",
-                        table, f"%{SYSTEM_ROLE}%",
-                    )
-                    self.assertEqual(
-                        [r["policyname"] for r in policies], [],
-                        f"{SYSTEM_ROLE} has a policy on {table}",
-                    )
+                    privileges = {
+                        r["privilege_type"] for r in await conn.fetch(
+                            "SELECT privilege_type FROM information_schema."
+                            "role_table_grants WHERE table_name = $1 AND grantee = $2",
+                            table, SYSTEM_ROLE,
+                        )
+                    }
+                    policies = {
+                        r["policyname"] for r in await conn.fetch(
+                            "SELECT policyname FROM pg_policies WHERE schemaname = "
+                            "'public' AND tablename = $1 AND roles::text LIKE $2",
+                            table, f"%{SYSTEM_ROLE}%",
+                        )
+                    }
+                    if table == "run_records":
+                        # The documented exception, asserted rather than excluded.
+                        # The compare-and-set lifecycle guard needs to read the state
+                        # it guards, so SELECT is granted and a policy to match it
+                        # exists. Nothing else is: this scope cannot create, modify,
+                        # or erase a run, and "cannot modify" is the half that matters.
+                        self.assertEqual(privileges, {"SELECT"},
+                                         f"{SYSTEM_ROLE} on {table}")
+                        self.assertEqual(policies, {"run_records_system_select"},
+                                         f"{SYSTEM_ROLE} policies on {table}")
+                    else:
+                        self.assertEqual(
+                            privileges, set(),
+                            f"{SYSTEM_ROLE} holds a privilege on {table}",
+                        )
+                        self.assertEqual(
+                            policies, set(),
+                            f"{SYSTEM_ROLE} has a policy on {table}",
+                        )
         run_async(body())
 
     def test_111_no_for_all_system_policy_on_tenant_tables(self):
@@ -403,11 +418,13 @@ class SystemScopeContainmentTests(SecurityTestCase):
         run_async(body())
 
     def test_112_system_scope_cannot_enumerate_tenant_work(self):
-        """Discovery reads identity and tenancy; it does not read tenant work.
+        """Discovery reads identity and tenancy. Tenant work is not readable, with one
+        documented exception: `run_records` is readable so the compare-and-set
+        lifecycle guard can see the state it guards, and it is read-only.
 
         Asserted from a real non-superuser login holding only the system scope, so
-        the refusal is a genuine privilege denial rather than the owner's silent
-        zero-row bypass.
+        every refusal here is a genuine privilege denial rather than the owner's
+        silent zero-row bypass.
         """
 
         async def body():
@@ -426,6 +443,35 @@ class SystemScopeContainmentTests(SecurityTestCase):
                         # report InFailedSQLTransactionError instead of the
                         # denial actually under test.
                         for table in OPERATIONAL_TABLES:
+                            if table == "run_records":
+                                # The documented exception: readable ...
+                                await login.execute("SAVEPOINT s")
+                                visible = await login.fetchval(
+                                    f"SELECT count(*) FROM {table}"
+                                )
+                                self.assertEqual(visible, 1,
+                                                 "the CAS guard needs this read")
+                                await login.execute("ROLLBACK TO SAVEPOINT s")
+                                # ... and read-only. Three of the four DML
+                                # privileges are absent, so no policy can grant them.
+                                for verb in (
+                                    "UPDATE run_records SET attempt_count = 99",
+                                    "DELETE FROM run_records",
+                                    f"INSERT INTO run_records (id, organization_id, "
+                                    f"project_id, core_run_id, initiated_by_user_id, "
+                                    f"status, started_at, created_at) VALUES "
+                                    f"('{uuid.uuid4()}', '{tenant.organization_id}', "
+                                    f"'{tenant.project_id}', 'core-x', "
+                                    f"'{tenant.user_id}', 'running', now(), now())",
+                                ):
+                                    await login.execute("SAVEPOINT s")
+                                    with self.assertRaises(
+                                        asyncpg_module().InsufficientPrivilegeError,
+                                        msg=f"system scope wrote run_records: {verb}",
+                                    ):
+                                        await login.execute(verb)
+                                    await login.execute("ROLLBACK TO SAVEPOINT s")
+                                continue
                             await login.execute("SAVEPOINT s")
                             with self.assertRaises(
                                 asyncpg_module().InsufficientPrivilegeError,
@@ -498,12 +544,15 @@ class SystemScopeContainmentTests(SecurityTestCase):
                     await conn.execute("RESET ROLE")
         run_async(body())
 
-    def test_115_system_scope_cannot_modify_or_delete_identity(self):
-        """Discovery is a read. Account mutation is not part of this scope.
+    def test_115_system_scope_may_change_only_server_controlled_fields(self):
+        """Account administration is server-side, and it is column-limited.
 
-        UPDATE on `users` and DELETE on `users` or `organizations` have no policy
-        for this scope AND no privilege, so this is a privilege denial rather than
-        a policy that happens to match nothing.
+        This scope MAY set `status` and `email`, because a suspended account must not
+        be able to un-suspend itself and an email change is an administrative act.
+        It may NOT set `display_name`, which the subject owns, and it may not DELETE
+        an account or touch a tenant at all. All four refusals come from a withheld
+        privilege or a missing policy, so they cannot be undone by editing a policy to
+        match by accident.
         """
 
         async def body():
@@ -515,7 +564,8 @@ class SystemScopeContainmentTests(SecurityTestCase):
                 login = await db.login_as_proof_role(SYSTEM_ROLE)
                 try:
                     for statement, args in (
-                        ("UPDATE users SET email = 'hijacked@example.test' "
+                        # display_name belongs to the subject, not to this scope
+                        ("UPDATE users SET display_name = 'hijacked' "
                          "WHERE id = $1", (tenant.user_id,)),
                         ("DELETE FROM users WHERE id = $1", (tenant.user_id,)),
                         ("UPDATE organizations SET status = 'suspended' "
@@ -1229,7 +1279,11 @@ class SchemaRegressionTests(SecurityTestCase):
                             for r in rows}
                 expected = {
                     # the ordinary tenant path
-                    ("users", APP_ROLE): "DELETE, INSERT, SELECT, UPDATE",
+                    # UPDATE on `users` is COLUMN-level for the tenant role
+                    # (display_name, updated_at), and a column-level grant does not
+                    # appear in this table-level view. `test_210` asserts the columns
+                    # directly, so the omission here is stated rather than overlooked.
+                    ("users", APP_ROLE): "DELETE, INSERT, SELECT",
                     ("organizations", APP_ROLE): "DELETE, INSERT, SELECT, UPDATE",
                     ("memberships", APP_ROLE): "DELETE, INSERT, SELECT, UPDATE",
                     ("projects", APP_ROLE): "DELETE, INSERT, SELECT, UPDATE",
@@ -1238,12 +1292,19 @@ class SchemaRegressionTests(SecurityTestCase):
                     ("run_records", APP_ROLE): "INSERT, SELECT, UPDATE",
                     ("usage_records", APP_ROLE): "INSERT, SELECT",
                     # the server-only scope: identity and tenancy, read plus
-                    # bootstrap, and the one operational exception
+                    # bootstrap, and the one operational exception. Its UPDATE on
+                    # `users` is column-level (status, email, updated_at) and therefore
+                    # absent from this view.
                     ("users", SYSTEM_ROLE): "INSERT, SELECT",
                     ("organizations", SYSTEM_ROLE): "INSERT, SELECT",
                     ("memberships", SYSTEM_ROLE): "DELETE, INSERT, SELECT, UPDATE",
                     ("provider_accounts", SYSTEM_ROLE):
                         "DELETE, INSERT, SELECT, UPDATE",
+                    # The compare-and-set lifecycle guard needs to read the state it
+                    # guards, so this scope gained SELECT on run_records. It has no
+                    # INSERT and no DELETE: it can observe a run, not create or erase
+                    # one.
+                    ("run_records", SYSTEM_ROLE): "SELECT",
                 }
                 self.assertEqual(observed, expected)
         run_async(body())

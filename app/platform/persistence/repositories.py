@@ -46,7 +46,9 @@ from app.platform.models import (
 )
 from app.platform.persistence.database import Session
 from app.platform.persistence.errors import (
+    ConcurrentModificationError,
     EntityNotFound,
+    PermissionDeniedError,
     PersistenceError,
     TransactionError,
 )
@@ -70,6 +72,7 @@ __all__ = [
     "PostgresOrganizationRepository",
     "PostgresMembershipRepository",
     "PostgresSystemMembershipRepository",
+    "PostgresSystemUserRepository",
     "PostgresProjectRepository",
     "PostgresProviderAccountRepository",
     "PostgresSystemProviderAccountRepository",
@@ -149,6 +152,30 @@ class _TenantBound:
             )
         return organization_id
 
+    def _require_matching_tenant(self, organization_id: Optional[str]) -> None:
+        """Refuse a record that names a different tenant.
+
+        The tenant a write lands in comes from the session, so a record naming
+        another tenant is a disagreement between the caller and its own transaction.
+        Silently writing it into the session's tenant would be confused-deputy
+        behaviour: the caller believes it addressed one tenant and another was
+        written. The write is refused instead, and the caller is told which two
+        identifiers disagree.
+        """
+
+        if organization_id is None:
+            raise TransactionError(
+                "this record carries no organization_id, and this layer does not "
+                "infer one: set organization_id to the tenant of the transaction "
+                "explicitly, so the write is never an implicit redirect"
+            )
+        if str(organization_id) != str(self._tenant()):
+            raise TransactionError(
+                f"record organization_id {organization_id!r} is not the tenant of "
+                f"this transaction ({self._tenant()!r}); refusing to write it into a "
+                "different tenant"
+            )
+
 
 # =========================================================================== #
 # users
@@ -165,13 +192,16 @@ class PostgresUserRepository:
         # stays NULL until an update sets it. Writing a domain field that does not
         # exist is how a mapper silently drifts from its model; this one is caught
         # by the tests rather than by a reader.
-        await self._session.execute(
+        row = await self._session.fetchrow(
             "INSERT INTO users (id, email, display_name, status, created_at) "
-            "VALUES ($1, $2, $3, $4, $5)",
+            "VALUES ($1, $2, $3, $4, $5) "
+            f"RETURNING {USER_COLUMNS}",
             user_id, user.email, user.display_name, user.status.value,
             user.created_at,
         )
-        return await self.get(str(user_id)) or user
+        if row is None:  # pragma: no cover - RETURNING always yields a row
+            raise EntityNotFound("User", str(user_id))
+        return user_from_row(row)
 
     async def get(self, user_id: str) -> Optional[User]:
         row = await self._session.fetchrow(
@@ -181,22 +211,30 @@ class PostgresUserRepository:
         return None if row is None else user_from_row(row)
 
     async def find_by_email(self, email: str) -> Optional[User]:
+        """Resolve a user by email, within what this scope may see.
+
+        Under the system scope the discovery policy returns only the declared
+        subject's own row, so this is "resolve the subject I was asked about" and not
+        a way to look anybody up. Under the tenant scope the row-level policy decides,
+        which means a same-tenant user may be resolved and a foreign one may not.
+        """
+
         row = await self._session.fetchrow(
             f"SELECT {USER_COLUMNS} FROM users WHERE email = $1", email
         )
         return None if row is None else user_from_row(row)
 
-    async def set_status(self, user_id: str, status: UserStatus) -> User:
-        row = await self._session.fetchrow(
-            "UPDATE users SET status = $1, updated_at = now() WHERE id = $2 "
-            f"RETURNING {USER_COLUMNS}",
-            status.value, as_uuid(user_id, "User.id"),
-        )
-        if row is None:
-            raise EntityNotFound("User", user_id)
-        return user_from_row(row)
+    # THERE IS DELIBERATELY NO set_status AND NO set_email ON THIS REPOSITORY.
+    #
+    # `status` is a server decision -- a suspended account must not be able to
+    # un-suspend itself -- and `email` is an identity attribute. The tenant role's
+    # UPDATE privilege is column-limited to `display_name` in migration 0015, so both
+    # are denied at the privilege layer as well as having no policy. The server scope
+    # owns them; see `PostgresSystemUserRepository`.
 
     async def set_display_name(self, user_id: str, display_name: str) -> User:
+        """Set the subject's own display name. The only self-service field."""
+
         row = await self._session.fetchrow(
             "UPDATE users SET display_name = $1, updated_at = now() WHERE id = $2 "
             f"RETURNING {USER_COLUMNS}",
@@ -206,11 +244,67 @@ class PostgresUserRepository:
             raise EntityNotFound("User", user_id)
         return user_from_row(row)
 
-    async def list_all(self) -> Sequence[User]:
-        """Every identity. Server scope only; the tenant role sees far less."""
+    # THERE IS DELIBERATELY NO list_all.
+    #
+    # It existed as a "server scope" directory read. The discovery policies are now
+    # bounded by the declared subject, so under the system scope it could only ever
+    # return that one subject's row -- and under the tenant scope it would return
+    # whatever the tenant policy allows, which is a different question. A method whose
+    # name claims a directory and whose behaviour is "one row, or this tenant's rows"
+    # is a trap, so it is gone. Enumerating identities is not a persistence
+    # capability at this stage.
 
-        rows = await self._session.fetch(f"SELECT {USER_COLUMNS} FROM users")
-        return [user_from_row(r) for r in rows]
+
+class PostgresSystemUserRepository:
+    """Account administration on the server-only scope.
+
+    The counterpart of the tenant repository, and deliberately not the same class:
+    the two hold **disjoint** write capabilities on ``users``.
+
+    * the tenant scope may set ``display_name`` on the subject's own row;
+    * this scope may set ``status`` and ``email`` on any row, because account
+      administration is server-side by design.
+
+    Neither can do the other's job, and that is enforced by column-level privileges
+    with a policy attached to each, not by convention.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    async def _update(self, user_id: str, assignments: str, *args: object) -> User:
+        row = await self._session.fetchrow(
+            f"UPDATE users SET {assignments}, updated_at = now() "
+            f"WHERE id = ${len(args) + 1} RETURNING {USER_COLUMNS}",
+            *args,
+            as_uuid(user_id, "User.id"),
+        )
+        if row is None:
+            raise EntityNotFound("User", user_id)
+        return user_from_row(row)
+
+    async def set_status(self, user_id: str, status: UserStatus) -> User:
+        """Suspend or reactivate an account. A server decision."""
+
+        return await self._update(user_id, "status = $1", status.value)
+
+    async def set_email(self, user_id: str, email: str) -> User:
+        """Change the identity attribute. A server decision."""
+
+        return await self._update(user_id, "email = $1", email)
+
+    async def set_display_name(self, user_id: str, display_name: str) -> User:
+        """Refused: this scope does not hold the column.
+
+        The method exists so the refusal is this layer's ``PermissionDeniedError``
+        naming the boundary, rather than a raw driver privilege error the caller has
+        to interpret. Migration 0015 grants this scope ``status`` and ``email`` only.
+        """
+
+        raise PermissionDeniedError(
+            "the server scope may change status and email, not display_name; the "
+            "subject owns its display name and sets it through the tenant scope"
+        )
 
 
 # =========================================================================== #
@@ -226,9 +320,10 @@ class PostgresOrganizationRepository:
         organization_id = as_uuid(organization.id, "Organization.id")
         # `updated_at` exists in the table but not in the domain contract, so it
         # stays NULL until an update sets it.
-        await self._session.execute(
+        row = await self._session.fetchrow(
             "INSERT INTO organizations (id, name, slug, is_personal, status, "
-            "created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "created_at) VALUES ($1, $2, $3, $4, $5, $6) "
+            f"RETURNING {ORGANIZATION_COLUMNS}",
             organization_id, organization.name,
             # The domain uses '' for "no slug"; the column uses NULL. The mapping
             # is explicit here rather than relying on the two agreeing.
@@ -236,10 +331,9 @@ class PostgresOrganizationRepository:
             organization.is_personal, organization.status.value,
             organization.created_at,
         )
-        created = await self.get(str(organization_id))
-        if created is None:
+        if row is None:  # pragma: no cover - RETURNING always yields a row
             raise EntityNotFound("Organization", str(organization_id))
-        return created
+        return organization_from_row(row)
 
     async def get(self, organization_id: str) -> Optional[Organization]:
         row = await self._session.fetchrow(
@@ -251,10 +345,13 @@ class PostgresOrganizationRepository:
     async def list_for_user(self, user_id: str) -> Sequence[Organization]:
         """The tenants a subject can reach, through their memberships.
 
-        The pre-tenant discovery read. It lists candidates; choosing among them is
-        an application decision.
+        The pre-tenant discovery read. It lists candidates; choosing among them is an
+        application decision. The organization policy resolves tenancy through the
+        **declared subject's** membership, so the session is asked to agree with the
+        argument before any SQL runs.
         """
 
+        self._session.require_subject(user_id)
         rows = await self._session.fetch(
             f"SELECT o.{ORGANIZATION_COLUMNS.replace(', ', ', o.')} "
             "FROM organizations o "
@@ -307,19 +404,19 @@ class PostgresMembershipRepository(_TenantBound):
 
     async def _insert(self, organization_id: str, membership: Membership) -> Membership:
         membership_id = as_uuid(membership.id, "Membership.id")
-        await self._session.execute(
+        row = await self._session.fetchrow(
             "INSERT INTO memberships (id, organization_id, user_id, role, status, "
-            "created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) "
+            f"RETURNING {MEMBERSHIP_COLUMNS}",
             membership_id,
             as_uuid(organization_id, "organization_id"),
             as_uuid(membership.user_id, "Membership.user_id"),
             membership.role.value, membership.status.value,
             membership.created_at, membership.updated_at,
         )
-        created = await self.get(str(membership_id))
-        if created is None:
+        if row is None:  # pragma: no cover - RETURNING always yields a row
             raise EntityNotFound("Membership", str(membership_id))
-        return created
+        return membership_from_row(row)
 
     async def get(self, membership_id: str) -> Optional[Membership]:
         row = await self._session.fetchrow(
@@ -340,8 +437,15 @@ class PostgresMembershipRepository(_TenantBound):
         return None if row is None else membership_from_row(row)
 
     async def list_for_user(self, user_id: str) -> Sequence[Membership]:
-        """Every membership of a user. Pre-tenant discovery."""
+        """Every membership of a user. Pre-tenant discovery.
 
+        The discovery policy returns only memberships of the subject the transaction
+        declared, so this read cannot be pointed at somebody else: the session
+        refuses the disagreement rather than silently returning nothing, and the
+        policy would refuse it even if the session allowed it.
+        """
+
+        self._session.require_subject(user_id)
         rows = await self._session.fetch(
             f"SELECT {MEMBERSHIP_COLUMNS} FROM memberships WHERE user_id = $1 "
             "ORDER BY created_at",
@@ -405,22 +509,19 @@ class PostgresSystemMembershipRepository:
                 f"match the organization argument {organization_id!r}"
             )
         membership_id = as_uuid(membership.id, "Membership.id")
-        await self._session.execute(
+        row = await self._session.fetchrow(
             "INSERT INTO memberships (id, organization_id, user_id, role, status, "
-            "created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) "
+            f"RETURNING {MEMBERSHIP_COLUMNS}",
             membership_id,
             as_uuid(organization_id, "organization_id"),
             as_uuid(membership.user_id, "Membership.user_id"),
             membership.role.value, membership.status.value,
             membership.created_at, membership.updated_at,
         )
-        created = await self._session.fetchrow(
-            f"SELECT {MEMBERSHIP_COLUMNS} FROM memberships WHERE id = $1",
-            membership_id,
-        )
-        if created is None:
+        if row is None:  # pragma: no cover - RETURNING always yields a row
             raise EntityNotFound("Membership", str(membership_id))
-        return membership_from_row(created)
+        return membership_from_row(row)
 
 
 class PostgresProjectRepository(_TenantBound):
@@ -921,50 +1022,104 @@ class PostgresRunRecordRepository(_TenantBound):
             raise EntityNotFound("RunRecord (claimable)", run_id)
         return run_record_from_row(row)
 
+    #: Statuses a lifecycle mutation may not move a run away from. O-7 has not fixed
+    #: which statuses are terminal, so this is deliberately the conservative set: a run
+    #: that has finished is finished, and no ordinary transition may reopen it.
+    TERMINAL_STATUSES = (
+        RunRecordStatus.SUCCEEDED,
+        RunRecordStatus.FAILED,
+        RunRecordStatus.CANCELLED,
+        RunRecordStatus.TIMED_OUT,
+        RunRecordStatus.INTERRUPTED,
+    )
+
     async def finish(
         self, run_id: str, *, status: RunRecordStatus, finished_at: datetime,
         failure_classification: str = "",
+        expected_status: Optional[RunRecordStatus] = None,
     ) -> RunRecord:
-        """Move a run to a terminal status.
+        """Move a run to a terminal status, compare-and-set.
 
-        The ``status <> 'queued'`` predicate keeps a queued run from being finished
-        without ever having been claimed, and the schema's own CHECK constraints
-        refuse an inconsistent combination; this method does not re-implement them.
+        **The guard is part of the UPDATE**, so two workers racing to finish one run
+        cannot both succeed: the second statement matches no row and this raises
+        :class:`~app.platform.persistence.errors.ConcurrentModificationError`. A
+        read-then-update would let both pass the read.
+
+        Two conditions are always applied, on top of the caller's expectation:
+
+        * ``status <> 'queued'``, because a queued run has never been claimed and the
+          schema requires a Core identity and an initiator before any other status;
+        * ``status NOT IN (<terminal>)``, because a finished run must not be finished
+          again by a later worker holding a stale view.
+
+        ``expected_status`` narrows the guard further when the caller knows which
+        state it observed. It is optional so existing callers keep working, and it
+        does not fix O-7: this is a concurrency guard, not a lifecycle model.
         """
 
+        if status not in self.TERMINAL_STATUSES:
+            raise TransactionError(
+                f"{status.value!r} is not a terminal status; use set_status for a "
+                "transition that does not finish the run"
+            )
+        terminal = [s.value for s in self.TERMINAL_STATUSES]
         row = await self._session.fetchrow(
             "UPDATE run_records SET status = $1, finished_at = $2, "
             "failure_classification = $3, updated_at = now() "
-            "WHERE id = $4 AND organization_id = $5 AND status <> 'queued' "
+            "WHERE id = $4 AND organization_id = $5 "
+            "AND status <> 'queued' AND NOT (status = ANY($6::text[])) "
+            "AND ($7::text IS NULL OR status = $7) "
             f"RETURNING {RUN_RECORD_COLUMNS}",
             status.value, finished_at, failure_classification,
             as_uuid(run_id, "RunRecord.id"),
             as_uuid(self._tenant(), "organization_id"),
+            terminal,
+            None if expected_status is None else expected_status.value,
         )
         if row is None:
-            raise EntityNotFound("RunRecord (finishable)", run_id)
+            raise ConcurrentModificationError(
+                "RunRecord", run_id,
+                f"finish to {status.value!r} matched no row: the run is absent, "
+                "already finished, still queued, or in a state other than the "
+                "expected one",
+            )
         return run_record_from_row(row)
 
     async def set_status(
         self, run_id: str, status: RunRecordStatus, *,
         failure_classification: str = "",
+        expected_status: Optional[RunRecordStatus] = None,
     ) -> RunRecord:
-        """Change status without finishing, for a non-terminal transition.
+        """Change status without finishing, compare-and-set.
+
+        The ``NOT (status = ANY(<terminal>))`` condition is what stops a stale worker
+        from resurrecting a finished run: ``running`` is reachable only from a state
+        that has not finished. ``expected_status`` narrows the guard when the caller
+        knows the state it observed.
 
         The status vocabulary is whatever the domain enum holds; no new lifecycle
-        state is introduced here, and O-7 remains open.
+        state is introduced here, and **O-7 remains open**.
         """
 
+        terminal = [s.value for s in self.TERMINAL_STATUSES]
         row = await self._session.fetchrow(
             "UPDATE run_records SET status = $1, failure_classification = $2, "
             "updated_at = now() WHERE id = $3 AND organization_id = $4 "
+            "AND NOT (status = ANY($5::text[])) "
+            "AND ($6::text IS NULL OR status = $6) "
             f"RETURNING {RUN_RECORD_COLUMNS}",
             status.value, failure_classification,
             as_uuid(run_id, "RunRecord.id"),
             as_uuid(self._tenant(), "organization_id"),
+            terminal,
+            None if expected_status is None else expected_status.value,
         )
         if row is None:
-            raise EntityNotFound("RunRecord", run_id)
+            raise ConcurrentModificationError(
+                "RunRecord", run_id,
+                f"transition to {status.value!r} matched no row: the run is absent, "
+                "already finished, or in a state other than the expected one",
+            )
         return run_record_from_row(row)
 
     async def increment_attempt_count(self, run_id: str) -> RunRecord:
@@ -1009,6 +1164,7 @@ class PostgresUsageRecordRepository(_TenantBound):
         silent overwrite. The database is the authority on that, not a pre-check.
         """
 
+        self._require_matching_tenant(usage.organization_id)
         await self._session.execute(
             "INSERT INTO usage_records (id, organization_id, run_record_id, "
             "core_run_id, attempt_number, provider_name, model_name, input_tokens, "

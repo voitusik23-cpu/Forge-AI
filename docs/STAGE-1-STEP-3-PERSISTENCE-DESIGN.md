@@ -211,7 +211,7 @@ Two rules:
 
 ## 13. Test strategy
 
-`tests/test_platform_persistence.py` (100 tests) and `tests/persistence_fixture.py`
+`tests/test_platform_persistence.py` (107 tests) and `tests/persistence_fixture.py`
 run against real PostgreSQL. The fixture provisions **two logins, each a member of
 exactly one platform role**, because a single login in both would let the tests step
 around the boundary they are meant to prove.
@@ -277,6 +277,49 @@ and validated role names are interpolated, and all values are bound); no tenant 
 leaks across pooled connections; error normalization is idempotent; the mapping layer
 matches every domain record field for field; and nothing outside `app/platform` imports
 the persistence package or the driver.
+
+## 15.1 Second review: the hardening pass
+
+A **second** adversarial review reported six further findings — one HIGH and five
+MEDIUM — and all six are fixed with regression tests. The full record is
+`D-PLATFORM-21`; the parts that changed this design are summarised here because a
+reader of the sections above would otherwise be misled.
+
+**Commit correctness (H-1).** PostgreSQL accepts `COMMIT` on a transaction that an
+earlier failed statement aborted, **rolls it back**, and returns the status string
+`ROLLBACK` without raising. A service that caught a repository error and continued
+therefore lost every write silently. `Session` now records the aborted state, checks
+the `COMMIT` status string, rolls back, and raises `TransactionError` naming the
+original cause. Section 4's description of `commit` as idempotent still holds for a
+transaction that already ended; it is no longer true that a failed transaction commits
+quietly, which was the defect.
+
+**Discovery (M-2).** The discovery policies no longer grant the system scope a read of
+every identity, membership, and tenant. Discovery is bound to **one subject per
+transaction**, enforced by `Session.require_subject`, and `users.list_all` is removed.
+Section 3's scope table and section 7's repository inventory both changed: the
+`memberships` and `organizations` rows now say the subject is required, and the `users`
+row no longer offers a directory read.
+
+The binding lives in the session rather than in the policy, and **that choice was made
+after measuring the alternative**: a subject predicate in the policy makes
+`INSERT ... RETURNING` unsatisfiable for bootstrap, because `RETURNING` also consults
+the SELECT policies for the columns it returns. `forge.user_id` remains not
+authentication; section 3's statement about `forge.system_scope` applies equally to the
+subject setting.
+
+**Identity writes (M-3).** The two Platform scopes now hold **disjoint** write
+capabilities on `users`: the tenant scope may set `display_name` on the subject's own
+row, and the system scope may set `status` and `email` on any row with a policy to
+match. Section 3's "the system scope cannot change an account" is superseded: it can,
+and only for server-controlled fields.
+
+**Lifecycle (M-4) and tenant binding (M-5).** `finish` and `set_status` are
+compare-and-set inside the `UPDATE` and raise `ConcurrentModificationError` on a lost
+race; a finished run cannot be finished again or revived, and **O-7 remains open**.
+A tenant-scoped write whose record names a different tenant is refused rather than
+redirected. The system scope gained read-only `SELECT` on `run_records` so the guard can
+see the state it guards.
 
 ## 16. Open decisions
 
@@ -531,7 +574,7 @@ Queued-запуск не несёт ни `core_run_id`, ни `started_at`, ни 
 
 ## 13. Стратегия тестов
 
-`tests/test_platform_persistence.py` (100 тестов) и `tests/persistence_fixture.py`
+`tests/test_platform_persistence.py` (107 тестов) и `tests/persistence_fixture.py`
 работают против реального PostgreSQL. Фикстура создаёт **два логина, каждый член
 ровно одной роли Platform**, потому что один логин в обеих позволил бы тестам обойти
 границу, которую они должны доказать.
@@ -586,6 +629,29 @@ tenant-сессии в любой операции; SQL-инъекций нет;
 соединениями пула; нормализация ошибок идемпотентна; слой маппинга соответствует
 каждой доменной записи поле за полем; и ничто вне `app/platform` не импортирует пакет
 персистентности или драйвер.
+
+## 15.1 Второе ревью: проход усиления — русская версия
+
+**Второе** адверсариальное ревью сообщило о шести новых находках — одна HIGH и пять
+MEDIUM — и все шесть исправлены с регрессионными тестами. Полная запись —
+`D-PLATFORM-21`.
+
+**Корректность commit (H-1).** PostgreSQL принимает `COMMIT` на aborted-транзакции,
+**откатывает** её и возвращает строку `ROLLBACK` без ошибки. Теперь сессия помнит
+aborted-состояние, проверяет строку статуса, откатывает и поднимает `TransactionError`.
+
+**Discovery (M-2).** Политики больше не дают system-скоупу чтение всех
+идентичностей, membership'ов и арендаторов. Discovery привязан к **одному субъекту на
+транзакцию** через `Session.require_subject`, и `users.list_all` удалён. Привязка живёт в сессии, а
+не в политике, и **этот выбор сделан после измерения альтернативы**:
+предикат субъекта в политике делает `INSERT ... RETURNING` невыполнимым.
+
+**Запись идентичностей (M-3).** Скоупы имеют **непересекающиеся** права
+записи на `users`: tenant — `display_name`, system — `status` и `email`.
+
+**Жизненный цикл (M-4) и привязка арендатора (M-5).** `finish` и `set_status` —
+compare-and-set внутри `UPDATE`, поднимают `ConcurrentModificationError`; **O-7 остаётся открытым**.
+Tenant-scoped запись с чужим `organization_id` отклоняется, а не перенаправляется.
 
 ## 16. Открытые решения
 

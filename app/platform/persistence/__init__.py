@@ -43,6 +43,7 @@ from app.platform.persistence.database import (
 )
 from app.platform.persistence.errors import (
     CheckViolationError,
+    ConcurrentModificationError,
     ConnectionError,
     EntityNotFound,
     ForeignKeyViolationError,
@@ -75,6 +76,7 @@ __all__ = [
     "UniqueViolationError",
     "ForeignKeyViolationError",
     "CheckViolationError",
+    "ConcurrentModificationError",
     "PermissionDeniedError",
     "TransactionError",
     "ConnectionError",

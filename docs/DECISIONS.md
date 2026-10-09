@@ -4959,3 +4959,260 @@ memberships и organizations. *Исправление:* когда запрош�
 больше не выпускают сырой ``TypeError``/``ValueError``; строка больше не разбивается на символы в
 ``scopes``; ``find_by_slug`` согласован с пишущим кодом; неудавшийся ``COMMIT`` больше не выглядит
 успешным, и неудавшееся закрытие видно через ``Session.close_error``.
+
+## Stage 1 persistence hardening after adversarial review (D-PLATFORM-21)
+
+A second adversarial review of the Step 3 persistence layer reported six findings:
+one HIGH and five MEDIUM. All six are fixed, each with a regression test that fails
+against the previous behaviour. Two of them changed a design constraint rather than
+only a line of code, and those changes are recorded here because they narrow what the
+schema claims.
+
+### H-1 — a COMMIT on an aborted transaction reported success
+
+**Measured, not assumed.** PostgreSQL accepts ``COMMIT`` on a transaction that an
+earlier failed statement aborted, performs a **rollback**, and returns the status
+string ``ROLLBACK`` without raising. `asyncpg` passes that string through. So a
+service that caught a repository error and continued would exit its Unit of Work
+cleanly while every write in it was discarded — the worst possible outcome, because
+nothing reports it.
+
+Two independent signals are now checked, because neither covers the other:
+
+* the session records that a statement failed inside the transaction, so a failure it
+  saw is never forgotten even after the caller catches the exception;
+* the ``COMMIT`` status string is inspected, so a transaction that is already aborted
+  for a reason this session did not record is still caught.
+
+On either signal the transaction is rolled back and a `TransactionError` names the
+original cause. `ROLLBACK TO SAVEPOINT` is the one statement exempt from the aborted
+guard, because it is the statement that repairs the transaction; the server accepts
+nothing else in that state, so the exemption cannot be used to smuggle work through.
+A failed statement now also makes further statements on that session fail with a named
+error instead of a driver error the caller has to decode.
+
+### M-1 — the role/scope boundary is proven from the catalogue
+
+`application_role=None` is no longer a valid state: a pool must step down, and the
+constructor refuses the alternative. `pg_has_role` is **not** used to decide
+membership, because it is vacuously true for a superuser for every role and also
+follows inherited membership, which `NOINHERIT` deliberately does not exercise.
+Membership is read from `pg_auth_members`, the catalogue a `GRANT` writes to, and:
+
+* the login must be an explicit member of the role it steps down to;
+* the login must **not** be an explicit member of the other Platform role, so one
+  login cannot serve both scopes;
+* the login's own attributes are read before the switch, and the effective role's
+  after it, so neither a privileged login nor a privileged substitute is accepted;
+* no superuser name is named anywhere — privilege is read as `rolsuper` /
+  `rolbypassrls`, so the check holds on a cluster whose superuser is called something
+  else.
+
+`SET LOCAL ROLE` remains the mechanism for the tenant and system scopes.
+
+### M-2 — discovery is bounded by a declared subject
+
+The system scope could read every identity, membership, and tenant, gated only by the
+scope flag. Discovery is now bound to **one subject per transaction**, and the binding
+is enforced where it can be expressed without breaking bootstrap.
+
+The first attempt put the subject in the policy
+(`USING (... AND id = platform.current_user_id())`). **That does not work**, and the
+reason is worth keeping: `INSERT ... RETURNING` also consults the SELECT policies for
+the returned columns, so bootstrap — which by definition creates the subject and
+cannot yet declare one — was refused its own new row. The subject-bound read and the
+bootstrap write cannot both be expressed by one predicate on the same table.
+
+So `Session` owns the binding: `set_subject` records the declared subject,
+`require_subject` **refuses** a discovery read that names a different one, and every
+discovery read passes its argument through it. The policy keeps the half a policy can
+decide: the system scope must be declared, or the scope reads nothing. `users.list_all`
+is **removed** — a directory read cannot survive this rule, and a method named
+`list_all` that can only ever return one row is a trap. `find_by_email` and the
+membership and organization discovery reads are bounded to the subject.
+
+`forge.user_id` is **not authentication**, and this is stated in the migration as well
+as here: any session can set a custom GUC, so a session that can already use this role
+could name any subject. What the binding buys is that a discovery read is expressed as
+"the subject this transaction was bound to" rather than "everyone", so a caller mistake
+yields one subject's rows instead of the whole directory. Deciding who the subject
+really is belongs to the authentication path above this layer.
+
+### M-3 — the tenant UPDATE on `users` is column-limited
+
+The tenant role held `UPDATE` on the whole row, so a subject could change its own
+`status` — a suspended account could un-suspend itself — and its own `email`. The
+privilege is now `UPDATE (display_name, updated_at)` with the policy unchanged, and the
+two Platform scopes hold **disjoint write capabilities** on this table:
+
+| scope | may write |
+| --- | --- |
+| tenant | `display_name` (the subject's own row) |
+| system | `status`, `email` (any row, with a policy to match) |
+
+`updated_at` is granted to both because every writer in this layer stamps it and a
+column-level grant does not cover a column it does not name; the database supplies the
+value, so it widens nothing a caller can decide. `set_status` and `set_email` were
+**removed** from the tenant repository and now live on a server-side repository, and
+the tenant scope has no method that could name them at all.
+
+### M-4 — lifecycle transitions are compare-and-set
+
+`finish` and `set_status` carried no state guard, so two workers could both act on one
+run and a finished run could be overwritten. Both now apply the guard **inside the
+UPDATE** — a read-then-update would let both writers pass the read — and raise a new
+`ConcurrentModificationError` when no row matches, which is distinct from
+`EntityNotFound` on purpose: the row usually exists, and reporting "not found" for a
+lost race sends a caller looking for the wrong problem.
+
+The conditions are `status <> 'queued'` (a queued run has no Core identity or
+initiator) and `status NOT IN (<terminal>)`, so a finished run cannot be finished
+again or revived. An optional `expected_status` narrows the guard when the caller knows
+the state it observed. **O-7 is not closed by this**: which statuses are terminal is
+still open, and the terminal set here is deliberately the conservative one, chosen so
+that no ordinary transition can reopen a run that has finished.
+
+Reading a run's state for that guard needs a system-scope read, so this scope gained
+`SELECT` on `run_records` — with the grant and the policy added **together**, because
+this repository has already been bitten twice by a privilege with no policy and the
+reverse is the same inconsistency from the other side. It has no `INSERT`, no `UPDATE`,
+and no `DELETE`: it can observe a run, not create, modify, or erase one.
+
+### M-5 — a mismatching `organization_id` is refused, never overridden
+
+A tenant-scoped write took the tenant from the session and silently ignored a record
+naming another tenant. Writing it into the session's tenant is confused-deputy
+behaviour: the caller believes it addressed one tenant and another was written.
+`usage.append` now requires the record's `organization_id` to equal the session's
+tenant and refuses a disagreement with both identifiers in the error; a record with no
+`organization_id` is refused as well, because inferring one is the same implicit
+redirect. The membership insert never had the parameter at all — the tenant comes from
+the session — and the system repositories keep their own explicit and strict handling.
+
+### Rejected alternatives
+
+- **Trusting the `COMMIT` status string alone.** Rejected: a failure the session
+  recorded is more precise about the cause, and the string alone would make the error
+  message useless.
+- **Trusting the session flag alone.** Rejected: it only knows about failures this
+  session saw.
+- **A savepoint around every repository call.** Rejected: it would change the
+  transaction semantics of every write to make one diagnostic easier, and a savepoint
+  per call would silently change what a partial failure means.
+- **`pg_has_role` for membership.** Rejected: vacuous for a superuser, and it follows
+  inherited membership.
+- **Naming `postgres` as the superuser to reject.** Rejected: not deployment-neutral.
+- **The subject predicate in the policy.** Rejected **after measuring it**: it makes
+  bootstrap's `INSERT ... RETURNING` unsatisfiable.
+- **Keeping `users.list_all` and bounding it by the subject.** Rejected: it would
+  return one row under a name that claims a directory.
+- **A `FOR ALL` system policy on `run_records`.** Rejected: it would grant write
+  capabilities the contract does not ask for. `SELECT` is granted individually.
+
+### Consequences
+
+1. **A caught statement failure can no longer be committed silently.** The transaction
+   is rolled back and the failure is named.
+2. **One login cannot serve both scopes**, and the refusal is derived from the
+   catalogue rather than from a configuration convention.
+3. **Discovery is one subject per transaction**, and bootstrap still works because the
+   binding lives in the layer rather than in a predicate that would block it.
+4. **Neither Platform scope can do the other's job on `users`**, enforced by
+   column-level privileges with a policy attached to each.
+5. **A lifecycle race is a named error**, and a finished run cannot be reopened by an
+   ordinary transition.
+6. **No tenant-scoped write can be redirected to another tenant by the data it is
+   handed.**
+7. **O-7 … O-13 remain open or deferred**, unchanged. No new decision was invented to
+   make a fix convenient, and no frozen contract was altered.
+
+
+## Усиление персистентности Step 1 после адверсариального ревью (D-PLATFORM-21) — русская версия
+
+Второе адверсариальное ревью слоя персистентности Шага 3 сообщило о шести
+находках: одна HIGH и пять MEDIUM. Все шесть исправлены, каждая — с регрессионным
+тестом, падающим на предыдущем поведении. Две из них изменили дизайн-ограничение,
+а не только строку кода, и эти изменения зафиксированы здесь, потому что они
+сужают то, что заявляет схема.
+
+### H-1 — COMMIT на aborted-транзакции сообщал об успехе
+
+**Измерено, а не предположено.** PostgreSQL принимает ``COMMIT`` на
+транзакции, которую предыдущий неудавшийся оператор перевёл в aborted-состояние, выполняет
+**откат** и возвращает строку статуса ``ROLLBACK``, не поднимая ошибку. Поэтому сервис,
+который перехватил ошибку репозитория и продолжил, вышел бы из Unit of Work чисто, а все
+записи в нём были бы отброшены.
+
+Теперь проверяются два независимых сигнала: сессия помнит, что оператор внутри
+транзакции не удался, а строка статуса ``COMMIT`` проверяется отдельно. При любом из
+сигналов транзакция откатывается, а `TransactionError` называет исходную причину.
+`ROLLBACK TO SAVEPOINT` — единственный оператор, исключённый из aborted-защиты, потому что он
+восстанавливает транзакцию.
+
+### M-1 — граница ролей доказывается по каталогу
+
+`application_role=None` больше не допустимое состояние. `pg_has_role` **не**
+используется для решения о членстве: она ложно истинна для суперпользователя для
+любой роли. Членство читается из `pg_auth_members`. Логин обязан быть явным членом своей
+роли и **не** быть членом другой роли Platform. Имя суперпользователя нигде не
+называется.
+
+### M-2 — discovery ограничен объявленным субъектом
+
+Первая попытка поместить субъект в политику **не работает**:
+`INSERT ... RETURNING` также консультирует SELECT-политики, поэтому bootstrap лишался собственной
+новой строки. Привязка перенесена в `Session`: `require_subject` **отказывает** discovery-чтению,
+называющему другого субъекта. Политика оставляет себе то, что может решить:
+скоуп должен быть объявлен. `users.list_all` **удалён**.
+
+`forge.user_id` — **не аутентификация**: любая сессия может установить
+пользовательскую GUC. Привязка даёт то, что discovery выражается как «субъект, к
+которому привязана транзакция», а не «все».
+
+### M-3 — tenant UPDATE на `users` ограничен колонками
+
+Привилегия теперь `UPDATE (display_name, updated_at)`, и два скоупа Platform имеют
+**непересекающиеся права записи**: tenant — `display_name`, system — `status`, `email`. `set_status` и `set_email`
+**удалены** из tenant-репозитория.
+
+### M-4 — переходы жизненного цикла — compare-and-set
+
+Гард встроен **в сам UPDATE**; новый `ConcurrentModificationError` отличается от
+`EntityNotFound`. Условия: `status <> 'queued'` и `status NOT IN (<terminal>)`. **O-7 не закрытто**: набор
+терминальных статусов здесь консервативный. System-скоуп получил `SELECT` на `run_records`
+вместе с привилегией и политикой; `INSERT`, `UPDATE` и `DELETE` не выданы.
+
+### M-5 — несовпадающий `organization_id` отклоняется, а не переопределяется
+
+`usage.append` требует совпадения `organization_id` записи с арендатором сессии и
+отказывает запись без `organization_id` — выводить его самому было бы тем же неявным
+перенаправлением.
+
+### Отклонённые альтернативы
+
+- **Доверять только строке статуса `COMMIT`.** Отклонено: флаг точнее называет
+  причину.
+- **Доверять только флагу сессии.** Отклонено: он знает только о тех сбоях,
+  которые видела сама.
+- **Savepoint вокруг каждого вызова репозитория.** Отклонено: изменило бы
+  семантику каждой записи.
+- **`pg_has_role` для членства.** Отклонено: ложно истинна для суперпользователя.
+- **Имя `postgres` как запретное.** Отклонено: не deployment-neutral.
+- **Предикат субъекта в политике.** Отклонено **после измерения**:
+  он делает `INSERT ... RETURNING` невыполнимым для bootstrap.
+- **Оставить `users.list_all`.** Отклонено: вернул бы одну строку под
+  именем, обещающим каталог.
+- **`FOR ALL` для system-скоупа на `run_records`.** Отклонено: выдало бы права записи,
+  которых контракт не требует.
+
+### Следствия
+
+1. **Перехваченная ошибка оператора больше не может быть закоммичена молча.**
+2. **Один логин не может обслуживать оба скоупа.**
+3. **Discovery — один субъект на транзакцию**, и bootstrap работает.
+4. **Ни один скоуп не может сделать работу другого на `users`.**
+5. **Гонка жизненного цикла — именованная ошибка**, и завершённый запуск
+   нельзя переоткрыть.
+6. **Ни одна tenant-scoped запись не может быть перенаправлена в другого
+   арендатора данными, которые ей передали.**
+7. **O-7 … O-13 остаются открытыми/отложенными** без изменений.

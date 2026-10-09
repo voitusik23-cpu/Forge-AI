@@ -23,6 +23,7 @@ import datetime as dt
 import pathlib
 import unittest
 import uuid
+from typing import Optional
 
 from persistence_fixture import (
     PERSISTENCE_LOGIN_ROLE,
@@ -59,6 +60,7 @@ from app.platform.models import (  # noqa: E402
 from app.platform.persistence import (  # noqa: E402
     APP_ROLE,
     CheckViolationError,
+    ConcurrentModificationError,
     PersistenceError,
     ConnectionError,
     EntityNotFound,
@@ -239,13 +241,13 @@ async def seed_tenant(handle: PersistenceDatabase, label: str) -> TenantSeed:
 # A. Unit of Work and scope
 # =========================================================================== #
 class UnitOfWorkTests(PersistenceTestCase):
-    def test_001_pool_refuses_a_superuser_connection(self):
-        """A pool whose row-level security would not apply is refused, not warned.
+    def test_001_no_application_role_is_refused(self):
+        """A pool must step down, so "do not step down" is not a supported state.
 
-        The connection is made as the administrator and no step-down is requested,
-        which is exactly the deployment mistake this guard exists to catch. The
-        refusal must happen at ``connect()``: a pool that only failed on first use
-        would let a caller believe it had policy enforcement it never had.
+        This is the first line of defence and it is a constructor error: a pool built
+        without an application role is one whose row-level security may not apply,
+        and there is nothing it is good for. The superuser case with a role requested
+        is covered by test_019.
         """
 
         async def body():
@@ -257,15 +259,10 @@ class UnitOfWorkTests(PersistenceTestCase):
                     f"postgresql://{parts['user']}:{parts.get('password') or ''}"
                     f"@{parts['host']}:{parts['port']}/{handle.name}"
                 )
-                database = PlatformDatabase(
-                    admin_dsn, application_role=None, min_size=1, max_size=1
-                )
-                try:
-                    with self.assertRaises(ConnectionError) as caught:
-                        await database.connect()
-                    self.assertIn("superuser", str(caught.exception))
-                finally:
-                    await database.close()
+                with self.assertRaises(ValueError) as caught:
+                    PlatformDatabase(admin_dsn, application_role=None,
+                                     min_size=1, max_size=1)
+                self.assertIn("application_role is required", str(caught.exception))
         run_async(body())
 
     def test_002_pool_refuses_a_role_without_the_application_membership(self):
@@ -1187,10 +1184,18 @@ class TenantIsolationTests(PersistenceTestCase):
                     seed_a, seed_b = await self._two(handle)
                     async with database.tenant(seed_a.organization_id,
                                               user_id=seed_a.user_id) as uow:
+                        # A refusal aborts the transaction; a savepoint is the
+                        # documented way to recover and keep going in the same one.
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(ForeignKeyViolationError):
                             await uow.api_keys.create(
                                 str(uuid.uuid4()), seed_b.user_id, "cross-tenant"
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        # Recovery is real: the session works again.
+                        self.assertEqual(
+                            await uow.api_keys.list_for_current_tenant(), []
+                        )
                 finally:
                     await database.close()
         run_async(body())
@@ -1203,10 +1208,18 @@ class TenantIsolationTests(PersistenceTestCase):
                     seed_a, seed_b = await self._two(handle)
                     async with database.tenant(seed_a.organization_id,
                                               user_id=seed_a.user_id) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(ForeignKeyViolationError):
                             await uow.run_records.create_queued(
                                 str(uuid.uuid4()), seed_b.project_id
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        # A run for the tenant's OWN project still works afterwards.
+                        created = await uow.run_records.create_queued(
+                            str(uuid.uuid4()), seed_a.project_id
+                        )
+                        self.assertEqual(created.organization_id,
+                                         seed_a.organization_id)
                 finally:
                     await database.close()
         run_async(body())
@@ -1219,15 +1232,23 @@ class TenantIsolationTests(PersistenceTestCase):
                     seed_a, seed_b = await self._two(handle)
                     async with database.tenant(seed_a.organization_id,
                                               user_id=seed_a.user_id) as uow:
+                        # Another tenant's run is not addressable at all, so both
+                        # the increment and the compare-and-set finish match no row:
+                        # increment reports absence, finish reports a lost
+                        # compare-and-set because its guard is part of the UPDATE.
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(EntityNotFound):
                             await uow.run_records.increment_attempt_count(
                                 seed_b.run_id
                             )
-                        with self.assertRaises(EntityNotFound):
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        await uow.session.execute("SAVEPOINT s")
+                        with self.assertRaises(ConcurrentModificationError):
                             await uow.run_records.finish(
                                 seed_b.run_id, status=RunRecordStatus.SUCCEEDED,
                                 finished_at=utc_now(),
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
                 finally:
                     await database.close()
         run_async(body())
@@ -1338,8 +1359,8 @@ class ProjectRepositoryTests(PersistenceTestCase):
             async with PersistenceDatabase() as handle:
                 database = await open_database(handle)
                 try:
-                    seed_a, seed_b = await seed_tenant(handle, "A"), \
-                        await seed_tenant(handle, "B")
+                    seed_a = await seed_tenant(handle, "A")
+                    seed_b = await seed_tenant(handle, "B")
                     # The same slug in a different tenant is allowed (K-3).
                     async with database.tenant(seed_b.organization_id,
                                               user_id=seed_b.user_id) as uow:
@@ -1349,12 +1370,21 @@ class ProjectRepositoryTests(PersistenceTestCase):
                     # The same slug in one tenant is refused.
                     async with database.tenant(seed_a.organization_id,
                                               user_id=seed_a.user_id) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(UniqueViolationError) as caught:
                             await uow.projects.create(
                                 str(uuid.uuid4()), "Duplicate", slug="project-a"
                             )
-                        self.assertIn("projects_organization_slug_unique",
-                                      caught.exception.constraint or "")
+                        self.assertEqual(
+                            caught.exception.constraint,
+                            "projects_organization_slug_unique",
+                        )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        # A different slug still succeeds in the same transaction.
+                        created = await uow.projects.create(
+                            str(uuid.uuid4()), "Distinct", slug="project-a2"
+                        )
+                        self.assertEqual(created.slug, "project-a2")
                 finally:
                     await database.close()
         run_async(body())
@@ -1422,6 +1452,7 @@ class MembershipRepositoryTests(PersistenceTestCase):
                     seed = await seed_tenant(handle, "A")
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(UniqueViolationError) as caught:
                             await uow.memberships.create(
                                 Membership(
@@ -1435,6 +1466,10 @@ class MembershipRepositoryTests(PersistenceTestCase):
                         self.assertEqual(
                             caught.exception.constraint,
                             "memberships_organization_user_unique",
+                        )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        self.assertEqual(
+                            len(await uow.memberships.list_for_current_tenant()), 1
                         )
                 finally:
                     await database.close()
@@ -1588,18 +1623,20 @@ class ProviderAccountRepositoryTests(PersistenceTestCase):
                 database = await open_database(handle)
                 try:
                     seed = await seed_tenant(handle, "A")
-                    async with database.tenant(seed.organization_id,
-                                              user_id=seed.user_id) as uow:
-                        # There is no API to do this: the repository writes the
-                        # tenant from the context. The row-level policy refuses a
-                        # null tenant even if one were attempted directly.
-                        with self.assertRaises(PermissionDeniedError):
-                            await uow.session.execute(
-                                "INSERT INTO provider_accounts (id, "
-                                "organization_id, provider_name, secret_ref, "
-                                "created_at) VALUES ($1, NULL, 'evil', 'x', now())",
-                                uuid.uuid4(),
-                            )
+                    with self.assertRaises(TransactionError):
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            # There is no API to do this: the repository writes the
+                            # tenant from the context. The policy refuses a null
+                            # tenant even when one is attempted directly.
+                            with self.assertRaises(PermissionDeniedError):
+                                await uow.session.execute(
+                                    "INSERT INTO provider_accounts (id, "
+                                    "organization_id, provider_name, secret_ref, "
+                                    "created_at) VALUES ($1, NULL, 'evil', 'x', "
+                                    "now())",
+                                    uuid.uuid4(),
+                                )
                 finally:
                     await database.close()
         run_async(body())
@@ -1610,16 +1647,22 @@ class ProviderAccountRepositoryTests(PersistenceTestCase):
                 database = await open_database(handle)
                 try:
                     seed = await seed_tenant(handle, "A")
+                    account_id = str(uuid.uuid4())
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
-                        account = await uow.provider_accounts.create(
-                            str(uuid.uuid4()), "openai", "ref:tenant"
+                        await uow.provider_accounts.create(
+                            account_id, "openai", "ref:tenant"
                         )
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(PermissionDeniedError):
                             await uow.session.execute(
                                 "UPDATE provider_accounts SET organization_id = "
-                                "NULL WHERE id = $1", uuid.UUID(account.id),
+                                "NULL WHERE id = $1", uuid.UUID(account_id),
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        still = await uow.provider_accounts.get(account_id)
+                        self.assertEqual(still.organization_id,
+                                         seed.organization_id)
                 finally:
                     await database.close()
         run_async(body())
@@ -1655,14 +1698,21 @@ class ProviderAccountRepositoryTests(PersistenceTestCase):
                     await database.close()
         run_async(body())
 
-    def test_065_the_system_scope_cannot_read_tenant_work(self):
+    def test_065_the_system_scope_cannot_write_or_enumerate_tenant_work(self):
+        """The system scope gained one read exception, and nothing else.
+
+        `run_records` is now readable by this scope so the compare-and-set lifecycle
+        guard can see the state it guards. Everything else about tenant work is
+        unchanged: it cannot read projects, api keys, or usage, and it cannot write or
+        delete a run.
+        """
+
         async def body():
             async with PersistenceDatabase() as handle:
-                await seed_tenant(handle, "A")
+                seed = await seed_tenant(handle, "A")
                 async with system_scope(handle) as uow:
                     for statement in (
                         "SELECT count(*) FROM projects",
-                        "SELECT count(*) FROM run_records",
                         "SELECT count(*) FROM api_keys",
                         "SELECT count(*) FROM usage_records",
                     ):
@@ -1672,23 +1722,67 @@ class ProviderAccountRepositoryTests(PersistenceTestCase):
                         with self.assertRaises(PermissionDeniedError):
                             await uow.session.fetchval(statement)
                         await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+
+                    # The documented exception: readable, because the guard needs it.
+                    await uow.session.execute("SAVEPOINT s")
+                    visible = await uow.session.fetchval(
+                        "SELECT count(*) FROM run_records WHERE id = $1",
+                        uuid.UUID(seed.run_id),
+                    )
+                    self.assertEqual(visible, 1)
+                    await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+
+                    # Readable is all it is: no write, no delete, on any run.
+                    for statement, args in (
+                        ("UPDATE run_records SET attempt_count = 99 WHERE id = $1",
+                         (uuid.UUID(seed.run_id),)),
+                        ("DELETE FROM run_records WHERE id = $1",
+                         (uuid.UUID(seed.run_id),)),
+                        ("INSERT INTO run_records (id, organization_id, project_id, "
+                         "core_run_id, initiated_by_user_id, status, started_at, "
+                         "created_at) VALUES ($1, $2, $3, 'core-x', $4, 'running', "
+                         "now(), now())",
+                         (uuid.uuid4(), uuid.UUID(seed.organization_id),
+                          uuid.UUID(seed.project_id), uuid.UUID(seed.user_id))),
+                    ):
+                        await uow.session.execute("SAVEPOINT s")
+                        with self.assertRaises(PermissionDeniedError):
+                            await uow.session.execute(statement, *args)
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+
+                    # And the run is untouched after all of that.
+                    unchanged = await uow.session.fetchrow(
+                        "SELECT attempt_count FROM run_records WHERE id = $1",
+                        uuid.UUID(seed.run_id),
+                    )
+                    self.assertEqual(unchanged["attempt_count"], 0)
         run_async(body())
 
     def test_066_system_owned_uniqueness_per_provider(self):
         async def body():
             async with PersistenceDatabase() as handle:
-                database = await open_database(handle)
-                try:
-                    async with system_scope(handle) as uow:
+                await seed_tenant(handle, "A")
+                async with system_scope(handle) as uow:
+                    await uow.system_provider_accounts.create(
+                        str(uuid.uuid4()), "google", "ref:1"
+                    )
+                    await uow.session.execute("SAVEPOINT s")
+                    with self.assertRaises(UniqueViolationError):
                         await uow.system_provider_accounts.create(
-                            str(uuid.uuid4()), "google", "ref:1"
+                            str(uuid.uuid4()), "google", "ref:2"
                         )
-                        with self.assertRaises(UniqueViolationError):
-                            await uow.system_provider_accounts.create(
-                                str(uuid.uuid4()), "google", "ref:2"
-                            )
-                finally:
-                    await database.close()
+                    await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                    self.assertEqual(
+                        len(await uow.system_provider_accounts.list_system_owned()),
+                        1,
+                    )
+                    await uow.system_provider_accounts.create(
+                        str(uuid.uuid4()), "anthropic", "ref:3"
+                    )
+                    self.assertEqual(
+                        len(await uow.system_provider_accounts.list_system_owned()),
+                        2,
+                    )
         run_async(body())
 
     def test_067_tenant_owned_uniqueness_is_per_tenant_not_global(self):
@@ -1703,10 +1797,13 @@ class ProviderAccountRepositoryTests(PersistenceTestCase):
                         await uow.provider_accounts.create(
                             str(uuid.uuid4()), "openai", "ref:a"
                         )
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(UniqueViolationError):
                             await uow.provider_accounts.create(
                                 str(uuid.uuid4()), "openai", "ref:a2"
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                    # The same provider name in another tenant is a different row.
                     async with database.tenant(seed_b.organization_id,
                                               user_id=seed_b.user_id) as uow:
                         other = await uow.provider_accounts.create(
@@ -1717,7 +1814,6 @@ class ProviderAccountRepositoryTests(PersistenceTestCase):
                 finally:
                     await database.close()
         run_async(body())
-
 
 class APIKeyRepositoryTests(PersistenceTestCase):
     def test_070_lifecycle(self):
@@ -1942,7 +2038,10 @@ class RunRecordRepositoryTests(PersistenceTestCase):
                         await uow.run_records.create_queued(
                             run_id, seed.project_id
                         )
-                        with self.assertRaises(EntityNotFound):
+                        # A queued run has no Core identity or initiator, so the
+                        # schema forbids finishing it; the compare-and-set guard
+                        # refuses before the constraint would have to.
+                        with self.assertRaises(ConcurrentModificationError):
                             await uow.run_records.finish(
                                 run_id, status=RunRecordStatus.SUCCEEDED,
                                 finished_at=utc_now(),
@@ -1968,12 +2067,22 @@ class RunRecordRepositoryTests(PersistenceTestCase):
                             initiated_by_user_id=seed.user_id,
                             started_at=utc_now(),
                         )
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(CheckViolationError):
                             await uow.run_records.finish(
                                 run_id, status=RunRecordStatus.SUCCEEDED,
                                 finished_at=utc_now(),
                                 failure_classification="timeout",
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        # The run is still running, and can still be finished
+                        # correctly in the same transaction.
+                        finished = await uow.run_records.finish(
+                            run_id, status=RunRecordStatus.SUCCEEDED,
+                            finished_at=utc_now(),
+                        )
+                        self.assertEqual(finished.status,
+                                         RunRecordStatus.SUCCEEDED)
                 finally:
                     await database.close()
         run_async(body())
@@ -2073,13 +2182,13 @@ class RunRecordRepositoryTests(PersistenceTestCase):
                     seed = await seed_tenant(handle, "A")
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(PermissionDeniedError):
                             await uow.session.execute(
                                 "DELETE FROM run_records WHERE id = $1",
                                 uuid.UUID(seed.run_id),
                             )
-                    async with database.tenant(seed.organization_id,
-                                              user_id=seed.user_id) as uow:
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
                         self.assertIsNotNone(
                             await uow.run_records.get(seed.run_id)
                         )
@@ -2088,6 +2197,9 @@ class RunRecordRepositoryTests(PersistenceTestCase):
         run_async(body())
 
 
+# =========================================================================== #
+# E. Usage records
+# =========================================================================== #
 class UsageRecordRepositoryTests(PersistenceTestCase):
     def _usage(self, seed: TenantSeed, *, attempt: int = 0) -> UsageRecord:
         return UsageRecord(
@@ -2262,8 +2374,14 @@ class UsageRecordRepositoryTests(PersistenceTestCase):
                             attempt_number=0,
                             created_at=forged.created_at,
                         )
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(ForeignKeyViolationError):
                             await uow.usage_records.append(forged)
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        # Nothing was written, and the session still works.
+                        self.assertEqual(
+                            await uow.usage_records.list_for_current_tenant(), []
+                        )
                 finally:
                     await database.close()
         run_async(body())
@@ -2321,10 +2439,10 @@ class UserAndOrganizationRepositoryTests(PersistenceTestCase):
 
         Two boundaries, both enforced by the database rather than by this layer:
 
-        * the system scope holds INSERT and SELECT on ``users`` and no UPDATE, so it
-          cannot change an account at all;
-        * the tenant scope may update only the subject's own row, so one subject
-          cannot rewrite another's record.
+        * the system scope may change a server-controlled field (status) and may not
+          change one the subject owns (display_name);
+        * the tenant scope may change only the subject's own display_name, because
+          the UPDATE privilege is column-limited and the policy is row-bounded.
         """
 
         async def body():
@@ -2334,16 +2452,22 @@ class UserAndOrganizationRepositoryTests(PersistenceTestCase):
                     seed = await seed_tenant(handle, "A")
                     other_id = str(uuid.uuid4())
                     async with system_scope(handle) as uow:
-                        # It may create an account (the bootstrap path) ...
                         await uow.users.create(
                             User(id=other_id, email="other@example.test",
                                  created_at=utc_now())
                         )
-                        # ... and it may not change one.
+                        # A server-controlled field is this scope's to set ...
+                        suspended = await uow.system_users.set_status(
+                            seed.user_id, UserStatus.SUSPENDED
+                        )
+                        self.assertEqual(suspended.status, UserStatus.SUSPENDED)
+                        # ... and a self-service field is not.
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(PermissionDeniedError):
-                            await uow.users.set_status(
-                                seed.user_id, UserStatus.SUSPENDED
+                            await uow.system_users.set_display_name(
+                                seed.user_id, "not the server's to set"
                             )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
 
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
@@ -2351,19 +2475,27 @@ class UserAndOrganizationRepositoryTests(PersistenceTestCase):
                             seed.user_id, "Renamed"
                         )
                         self.assertEqual(renamed.display_name, "Renamed")
-                        suspended = await uow.users.set_status(
-                            seed.user_id, UserStatus.SUSPENDED
+                        # The subject cannot change its own server-controlled fields,
+                        # and cannot name them at all: the method does not exist on
+                        # this repository, and the column-level grant would refuse the
+                        # statement even if it did.
+                        self.assertFalse(
+                            hasattr(type(uow.users), "set_status"),
+                            "the tenant scope must not offer a status change",
                         )
-                        self.assertEqual(suspended.status, UserStatus.SUSPENDED)
-                        # Its own row was reachable; another subject's was not,
-                        # because the policy requests the subject's own id. The
-                        # result is EntityNotFound: within this scope the row is not
-                        # addressable at all, and the invariant that a permission
-                        # refusal is not absence holds because the tenant policy
-                        # grants the UPDATE privilege and bounds it by the subject,
-                        # rather than denying the statement.
+                        self.assertFalse(hasattr(type(uow.users), "set_email"))
+                        await uow.session.execute("SAVEPOINT s")
+                        with self.assertRaises(PermissionDeniedError):
+                            await uow.session.execute(
+                                "UPDATE users SET status = 'suspended' "
+                                "WHERE id = $1", uuid.UUID(seed.user_id),
+                            )
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        # Nor another subject's record.
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(EntityNotFound):
                             await uow.users.set_display_name(other_id, "not mine")
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
                 finally:
                     await database.close()
         run_async(body())
@@ -2378,6 +2510,7 @@ class UserAndOrganizationRepositoryTests(PersistenceTestCase):
                     # The duplicate is created on the bootstrap path, the only scope
                     # that may insert an account at all.
                     async with system_scope(handle) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(UniqueViolationError) as caught:
                             await uow.users.create(
                                 User(id=str(uuid.uuid4()), email=email,
@@ -2385,6 +2518,13 @@ class UserAndOrganizationRepositoryTests(PersistenceTestCase):
                             )
                         self.assertEqual(caught.exception.constraint,
                                          "users_email_unique")
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        created = await uow.users.create(
+                            User(id=str(uuid.uuid4()),
+                                 email="brand-new@example.test",
+                                 created_at=utc_now())
+                        )
+                        self.assertEqual(created.email, "brand-new@example.test")
                 finally:
                     await database.close()
         run_async(body())
@@ -2456,20 +2596,20 @@ class UserAndOrganizationRepositoryTests(PersistenceTestCase):
                 database = await open_database(handle)
                 try:
                     seed = await seed_tenant(handle, "A")
-                    async with database.tenant(seed.organization_id,
-                                              user_id=seed.user_id) as uow:
-                        with self.assertRaises(PermissionDeniedError):
-                            await uow.organizations.create(
-                                Organization(
-                                    id=str(uuid.uuid4()),
-                                    name="rogue",
-                                    created_at=utc_now(),
+                    with self.assertRaises(TransactionError):
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            with self.assertRaises(PermissionDeniedError):
+                                await uow.organizations.create(
+                                    Organization(
+                                        id=str(uuid.uuid4()),
+                                        name="rogue",
+                                        created_at=utc_now(),
+                                    )
                                 )
-                            )
                 finally:
                     await database.close()
         run_async(body())
-
 
 # =========================================================================== #
 # E. Pre-tenant discovery
@@ -2578,6 +2718,8 @@ class PreTenantDiscoveryTests(PersistenceTestCase):
 # F. Error normalization
 # =========================================================================== #
 class ErrorNormalizationTests(PersistenceTestCase):
+    """Every documented persistence error, and the state each one leaves behind."""
+
     def test_120_unique_violation_names_the_constraint(self):
         """A lost race must be diagnosable, so the constraint name is preserved."""
 
@@ -2588,6 +2730,7 @@ class ErrorNormalizationTests(PersistenceTestCase):
                     seed = await seed_tenant(handle, "A")
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(UniqueViolationError) as caught:
                             await uow.memberships.create(
                                 Membership(
@@ -2604,6 +2747,7 @@ class ErrorNormalizationTests(PersistenceTestCase):
                         )
                         self.assertIn("memberships_organization_user_unique",
                                       str(caught.exception))
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
                 finally:
                     await database.close()
         run_async(body())
@@ -2616,11 +2760,13 @@ class ErrorNormalizationTests(PersistenceTestCase):
                     seed = await seed_tenant(handle, "A")
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
+                        await uow.session.execute("SAVEPOINT s")
                         with self.assertRaises(ForeignKeyViolationError) as caught:
                             await uow.run_records.create_queued(
                                 str(uuid.uuid4()), str(uuid.uuid4())
                             )
                         self.assertIsNotNone(caught.exception.constraint)
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
                 finally:
                     await database.close()
         run_async(body())
@@ -2633,7 +2779,8 @@ class ErrorNormalizationTests(PersistenceTestCase):
                     seed = await seed_tenant(handle, "A")
                     async with database.tenant(seed.organization_id,
                                               user_id=seed.user_id) as uow:
-                        with self.assertRaises(CheckViolationError):
+                        await uow.session.execute("SAVEPOINT s")
+                        with self.assertRaises(CheckViolationError) as caught:
                             await uow.session.execute(
                                 "INSERT INTO run_records (id, organization_id, "
                                 "project_id, attempt_count, created_at) "
@@ -2641,51 +2788,67 @@ class ErrorNormalizationTests(PersistenceTestCase):
                                 uuid.uuid4(), uuid.UUID(seed.organization_id),
                                 uuid.UUID(seed.project_id),
                             )
+                        self.assertIsNotNone(caught.exception.constraint)
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
                 finally:
                     await database.close()
         run_async(body())
 
     def test_123_permission_denial_is_not_reported_as_not_found(self):
-        """An authorization failure must not masquerade as absence."""
+        """An authorization failure must not masquerade as absence.
+
+        It must also not be turned into a successful exit: the refusal aborts the
+        transaction, so the Unit of Work refuses to commit it.
+        """
 
         async def body():
             async with PersistenceDatabase() as handle:
                 database = await open_database(handle)
                 try:
                     seed = await seed_tenant(handle, "A")
-                    async with database.tenant(seed.organization_id,
-                                              user_id=seed.user_id) as uow:
-                        with self.assertRaises(PermissionDeniedError):
-                            await uow.session.execute(
-                                "INSERT INTO provider_accounts (id, "
-                                "organization_id, provider_name, secret_ref, "
-                                "created_at) VALUES ($1, NULL, 'x', 'y', now())",
-                                uuid.uuid4(),
-                            )
+                    with self.assertRaises(TransactionError):
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            with self.assertRaises(PermissionDeniedError):
+                                await uow.session.execute(
+                                    "INSERT INTO provider_accounts (id, "
+                                    "organization_id, provider_name, secret_ref, "
+                                    "created_at) VALUES ($1, NULL, 'x', 'y', now())",
+                                    uuid.uuid4(),
+                                )
                 finally:
                     await database.close()
         run_async(body())
 
-    def test_124_a_failed_statement_aborts_the_transaction(self):
+    def test_124_a_failed_statement_makes_the_session_refuse_more_work(self):
+        """A caught error does not make the transaction usable again.
+
+        The failure was already reported once, so continuing looks harmless while
+        PostgreSQL refuses every later statement and the eventual commit discards
+        everything. The session says so explicitly instead of letting the second
+        statement produce a driver error the caller has to decode.
+        """
+
         async def body():
             async with PersistenceDatabase() as handle:
                 database = await open_database(handle)
                 try:
                     seed = await seed_tenant(handle, "A")
-                    async with database.tenant(seed.organization_id,
-                                              user_id=seed.user_id) as uow:
-                        with self.assertRaises(PermissionDeniedError):
-                            await uow.session.execute(
-                                "INSERT INTO provider_accounts (id, "
-                                "organization_id, provider_name, secret_ref, "
-                                "created_at) VALUES ($1, NULL, 'x', 'y', now())",
-                                uuid.uuid4(),
-                            )
-                        # The transaction is aborted; the next statement must be
-                        # reported as a transaction error, not as an empty result.
-                        with self.assertRaises(Exception) as caught:
-                            await uow.projects.list_for_current_tenant()
-                        self.assertNotIsInstance(caught.exception, EntityNotFound)
+                    with self.assertRaises(TransactionError):
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            with self.assertRaises(PermissionDeniedError):
+                                await uow.session.execute(
+                                    "INSERT INTO provider_accounts (id, "
+                                    "organization_id, provider_name, secret_ref, "
+                                    "created_at) VALUES ($1, NULL, 'x', 'y', now())",
+                                    uuid.uuid4(),
+                                )
+                            self.assertTrue(uow.session.transaction_failed)
+                            with self.assertRaises(TransactionError) as caught:
+                                await uow.projects.list_for_current_tenant()
+                            self.assertIn("aborted", str(caught.exception))
+                            self.assertIn("Original failure", str(caught.exception))
                 finally:
                     await database.close()
         run_async(body())
@@ -2698,6 +2861,251 @@ class ErrorNormalizationTests(PersistenceTestCase):
         self.assertIs(normalize_error(original), original)
         self.assertIsInstance(normalize_error(ValueError("plain")),
                               PersistenceError)
+
+    def test_126_a_savepoint_rollback_restores_the_transaction(self):
+        """The documented recovery path, stated as a test.
+
+        ``ROLLBACK TO SAVEPOINT`` is the only thing that makes an aborted
+        transaction usable again, so the session must accept it while aborted and
+        clear the aborted state afterwards. Work done before the savepoint survives,
+        and work after it works normally.
+        """
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                database = await open_database(handle)
+                try:
+                    seed = await seed_tenant(handle, "A")
+                    async with database.tenant(seed.organization_id,
+                                              user_id=seed.user_id) as uow:
+                        before = await uow.projects.create(
+                            str(uuid.uuid4()), "Before the savepoint",
+                            slug="before-savepoint",
+                        )
+                        await uow.session.execute("SAVEPOINT s")
+                        with self.assertRaises(CheckViolationError):
+                            await uow.session.execute(
+                                "INSERT INTO projects (id, organization_id, name, "
+                                "created_at) VALUES ($1, $2, '', now())",
+                                uuid.uuid4(), uuid.UUID(seed.organization_id),
+                            )
+                        self.assertTrue(uow.session.transaction_failed)
+                        await uow.session.execute("ROLLBACK TO SAVEPOINT s")
+                        self.assertFalse(uow.session.transaction_failed)
+                        # Both directions: the earlier work is still there, and new
+                        # work succeeds in the same transaction.
+                        self.assertIsNotNone(await uow.projects.get(before.id))
+                        after = await uow.projects.create(
+                            str(uuid.uuid4()), "After the savepoint",
+                            slug="after-savepoint",
+                        )
+                        self.assertIsNotNone(
+                            await uow.projects.find_by_slug(after.slug)
+                        )
+                finally:
+                    await database.close()
+        run_async(body())
+
+
+class AbortedTransactionTests(PersistenceTestCase):
+    """H-1: a caught error must not turn a commit into a silent rollback.
+
+    PostgreSQL accepts ``COMMIT`` on an aborted transaction and performs a
+    ``ROLLBACK``, reporting the status string ``ROLLBACK`` rather than raising. A
+    service that catches a repository error and keeps going would therefore have its
+    Unit of Work exit cleanly while every write in it was discarded. These tests pin
+    the refusal down.
+    """
+
+    def test_130_a_caught_error_turns_a_clean_exit_into_an_error(self):
+        """The central case, end to end.
+
+        1. one statement succeeds;
+        2. a second one fails, and the caller catches it;
+        3. the Unit of Work exits with no Python exception;
+        4. the exit must NOT be a silent success;
+        5. the first statement must not be in the database;
+        6. a TransactionError must be raised.
+        """
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                database = await open_database(handle)
+                try:
+                    seed = await seed_tenant(handle, "A")
+                    slug = "h1-must-not-survive"
+                    raised: Optional[BaseException] = None
+                    try:
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            # 1. succeeds
+                            await uow.projects.create(
+                                str(uuid.uuid4()), "First write", slug=slug
+                            )
+                            # 2. fails; 3. the caller catches it and continues
+                            with self.assertRaises(CheckViolationError):
+                                await uow.session.execute(
+                                    "INSERT INTO projects (id, organization_id, "
+                                    "name, created_at) VALUES ($1, $2, '', now())",
+                                    uuid.uuid4(),
+                                    uuid.UUID(seed.organization_id),
+                                )
+                        # 4. reaching here with no exception would be the defect
+                    except TransactionError as exc:
+                        raised = exc
+
+                    self.assertIsNotNone(
+                        raised,
+                        "a clean exit after a caught error must not be a silent "
+                        "success: PostgreSQL would have rolled the work back",
+                    )
+                    self.assertIn("aborted", str(raised))
+                    # 6. and it names the original failure, so the cause is not lost
+                    self.assertIn("Original failure", str(raised))
+
+                    # 5. the first write is not in the database
+                    async with database.tenant(seed.organization_id,
+                                              user_id=seed.user_id) as uow:
+                        self.assertIsNone(
+                            await uow.projects.find_by_slug(slug),
+                            "the successful write must NOT survive a commit that "
+                            "PostgreSQL turned into a rollback",
+                        )
+                finally:
+                    await database.close()
+        run_async(body())
+
+    def test_131_commit_refuses_directly_on_a_failed_session(self):
+        """The refusal at the session level, with a real aborted transaction.
+
+        The abort comes from a statement this scope is permitted to attempt, so the
+        test proves the commit guard and not a privilege denial that happens to abort
+        first.
+        """
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                async with system_scope(handle) as uow:
+                    session = uow.session
+                    existing = str(uuid.uuid4())
+                    await session.execute(
+                        "INSERT INTO organizations (id, name, created_at) "
+                        "VALUES ($1, 'org', now())", uuid.UUID(existing),
+                    )
+                    await session.execute("SAVEPOINT s")
+                    with self.assertRaises(UniqueViolationError):
+                        await session.execute(
+                            "INSERT INTO organizations (id, name, created_at) "
+                            "VALUES ($1, 'org again', now())", uuid.UUID(existing),
+                        )
+                    self.assertTrue(session.transaction_failed)
+                    with self.assertRaises(TransactionError) as caught:
+                        await session.commit()
+                    self.assertIn("refusing to commit", str(caught.exception))
+                    self.assertFalse(session.in_transaction)
+        run_async(body())
+
+    def test_132_a_normal_unit_of_work_still_commits(self):
+        """The ordinary path is unchanged: writes land, and nothing raises."""
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                database = await open_database(handle)
+                try:
+                    seed = await seed_tenant(handle, "A")
+                    async with database.tenant(seed.organization_id,
+                                              user_id=seed.user_id) as uow:
+                        created = await uow.projects.create(
+                            str(uuid.uuid4()), "Committed", slug="normal-commit"
+                        )
+                    async with database.tenant(seed.organization_id,
+                                              user_id=seed.user_id) as uow:
+                        found = await uow.projects.get(created.id)
+                        self.assertIsNotNone(found)
+                        self.assertEqual(found.name, "Committed")
+                finally:
+                    await database.close()
+        run_async(body())
+
+    def test_133_a_raised_error_still_rolls_back(self):
+        """The ordinary failure path is unchanged: an exception means rollback."""
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                database = await open_database(handle)
+                try:
+                    seed = await seed_tenant(handle, "A")
+                    try:
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            await uow.projects.create(
+                                str(uuid.uuid4()), "Rolled back",
+                                slug="normal-rollback",
+                            )
+                            raise RuntimeError("deliberate")
+                    except RuntimeError:
+                        pass
+                    async with database.tenant(seed.organization_id,
+                                              user_id=seed.user_id) as uow:
+                        self.assertIsNone(
+                            await uow.projects.find_by_slug("normal-rollback")
+                        )
+                finally:
+                    await database.close()
+        run_async(body())
+
+    def test_134_the_aborted_state_does_not_outlive_the_transaction(self):
+        """A failed transaction must not poison the next Unit of Work."""
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                database = await open_database(handle)
+                try:
+                    seed = await seed_tenant(handle, "A")
+                    # The refusal ends this transaction; its exit is an error.
+                    with self.assertRaises(TransactionError):
+                        async with database.tenant(seed.organization_id,
+                                                  user_id=seed.user_id) as uow:
+                            with self.assertRaises(PermissionDeniedError):
+                                await uow.session.execute(
+                                    "INSERT INTO provider_accounts (id, "
+                                    "organization_id, provider_name, secret_ref, "
+                                    "created_at) VALUES ($1, NULL, 'x', 'y', now())",
+                                    uuid.uuid4(),
+                                )
+                    # A fresh transaction on a possibly reused connection is clean.
+                    async with database.tenant(seed.organization_id,
+                                              user_id=seed.user_id) as uow:
+                        self.assertFalse(uow.session.transaction_failed)
+                        created = await uow.projects.create(
+                            str(uuid.uuid4()), "After a failed transaction",
+                            slug="after-failure",
+                        )
+                        self.assertEqual(created.slug, "after-failure")
+                finally:
+                    await database.close()
+        run_async(body())
+
+    def test_135_a_non_transactional_failure_does_not_poison_anything(self):
+        """Migration work runs un-transacted, so a failure there must not mark a
+        transaction aborted -- there is no transaction to abort."""
+
+        async def body():
+            async with PersistenceDatabase() as handle:
+                database = await open_database(handle)
+                try:
+                    async with database.direct_session() as session:
+                        with self.assertRaises(PersistenceError):
+                            await session.execute("SELECT * FROM table_that_is_absent")
+                        self.assertFalse(session.transaction_failed)
+                        # The session is still usable, which is what makes an
+                        # idempotent migration runner possible.
+                        self.assertEqual(
+                            await session.fetchval("SELECT 1"), 1
+                        )
+                finally:
+                    await database.close()
+        run_async(body())
 
 
 if __name__ == "__main__":
