@@ -3,6 +3,7 @@
 **Purpose:** Preserve owner-approved product intent, architecture direction, stage gates, and next actions across chat sessions and agent handoffs.
 
 This is a handoff index, not a replacement for the repository's sources of truth:
+- Product manifesto: [MANIFESTO.md](MANIFESTO.md)
 - Verified implementation status: [SOURCE_OF_TRUTH.md](SOURCE_OF_TRUTH.md)
 - Target architecture: [TECHNICAL_SPECIFICATION.md](TECHNICAL_SPECIFICATION.md)
 - Current architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
