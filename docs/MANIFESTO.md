@@ -3,6 +3,8 @@
 
 **Status:** Product manifesto and long-term intent. This document describes what Forge AI is meant to become; it is not a claim that every capability is implemented today.
 
+For the expanded product direction, target architecture, stage-by-stage roadmap, autonomy guardrails, and immediate priorities, see [MASTER_VISION.md](MASTER_VISION.md). This manifesto states the durable principles; the master vision translates them into a development direction.
+
 ## 1. Why Forge exists
 
 A powerful model can produce an answer. A useful engineering system must do more: understand the goal, expose uncertainty, make a plan, coordinate the right capabilities, work within an authorized boundary, verify the result, explain what happened, and preserve the knowledge that should survive the task.
@@ -121,6 +123,8 @@ A user can bring Forge a meaningful goal and receive more than generated text: a
 ## Инженерная фабрика, превращающая намерение в проверяемый результат
 
 **Статус:** продуктовое видение и долгосрочное намерение. Документ описывает, чем должен стать Forge AI, но не утверждает, что все перечисленные возможности уже реализованы.
+
+Расширенное описание продуктового направления, целевой архитектуры, этапов развития, ограничений автономности и ближайших приоритетов находится в [MASTER_VISION.md](MASTER_VISION.md). Этот манифест закрепляет устойчивые принципы, а master vision переводит их в направление разработки.
 
 ## 1. Зачем существует Forge
 
