@@ -113,6 +113,7 @@ both languages in one file prevents the two versions from drifting apart.
 | Technology candidates / технологические кандидаты | [`docs/TECHNOLOGY_RADAR.md`](docs/TECHNOLOGY_RADAR.md) | same file → «Technology Radar — русская версия» |
 | Target architecture / целевая архитектура | [`docs/TECHNICAL_SPECIFICATION.md`](docs/TECHNICAL_SPECIFICATION.md) | same file → «Technical Specification v1.0 — русская версия (разделы 1–20)» + «русская версия дополнения Stage 1.3» |
 | Product vision / продуктовое видение | [`docs/FORGE_VISION.md`](docs/FORGE_VISION.md) | same file → «Product Vision — русская версия» |
+| Project continuity / передача контекста | [`docs/PROJECT_CONTINUITY.md`](docs/PROJECT_CONTINUITY.md) | same file → «Непрерывность проекта — русская версия» |
 
 ## Documentation map
 
@@ -124,6 +125,7 @@ both languages in one file prevents the two versions from drifting apart.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Current architecture and implemented behavior. |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Implementation order and progress. |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Durable decisions and rejected alternatives. |
+| [`docs/PROJECT_CONTINUITY.md`](docs/PROJECT_CONTINUITY.md) | Owner's product intent, stage gates, open blockers, and handoff checklist across chats/agents. |
 | [`docs/TECHNOLOGY_RADAR.md`](docs/TECHNOLOGY_RADAR.md) | External technology candidates and their rings. |
 | [`AGENTS.md`](AGENTS.md) | Operating contract for AI agents working in this repository. |
 | [`docs/reviews/`](docs/reviews/README.md), [`docs/benchmarks/`](docs/benchmarks/README.md) | External reviews and benchmark reports (working artifacts; see the directory READMEs for their language policy). |
