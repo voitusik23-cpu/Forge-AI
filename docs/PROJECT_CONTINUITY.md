@@ -10,10 +10,13 @@ This is a handoff index, not a replacement for the repository's sources of truth
 - Durable decisions: [DECISIONS.md](DECISIONS.md)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Product vision: [FORGE_VISION.md](FORGE_VISION.md)
+- Expanded master vision and staged direction: [MASTER_VISION.md](MASTER_VISION.md)
 
 Last updated: 2026-10-09.
 
 ## 1. Owner's product vision
+
+For the complete expanded product direction, target architecture, seven-stage roadmap, autonomy guardrails, and immediate priorities, use [MASTER_VISION.md](MASTER_VISION.md). This continuity document preserves the handoff state and current audit blockers; it does not replace that master vision or the verified implementation source of truth.
 
 - **One integrated system:** models, agents, tools, projects, execution, verification, memory, and governance evolve as one coherent product.
 - **Sequential development:** build on verified foundations; do not skip stage gates or expand scope before the previous stage is accepted.
