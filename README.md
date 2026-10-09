@@ -113,6 +113,7 @@ both languages in one file prevents the two versions from drifting apart.
 | Technology candidates / технологические кандидаты | [`docs/TECHNOLOGY_RADAR.md`](docs/TECHNOLOGY_RADAR.md) | same file → «Technology Radar — русская версия» |
 | Target architecture / целевая архитектура | [`docs/TECHNICAL_SPECIFICATION.md`](docs/TECHNICAL_SPECIFICATION.md) | same file → «Technical Specification v1.0 — русская версия (разделы 1–20)» + «русская версия дополнения Stage 1.3» |
 | Product vision / продуктовое видение | [`docs/FORGE_VISION.md`](docs/FORGE_VISION.md) | same file → «Product Vision — русская версия» |
+| Expanded master vision / расширенное видение проекта | [`docs/MASTER_VISION.md`](docs/MASTER_VISION.md) | same file → «Главное видение и направление разработки — русская версия» |
 | Manifesto / манифест | [`docs/MANIFESTO.md`](docs/MANIFESTO.md) | same file → «Манифест Forge AI — русская версия» |
 | Project continuity / передача контекста | [`docs/PROJECT_CONTINUITY.md`](docs/PROJECT_CONTINUITY.md) | same file → «Непрерывность проекта — русская версия» |
 
@@ -122,6 +123,7 @@ both languages in one file prevents the two versions from drifting apart.
 | --- | --- |
 | [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md) | Verified current state, per-area evidence, known limitations, planned/rejected items. |
 | [`docs/FORGE_VISION.md`](docs/FORGE_VISION.md) | Product direction and long-term lifecycle. |
+| [`docs/MASTER_VISION.md`](docs/MASTER_VISION.md) | Expanded owner vision, target architecture, stage gates, autonomy rules, and immediate priorities. |
 | [`docs/MANIFESTO.md`](docs/MANIFESTO.md) | Product principles, long-term ambition, staged development, and human/agent working agreement. |
 | [`docs/TECHNICAL_SPECIFICATION.md`](docs/TECHNICAL_SPECIFICATION.md) | Target architecture and constraints (future design). |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Current architecture and implemented behavior. |
