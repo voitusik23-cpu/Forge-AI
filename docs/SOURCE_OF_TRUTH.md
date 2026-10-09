@@ -196,7 +196,9 @@ remaining steps are not, and nothing below should be read as a claim about them.
 | Column-limited identity writes: disjoint capabilities per scope | **CURRENT / VERIFIED** | migration `0015` — `tests/test_platform_persistence.py`, `tests/test_platform_postgres_security.py` |
 | Compare-and-set run lifecycle transitions | **CURRENT / VERIFIED** | `app/platform/persistence/repositories.py` — `tests/test_platform_persistence.py` |
 | Platform Application Services over those repositories | **PLANNED / NOT IMPLEMENTED** | no such module exists; `app/platform/persistence/protocols.py` is the interface they will use |
-| Platform HTTP API, authentication, API-key token handling | **PLANNED / NOT IMPLEMENTED** | see O-1 and O-2 in `DECISIONS.md`; no endpoint and no token column exist |
+| Authentication trust boundary: `AuthenticatedPrincipal`, verifier port, fail-closed refusals | **CURRENT / VERIFIED** (contract only; no credential mechanism) | `app/platform/principal.py` — `tests/test_platform_auth_contracts.py` |
+| Authentication mechanism (session / JWT / federated) | **PLANNED / NOT IMPLEMENTED** | open decision O-2; the port is defined and no implementation ships |
+| Application Services (use cases, authorization flow, Platform -> Core port) | **DESIGNED / NOT IMPLEMENTED** | `docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`; no such module exists |
 | Platform -> Core transport (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; see `ROADMAP.md` |
 | Billing (cost records, pricing, wallet, ledger) | **PLANNED / NOT IMPLEMENTED** | Stage 2; no such table and no money column exist |
 
@@ -666,7 +668,9 @@ Stage 1 строится упорядоченными шагами. Шаги с 
 | Колоночно-ограниченная запись идентичностей: непересекающиеся права на скоуп | **CURRENT / VERIFIED** | миграция `0015` — `tests/test_platform_persistence.py`, `tests/test_platform_postgres_security.py` |
 | Compare-and-set переходы жизненного цикла запуска | **CURRENT / VERIFIED** | `app/platform/persistence/repositories.py` — `tests/test_platform_persistence.py` |
 | Прикладные сервисы Platform поверх этих репозиториев | **PLANNED / NOT IMPLEMENTED** | такого модуля не существует; `app/platform/persistence/protocols.py` — интерфейс, которым они будут пользоваться |
-| HTTP API Platform, аутентификация, обработка токенов API-ключей | **PLANNED / NOT IMPLEMENTED** | см. O-1 и O-2 в `DECISIONS.md`; ни эндпоинта, ни колонки токена не существует |
+| Граница доверия аутентификации: `AuthenticatedPrincipal`, порт верификатора, fail-closed отказы | **CURRENT / VERIFIED** (только контракт; механизма креденлов нет) | `app/platform/principal.py` — `tests/test_platform_auth_contracts.py` |
+| Механизм аутентификации (сессия / JWT / федерация) | **PLANNED / NOT IMPLEMENTED** | открытое решение O-2; порт определён, реализация не поставляется |
+| Прикладные сервисы Platform (use cases, поток авторизации, порт Platform -> Core) | **DESIGNED / NOT IMPLEMENTED** | `docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`; такого модуля не существует |
 | Транспорт Platform -> Core (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; см. `ROADMAP.md` |
 | Billing (cost records, ценообразование, кошелёк, леджер) | **PLANNED / NOT IMPLEMENTED** | Stage 2; ни такой таблицы, ни денежной колонки не существует |
 

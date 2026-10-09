@@ -5216,3 +5216,212 @@ the session — and the system repositories keep their own explicit and strict h
 6. **Ни одна tenant-scoped запись не может быть перенаправлена в другого
    арендатора данными, которые ей передали.**
 7. **O-7 … O-13 остаются открытыми/отложенными** без изменений.
+
+## Stage 1 Step 4: authentication boundary and Application Services contracts (D-PLATFORM-22)
+
+Design step. Records the trust boundary between a verified identity, an authorized
+operation, and the persistence and execution layers, and records exactly one executable
+contract. Contract document:
+`docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`.
+
+### What is accepted
+
+- **A verified identity exists only as `AuthenticatedPrincipal`.** Four fields:
+  `subject_id`, `subject_kind`, `method`, `verified_at`. Deliberately absent:
+  `organization_id`, `project_id`, role, scopes, email, display name, workspace, and any
+  credential material. A principal answers **who**; every **what** is resolved per
+  operation. A principal that carried authority would make "verified identity" and
+  "authorized operation" the same object, and the authorization step could be skipped by
+  constructing one.
+- **Only a verifier may produce one.** `AuthenticatedPrincipal.create(...)` requires a
+  module-private sentinel, mirroring the `AuthorizedExecution` mechanism Core already
+  uses. This is an **accident guard, not a boundary**: Python cannot stop hostile
+  in-process code, and the same caveat is already documented for `AuthorizedExecution`.
+  What it guarantees is that no ordinary code path can mint an identity, so "the client
+  sent us a `user_id`" has no route to becoming a principal.
+- **The authentication mechanism is not designed here.** O-2 stays open. The port is
+  defined; no implementation ships, and nothing in `app/platform/persistence/` may ever
+  verify a password, a JWT, or an external token — a repository that could verify a
+  credential would become an authentication authority by accident.
+- **Authorization is decided in the application layer, never in persistence.** An ordered,
+  fail-closed algorithm resolves principal -> ACTIVE membership -> organization ->
+  project -> required role, and the tenant-scoped Unit of Work is opened **only after**
+  every check passes, so a denied operation cannot leave a partial write.
+  `PermissionDeniedError` from row-level security reaching the application layer is
+  treated as a **bug signal** — the layer should have denied first — and is surfaced as a
+  denial, never softened into "not found".
+- **A client claim is never repaired.** A wrong `organization_id` is refused; the server
+  does not substitute the right one. Substitution teaches the client that a wrong
+  identifier works and hides the defect from the operator.
+- **Platform may deny a launch but never expand Core's authority.** Platform resolves and
+  may only **narrow** the profile, the allowed-command set, the allowed tools, and network
+  access; `ExecutionCoordinator` re-derives all of it, `RunScope` validates the workspace
+  root and the full command identity, and only the coordinator can mint
+  `AuthorizedExecution`. An `AuthorizedExecution` is not client-creatable, and
+  `dataclasses.replace` on a principal is refused because the generated `__init__` is not
+  in use.
+- **`forge.user_id` is not authentication.** The GUC decides which subject a transaction
+  is *willing to talk about*; it never decides who the caller *is*. Step 3 enforces "one
+  subject, and always the same one"; Step 4 owns "only a verifier may name the subject".
+- **M-2's guarantee is a composition, not a single layer.** The RLS policy decides only
+  that the system scope is declared; the session decides *one subject per transaction*;
+  the verifier decides *this subject is who the caller is*. Step 4 carries the subject to
+  `pre_tenant` from the principal and from nowhere else, and no use case accepts a
+  `user_id` parameter.
+- **Two error vocabularies, kept apart.** Persistence errors stay in persistence; the
+  application layer translates them into a closed refusal code list. An API layer that
+  had to catch `UniqueViolationError` would be coupled to the schema.
+- **Cross-tenant attempts are answered `not_found` rather than `not_permitted`**
+  (recorded as Q-6). `not_permitted` would disclose that an identifier exists, which
+  allows enumeration. Within a caller's own tenant a genuine shortfall is
+  `not_permitted`. The usability cost is named, and the owner may reverse it.
+- **Roles are not turned into a permission matrix.** `MembershipRole` already exists as a
+  vocabulary, but no accepted contract states what each role may do, and section 17 of the
+  architecture contract orders "Membership / RBAC" as step 5. Step 4 fixes only the
+  mechanism: an operation declares `any_active_member` or `named_roles`, the role is
+  resolved from the membership and never from a claim, and `OWNER` cannot be
+  manufactured. `BILLING` has no Step 4 operation at all. A proposed default matrix is
+  offered as a proposal, not a decision (Q-2).
+- **`TrustedExecutionRequest` is a contract here, not an implementation.** The name
+  appears nowhere in `app/`; step 10 owns it. The draft shape separates trusted
+  server-derived fields, correlation-only fields, and fields that must never appear — in
+  particular any plaintext provider secret in any spelling, which the contract explicitly
+  rejects.
+- **`EphemeralSecretResolver` remains a named boundary with no implementation.** R-2
+  defines the port on Core's side; step 7 owns it. The request carries an opaque handle;
+  `ProviderAccount.secret_ref` is extended, not replaced.
+- **The Platform id and the Core run id stay distinct** (R-1). The request carries
+  `platform_run_id`; Core produces `core_run_id` and returns it in
+  `PhysicalTelemetry.run_id`; `UsageRecord` carries both under distinct names.
+- **The ordering problem between the durable row and the Core launch is named, not
+  assumed away.** All three orderings leave a failure mode; the recommendation is to
+  commit the `RunRecord` first and make the orphan **visible** rather than impossible,
+  with a reconciliation sweep as the R-6 mechanism. R-6 leaves the mechanism open, so this
+  is a proposal (Q-3), not a decision.
+
+### Rejected alternatives
+
+- **A principal carrying tenancy or role.** Rejected: it collapses verification and
+  authorization into one object, and the authorization step becomes skippable.
+- **Creating a principal with the dataclass constructor.** Rejected: an unverified
+  identity would be one keyword away.
+- **Putting the credential check in the persistence layer.** Rejected: a repository that
+  can verify a credential is an authentication authority by accident.
+- **Treating `forge.user_id` as proof.** Rejected: any session can set a custom setting.
+- **Substituting the correct organization for a wrong client claim.** Rejected:
+  confused-deputy behaviour, and it hides the defect.
+- **One error vocabulary across both layers.** Rejected: it couples the API to the schema.
+- **Answering a cross-tenant attempt with `not_permitted`.** Rejected: it discloses
+  existence and permits enumeration.
+- **Freezing a complete RBAC matrix.** Rejected: step 5 owns it and the owner has not
+  decided it.
+- **Implementing a fake authentication service so the suite can pass.** Rejected: it would
+  make the tests green while proving nothing.
+
+### Consequences
+
+1. **The trust boundary is executable, and small.** One module,
+   `app/platform/principal.py`, plus `tests/test_platform_auth_contracts.py` (26 tests, no
+   database needed).
+2. **The application layer has a contract to be written against.** Nine use cases with
+   inputs, authorization requirements, transaction boundaries, error behaviour and
+   idempotency requirements, and a named ordering problem for the launch path.
+3. **Nothing is implemented beyond the principal contract.** No service, no endpoint, no
+   authorization engine, no transport, no schema change.
+4. **Open decisions are unchanged and several are newly raised.** O-1..O-7 stay open;
+   Q-2 (first role matrix), Q-3 (R-6 mechanism), Q-4 (where Platform idempotency is
+   recorded), and Q-5 (how the result intake is authenticated) need an owner decision
+   before the steps that depend on them. Q-4 and Q-3 must be answered before AS-3 and AS-6
+   can be implemented, so the recommended first implementation task deliberately avoids
+   both.
+
+
+## Stage 1 Шаг 4: граница аутентификации и контракты Application Services (D-PLATFORM-22) — русская версия
+
+Шаг проектирования. Фиксирует границу доверия между проверенной идентичностью,
+разрешённой операцией и слоями персистентности и исполнения, и записывает ровно один
+исполняемый контракт. Документ контракта:
+`docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`.
+
+### Что принято
+
+- **Проверенная идентичность существует только как `AuthenticatedPrincipal`.** Четыре поля:
+  `subject_id`, `subject_kind`, `method`, `verified_at`. Намеренно отсутствуют:
+  `organization_id`, `project_id`, роль, scopes, email, display name, workspace и любой
+  материал креденла. Principal отвечает на вопрос **кто**; каждое **что**
+  разрешается для каждой операции. Principal, несущий authority, сделал бы
+  «проверенную идентичность» и «авторизованную операцию» одним объектом, и шаг
+  авторизации можно было бы пропустить, просто создав его.
+- **Создать его может только верификатор.** `create(...)` требует
+  модульно-приватный sentinel. Это **защита от случайности, а не граница**: Python
+  не остановит враждебный внутрипроцессный код, и та же оговорка уже задокументирована
+  для `AuthorizedExecution`.
+- **Механизм аутентификации здесь не проектируется.** O-2 остаётся открытым.
+  Порт определён; никакая реализация не поставляется, и ничто в
+  `app/platform/persistence/` никогда не должно проверять пароль, JWT или внешний токен.
+- **Авторизация решается в application-слое, никогда в персистентности.**
+  Упорядоченный fail-closed алгоритм разрешает principal -> ACTIVE membership ->
+  организация -> проект -> требуемая роль, и tenant-scoped Unit of Work открывается **только
+  после** всех проверок, поэтому отклонённая операция не может оставить частичную
+  запись. `PermissionDeniedError` от RLS, дошедший до application-слоя, считается **сигналом
+  бага** и показывается как отказ, никогда не смягчается в «не найдено».
+- **Утверждение клиента никогда не «ремонтируется».** Неверный
+  `organization_id` отклоняется; сервер не подставляет правильный.
+- **Platform может отказать в запуске, но никогда не расширяет authority Core.**
+  Platform может только **сужать** профиль, набор разрешённых команд, инструментов и
+  сетевой доступ; `ExecutionCoordinator` перевыводит всё заново, `RunScope` проверяет
+  workspace-корень и полную идентичность команды, и только координатор может создать
+  `AuthorizedExecution`. `AuthorizedExecution` нельзя создать из клиента, а `dataclasses.replace` для principal
+  отвергается, потому что сгенерированный `__init__` не используется.
+- **`forge.user_id` не является аутентификацией.** GUC решает, о каком субъекте
+  транзакция *готова говорить*; он никогда не решает, *кем является* вызывающий.
+- **Гарантия M-2 — это композиция, а не один слой.** RLS-политика
+  решает только, что system-скоуп объявлен; сессия — *один субъект на транзакцию*;
+  верификатор — *этот субъект есть тот, кем является вызывающий*.
+- **Два словаря ошибок разделены.** Ошибки персистентности остаются в
+  персистентности; application-слой транслирует их в закрытый список кодов отказа.
+- **Кросс-арендаторные попытки отвечаются `not_found`, а не `not_permitted`** (Q-6).
+- **Роли не превращаются в матрицу разрешений.** Механизм фиксируется
+  (`any_active_member` или `named_roles`), а матрица предлагается как предложение (Q-2).
+- **`TrustedExecutionRequest` — здесь контракт, а не реализация.** Имя не
+  встречается в `app/`; им владеет шаг 10.
+- **`EphemeralSecretResolver` остаётся названной границей без реализации.**
+- **Идентификатор Platform и идентификатор запуска Core остаются различными** (R-1).
+- **Проблема порядка между устойчивой строкой и запуском Core названа, а не
+  предположена замолчанной.** Рекомендация — сначала коммит `RunRecord`, orphan
+  сделать **видимым**, а не невозможным, со сверкой-развёрткой как механизмом R-6 (Q-3).
+
+### Отклонённые альтернативы
+
+- **Principal, несущий аренду или роль.** Отклонено: сворачивает
+  проверку и авторизацию в один объект.
+- **Создание principal через конструктор dataclass.** Отклонено: непроверенная
+  идентичность была бы на расстоянии одного ключевого слова.
+- **Проверка креденла в слое персистентности.** Отклонено: репозиторий,
+  способный проверить креденл, становится authority аутентификации по случайности.
+- **Трактовка `forge.user_id` как доказательства.** Отклонено: любая сессия
+  может установить пользовательскую настройку.
+- **Подстановка правильной организации вместо неверного утверждения.** Отклонено:
+  confused-deputy поведение, и оно скрывает дефект.
+- **Один словарь ошибок на оба слоя.** Отклонено: связывает API со схемой.
+- **Ответ `not_permitted` на кросс-арендаторную попытку.** Отклонено: раскрывает
+  существование и позволяет перечисление.
+- **Замораживание полной RBAC-матрицы.** Отклонено: им владеет шаг 5,
+  и владелец этого не решил.
+- **Реализация fake-сервиса аутентификации, чтобы набор прошёл.** Отклонено: это
+  сделало бы тесты зелёными, ничего не доказывая.
+
+### Следствия
+
+1. **Граница доверия исполняема и мала.** Один модуль,
+   `app/platform/principal.py`, плюс `tests/test_platform_auth_contracts.py` (26 тестов, БД не нужна).
+2. **У application-слоя есть контракт, под который писать.** Девять use cases
+   с входами, требованиями авторизации, границами транзакций, поведением при
+   ошибках и требованиями идемпотентности, и названная проблема порядка для
+   пути запуска.
+3. **За пределами контракта principal ничего не реализовано.** Ни сервиса, ни
+   эндпоинта, ни движка авторизации, ни транспорта, ни изменения схемы.
+4. **Открытые решения не изменены, и несколько подняты заново.** O-1..O-7
+   остаются открытыми; Q-2 (первая матрица ролей), Q-3 (механизм R-6), Q-4 (где
+   записывается идемпотентность Platform) и Q-5 (как аутентифицируется приём результата)
+   требуют решения владельца.
