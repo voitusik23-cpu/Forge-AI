@@ -198,7 +198,8 @@ remaining steps are not, and nothing below should be read as a claim about them.
 | Platform Application Services over those repositories | **PLANNED / NOT IMPLEMENTED** | no such module exists; `app/platform/persistence/protocols.py` is the interface they will use |
 | Authentication trust boundary: `AuthenticatedPrincipal`, verifier port, fail-closed refusals | **CURRENT / VERIFIED** (contract only; no credential mechanism) | `app/platform/principal.py` — `tests/test_platform_auth_contracts.py` |
 | Authentication mechanism (session / JWT / federated) | **PLANNED / NOT IMPLEMENTED** | open decision O-2; the port is defined and no implementation ships |
-| Application Services (use cases, authorization flow, Platform -> Core port) | **DESIGNED / NOT IMPLEMENTED** | `docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`; no such module exists |
+| Application Services slice: AS-1 discovery and AS-2 project listing, authorization algorithm, application error vocabulary | **CURRENT / VERIFIED** | `app/platform/application/` — `tests/test_platform_application_discovery.py` |
+| Application Services AS-3..AS-9 (project creation, run preparation, `RunRecord`, Platform -> Core port) | **DESIGNED / NOT IMPLEMENTED** | `docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md` section 5 |
 | Platform -> Core transport (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; see `ROADMAP.md` |
 | Billing (cost records, pricing, wallet, ledger) | **PLANNED / NOT IMPLEMENTED** | Stage 2; no such table and no money column exist |
 
@@ -670,7 +671,8 @@ Stage 1 строится упорядоченными шагами. Шаги с 
 | Прикладные сервисы Platform поверх этих репозиториев | **PLANNED / NOT IMPLEMENTED** | такого модуля не существует; `app/platform/persistence/protocols.py` — интерфейс, которым они будут пользоваться |
 | Граница доверия аутентификации: `AuthenticatedPrincipal`, порт верификатора, fail-closed отказы | **CURRENT / VERIFIED** (только контракт; механизма креденлов нет) | `app/platform/principal.py` — `tests/test_platform_auth_contracts.py` |
 | Механизм аутентификации (сессия / JWT / федерация) | **PLANNED / NOT IMPLEMENTED** | открытое решение O-2; порт определён, реализация не поставляется |
-| Прикладные сервисы Platform (use cases, поток авторизации, порт Platform -> Core) | **DESIGNED / NOT IMPLEMENTED** | `docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`; такого модуля не существует |
+| Срез Application Services: discovery AS-1 и список проектов AS-2, алгоритм авторизации, словарь прикладных ошибок | **CURRENT / VERIFIED** | `app/platform/application/` — `tests/test_platform_application_discovery.py` |
+| Application Services AS-3..AS-9 (создание проекта, подготовка запуска, `RunRecord`, порт Platform -> Core) | **DESIGNED / NOT IMPLEMENTED** | `docs/STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`, раздел 5 |
 | Транспорт Platform -> Core (`TrustedExecutionRequest`) | **PLANNED / NOT IMPLEMENTED** | Stage 0.2; см. `ROADMAP.md` |
 | Billing (cost records, ценообразование, кошелёк, леджер) | **PLANNED / NOT IMPLEMENTED** | Stage 2; ни такой таблицы, ни денежной колонки не существует |
 

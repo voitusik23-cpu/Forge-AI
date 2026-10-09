@@ -671,6 +671,61 @@ Every row is a state an operator can query. None is silent.
 
 ---
 
+
+## 7.6 What implementing AS-1 and AS-2 established
+
+Section 7.1 states the default as "one transaction per use case". Implementing the first
+slice showed that the real boundary is **one pre-tenant read transaction plus one tenant
+transaction**, and the reason is structural rather than incidental:
+
+* naming the subject's **candidate** organizations requires a scope that is not yet bound
+  to an organization. That is precisely what ``pre_tenant`` is for, and there is no way
+  to express it inside a tenant transaction, because a tenant transaction exists only
+  after the choice has been made;
+* so **every** use case that binds an organization opens a pre-tenant read first. The
+  algorithm in 4.1 is unchanged; what changes is the number of transactions it spans.
+
+The authorization decision is therefore split across those two transactions, and each
+half is decided against data read **inside the transaction that uses it**:
+
+| Step | Transaction | Decided against |
+| --- | --- | --- |
+| 1-3: subject admissible, candidate set | pre-tenant | the subject's own row, its memberships, and their organizations, as the discovery policy returns them |
+| 4-6: one organization bound, membership and organization status | tenant | the membership and organization re-read inside the bound tenant |
+
+Step 4's *selection* happens between the two, from the pre-tenant candidate set, and is a
+pure function of that set and the client claim -- no new data is consulted, so no staleness
+is introduced. Steps 5 and 6 are deliberately **re-read** rather than trusted from the
+candidate list: a membership revoked, or a tenant suspended, between the two reads must
+not be usable, and only a read inside the deciding transaction can promise that.
+
+### Two handles, one per scope
+
+Each Platform login is a member of **exactly one** role -- that separation is a security
+invariant asserted by ``platform.platform_scopes_are_separate()``. It follows that no
+single login can serve both scopes, so the discovery service takes two database handles:
+
+* the **system** login, for ``pre_tenant`` (the system role with the system scope
+  declared);
+* the **application** login, for the tenant scope.
+
+A fixture that used one login for both would be weakening the boundary these tests exist
+to check, which is why the test suite provisions both. ``DiscoveryService`` accepts a
+single handle as a default for a deployment that genuinely has one, and the tenant scope
+still steps down with ``SET LOCAL ROLE``; the two-handle form is the one this layer
+expects.
+
+### One persistence read worth naming
+
+Step 2 ("subject state admissible") reads the subject's own row through the **users
+repository inside the pre-tenant scope**. That read is subject-bound by the discovery
+policy, so a principal naming somebody else finds nothing and is refused -- the refusal is
+the database's answer, not a Python comparison. It is also why the slice needs no new
+persistence method: the existing ``users.get`` is exactly the subject-bound read the step
+needs.
+
+---
+
 ## 8. M-2 — subject-bound discovery, and what each layer guarantees
 
 Step 3's hardening pass (task #61) established that the subject binding is enforced at the
@@ -1106,10 +1161,11 @@ Stage 1    =  ARCHITECTURE CONTRACT READY
 Step 1     =  DOMAIN CONTRACTS READY
 Step 2     =  POSTGRESQL SCHEMA AND RLS IMPLEMENTED
 Step 3     =  PERSISTENCE, REPOSITORIES, UNIT OF WORK IMPLEMENTED
-Step 4     =  AUTHENTICATION AND APPLICATION SERVICES CONTRACTS DESIGNED
-              (principal contract implemented; services NOT implemented)
+Step 4     =  AUTHENTICATION CONTRACT DESIGNED AND IMPLEMENTED
+              APPLICATION SERVICES AS-1 + AS-2 IMPLEMENTED
+              (AS-3..AS-9 designed, NOT implemented)
 
-Implementation status:  DESIGN AND CONTRACTS ONLY
+Implementation status:  PRINCIPAL CONTRACT + DISCOVERY SLICE IMPLEMENTED
 ```
 
 ## OPEN DECISIONS
@@ -1735,6 +1791,42 @@ Core.
 
 ---
 
+
+## 7.6 Что дала реализация AS-1 и AS-2 — русская версия
+
+Раздел 7.1 объявляет дефолтом «одна транзакция на use case». Реализация первого
+среза показала, что реальная граница — это **одна читающая pre-tenant-транзакция плюс
+одна tenant-транзакция**, и причина структурная:
+
+* чтобы назвать **организации-кандидаты** субъекта, нужен скоуп, ещё не
+  привязанный к организации. Именно для этого существует ``pre_tenant``, и выразить это
+  внутри tenant-транзакции нельзя: tenant-транзакция существует только после выбора;
+* поэтому **каждый** use case, привязывающий организацию, сначала открывает
+  pre-tenant-чтение. Алгоритм 4.1 не меняется; меняется число транзакций, которые он
+  охватывает.
+
+Шаги 5 и 6 намеренно **перечитываются**, а не доверяются списку кандидатов:
+membership, отозванный между двумя чтениями, или приостановленный арендатор не должны быть
+используемы, и только чтение внутри решающей транзакции это гарантирует.
+
+### Два хендла, по одному на скоуп
+
+Каждый логин Platform — член **ровно одной** роли; это разделение подтверждается
+``platform.platform_scopes_are_separate()``. Следовательно, ни один логин не может обслужить оба скоупа, и
+сервис discovery принимает два хендла базы: system-логин для ``pre_tenant`` и application-логин для
+tenant-скоупа. Фикстура, использующая один логин для обоих, ослабляла бы границу,
+которую эти тесты проверяют.
+
+### Одно чтение персистентности, которое стоит назвать
+
+Шаг 2 («состояние субъекта допустимо») читает собственную строку субъекта через
+**репозиторий users внутри pre-tenant-скоупа**. Это чтение привязано к субъекту
+discovery-политикой, поэтому principal, называющий другого, не находит ничего и получает отказ:
+отказ — это ответ базы, а не сравнение в Python. Именно поэтому срезу не нужен новый метод
+персистентности: существующий ``users.get`` и есть нужное subject-bound чтение.
+
+---
+
 ## 8. M-2 — subject-bound discovery и что гарантирует каждый слой
 
 Усиление Шага 3 (задание #61) установило, что привязка субъекта обеспечивается на уровне
@@ -2154,10 +2246,11 @@ Stage 1    =  ARCHITECTURE CONTRACT READY
 Step 1     =  DOMAIN CONTRACTS READY
 Step 2     =  POSTGRESQL SCHEMA AND RLS IMPLEMENTED
 Step 3     =  PERSISTENCE, REPOSITORIES, UNIT OF WORK IMPLEMENTED
-Step 4     =  AUTHENTICATION AND APPLICATION SERVICES CONTRACTS DESIGNED
-              (контракт principal реализован; сервисы НЕ реализованы)
+Step 4     =  КОНТРАКТ АУТЕНТИФИКАЦИИ СПРОЕКТИРОВАН И РЕАЛИЗОВАН
+              APPLICATION SERVICES AS-1 + AS-2 РЕАЛИЗОВАНЫ
+              (AS-3..AS-9 спроектированы, НЕ реализованы)
 
-Implementation status:  DESIGN AND CONTRACTS ONLY
+Implementation status:  КОНТРАКТ PRINCIPAL + СРЕЗ DISCOVERY РЕАЛИЗОВАНЫ
 ```
 
 ## OPEN DECISIONS
