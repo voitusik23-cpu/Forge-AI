@@ -20,6 +20,7 @@ from app.execution.request import (
     ExecutionStatus,
 )
 from app.runtime.run_scope import RunScope
+from app.tools.approval import ApprovalPolicy
 from app.tools.workspace import Workspace
 from run_scope_support import freeze_scope
 
@@ -101,6 +102,12 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             run_id=self.run_id,
             allowed_commands=declared,
             run_scope=self.scope,
+            # These tests are about the adapter (exit codes, timeout, truncation,
+            # redaction, working directory), not about approval. A stated policy is
+            # mandatory in the coordinator, so state the empty one: it requires
+            # approval for nothing dispatched here, which is what the unstated
+            # ``None`` used to mean.
+            approval_policy=ApprovalPolicy(),
         )
 
     def test_direct_call_without_authorized_execution_rejected(self) -> None:
@@ -204,6 +211,10 @@ class TestLocalExecutionAdapter(unittest.TestCase):
             run_id=self.run_id,
             allowed_commands=frozenset({sys.executable}),
             run_scope=self.scope,
+            # The subject here is the *policy* denial ("Execution denied by
+            # policy"), so a policy must be stated or the mandatory-policy guard
+            # would deny first and this test would pass for the wrong reason.
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.status, ExecutionStatus.DENIED)
         self.assertIsNone(result.exit_code)

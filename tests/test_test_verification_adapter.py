@@ -285,7 +285,12 @@ class TestTestVerificationAdapter(unittest.TestCase):
             run_id="tva-run-1",
             run_scope=_scope_for(
                 exec_req, "tva-run-1", ("disallowed_cmd",), workspace=self.workspace_root
-            ),)
+            ),
+            # Not about approval: the command is refused by the permission layer
+            # before the approval layer. A stated policy is mandatory now, so state
+            # the empty one the unstated ``None`` used to amount to.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(exec_res.status, ExecutionStatus.DENIED)
         self.assertEqual(exec_res.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
 
@@ -338,7 +343,12 @@ class TestTestVerificationAdapter(unittest.TestCase):
             run_id="tva-run-3",
             run_scope=_scope_for(
                 exec_req, "tva-run-3", (sys.executable,), workspace=self.workspace_root
-            ),)
+            ),
+            # The subject is the *policy* denial (``restricted_profile``), so a
+            # policy must be stated: with ``None`` the mandatory-policy guard would
+            # deny first and this test would pass without ever reaching the policy.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(exec_res.status, ExecutionStatus.DENIED)
         self.assertEqual(exec_res.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
 
@@ -362,7 +372,11 @@ class TestTestVerificationAdapter(unittest.TestCase):
             run_id="tva-run-4",
             run_scope=_scope_for(
                 exec_req, "tva-run-4", (sys.executable, self.ok_cmd,), workspace=self.workspace_root
-            ),)
+            ),
+            # Not about approval: the empty policy requires approval for nothing
+            # dispatched here, which is what the unstated ``None`` used to mean.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(exec_res.status, ExecutionStatus.SUCCESS)
         self.assertEqual(exec_res.exit_code, 0)
         self.assertEqual(exec_res.stdout, "test_ok")
@@ -389,7 +403,11 @@ class TestTestVerificationAdapter(unittest.TestCase):
             run_id="tva-run-5",
             run_scope=_scope_for(
                 exec_req, "tva-run-5", (sys.executable, self.fail_cmd,), workspace=self.workspace_root
-            ),)
+            ),
+            # Not about approval: the empty policy requires approval for nothing
+            # dispatched here, which is what the unstated ``None`` used to mean.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(exec_res.status, ExecutionStatus.FAILURE)
         self.assertEqual(exec_res.exit_code, 1)
 
@@ -414,7 +432,13 @@ class TestTestVerificationAdapter(unittest.TestCase):
             run_id="tva-run-6",
             run_scope=_scope_for(
                 exec_req, "tva-run-6", (sys.executable,), workspace=self.workspace_root
-            ),)
+            ),
+            # Not about approval: the empty policy requires approval for nothing
+            # dispatched here, which is what the unstated ``None`` used to mean.
+            # Without it the dispatch would be denied and the traceability
+            # assertions below would be satisfied by a denial rather than a run.
+            approval_policy=ApprovalPolicy(),
+        )
         v_res = self.adapter.evaluate_result(intent, exec_res)
 
         trace = validate_verification_traceability(
@@ -465,7 +489,13 @@ class TestTestVerificationAdapter(unittest.TestCase):
             run_id="tva-run-7",
             run_scope=_scope_for(
                 exec_req, "tva-run-7", (sys.executable,), workspace=self.workspace_root
-            ),)
+            ),
+            # Not about approval: the empty policy requires approval for nothing
+            # dispatched here, which is what the unstated ``None`` used to mean.
+            # Without it the dispatch would be denied and this test would inspect
+            # the events of a refusal instead of those of a real execution.
+            approval_policy=ApprovalPolicy(),
+        )
         v_res = self.adapter.evaluate_result(
             intent,
             exec_res,

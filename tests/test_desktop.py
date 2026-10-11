@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from app.api.client import ForgeApiClient
 from app.api.service import ForgeApiService
+from offline_runtime import offline_runtime
 from app.desktop.app import ForgeDesktopApp
 from app.desktop.views import (
     AgentsView,
@@ -21,6 +23,16 @@ class DesktopShellTests(unittest.TestCase):
     """Verify Desktop Shell window creation, view navigation, and task dispatch."""
 
     def setUp(self) -> None:
+        # The service must be composed with an offline runtime. A bare `ForgeApiService()`
+        # resolves its runtime through `create_runtime()`, which reads the real `.env`; on a
+        # machine where that file exists, live providers are enabled and `_on_run_task`
+        # below dispatches straight to the network. That was measured, not feared: this
+        # test previously reached OpenRouter and returned 586 real tokens. Patching the
+        # factory keeps the provider set offline for every service built here, so the test
+        # cannot spend credits and its result does not depend on the developer's `.env`.
+        patcher = patch("app.api.service.create_runtime", offline_runtime)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.service = ForgeApiService()
         self.client = ForgeApiClient(api_service=self.service)
         self.app = ForgeDesktopApp(client=self.client, headless=True)
@@ -61,6 +73,11 @@ class DesktopShellTests(unittest.TestCase):
         output_text = home_view.txt_output.get("1.0", "end")
         self.assertIn("Result: SUCCESS", output_text)
         self.assertIn("Run ID: run-api-", output_text)
+        # No error line, and the offline provider's own response text is what the view
+        # renders. `setUp` restricts the runtime to mock, so the dispatch cannot reach an
+        # external provider; both facts are asserted rather than assumed.
+        self.assertNotIn("Error:", output_text)
+        self.assertIn("MockProvider response:", output_text)
 
     def test_05_costs_view_dashboard_render(self) -> None:
         self.app.show_view("costs")

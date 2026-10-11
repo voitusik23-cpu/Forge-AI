@@ -263,6 +263,12 @@ class TestExecutionPlane(unittest.TestCase):
                     run_id=self.run_id,
                     allowed_commands=allowed,
                     run_scope=self.scope,
+                    # These cases are about the execution plane (artifacts,
+                    # isolation, redaction, timeouts), not about approval. A stated
+                    # policy is mandatory in the coordinator, so state the empty one:
+                    # it requires approval for nothing dispatched here, which is what
+                    # the unstated ``None`` used to mean.
+                    approval_policy=ApprovalPolicy(),
                 )
             return orig_execute(target)
 
@@ -351,6 +357,7 @@ class TestExecutionPlane(unittest.TestCase):
             run_id=self.run_id,
             allowed_commands=self.scope.allowed_execution_commands,
             run_scope=self.scope,
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(len(captured_scratch), 1)
@@ -384,6 +391,7 @@ class TestExecutionPlane(unittest.TestCase):
             run_id=self.run_id,
             allowed_commands=self.scope.allowed_execution_commands,
             run_scope=self.scope,
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.status, ExecutionStatus.FAILURE)
         self.assertEqual(len(captured_scratch), 1)
@@ -487,6 +495,7 @@ class TestExecutionPlane(unittest.TestCase):
             run_id=provenance_run_id,
             allowed_commands=self.scope.allowed_execution_commands,
             run_scope=provenance_scope,
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.status, ExecutionStatus.SUCCESS)
         self.assertEqual(len(result.artifacts), 1)
@@ -797,6 +806,10 @@ class TestExecutionPlane(unittest.TestCase):
                 run_id=self.run_id,
                 allowed_commands=self.git_commands,
                 run_scope=self.scope,
+                # The subject is the forbidden git flag, so a policy must be stated
+                # or the mandatory-policy guard would deny first and the assertion
+                # on the ``forbidden_flag:--git-dir`` reason would never be reached.
+                approval_policy=ApprovalPolicy(),
             )
             self.assertEqual(res.status, ExecutionStatus.DENIED)
             self.assertIn("forbidden_flag:--git-dir", res.stderr)
@@ -825,6 +838,10 @@ class TestExecutionPlane(unittest.TestCase):
                 run_id=self.run_id,
                 allowed_commands=self.git_commands,
                 run_scope=self.scope,
+                # Same reason as the --git-dir case: the subject is the forbidden
+                # flag, so the policy must be stated for the policy layer to be
+                # the layer that refuses.
+                approval_policy=ApprovalPolicy(),
             )
             self.assertEqual(res.status, ExecutionStatus.DENIED)
             self.assertIn("forbidden_flag:--work-tree", res.stderr)

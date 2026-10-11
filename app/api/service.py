@@ -56,6 +56,7 @@ from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import ExecutionOutcomeStatus
 from app.fabric.fabric import CapabilityFabric
 from app.orchestrator.models import EventType, RunState, Task, TaskCategory
+from app.orchestrator.orchestrator import Orchestrator
 from app.orchestrator.run import RunExecutor
 from app.runtime.bootstrap import (
     create_agent_harness,
@@ -64,7 +65,7 @@ from app.runtime.bootstrap import (
 )
 from app.runtime.context import RuntimeContext
 from app.runtime.run_scope import RunScope, require_active_scope
-from app.runtime.run_store import RunStateSnapshot, RunStore
+from app.runtime.run_store import RunStateSnapshot, RunStore, project_run_store_root
 from app.tasks.specification import TaskSpecification
 from app.tools.approval import ApprovalPolicy, ApprovalResolver
 from app.tools.acceptance import AcceptanceCriterion, AcceptanceStatus
@@ -74,6 +75,104 @@ from app.tools.workspace import Workspace
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.execution.request import ExecutionRequest
+
+
+#: Distinguishes "the attribute is absent" from "the attribute is present and
+#: None". An absent routing value must never be replaced by a guess.
+_MISSING = object()
+
+
+def _dispatcher_route_value(dispatcher: object, name: str) -> object:
+    """Read one routing value the caller's orchestrator actually dispatches with.
+
+    Returns ``_MISSING`` when the attribute is absent, so a caller can decide
+    what to do instead of silently substituting a different value. The value is
+    returned even when it is falsy (``()``, ``False``, ``None``): an empty
+    fallback chain and a disabled paid-provider flag are real configuration.
+    """
+    return getattr(dispatcher, name, _MISSING)
+
+
+def bind_fabric_to_runtime(
+    runtime: RuntimeContext, fabric: CapabilityFabric
+) -> RuntimeContext:
+    """Return ``runtime`` whose orchestrator dispatches with ``fabric``.
+
+    Provider and model accounting is recorded by the dispatcher, which reads
+    ``self._fabric`` and skips the record entirely when it is None
+    (``app/orchestrator/dispatcher.py``). The fabric is not a property the dispatcher can
+    be handed afterwards, and a runtime supplied by a caller is built by ``create_runtime``
+    without one, so a service that keeps its own fabric object observed nothing: the
+    response reported empty ``provider_used``/``model_used`` and the dashboard saw no runs.
+
+    The fabric cannot be attached after construction, so a replacement orchestrator
+    is built and the orchestrator reference is rebound. Every other runtime field,
+    including ``run_executor``, is carried over untouched.
+
+    **What is preserved, and from where.** The replacement carries the *routing
+    configuration the caller's own dispatcher was constructed with* -- its
+    ``_default_provider``, ``_fallback_chain``, ``_allow_paid_providers``,
+    ``_model_registry``, ``_provider_registry``, ``_capabilities_registry``, and
+    ``_registry``. It is **not** rebuilt from ``runtime.settings``. Rebuilding
+    from settings was a defect: when a caller injected a runtime whose
+    orchestrator disagreed with ``runtime.settings``, the rebind silently
+    rewrote the routing policy in *either* direction, including the permissive
+    one (a caller's ``allow_paid_providers=False`` becoming ``True``). The only
+    value taken from settings is a routing value the dispatcher does not expose
+    at all, used as a documented fallback; the dispatcher always sets these
+    attributes, so in practice nothing is taken from settings.
+
+    This is deliberately tolerant of a runtime the caller assembled by hand: several suite
+    doubles stand in for an orchestrator and expose ``dispatch`` but no dispatcher
+    internals. Such a runtime is returned unchanged, because there is nothing to rebind and
+    replacing a working double would break the caller for no gain.
+    """
+
+    orchestrator = runtime.orchestrator
+    dispatcher = getattr(orchestrator, "_dispatcher", None)
+    if dispatcher is None:
+        return runtime
+    if getattr(dispatcher, "_fabric", None) is fabric:
+        return runtime
+
+    settings = runtime.settings
+
+    def _route(name: str, setting_name: str, default: object) -> object:
+        """Prefer the dispatcher's own value; fall back to settings, then default."""
+        value = _dispatcher_route_value(dispatcher, name)
+        if value is not _MISSING:
+            return value
+        if settings is not None:
+            setting_value = getattr(settings, setting_name, _MISSING)
+            if setting_value is not _MISSING:
+                return setting_value
+        return default
+
+    return replace(
+        runtime,
+        orchestrator=Orchestrator(
+            _route("_registry", "agent_registry", runtime.agent_registry),
+            default_provider=_route("_default_provider", "default_provider", "mock"),
+            fallback_chain=_route(
+                "_fallback_chain", "provider_fallback_chain", ()
+            ),
+            provider_registry=_route(
+                "_provider_registry", "provider_registry", runtime.provider_registry
+            ),
+            capabilities_registry=_route(
+                "_capabilities_registry",
+                "provider_capabilities",
+                runtime.provider_capabilities,
+            ),
+            model_registry=_route(
+                "_model_registry", "model_registry", None
+            ),
+            fabric=fabric,
+            allow_paid_providers=bool(
+                _route("_allow_paid_providers", "allow_paid_providers", False)
+            ),
+        ),
+    )
 
 
 def default_api_execution_profile() -> ProjectExecutionProfile:
@@ -214,6 +313,15 @@ class ForgeApiService:
         # and one of them would silently widen the perimeter. The retained
         # parameter is accepted for compatibility but no longer grants anything.
         self._allowed_execution_commands = frozenset()
+        # Deliberately allowed to stay ``None``: "no server-side approval policy was
+        # composed" is a real, fail-closed state that `RunExecutor` reports as
+        # ``approval_policy_required``, and two existing contract tests assert exactly
+        # that (``test_missing_approval_policy_refuses_to_execute``,
+        # ``test_default_service_requests_no_execution``). Replacing it with a default
+        # policy here would have silently turned "no approval configured" into "approval
+        # configured" -- a permissive reading of a security-relevant default. A
+        # composition that wants a working policy supplies one explicitly, which is what
+        # ``create_api_app`` does.
         self._approval_policy = approval_policy
         # Server-side only: a callable that *asks* for execution. It cannot
         # authorise anything, and it is never populated from client input. It is
@@ -278,24 +386,54 @@ class ForgeApiService:
             approval_resolver=approval_resolver,
         )
 
-        resolved_runtime = runtime or create_runtime(tool_registry=self._tool_registry)
-        # The shared ToolExecutor must reach the executor that actually dispatches
-        # tools. RunExecutor carries no mutable state beyond immutable references,
-        # so rebinding it to the same orchestrator preserves behavior exactly.
-        self._runtime = replace(
-            resolved_runtime,
-            run_executor=RunExecutor(
-                resolved_runtime.orchestrator,
-                tool_executor=self._tool_executor,
-            ),
-        )
-
+        # The fabric is created FIRST, before the runtime, because the dispatcher records
+        # provider usage through it: a runtime built without one produces empty
+        # `provider_used`/`model_used` and a dashboard that sees no runs. `bind_fabric_to_runtime`
+        # attaches this exact object to the orchestrator that will dispatch, so the service
+        # and the runtime never disagree about which fabric is authoritative.
         self._fabric = fabric or CapabilityFabric(
             workspace=self._workspace,
             tool_registry=self._tool_registry,
         )
-        self._run_store = run_store or RunStore()
-        self._health_monitor = ProviderHealthMonitor()
+        # Scoped to THIS workspace. ``RunStore()`` with no root resolves to a per-USER
+        # directory, so two projects on one machine shared it: a run id used in one was
+        # replayed as the other's ``COMPLETED`` result while its own artifact was never
+        # created. The space is derived from the trusted workspace this service was
+        # constructed with -- never from anything the caller sends.
+        self._run_store = run_store or RunStore(
+            root=project_run_store_root(self._workspace.root)
+        )
+
+        resolved_runtime = runtime or create_runtime(
+            fabric=self._fabric, tool_registry=self._tool_registry
+        )
+        # The runtime's orchestrator must dispatch with the same fabric the service reads
+        # accounting from. `bind_fabric_to_runtime` returns a runtime whose orchestrator
+        # carries this exact object; binding it once here keeps every later reference
+        # consistent.
+        bound_runtime = bind_fabric_to_runtime(resolved_runtime, self._fabric)
+        # The health monitor is built from the RESOLVED runtime's settings, never from the
+        # ambient environment. `ProviderHealthMonitor` opens real TCP probes to provider
+        # endpoints, so a monitor that resolves its own environment would keep probing even
+        # when the composition is a test-mode runtime whose providers were all disabled --
+        # the offline guarantee has to come from the composition, not from every caller
+        # remembering to set `FORGE_ENV=test`. Passing the settings makes test mode
+        # structural, and leaves production probing untouched because the resolved settings
+        # there are the ordinary development/production ones.
+        self._health_monitor = ProviderHealthMonitor(
+            settings=getattr(resolved_runtime, "settings", None)
+        )
+        # The shared ToolExecutor must reach the executor that actually dispatches
+        # tools. RunExecutor carries no mutable state beyond immutable references,
+        # so rebinding it to the same orchestrator preserves behavior exactly.
+        self._runtime = replace(
+            bound_runtime,
+            run_executor=RunExecutor(
+                bound_runtime.orchestrator,
+                tool_executor=self._tool_executor,
+            ),
+        )
+
         self._dashboard_service = dashboard_service or CostDashboardService(
             fabric=self._fabric,
             health_monitor=self._health_monitor,
@@ -520,7 +658,25 @@ class ForgeApiService:
 
     @property
     def runtime(self) -> RuntimeContext:
+        """The runtime this service dispatches through.
+
+        Exposed so a trusted in-process caller can *observe* a dispatch (for
+        example to read the ``ExecutionResult`` a declared verification really
+        produced) instead of re-deriving it, and can put an equivalent runtime
+        back afterwards. Assigning a runtime is a composition act: it replaces
+        the registries, the executor, and the harness wholesale, so a caller
+        that does it owns the result. It is not reachable from the HTTP
+        contract, and it grants no authority -- every dispatch still passes the
+        frozen ``RunScope``, the approval decision, the execution policy, and
+        the workspace check.
+        """
         return self._runtime
+
+    @runtime.setter
+    def runtime(self, runtime: RuntimeContext) -> None:
+        if not isinstance(runtime, RuntimeContext):
+            raise TypeError("runtime must be a RuntimeContext")
+        self._runtime = runtime
 
     @property
     def fabric(self) -> CapabilityFabric:
@@ -560,6 +716,186 @@ class ForgeApiService:
     def run_store(self) -> RunStore:
         return self._run_store
 
+    @property
+    def workspace(self) -> Workspace:
+        """The workspace this service was composed with, for in-process callers.
+
+        Read-only accessor. It exposes the object the service already owns; it
+        grants nothing, and it is not reachable from the HTTP contract.
+        """
+        return self._workspace
+
+    @property
+    def declarations(self) -> Mapping[str, ExecutionDeclaration]:
+        """The operator-declared executions, read-only.
+
+        The mapping is a copy taken at composition time, so a caller cannot
+        widen the declaration set. Declarations are data, never a gate: adding
+        one to a copy would not reach any authority check.
+        """
+        return self._declarations
+
+    @property
+    def acceptance_specs(self) -> Mapping[str, AcceptanceSpec]:
+        """The operator-declared acceptance specs, read-only.
+
+        Same rule as ``declarations``: this is a copy, and a criterion copied out
+        of it carries no authority.
+        """
+        return self._acceptance_specs
+
+    @property
+    def loop_coordinator_factory(self) -> Callable[..., object]:
+        """The composition-supplied coordinator factory.
+
+        Exposed so a trusted in-process caller can observe the coordinator the
+        acceptance slice dispatches through, and assign it back to restore the
+        composition. It mints no authority: the coordinator still performs every
+        ``RunScope``, approval, policy, and workspace check on every dispatch.
+        """
+        return self._loop_coordinator_factory
+
+    @loop_coordinator_factory.setter
+    def loop_coordinator_factory(self, factory: Callable[..., object]) -> None:
+        if not callable(factory):
+            raise TypeError("loop_coordinator_factory must be callable")
+        self._loop_coordinator_factory = factory
+
+    @property
+    def execution_profile(self) -> ProjectExecutionProfile:
+        """The profile every RunScope of this service is built from.
+
+        Read-only. It is the ceiling, never a grant: exposing it lets an
+        operator-facing view report *which* commands the deployment admits, and
+        reporting a ceiling cannot raise it.
+        """
+        return self._execution_profile
+
+    # ------------------------------------------------------------------
+    # composition accessor for the operating surface
+    #
+    # This method hands out the *ingredients* of a step-graph or recovery
+    # composition and nothing else. It deliberately does NOT construct the runner,
+    # the coordinator or the backing adapter. The API layer is asserted by
+    # ``test_api_layer_has_no_direct_adapter_or_process_access`` to reach neither
+    # the execution adapter nor process spawning, and that boundary is kept: this
+    # service delegates, it does not spawn. ``app/api/operating_surface.py`` builds
+    # the composition from these values.
+    # ------------------------------------------------------------------
+    def step_graph_composition(self) -> Optional[Dict[str, Any]]:
+        """The values a step-graph runner needs, or ``None`` when not composable.
+
+        Fails closed on two conditions:
+
+        * no runtime carrying a composed run executor;
+        * **no injected idempotency guard**. The process-wide default guard shares
+          one ledger root across every caller, and this project has already measured
+          false failures from shared default roots. An embedding composition that
+          wants the HTTP step-graph route supplies its own guard, exactly as the
+          tests do.
+
+        The returned mapping reports ``approval_policy`` **as it is**, including
+        ``None``. It does not substitute a default: an unresolved policy must never
+        silently mean "no approval needed". The consumer of this mapping refuses when
+        the policy is absent, which is the same fail-closed answer ``RunExecutor``
+        and ``StepGraphRunner`` already give.
+
+        The values returned carry no authority of their own: the runner still
+        re-checks ``RunScope``, ``ApprovalPolicy``, ``ExecutionCoordinator`` and the
+        workspace on every dispatch.
+        """
+
+        runtime = self._runtime
+        if runtime is None or getattr(runtime, "run_executor", None) is None:
+            return None
+        if self._idempotency_guard is None:
+            return None
+        return {
+            "runtime": runtime,
+            "workspace": self._workspace,
+            "execution_profile": self._execution_profile,
+            "declarations": dict(self._declarations),
+            "run_store": self._run_store,
+            "idempotency_guard": self._idempotency_guard,
+            # `None` stays `None`, verbatim. Whether an absent policy is acceptable
+            # is the consumer's decision, and the consumer refuses -- it does not
+            # weaken it here.
+            "approval_policy": self._approval_policy,
+            "approval_resolver": self._approval_resolver,
+            "allowed_tool_ids": self._effective_tool_ids(),
+        }
+
+    def recovery_composition(self) -> Optional[Dict[str, Any]]:
+        """The values a ``RecoveryPlanner`` needs, or ``None`` when not composable."""
+
+        if self._idempotency_guard is None:
+            return None
+        return {
+            "run_store": self._run_store,
+            "idempotency_guard": self._idempotency_guard,
+            "declarations": dict(self._declarations),
+            "workspace": self._workspace,
+        }
+
+    def can_run_step_graph(self) -> bool:
+        """Whether a step-graph run is composed. Fail-closed default: ``False``.
+
+        Requires a composed run executor, an injected idempotency guard, **and a
+        stated approval policy**. A deployment with no approval position cannot run
+        step graphs, because the alternative is running declared host commands under
+        a policy nobody stated.
+        """
+
+        return (
+            self._approval_policy is not None
+            and self.step_graph_composition() is not None
+        )
+
+    def can_plan_recovery(self) -> bool:
+        return self.recovery_composition() is not None
+
+    def can_run_accept_cycle(self) -> bool:
+        """Whether the accept cycle could run at all.
+
+        Requires a harness and an acceptance spec for at least one declaration:
+        without trusted criteria nothing can legitimately be accepted.
+
+        It also requires a **stated approval policy**, for the same reason
+        ``can_run_declared_verification`` does. The accept cycle dispatches host
+        commands through the same chain and receives ``self._approval_policy``;
+        ``OperatingSurface.run_accepted_task`` refuses outright when it is ``None``
+        (a controlled configuration error, never a 409). Measured before this
+        requirement was added: with no policy composed, the flag reported ``True``
+        while ``POST /api/product/accept`` returned 500
+        ``approval_policy_required`` and nothing ran -- a capability signal that
+        disagreed with the behaviour it describes, which is the one thing this
+        surface may not do.
+        """
+
+        if getattr(self._runtime, "harness", None) is None:
+            return False
+        if self._approval_policy is None:
+            return False
+        return any(
+            declaration_id in self._acceptance_specs
+            for declaration_id in self._declarations
+        )
+
+    def can_run_declared_verification(self) -> bool:
+        """Whether a declared verification could actually execute anything.
+
+        Requires an operator declaration **and a stated approval policy**. The
+        policy requirement is not decoration: every dispatch passes
+        ``self._approval_policy`` into the execution chain, and a ``None`` policy is
+        an unconditional denial there. Reporting ``True`` on declarations alone told
+        an operator "declared verification is available" on a composition where
+        every single call was refused -- a capability flag that disagreed with the
+        behaviour it describes, which is exactly the kind of claim this surface is
+        not allowed to make.
+        """
+
+        return bool(self._declarations) and self._approval_policy is not None
+
     def get_run_record(self, run_id: str) -> Optional[Dict[str, object]]:
         """Return the durable history of a Run, or None when unknown.
 
@@ -567,6 +903,14 @@ class ForgeApiService:
         retries, or re-executes an interrupted Run, and never returns secrets or
         raw payloads: the stored history is already sanitized by the canonical
         event-metadata policy.
+
+        The response carries one added key, ``classification``, computed at read time by
+        `RunStore.classify_record`. It answers "what does this record actually prove",
+        which the raw `state`/`status` pair does not: a record claiming to be in progress
+        has no heartbeat, owner or lease, so it classifies as ``INDETERMINATE`` rather
+        than being reported as a live run. Every key `summary()` already returned is
+        unchanged, so an existing consumer keeps working; the added key is omitted
+        entirely rather than guessed when classification cannot be computed.
         """
         if not isinstance(run_id, str) or not run_id.strip():
             return None
@@ -577,7 +921,16 @@ class ForgeApiService:
             return None
         if record is None:
             return None
-        return record.summary()
+        summary = record.summary()
+        try:
+            classification = self._run_store.classify_record(run_id.strip())
+        except Exception:  # noqa: BLE001 - a read path must not fail on classification
+            # Classification is an addition, never a precondition: if it cannot be
+            # computed the record is still returned, without the key rather than with a
+            # fabricated verdict.
+            return summary
+        summary["classification"] = classification.to_dict()
+        return summary
 
     def get_health(self) -> HealthResponse:
         """Return basic liveness and Core connection status."""
@@ -1617,6 +1970,14 @@ class ForgeApiService:
         ``RunScope`` -> ``RunExecutor`` -> ``ExecutionCoordinator`` ->
         ``AuthorizedExecution`` -> ``LocalExecutionAdapter``. Approval remains
         the sole decision of the server-side ``ApprovalPolicy``.
+
+        No generative provider call is made. The decision this run executes is the
+        operator's declaration, which was resolved and validated above; a second,
+        model-produced decision would be billable, would be discarded, and would
+        wrongly gate an already-authorized command on a model's availability. The
+        ``RunExecutor`` is told the decision already exists, so it records that
+        fact and goes straight to host execution -- through the same ``RunScope``,
+        ``ApprovalPolicy``, ``ExecutionCoordinator``, and adapter as before.
         """
         if not self._declarations:
             raise ExecutionDeclarationError(
@@ -1708,6 +2069,20 @@ class ForgeApiService:
             execution_request_factory=_factory,
             approval_policy=self._approval_policy,
             approval_resolver=self._approval_resolver,
+            # The decision for this run already exists: it is the operator's
+            # declaration, resolved and validated above. Asking a model for a
+            # *second* decision would be a pointless, billable provider call whose
+            # output this entry point discards, and it would put a model in the
+            # position of gating an already-authorized declared command -- when
+            # that dispatch failed, the declared command silently did not run.
+            #
+            # `False` removes exactly that generative call. It removes no
+            # authorization: the frozen `RunScope`, this service's mandatory
+            # `ApprovalPolicy`, the execution coordinator (still the only component
+            # that may mint an authorized execution), and the local adapter all
+            # still run, and the declared command's real exit code is still the
+            # only thing that decides the reported state.
+            generate_decision=False,
         )
         duration = time.perf_counter() - t0
 
@@ -1889,23 +2264,70 @@ class ForgeApiService:
         success = (run.state == RunState.COMPLETED)
 
         last_att = run_acc.attempt_records[-1] if run_acc.attempt_records else None
-        provider_used = last_att.provider_name if last_att else ""
-        model_used = last_att.model_name if last_att else ""
+        # Provider attribution comes from the terminal `TaskResult`, which the dispatcher
+        # sets to the provider it returned. Taking it from the last recorded attempt
+        # instead was wrong whenever the run had no success at all: the dispatcher tries
+        # every candidate and then returns a failure naming the **preferred** provider
+        # (`TaskResult(provider=selected, ...)`), while the last attempt record names the
+        # last candidate it happened to try. Measured with the mock provider removed:
+        # `run.result.provider == 'openrouter'` but the last attempt was `'groq'`, so a
+        # failed run was attributed to a provider the dispatcher never held responsible.
+        #
+        # On success the two agree by construction -- the dispatcher returns immediately on
+        # the first success, so no attempt can follow a successful one -- which is why the
+        # divergence only shows up on failure. `attempt_records` remains the fallback for a
+        # run whose result is unavailable.
+        terminal = run.result
+        provider_used = (
+            (getattr(terminal, "provider", None) or "")
+            if terminal is not None
+            else (last_att.provider_name if last_att else "")
+        )
+        # `model_used` is a MODEL name, never a provider name. The dispatcher's
+        # exhaustion `TaskResult` carries `provider=selected` but no `model_name`,
+        # so falling back to `provider_used` reported `model_used == 'openrouter'`
+        # for a totally failed run -- a value that names a provider, not a model,
+        # and that a caller uses to attribute cost. The fallback order is now:
+        # the terminal result's real model name; then the last recorded attempt's
+        # real model name; then empty, because an unknown model is reported as
+        # unknown rather than invented.
+        terminal_model = (
+            getattr(terminal, "model_name", None) if terminal is not None else None
+        )
+        model_used = terminal_model or (
+            (last_att.model_name or "") if last_att is not None else ""
+        )
 
-        # Check events for result or errors
+        # The failure reason comes from `run.error`, which the executor sets on EVERY
+        # failure path. Events must not decide failure: a rejected *intermediate* attempt
+        # also emits `provider_result(success=False, error=...)`, so scanning events for an
+        # error reported a **successful** run as failed with a stale message ("provider is
+        # disabled by configuration") -- observed on a completed run whose output was the
+        # mock provider's response.
+        #
+        # `run.result` is not sufficient either, and this is the narrower half of the same
+        # mistake: the executor assigns it only *inside* the try block
+        # (`app/orchestrator/run.py`), while its generic `except` sets `run.error` alone.
+        # A provider that raises something `ProviderAgent` does not translate to
+        # `ProviderError` therefore leaves `run.result is None` with a populated
+        # `run.error`. Reading only `run.result.error` reported that run as
+        # `success=False, error=None`, i.e. a failure with the reason silently dropped.
+        if run.error is not None:
+            error = getattr(run.error, "message", None) or str(run.error)
+            success = False
+        elif run.result is not None and run.result.error:
+            error = run.result.error
+            success = False
+
+        # Events are consulted for the human-readable output only, never for failure.
         for ev in reversed(run.events):
             if ev.data.get("result"):
                 res_obj = ev.data.get("result")
                 output = getattr(res_obj, "output", "") or str(res_obj)
                 break
-            if ev.data.get("error"):
-                error = str(ev.data.get("error"))
 
-        if not output and run.result:
+        if not output and run.result is not None:
             output = run.result.output
-            if run.result.error:
-                error = run.result.error
-                success = False
 
         return TaskRunResponse(
             run_id=run_id,

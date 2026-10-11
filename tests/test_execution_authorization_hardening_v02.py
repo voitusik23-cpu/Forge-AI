@@ -263,7 +263,13 @@ class Category1IntentImmutabilityTests(unittest.TestCase):
             workspace_root=self.workspace,
             run_scope=_scope_for(
                 req_b, "run-1", ("python",), req_b.command, source_root=self.workspace
-            ),)
+            ),
+            # I1 is about intent binding, and the request already declares
+            # ``approval_required=True``. Without a stated policy the mandatory-policy
+            # guard would deny first and the fingerprint comparison under test would
+            # never be reached. The empty policy adds no requirement of its own.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(result_b.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
 
 
@@ -384,7 +390,12 @@ class Category3CapabilityModelTests(unittest.TestCase):
             run_id="v02-run-2",
             run_scope=_scope_for(
                 req, "v02-run-2", ("python",), req.command, source_root=Path(temp_dir.name).resolve()
-            ),)
+            ),
+            # F4 is about the capability classifier, not approval: a policy must be
+            # stated so the capability denial, not the missing-policy guard, is what
+            # refuses this request.
+            approval_policy=ApprovalPolicy(),
+            )
             self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
             self.assertIn(result.failure_reason, ("argv_not_authorized", "capability_denied"))
         finally:
@@ -412,7 +423,12 @@ class Category3CapabilityModelTests(unittest.TestCase):
             run_id="v02-run-3",
             run_scope=_scope_for(
                 req, "v02-run-3", (cmd_id,), req.command, source_root=Path(temp_dir.name).resolve()
-            ),)
+            ),
+            # I9 is about the explicit CommandIdentity bypassing the generic
+            # capability denial, not about approval: the empty policy requires
+            # approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
+            )
             self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         finally:
             temp_dir.cleanup()
@@ -518,7 +534,13 @@ class Category4ApprovalContractTests(unittest.TestCase):
             workspace_root=self.workspace,
             run_scope=_scope_for(
                 req, "run-reuse", ("python",), req.command, source_root=self.workspace
-            ),)
+            ),
+            # I7/I8 are about single-use consumption. The request declares
+            # ``approval_required=True``; a stated policy is mandatory now, so state
+            # the empty one, which adds no requirement of its own and lets the
+            # resolver's single-use behaviour be the thing under test.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(r1.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(backend.call_count, 1)
 
@@ -531,7 +553,9 @@ class Category4ApprovalContractTests(unittest.TestCase):
             workspace_root=self.workspace,
             run_scope=_scope_for(
                 req, "run-reuse", ("python",), req.command, source_root=self.workspace
-            ),)
+            ),
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(r2.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 1)
 
@@ -551,7 +575,12 @@ class Category5WorkspaceRootEnforcementTests(unittest.TestCase):
             run_id="v02-run-6",
             run_scope=_scope_for(
                 req, "v02-run-6", ("python",), req.command, source_root=None
-            ),)
+            ),
+            # F2 is about the mandatory workspace_root check, which runs after the
+            # approval layer: a policy must be stated or the missing-policy guard
+            # would deny first and this test would pass for the wrong reason.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertIn("workspace_root", result.failure_reason)
 
@@ -663,7 +692,12 @@ class Category6BackendAuthorityTests(unittest.TestCase):
             run_id="v02-run-10",
             run_scope=_scope_for(
                 req, "v02-run-10", ("python",), req.command, source_root=self.workspace
-            ),)
+            ),
+            # F5 is about the AuthorizedExecution token the coordinator mints, not
+            # about approval: the empty policy requires approval for nothing
+            # dispatched here.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(result.exit_code, 0)
 
@@ -726,7 +760,12 @@ class Category7PipelineInvariantsTests(unittest.TestCase):
             run_id="v02-run-12",
             run_scope=_scope_for(
                 req, "v02-run-12", ("python",), req.command, source_root=self.workspace
-            ),)
+            ),
+            # I2/I3: the request declares ``approval_required=True`` and the resolver
+            # holds nothing, so the empty policy still yields APPROVAL_WAITING. A
+            # stated policy is mandatory now, and this one adds no requirement.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
@@ -757,7 +796,11 @@ class Category7PipelineInvariantsTests(unittest.TestCase):
             workspace_root=self.workspace,
             run_scope=_scope_for(
                 req, "run-1", ("python",), req.command, source_root=self.workspace
-            ),)
+            ),
+            # The request declares ``approval_required=True`` and the resolver holds a
+            # REJECTED entry, so the empty policy still yields APPROVAL_REJECTED.
+            approval_policy=ApprovalPolicy(),
+        )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_REJECTED)
         self.assertEqual(backend.call_count, 0)
 

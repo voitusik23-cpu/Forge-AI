@@ -17,7 +17,9 @@ The roadmap is capability-based and has no promised release dates. The
 **CURRENT/FUTURE** markers used by the phase sections below are historical
 labels; where a phase section uses them, `CURRENT` means **DONE** and `FUTURE`
 means **FUTURE**. Verified per-area status lives in
-[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md).
+[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md); which components are actually reached
+from an entry point is recorded in
+[`COMPONENT-REGISTRY.md`](COMPONENT-REGISTRY.md).
 
 ## Phase 0 вЂ” Foundation
 
@@ -179,6 +181,8 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Multi-step loops, revision, and multi-agent execution in production: `EngineeringRunExecutor`, `RevisionLoopExecutor`, `MultiAgentExecutor`, and `ProviderReviewer` remain test/smoke machinery until a separate decision.
 - [x] Production criterion, verification, and acceptance slice: `AcceptanceSpec` declares operator-owned criteria next to the execution declaration, `bind()` freezes them per run into `RunAcceptanceCriteria`, `FrozenCriteriaVerifier` checks workspace facts deterministically, and the existing `AcceptanceGate` decides PASS/FAIL. `ForgeApiService.run_accepted_task(declaration_id)` records the criterion, verification, and acceptance lifecycle in the durable history. `EXECUTION_SUCCESS` is not task acceptance: a successful process with a failing criterion is rejected.
 - [x] **GAP-F closed for the harness entry points** — trusted task/criterion identity end to end on those paths: `TaskIdentity` and `CriterionIdentity` are derived server-side from the trusted `TaskSpecification` and the operator's `AcceptanceSpec`, and bound to one run by a frozen `RunCriterionBinding` whose fingerprints cover the criterion and its verification expectation. Verification proves run, task, ownership, and expectation identity before evaluating anything; an identity mismatch emits `VERIFICATION_IDENTITY_FAILED`, blocks verification entirely, and is a terminal trust failure rather than an actionable revision failure. `run_agent_loop` carries a real criterion identity whenever the operator declared an acceptance spec, so its verification observations are verdicts rather than `not_evaluated`. Criteria still come from operator composition only: a client-, plan-, tool-, or LLM-supplied criterion remains rejected.
+- [x] First end-to-end vertical workflow: `app/workflows/project_workflow.py` composes `AcceptanceSpec` + `Planner` + the approval boundary + `run_accepted_task` + `run_declared_verification` into `goal -> specification -> plan -> approval -> execution -> verification -> result`, with a specification readable before the action runs and a dedicated `ProjectWorkflowResult` carrying the acceptance verdict, the measured verification exit code, and a measured created/deleted file diff. `TaskRunResponse` is unchanged. Scope limit recorded in `SOURCE_OF_TRUTH.md` §3.5: the project in this slice is produced by an operator-declared `python` command, **not** by an LLM, so the slice proves the workflow and its verification machinery, not the quality of model-generated code.
+- [x] Model-driven project generation as the sibling source of the project text: `app/workflows/project_generation.py` parses one strict schema (`{"decision": ..., "files": {path: body}}`), validates the `decision` member through the existing fail-closed ladder, and refuses — before writing a byte — absolute paths, drive/UNC prefixes, `.`/`..` segments, backslashes, control characters, Windows device names, `.git`/`.forge`/`.env`, credential paths and directories (through the shared `app/execution/secret_files.py` recognizer), resolutions that escape the workspace root, collisions with existing files the operator did not explicitly permit overwriting, credential-shaped content, non-text bodies, and bodies over the size limits. `run_project_workflow(..., ai_provider=...)` dispatches the model through the existing `RunExecutor` -> `Orchestrator.dispatch` -> `ProviderAgent` -> `Provider.generate` path, reads the text from `TaskResult.output`, records provider identity and usage from `last_provider_name` / `last_model_name` / `last_usage` and the durable `RunStore` history, materialises the files, and then really executes the generated project's own tests as the declared verification command, reading the real exit code. `ProjectWorkflowResult` gained a top-level `verdict` and generation/materialisation fields; no existing field changed meaning. **No real provider call is made by this repository** and the verdict `REAL LLM PROJECT GENERATION VERIFIED` is unreachable here: `verdict_expected_with_real_provider` names it as the value a real call would have to earn. An opt-in real-provider test exists (`tests/test_project_generation_real_provider.py`) and **was never executed**. Limits recorded in `SOURCE_OF_TRUTH.md` §3.5.1 (filesystem boundary over text, not an OS sandbox; name-driven secret content check, not a classifier; per-file refusals; no intent-conformance check).
 - [ ] Route the remaining task entry points through the same identity binding: legacy `run_task`, the HTTP task-run path, and desktop task dispatch still carry no criterion identity and remain `not_evaluated`. Also let a run reach `COMPLETED` after a passing acceptance within its action budget.
 - [ ] Acceptance reporting through the public API contract: `TaskRunResponse.success` still means "the action ran and its verification passed", while the acceptance verdict is recorded as `acceptance_status` in the durable run record. Redefining the public `success` field (or exposing acceptance directly) is a contract decision.
 - [ ] `TaskSpecification`/task-driven verification binding: the API path still has no trusted server-side verification identity (no production `VerificationExpectation`, no production `TestVerificationIntent`, and `TaskRunRequest` carries no verification field). A client-controlled selector (`context`, description, `category`, or `task_id`) is explicitly rejected, so this must not be closed by inventing one. `run_task` therefore stays execution-disabled by default.
@@ -231,12 +235,14 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Subsystem status: run idempotency **PARTIAL**, resume **PARTIAL**, execution idempotency **PARTIAL**, tool idempotency **PARTIAL**, side-effect journal integration **NOT WIRED**, concurrency **PARTIAL**.
 - [ ] Durable, resumable task queues
 
-## Phase 7 вЂ” Forge Platform (frozen direction, not implemented)
+## Phase 7 — Forge Platform (direction frozen; partly implemented, rest not started)
 
 Architecture decisions `D-PLATFORM-01..12` are frozen in
-[`DECISIONS.md`](DECISIONS.md) and the Stage 0 gate is satisfied. **Nothing in this
-phase exists in the repository yet**; the entries below are direction, and none of
-them may be described in the present tense.
+[`DECISIONS.md`](DECISIONS.md) and the Stage 0 gate is satisfied. **Parts of this
+phase do exist**: Stage 0.1 durable telemetry, and Steps 1 to 4 of Stage 1 are
+implemented and verified (see the `[x]` rows below and
+[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §3.7). Everything still marked `[ ]` is
+direction and must not be described in the present tense.
 
 - [x] **Stage 0.1 вЂ” durable physical telemetry in Core.** Implemented. `PhysicalTelemetry`
   (`app/agent_runtime/physical_telemetry.py`) is the physical contract, and
@@ -268,8 +274,16 @@ them may be described in the present tense.
   - [x] Step 3 — persistence, repositories and Unit of Work, with the three scopes
     and error normalization. Design in
     [`STAGE-1-STEP-3-PERSISTENCE-DESIGN.md`](STAGE-1-STEP-3-PERSISTENCE-DESIGN.md).
-  - [ ] Steps 4+ — application services, HTTP API, authentication, and the rest of
-    the contract's implementation order. **Not started.**
+  - [x] Step 4 (design) — authentication and Application Services contracts, in
+    [`STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`](STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md).
+    Composed in `20412ed`.
+  - [x] Step 4 (first slice) — AS-1 discovery and AS-2 project listing over the
+    frozen scope, in `app/platform/application/`. Composed in `d1c007a`.
+  - [ ] Steps 4+ (remainder) — AS-3..AS-9, the HTTP API, the authentication
+    mechanism, the Platform -> Core transport, and the rest of the contract's
+    implementation order. **Not started.** Several of these depend on owner
+    decisions that are still open: see `SOURCE_OF_TRUTH.md` §3.6 and the open
+    decisions in [`DECISIONS.md`](DECISIONS.md).
 - [ ] **Stage 2 вЂ” Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` with
   version snapshots, `Wallet` with compare-and-swap, immutable
   `CreditTransaction` ledger, prepaid top-up.
@@ -483,6 +497,8 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Многошаговые loop, ревизии и multi-agent выполнение в production: `EngineeringRunExecutor`, `RevisionLoopExecutor`, `MultiAgentExecutor` и `ProviderReviewer` остаются test/smoke-машинерией до отдельного решения.
 - [x] Первый production-срез criterion, verification и acceptance: `AcceptanceSpec` объявляет критерии оператора рядом с execution-объявлением, `bind()` замораживает их per-run в `RunAcceptanceCriteria`, `FrozenCriteriaVerifier` детерминированно проверяет факты workspace, а решение PASS/FAIL выдаёт существующий `AcceptanceGate`. `ForgeApiService.run_accepted_task(declaration_id)` записывает жизненный цикл criterion, verification и acceptance в durable history. `EXECUTION_SUCCESS` — не task acceptance: успешный процесс с непройденным критерием отвергается.
 - [x] **GAP-F закрыт для harness-точек входа** — доверенная идентичность task/criterion end to end на этих путях: `TaskIdentity` и `CriterionIdentity` выводятся server-side из доверенного `TaskSpecification` и операторского `AcceptanceSpec` и привязываются к одному run через frozen `RunCriterionBinding`, fingerprint которого покрывает criterion и его verification expectation. Verification доказывает идентичность run, task, принадлежность и expectation до любой оценки; несовпадение идентичности полностью блокирует verification и не является actionable-сбоем revision. `run_agent_loop` несёт настоящую идентичность criterion всякий раз, когда оператор объявил acceptance spec, поэтому его наблюдения verification — вердикты, а не `not_evaluated`.
+- [x] Первый сквозной вертикальный workflow: `app/workflows/project_workflow.py` собирает `AcceptanceSpec` + `Planner` + границу approval + `run_accepted_task` + `run_declared_verification` в `goal -> specification -> plan -> approval -> execution -> verification -> result`, со спецификацией, читаемой до запуска действия, и отдельным `ProjectWorkflowResult`, несущим вердикт acceptance, измеренный код возврата верификации и измеренную разницу созданных/удалённых файлов. `TaskRunResponse` не изменён. Ограничение области зафиксировано в `SOURCE_OF_TRUTH.md` §3.5: проект в этом срезе создаётся объявленной оператором командой `python`, **а не** LLM, поэтому срез доказывает workflow и его механику верификации, а не качество кода, сгенерированного моделью.
+- [x] Генерация проекта моделью как родственный источник текста проекта: `app/workflows/project_generation.py` разбирает одну строгую схему (`{"decision": ..., "files": {path: body}}`), валидирует член `decision` через существующую fail-closed лестницу и — до записи байта — отклоняет абсолютные пути, префиксы диска/UNC, сегменты `.`/`..`, обратные слэши, управляющие символы, имена устройств Windows, `.git`/`.forge`/`.env`, credential-пути и каталоги (через общий распознаватель `app/execution/secret_files.py`), разрешения с выходом за корень workspace, конфликты с существующими файлами, которые оператор явно не разрешил перезаписывать, содержимое credential-формы, нетекстовые тела и тела сверх ограничений размера. `run_project_workflow(..., ai_provider=...)` диспетчеризует модель через существующий путь `RunExecutor` -> `Orchestrator.dispatch` -> `ProviderAgent` -> `Provider.generate`, читает текст из `TaskResult.output`, записывает идентичность провайдера и usage из `last_provider_name` / `last_model_name` / `last_usage` и durable-историю `RunStore`, материализует файлы и затем действительно выполняет собственные тесты сгенерированного проекта как объявленную команду верификации, считывая реальный код возврата. `ProjectWorkflowResult` получил верхнеуровневый `verdict` и поля генерации/материализации; смысл ни одного существующего поля не изменился. **Ни одного реального вызова провайдера этим репозиторием не делается**, и вердикт `REAL LLM PROJECT GENERATION VERIFIED` здесь недостижим: `verdict_expected_with_real_provider` называет его как значение, которое должен заслужить реальный вызов. Opt-in тест реального провайдера существует (`tests/test_project_generation_real_provider.py`) и **никогда не выполнялся**. Ограничения зафиксированы в `SOURCE_OF_TRUTH.md` §3.5.1 (файловая граница по тексту, а не OS-песочница; проверка содержимого по именам, а не классификатор; отказы по каждому файлу; проверки соответствия намерению нет).
 - [ ] Перевести остальные task-точки входа на ту же привязку идентичности: legacy `run_task`, HTTP-путь task run и desktop dispatch по-прежнему не несут идентичности criterion и остаются `not_evaluated`. Также позволить run достигать `COMPLETED` после пройденного acceptance в пределах бюджета действий.
 - [ ] Отчётность acceptance через публичный контракт API: `TaskRunResponse.success` по-прежнему означает «действие выполнилось, и его verification прошёл», а вердикт acceptance записывается как `acceptance_status` в durable run record. Переопределение публичного поля `success` (или прямой экспорт acceptance) — решение о контракте.
 - [ ] Привязка verification к `TaskSpecification`/задаче: в API-пути по-прежнему нет доверенной server-side verification-идентичности (нет production `VerificationExpectation`, нет production `TestVerificationIntent`, а `TaskRunRequest` не несёт verification-поля). Управляемый клиентом селектор (`context`, description, `category` или `task_id`) явно отвергнут, поэтому закрывать пункт выдумыванием такого селектора нельзя. `run_task` поэтому остаётся execution-disabled по умолчанию.
@@ -535,12 +551,14 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Статус подсистемы: run idempotency **PARTIAL**, resume **PARTIAL**, execution idempotency **PARTIAL**, tool idempotency **PARTIAL**, интеграция журнала side effects **NOT WIRED**, concurrency **PARTIAL**.
 - [ ] Долговременные возобновляемые очереди задач
 
-## Фаза 7 — Forge Platform (направление заморожено, не реализовано)
+## Фаза 7 — Forge Platform (направление заморожено; часть реализована, остальное не начато)
 
 Архитектурные решения `D-PLATFORM-01..12` заморожены в
-[`DECISIONS.md`](DECISIONS.md), и gate Stage 0 выполнен. **Ничего из этой фазы
-в репозитории пока не существует**; пункты ниже — это направление, и ни один
-из них нельзя описывать в настоящем времени.
+[`DECISIONS.md`](DECISIONS.md), и gate Stage 0 выполнен. **Часть этой фазы
+существует**: durable physical telemetry Stage 0.1, а шаги 1–4 Stage 1 реализованы
+и проверены (см. строки `[x]` ниже и
+[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §3.7). Всё, что по-прежнему помечено
+`[ ]`, — это направление, и это нельзя описывать в настоящем времени.
 
 - [x] **Stage 0.1 — durable physical telemetry в Core.** Реализовано. `PhysicalTelemetry`
   (`app/agent_runtime/physical_telemetry.py`) — физический контракт, а `FileTelemetrySink` —
@@ -574,8 +592,15 @@ workflow review/ревизии. Выполнение плана, управле�
   - [x] Шаг 3 — персистентность, репозитории и Unit of Work с тремя скоупами и
     нормализацией ошибок. Дизайн в
     [`STAGE-1-STEP-3-PERSISTENCE-DESIGN.md`](STAGE-1-STEP-3-PERSISTENCE-DESIGN.md).
-  - [ ] Шаги 4+ — прикладные сервисы, HTTP API, аутентификация и остальная часть
-    порядка реализации из контракта. **Не начато.**
+  - [x] Шаг 4 (дизайн) — контракты аутентификации и Application Services, в
+    [`STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md`](STAGE-1-STEP-4-AUTH-APPLICATION-SERVICES-DESIGN.md).
+    Скомпонован в `20412ed`.
+  - [x] Шаг 4 (первый срез) — AS-1 discovery и AS-2 листинг проектов в рамках
+    замороженного scope, в `app/platform/application/`. Скомпонован в `d1c007a`.
+  - [ ] Шаги 4+ (остаток) — AS-3..AS-9, HTTP API, механизм аутентификации,
+    транспорт Platform -> Core и остальная часть порядка реализации из контракта.
+    **Не начато.** Часть из них зависит от ещё открытых решений владельца: см.
+    `SOURCE_OF_TRUTH.md` §3.7 и открытые решения в [`DECISIONS.md`](DECISIONS.md).
 - [ ] **Stage 2 — Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` со снимками
   версий, `Wallet` с compare-and-swap, неизменяемый ledger `CreditTransaction`,
   prepaid top-up.

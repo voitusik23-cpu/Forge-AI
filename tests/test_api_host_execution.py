@@ -313,14 +313,14 @@ class HostExecutionDenialTests(HostExecutionTestCase):
         )
 
     def test_workspace_mismatch_is_denied(self) -> None:
-        """E: a different execution root is refused.
+        """E: a different execution root is refused, and the refusal names the condition.
 
-        The default adapter isolates the workspace and runs in an ephemeral
-        scratch directory, which is why the coordinator skips the scope's
-        workspace-root check for it (the isolation is enforced by
-        EphemeralWorkspaceManager plus the Workspace boundary on the scratch
-        root instead). This test uses the non-isolating adapter, where the scope
-        root IS the execution root, so the mismatch must be denied.
+        The scope root IS the execution root here, so the mismatch must be denied. The
+        reason is ``workspace_root_mismatch`` rather than the general
+        ``run_scope_violation``: the coordinator now checks the frozen workspace root
+        unconditionally, including for an isolating adapter, and a workspace-root refusal
+        is reported as one so an operator can tell it apart from an ordinary perimeter
+        violation.
         """
         service = self._service(
             allowed_execution_commands=frozenset({SAFE_EXECUTABLE}),
@@ -343,7 +343,7 @@ class HostExecutionDenialTests(HostExecutionTestCase):
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertEqual(
-            result.metadata.get("denial_reason"), "run_scope_violation"
+            result.metadata.get("denial_reason"), "workspace_root_mismatch"
         )
 
     def test_isolated_adapter_runs_in_a_scratch_workspace(self) -> None:

@@ -126,13 +126,17 @@ class ExecutionCoordinator:
                 )
             try:
                 scope = require_active_scope(resolved, run_scope)
-                # An adapter that runs inside an ephemeral, adapter-managed
-                # workspace executes in a private scratch directory, so the
-                # execution root is not a scope-checkable property there. That
-                # isolation is enforced by EphemeralWorkspaceManager plus the
-                # Workspace boundary on the scratch root, independently.
-                if not bool(getattr(self._adapter, "_isolate_workspace", False)):
-                    scope.validate_workspace_root(workspace_root)
+                # The frozen workspace root is checked **unconditionally**. An adapter
+                # that isolates its runs copies the caller-supplied root into a private
+                # scratch directory, and that copy is contained by
+                # EphemeralWorkspaceManager plus the Workspace boundary on the scratch
+                # root -- but isolation says nothing about *which* root was supplied.
+                # Skipping the comparison when the adapter isolates therefore let a
+                # caller name a workspace other than the frozen one and have it copied,
+                # which is the one check tying the executed tree to the frozen
+                # perimeter. The comparison is now independent of the adapter's private
+                # `_isolate_workspace` flag.
+                scope.validate_workspace_root(workspace_root)
                 # validate_execution_request checks the command as a full identity,
                 # which preserves a pinned argv. Re-checking only the bare
                 # executable here would drop that pinning and reject a legitimate
@@ -147,13 +151,30 @@ class ExecutionCoordinator:
                 if allowed_commands is not None:
                     scope.validate_command_set(allowed_commands)
             except RunScopeError as exc:
+                # A workspace-root refusal is reported as one, not folded into the
+                # general scope violation. The reason string is what an operator and a
+                # test read, and "run_scope_violation" does not say that the executed
+                # tree and the frozen perimeter disagreed -- which is exactly the
+                # condition worth naming.
+                if "workspace root" in str(exc):
+                    # The reason keeps the literal ``workspace_root`` token: operators
+                    # and the existing hardening tests match on it, and renaming it would
+                    # break a tested contract for no gain.
+                    reason = "workspace_root_mismatch"
+                    message = (
+                        "Execution denied: workspace_root does not match the frozen "
+                        "run scope"
+                    )
+                else:
+                    reason = "run_scope_violation"
+                    message = f"Execution denied by run scope: {exc}"
                 return self._deny(
                     request=request,
                     run_id=resolved,
                     profile_id=profile_id,
                     outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
-                    reason="run_scope_violation",
-                    message=f"Execution denied by run scope: {exc}",
+                    reason=reason,
+                    message=message,
                     observer=observer,
                 )
             run_id = resolved
@@ -239,8 +260,39 @@ class ExecutionCoordinator:
             )
 
         # 4. Approval check
+        #
+        # A MISSING POLICY IS A DENIAL, NOT A PERMISSION. This guard used to read
+        # ``not needs_approval and approval_policy is not None and request.command``,
+        # which SKIPPED the whole approval layer when no policy was composed: a
+        # ``None`` policy therefore meant "no approval required" here. That directly
+        # contradicted ``RunExecutor``, which treats ``None`` as an unconditional
+        # denial (``approval_policy_required``), and the permissive reading won on
+        # every path that reached this coordinator without going through
+        # ``RunExecutor`` -- the accept route among them, where the declared host
+        # command really ran.
+        #
+        # There is one meaning now: a policy that does not exist cannot authorise
+        # anything, so the dispatch is denied before the adapter is reached. This
+        # makes the authorizer agree with ``RunExecutor`` and with
+        # ``_validate_step_graph_ingredients`` in the fail-closed direction. It is
+        # deliberately NOT resolved the other way: "no policy" must never come to
+        # mean "approval unnecessary".
+        if approval_policy is None:
+            return self._deny(
+                request=request,
+                run_id=run_id,
+                profile_id=profile_id,
+                outcome_status=ExecutionOutcomeStatus.POLICY_DENIED,
+                reason="approval_policy_required",
+                message=(
+                    "Execution denied: no ApprovalPolicy was supplied, so this "
+                    "dispatch cannot establish what approval it requires"
+                ),
+                observer=observer,
+            )
+
         needs_approval = bool(request.approval_required)
-        if not needs_approval and approval_policy is not None and request.command:
+        if not needs_approval and request.command:
             try:
                 identity = command_identity(request.command)
             except ValueError:

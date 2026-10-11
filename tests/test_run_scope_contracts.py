@@ -33,6 +33,7 @@ from app.runtime.run_scope import (
     require_active_scope,
 )
 from app.tools.acceptance import AcceptanceCriterion
+from app.tools.approval import ApprovalPolicy
 from app.tools.workspace import Workspace
 
 CRITERION = AcceptanceCriterion(criterion_id="crit-1", description="acceptance")
@@ -246,6 +247,11 @@ class CaseNGatingTest(RunScopeContractTestCase):
             run_id="run-case-n",
             allowed_commands=frozenset({identity}),
             run_scope=scope,
+            # Case N is about the perimeter admitting an in-scope command, not about
+            # approval. A stated policy is mandatory in the coordinator, so state the
+            # empty one: it requires approval for nothing dispatched here, which is
+            # what the unstated ``None`` used to mean.
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(
             result.outcome_status,

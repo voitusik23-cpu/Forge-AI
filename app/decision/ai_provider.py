@@ -40,6 +40,22 @@ from app.decision.validator import (
 from app.projects.state import ProjectState
 
 
+def strip_code_fence(output_text: str) -> str:
+    """Remove one surrounding markdown code fence from model output.
+
+    Module-level and public because two callers need the *same* unpacking: this
+    provider's validation ladder, and the generation stage that validates a whole
+    model-produced project. Two copies of this rule would drift, and a difference
+    in fence handling is a difference in what counts as valid model output.
+    """
+    cleaned = output_text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            cleaned = "\n".join(lines[1:-1]).strip()
+    return cleaned
+
+
 class AIDecisionProvider:
     """Advisory, bounded AI Decision Provider coordinating with the Decision Layer.
 
@@ -58,19 +74,73 @@ class AIDecisionProvider:
             | None
         ) = None,
         strict_validation: bool = False,
+        mock_transport: bool = False,
     ) -> None:
         self._provider = provider or OpenAIProvider()
         self._model_name = model_name or self._provider.model_name
         self._validator = validator or validate_decision
         self._strict_validation = strict_validation
+        # Whether the composed transport is an injected/mock one. It grants
+        # nothing and changes no behaviour; it travels with the provider so a
+        # caller can record *from data* that the text was not produced by a real
+        # remote model. Defaulting to False is the honest default: this class
+        # does not decide what its provider is, so a caller that composes a mock
+        # must say so.
+        self.mock_transport = bool(mock_transport)
         self.last_validation_report: DecisionValidationReport | None = None
         # Physical measurement of the most recent provider call. It is recorded
         # so the run loop can measure the attempt; it carries no authority and no
         # money. It stays ``None`` when no provider call produced a response, and
         # a missing measurement is never replaced with a guessed value.
+        #
+        # These three fields describe **the attempt**, not a producer: they are set
+        # as soon as a response arrives, *before* the reply is judged, so a caller
+        # can measure a call that produced nothing usable. Reading them directly
+        # therefore does NOT prove that a model answered. Use the
+        # ``producer_*`` properties below for that question; they withhold the
+        # identity unless the reply really produced a validated decision.
         self.last_usage: Usage | None = None
         self.last_provider_name: str = ""
         self.last_model_name: str = ""
+        #: Whether the most recent reply produced a usable decision. It is the gate
+        #: the ``producer_*`` properties below read, so "a call happened" and "a
+        #: model answered" can never be conflated.
+        self.last_response_produced_a_decision: bool = False
+
+    @property
+    def producer_provider_name(self) -> str:
+        """The provider that produced a decision, or ``""`` when none did.
+
+        ``last_provider_name`` is set as soon as a response arrives, so it names a
+        transport even for a reply that was rejected as empty or malformed. This
+        property answers the different, narrower question a report must ask before
+        attributing a result to a model: did a reply actually become a decision?
+        """
+
+        if not self.last_response_produced_a_decision:
+            return ""
+        return self.last_provider_name
+
+    @property
+    def producer_model_name(self) -> str:
+        """The model that produced a decision, or ``""`` when none did."""
+
+        if not self.last_response_produced_a_decision:
+            return ""
+        return self.last_model_name
+
+    @property
+    def producer_usage(self) -> Usage | None:
+        """The measurement of the call that produced a decision, or ``None``.
+
+        A rejected reply has no decision to measure, so no usage is attributable to
+        it: a caller cannot add an attempt's tokens to a project that was never
+        produced.
+        """
+
+        if not self.last_response_produced_a_decision:
+            return None
+        return self.last_usage
 
     @property
     def provider_name(self) -> str:
@@ -173,6 +243,76 @@ class AIDecisionProvider:
 
         return "\n".join(lines)
 
+    def build_generation_prompt(self, task_specification: Any, acceptance_criteria: Any) -> str:
+        """Construct the deterministic prompt that asks for a whole project.
+
+        Additive sibling of :meth:`build_prompt`; that method is unchanged. Like
+        it, this composes a prompt and nothing else: it reads no file, runs no
+        command, and returns no decision.
+
+        ``task_specification`` and ``acceptance_criteria`` are the operator's own
+        objects (a ``TaskSpecification`` and its ``AcceptanceCriterion`` tuple).
+        They are rendered as inert text. Text a model produces from this prompt
+        remains data: it is parsed, validated, and path-checked before any byte
+        reaches a disk, and it carries no execution authority at any point.
+        """
+        requirements = tuple(getattr(task_specification, "requirements", ()) or ())
+        criterion_items = tuple(acceptance_criteria or ())
+
+        lines = [
+            "ROLE: You are a Forge AI project author.",
+            "GOAL: Produce a complete, self-contained, runnable software project "
+            "that satisfies the acceptance criteria below.",
+            "AUTHORITY: You have NONE. You cannot execute commands, choose paths, "
+            "grant approval, or widen any perimeter. Every path you name is "
+            "validated before anything is written.",
+            "SAFETY: Never emit private keys, access keys, sign-in values, or "
+            "environment files holding them. If a settings template is needed, "
+            'name it with an ".example" suffix.',
+            "",
+            f"TITLE: {getattr(task_specification, 'title', '') or ''}",
+            f"DESCRIPTION: {getattr(task_specification, 'description', '') or ''}",
+        ]
+        if requirements:
+            rendered = []
+            for requirement in requirements:
+                rendered.append(
+                    "- "
+                    f"{getattr(requirement, 'requirement_id', '')}: "
+                    f"{getattr(requirement, 'description', '')}"
+                )
+            lines.append("REQUIREMENTS:")
+            lines.extend(rendered)
+        if criterion_items:
+            lines.append("ACCEPTANCE CRITERIA (each must hold in the produced project):")
+            for criterion in criterion_items:
+                lines.append(
+                    f"- {getattr(criterion, 'criterion_id', '')}: "
+                    f"{getattr(criterion, 'description', '')}"
+                )
+        lines.extend([
+            "",
+            "OUTPUT SCHEMA RULES:",
+            '- Respond with ONE JSON object shaped exactly as:',
+            '  {"decision": {"decision_type": "...", "action": "...", '
+            '"reason_code": "...", "rationale": "...", "confidence": 1.0}, '
+            '"files": {"<relative/posix/path>": "<entire file body>"}}',
+            "- decision.decision_type MUST be one of: CONTINUE, VERIFY, REVISE, "
+            "REQUEST_APPROVAL, WAIT, FAIL, COMPLETE",
+            "- decision.action MUST be one of: EXECUTE, RUN_VERIFICATION, "
+            "REQUEST_REVISION, REQUEST_USER_APPROVAL, WAIT_FOR_APPROVAL, "
+            "COMPLETE_RUN, FAIL_RUN",
+            '- every key of "files" MUST be a relative path using "/" separators; '
+            'absolute paths and ".." segments are refused',
+            "- every file body MUST be text, and SHOULD be valid UTF-8",
+            "- keep every file small; a single response is bounded in size",
+            "",
+            "OUTPUT FORMAT:",
+            "Respond ONLY with that single JSON object. Do not include markdown "
+            "code fences, backticks, or any conversational text.",
+        ])
+        return "\n".join(lines)
+
     def decide(self, request: DecisionRequest) -> Decision:
         """Query the model provider and return a strictly validated Decision recommendation.
 
@@ -186,6 +326,7 @@ class AIDecisionProvider:
         self.last_usage = None
         self.last_provider_name = ""
         self.last_model_name = ""
+        self.last_response_produced_a_decision = False
 
         try:
             provider_res = self._provider.generate(provider_req)
@@ -205,19 +346,63 @@ class AIDecisionProvider:
             getattr(provider_res, "model_name", "") or self.model_name
         )
 
-        output_text = getattr(provider_res, "output", "")
-        if not isinstance(output_text, str) or not output_text.strip():
+        return self._decide_from_text(
+            request, getattr(provider_res, "output", ""), in_process_call=True
+        )
+
+    @staticmethod
+    def _has_usable_text(output_text: Any) -> bool:
+        return isinstance(output_text, str) and bool(output_text.strip())
+
+    def decide_from_output(
+        self, request: DecisionRequest, output_text: Any
+    ) -> Decision:
+        """Validate an **already produced** model output as a Decision.
+
+        Additive sibling of :meth:`decide` for a caller that obtained the model
+        text through a different, existing route (for example a dispatched task
+        whose ``TaskResult.output`` carries it) and must not spend a second
+        provider call to have it validated.
+
+        It applies the *same* fail-closed ladder as :meth:`decide` --
+        ``empty_model_output``, ``malformed_json``, ``malformed_model_output``,
+        ``missing_decision_fields``, ``unknown_decision_type``, ``unknown_action``
+        -- and it does not touch the measurement fields (``last_usage``,
+        ``last_provider_name``, ``last_model_name``), which belong to whatever
+        call really happened, except in the one case where the supplied output is
+        empty: then there is no measurement to report and the fields are cleared,
+        so a caller cannot read a stale identity.
+
+        It still has zero execution authority: the returned ``Decision`` is a
+        recommendation and nothing in this module acts on it.
+        """
+        return self._decide_from_text(request, output_text, in_process_call=False)
+
+    def _decide_from_text(
+        self, request: DecisionRequest, output_text: Any, *, in_process_call: bool
+    ) -> Decision:
+        """The single fail-closed validation ladder shared by both entry points.
+
+        ``in_process_call`` says whether this validation is consuming the output of
+        a provider call this object just made. It matters only for the empty-output
+        case: when a caller supplies empty text there is no measurement belonging
+        to it, so the fields are cleared rather than left describing an earlier
+        call.
+        """
+        if not self._has_usable_text(output_text):
+            if not in_process_call:
+                self.last_usage = None
+                self.last_provider_name = ""
+                self.last_model_name = ""
+            # No reply produced a decision, so none may be attributed to a model.
+            self.last_response_produced_a_decision = False
             return self._fail_closed_decision(
                 request=request,
                 reason_code="empty_model_output",
                 rationale="Model provider returned empty response",
             )
 
-        cleaned = output_text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if len(lines) >= 2 and lines[-1].strip().startswith("```"):
-                cleaned = "\n".join(lines[1:-1]).strip()
+        cleaned = strip_code_fence(output_text)
 
         try:
             parsed = json.loads(cleaned)
@@ -307,7 +492,15 @@ class AIDecisionProvider:
                 validation_errors=val_report.errors,
             )
 
+        # A validated decision was really produced, so -- and only now -- the reply
+        # may be attributed to the provider/model that answered.
+        self.last_response_produced_a_decision = True
         return decision
+
+    @staticmethod
+    def _strip_code_fence(output_text: str) -> str:
+        """Backward-compatible alias for the module-level :func:`strip_code_fence`."""
+        return strip_code_fence(output_text)
 
     def _fail_closed_decision(
         self,
@@ -318,6 +511,10 @@ class AIDecisionProvider:
         error_type: str | None = None,
         validation_errors: tuple[str, ...] = (),
     ) -> Decision:
+        # Every fail-closed reply is, by construction, one that produced no
+        # decision, so no caller may attribute it to a model. Setting the gate here
+        # covers every reason code on the ladder in one place.
+        self.last_response_produced_a_decision = False
         refs: dict[str, object] = {
             "source": "ai_decision_provider",
             "provider_name": self.provider_name,

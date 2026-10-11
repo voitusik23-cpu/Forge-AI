@@ -400,5 +400,71 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("Macro Totals", md)
 
 
+class DashboardObservesApiRunsTests(unittest.TestCase):
+    """A run driven through the API service becomes visible to the Dashboard.
+
+    Before the fabric was shared, `CostDashboardService.get_run_records()` read a fabric
+    the dispatcher never recorded into, so the Dashboard reported no runs at all no matter
+    how many had executed. The assertion is on the Dashboard's own read path, not on the
+    dispatcher's internals, so it fails if the two objects drift apart again.
+    """
+
+    def _service(self):
+        from app.api.service import ForgeApiService
+        from app.config.settings import RuntimeSettings
+        from app.fabric.fabric import CapabilityFabric
+        from app.runtime.bootstrap import create_runtime
+
+        fabric = CapabilityFabric()
+        runtime = create_runtime(
+            settings=RuntimeSettings(
+                default_provider="mock",
+                enabled_providers=("mock",),
+                provider_fallback_chain=(),
+            ),
+            fabric=fabric,
+        )
+        return ForgeApiService(runtime=runtime, fabric=fabric)
+
+    def test_01_a_run_reaches_the_dashboard_with_its_attempts(self) -> None:
+        from app.api.models import TaskRunRequest
+
+        service = self._service()
+        response = service.run_task(TaskRunRequest(description="dashboard probe"))
+        self.assertTrue(response.success)
+
+        dashboard = CostDashboardService(fabric=service.fabric)
+        records = dashboard.get_run_records()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertGreaterEqual(record.total_attempts, 1)
+        self.assertEqual(record.attempt_records[-1].provider_name, response.provider_used)
+
+        report = dashboard.get_report()
+        providers = {entry.provider for entry in report.providers}
+        self.assertIn("mock", providers)
+
+    def test_02_the_dashboard_does_not_invent_records_it_did_not_receive(self) -> None:
+        """A Dashboard over a fresh fabric still reports nothing."""
+
+        dashboard = CostDashboardService(fabric=CapabilityFabric())
+        self.assertEqual(dashboard.get_run_records(), [])
+
+    def test_03_the_service_built_runtime_records_into_the_dashboard_fabric(self) -> None:
+        """The production construction path, with no fabric handed in by the caller.
+
+        `test_01` supplies the fabric explicitly, so it also passes on the pre-fix code.
+        Here nothing is injected and the service must reach the same object on its own --
+        which is what makes the Dashboard see real runs in the shipped configuration.
+        """
+
+        from app.api.service import ForgeApiService
+
+        service = ForgeApiService()
+        dispatcher_fabric = service.runtime.orchestrator._dispatcher._fabric
+        self.assertIs(dispatcher_fabric, service.fabric)
+        self.assertIs(service.dashboard_service._fabric, service.fabric)
+
+
 if __name__ == "__main__":
     unittest.main()

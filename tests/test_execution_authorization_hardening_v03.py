@@ -233,6 +233,18 @@ class ExecutionAuthorizationHardeningBlock1Tests(unittest.TestCase):
             workspace_root=self.workspace_root,
             run_id="run-appr-1",
             allowed_commands=frozenset({sys.executable}),
+            # A POLICY IS NOW MANDATORY, so the subject of this test -- the strict
+            # approval fingerprint check -- requires one to be stated. It previously
+            # relied on the coordinator's permissive reading of ``None`` ("no policy
+            # means no approval needed"). That reading was the Block #8 defect: it
+            # contradicted ``RunExecutor``, which denies ``None`` outright, and the
+            # permissive one won on every path that reached the coordinator directly.
+            # The policy is stated here at the strength the request already declares
+            # (``approval_required=True``), so nothing about the fingerprint check is
+            # relaxed; the request simply no longer arrives through a hole.
+            approval_policy=ApprovalPolicy(
+                approval_required_tools=(sys.executable,)
+            ),
             approval_resolver=resolver,
             run_scope=scope,
         )
@@ -262,6 +274,13 @@ class ExecutionAuthorizationHardeningBlock1Tests(unittest.TestCase):
             workspace_root=self.workspace_root,
             run_id="run-appr-2",
             allowed_commands=frozenset({sys.executable}),
+            # Stated for the same reason as ``run-appr-1``: a missing policy is now an
+            # unconditional denial, so the fingerprint check can only be reached with a
+            # policy in hand. The policy is stated at the request's own declared
+            # strength, so this test still measures the mismatch it is named for.
+            approval_policy=ApprovalPolicy(
+                approval_required_tools=(sys.executable,)
+            ),
             approval_resolver=resolver,
             run_scope=scope,
         )
@@ -297,6 +316,11 @@ class ExecutionAuthorizationHardeningBlock1Tests(unittest.TestCase):
             workspace_root=self.workspace_root,
             run_id="run-appr-3",
             allowed_commands=frozenset({sys.executable}),
+            # Stated so the granted approval is actually reachable: with no policy the
+            # coordinator denies before it ever compares fingerprints.
+            approval_policy=ApprovalPolicy(
+                approval_required_tools=(sys.executable,)
+            ),
             approval_resolver=resolver,
             run_scope=scope,
         )
@@ -305,6 +329,23 @@ class ExecutionAuthorizationHardeningBlock1Tests(unittest.TestCase):
         self.assertEqual(self.backend.call_count, 1)
 
     def test_12_no_approval_required_flow_remains_valid(self) -> None:
+        """The unapproved legitimate flow is still valid -- WITH a stated policy.
+
+        ``None`` NO LONGER MEANS "NO APPROVAL REQUIRED". It is an unconditional denial
+        in both ``ExecutionCoordinator`` and ``RunExecutor``, because the previous
+        disagreement between the two was the Block #8 defect: the coordinator skipped
+        approval entirely when no policy was composed, so the permissive reading won
+        on every path that reached it directly, and a declared host command really ran
+        with no policy in force.
+
+        The property this test is named for is unchanged and is still checked: a
+        policy that answers NOT_REQUIRED lets a request that declares
+        ``approval_required=False`` execute. What changed is that the flow now needs
+        the policy to be *stated* rather than assumed from its absence -- which is the
+        whole point of the fix. Nothing is relaxed: ``ApprovalPolicy()`` is the default
+        and requires approval for no tool, so the execution below is authorised by an
+        explicit declaration instead of by a missing one.
+        """
         profile = ProjectExecutionProfile(
             profile_id="p-no-appr",
             allowed_commands=(sys.executable,),
@@ -321,6 +362,7 @@ class ExecutionAuthorizationHardeningBlock1Tests(unittest.TestCase):
             workspace_root=self.workspace_root,
             run_id="run-no-appr",
             allowed_commands=frozenset({sys.executable}),
+            approval_policy=ApprovalPolicy(),
             approval_resolver=None,
             run_scope=scope,
         )

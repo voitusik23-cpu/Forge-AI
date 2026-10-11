@@ -63,7 +63,12 @@ class ProjectExecutionProfile:
     target_os: TargetOS = TargetOS.ANY
     working_directory: str = "."
     allowed_commands: tuple[str, ...] = ()
-    environment_variables: Mapping[str, str] = field(default_factory=dict)
+    # repr=False because this mapping holds the *values* a declared command may receive,
+    # and a deployment that authorizes a real credential declares it here. A profile is
+    # embedded in a run scope whose authority payload may be logged or returned; without
+    # this, an ordinary repr or traceback would print the secret. Use
+    # ``to_context_dict()`` for anything that reaches a prompt or an event.
+    environment_variables: Mapping[str, str] = field(default_factory=dict, repr=False)
     timeout_seconds: float = 30.0
     max_output_bytes: int = 1048576  # 1 MB
     network_access: bool = False
@@ -186,3 +191,31 @@ class ProjectExecutionProfile:
                 c.value if hasattr(c, "value") else str(c) for c in self.capabilities
             ),
         }
+
+    def to_context_dict(self) -> dict[str, object]:
+        """Serializable representation **safe to place in a model prompt or an event**.
+
+        The profile is an authority artifact: ``environment_variables`` is where a
+        deployment declares the values a *declared command* may receive, and a declaration
+        is admitted only when it matches those values exactly
+        (``app/execution/declaration.py``). A profile carrying a deploy token therefore
+        carries a real credential in that mapping.
+
+        ``to_dict()`` includes those values because it is the authority view: the run
+        scope fingerprints the profile and the policy compares requested values against
+        it. That view must never be handed to a model provider, and the engineering run
+        and task-specification paths did exactly that -- they placed
+        ``execution_profile.to_dict()`` into ``task.context``, which every provider
+        appends to its prompt as JSON. A probe confirmed a credential declared on the
+        profile appearing verbatim in the outbound request.
+
+        This projection keeps every field a prompt legitimately needs and replaces the
+        environment mapping with its **key names only**. Names describe what the run is
+        allowed to be given; values are what must not leave the process.
+        """
+
+        data = self.to_dict()
+        data["environment_variables"] = {
+            str(key): "<redacted>" for key in self.environment_variables
+        }
+        return data

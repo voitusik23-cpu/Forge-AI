@@ -493,6 +493,11 @@ class TestEngineeringExecutionIntegration(unittest.TestCase):
             run_id=self.run_id,
             allowed_commands=(sys.executable, self.cmd_verif),
             run_scope=self.scope,
+            # The subject is verification/execution linkage, not approval: the empty
+            # policy requires approval for nothing dispatched here, which is what the
+            # unstated ``None`` used to mean. The assertions below require a real
+            # EXECUTION_SUCCESS, so a policy must be stated.
+            approval_policy=ApprovalPolicy(),
         )
 
         evidence = create_execution_verification_evidence("crit-exec", exec_res)

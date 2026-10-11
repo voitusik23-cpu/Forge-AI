@@ -323,6 +323,10 @@ class Dispatcher:
         if provider_name is not None:
             attempts = [selected]
         elif cost_aware:
+            # The policy's candidates are authoritative and keep their order. The
+            # configured default provider is appended by `_with_default_provider` below,
+            # because it is the provider this deployment asked to run and a policy
+            # preference list is not a reason to ignore that.
             attempts = list(decision.candidates)
         else:
             attempts = [selected] if selected is not None else []
@@ -335,6 +339,7 @@ class Dispatcher:
                     for name in self._fallback_chain
                     if name != selected and name not in attempts
                 )
+            attempts = self._with_default_provider(attempts, task)
 
         if (
             allow_fallback
@@ -592,6 +597,49 @@ class Dispatcher:
                 is_fallback=(attempt > 1),
             )
             self._fabric.record_usage(run_id, attempt_rec)
+
+    def _with_default_provider(
+        self, attempts: list[str], task: Task
+    ) -> list[str]:
+        """Ensure the configured default provider is actually attempted.
+
+        The policy returns an ordered list of *preferences* per category. For a
+        specialized category that list is the whole attempt plan, so a deployment whose
+        `default_provider` is not among those preferences -- `mock`, for instance -- never
+        attempted the provider it had explicitly asked for. Observed consequence: with
+        only the mock provider installed, a `code` task failed with
+        "Provider fallback chain exhausted: openrouter: provider is unavailable or not
+        registered", because `openrouter` was the first preference and `mock` was never in
+        the list at all.
+
+        The policy's order is preserved: the default is **appended**, so every preference
+        keeps its priority and the default runs last. The default is included only when it
+        would pass the same automatic-route checks every other candidate passes —
+        registered, capability registered, enabled by configuration, not a disallowed paid
+        provider, and holding whatever key it declares. A default that fails those checks
+        is not added, so this cannot route to a provider the deployment did not enable.
+
+        Duplicates are impossible: the name is appended only when absent.
+        """
+
+        name = self._default_provider
+        if not name or name in attempts:
+            return attempts
+        if self._provider_registry is None:
+            # Without a registry there is no way to prove the provider is registered, and
+            # adding an unverifiable name would violate the same rule.
+            return attempts
+        # `_automatic_route_rejection` consults the *provider* registry. Dispatch needs an
+        # *agent*: a name registered as a provider but absent from the agent registry would
+        # pass that check and then raise `AgentNotFoundError` when the dispatcher looks it
+        # up -- a raise, not a failed `TaskResult`, which loses the reason on the way out.
+        # Both registries are populated together in the normal composition, so this is a
+        # guard against a half-registered provider rather than a live defect.
+        if name not in self._registry.list_agents():
+            return attempts
+        if self._automatic_route_rejection(name, task) is not None:
+            return attempts
+        return [*attempts, name]
 
     def _automatic_route_rejection(self, name: str, task: Task) -> Optional[str]:
         """Reject auto-route candidates that are disabled, unconfigured, or incapable."""

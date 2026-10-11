@@ -94,6 +94,13 @@ class CapabilityCeilingTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             run_id=scope.run_id,
             run_scope=scope,
+            # An approval position is STATED, not omitted. The coordinator denies a
+            # dispatch that names no policy -- a policy that does not exist cannot
+            # authorise anything -- so these ceiling tests must declare the position
+            # they are testing against. An empty policy requires approval for
+            # nothing, which keeps the outcome under test (the capability ceiling)
+            # the only thing that decides this result.
+            approval_policy=ApprovalPolicy(approval_required_tools=()),
         )
 
     def test_request_capability_absent_from_scope_is_denied(self) -> None:
@@ -196,6 +203,8 @@ class EnvironmentCeilingTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             run_id=scope.run_id,
             run_scope=scope,
+            # Stated explicitly: an omitted policy is a denial, not a default.
+            approval_policy=ApprovalPolicy(approval_required_tools=()),
         )
 
     def test_request_adds_key_absent_from_scope_is_denied(self) -> None:
@@ -244,6 +253,9 @@ class EnvironmentCeilingTests(unittest.TestCase):
             allowed_commands=frozenset({sys.executable}),
             run_id=scope.run_id,
             run_scope=scope,
+            # Stated explicitly, so any denial below is the environment ceiling and
+            # not a missing approval position.
+            approval_policy=ApprovalPolicy(approval_required_tools=()),
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
         self.assertNotIn("INJECTED_CODE_RAN", result.stderr or "")

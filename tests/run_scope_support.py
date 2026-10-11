@@ -20,6 +20,7 @@ from app.execution.profile import ProjectExecutionProfile
 from app.orchestrator.engineering import EngineeringRunRequest
 from app.runtime.run_scope import RunScope
 from app.tools.acceptance import AcceptanceCriterion
+from app.tools.approval import ApprovalPolicy
 from app.tools.workspace import Workspace
 
 DEFAULT_CRITERION = AcceptanceCriterion(
@@ -97,6 +98,14 @@ def engineering_request(
             scope.validate_command_set(declaration)
     if tools:
         scope.validate_tool_set(tools)
+    # A stated approval policy is now mandatory in ``ExecutionCoordinator``: an
+    # absent policy is a denial (``approval_policy_required``), not a permission.
+    # These callers are not about approval at all, so they state the empty policy
+    # the coordinator used to read out of an unstated ``None``: it requires
+    # approval for nothing beyond ``ApprovalPolicy.MANDATORY_APPROVAL_TOOLS``, so
+    # every command that reached the adapter before still reaches it. A caller
+    # that IS about approval passes its own policy, which wins over this default.
+    kwargs.setdefault("approval_policy", ApprovalPolicy())
     # The scope is the single source of truth for the workspace root; the request
     # restates it so the execution path re-validates the same value.
     kwargs.setdefault("workspace", scope.workspace)

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge AI — Operating Console</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <h1>Forge AI <span class="sub">Operating Console</span></h1>
+  <div class="top-right">
+    <span id="conn" class="pill pill-unknown" title="Connection state">unknown</span>
+    <button id="reload" type="button" class="btn btn-quiet">Reload all</button>
+  </div>
+</header>
+
+<!--
+  The console is a view. It has no authority of its own:
+  every value on this page comes from a route that computed it on the server,
+  and no control on this page can set an outcome. Statuses are rendered exactly
+  as the server reported them, including UNKNOWN and INDETERMINATE.
+-->
+<div id="boundary-note" class="banner banner-info" role="note">
+  <strong>Server-authoritative console.</strong>
+  Every panel below is read from the Forge API and shown as reported.
+  This page cannot set a status, grant an approval, or widen an execution.
+  Server-side checks are a text and contract boundary, not an operating-system sandbox.
+</div>
+
+<main id="app">
+
+  <section class="card" id="card-project">
+    <div class="card-head">
+      <h2>Project</h2>
+      <button class="btn btn-quiet" data-reload="onboarding" type="button">Refresh</button>
+    </div>
+    <div class="card-body" id="project-body">
+      <p class="state-loading">Loading…</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-goal">
+    <div class="card-head"><h2>Goal</h2></div>
+    <div class="card-body">
+      <p class="hint">
+        A goal is recorded as a <em>hypothesis</em>, never as a confirmed fact, and it
+        cannot select a command — the operator composition does that.
+      </p>
+      <label for="goal-input" class="label">What should this project achieve?</label>
+      <textarea id="goal-input" rows="3" placeholder="Describe the goal…"></textarea>
+      <div class="row">
+        <button id="goal-submit" type="button" class="btn btn-primary">Record goal</button>
+        <span id="goal-status" class="inline-status"></span>
+      </div>
+      <div id="requirements-body" class="nested">
+        <p class="state-empty">No requirements loaded yet.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="card-plan">
+    <div class="card-head">
+      <h2>Plan &amp; dependencies</h2>
+      <button class="btn btn-quiet" data-reload="plan" type="button">Refresh</button>
+    </div>
+    <div class="card-body" id="plan-body"><p class="state-loading">Loading…</p></div>
+  </section>
+
+  <section class="card" id="card-understanding">
+    <div class="card-head">
+      <h2>Project understanding</h2>
+      <button class="btn btn-quiet" data-reload="understanding" type="button">Rescan</button>
+    </div>
+    <div class="card-body" id="understanding-body"><p class="state-loading">Loading…</p></div>
+  </section>
+
+  <section class="card" id="card-execution">
+    <div class="card-head"><h2>Execution</h2></div>
+    <div class="card-body">
+      <p class="hint">
+        Steps run only through the existing authority chain
+        (<code>RunScope</code> → <code>ExecutionCoordinator</code> →
+        <code>AuthorizedExecution</code>). The server refuses an undeclared action,
+        a widened parameter, a cycle, or a missing dependency before anything starts.
+        A repeated graph run id executes nothing.
+      </p>
+      <div class="grid2">
+        <div>
+          <label for="graph-run-id" class="label">Graph run id</label>
+          <input id="graph-run-id" type="text" placeholder="demo-run-1">
+          <label for="graph-steps" class="label">Steps (JSON array)</label>
+          <textarea id="graph-steps" rows="7" spellcheck="false"></textarea>
+        </div>
+        <div id="graph-actions" class="actions-col">
+          <button id="graph-start" type="button" class="btn btn-primary">Start run</button>
+          <button id="graph-refresh" type="button" class="btn">Refresh status</button>
+          <button id="graph-resume" type="button" class="btn">Resume recorded run</button>
+        </div>
+      </div>
+      <div id="graph-status-text" class="inline-status"></div>
+      <div id="graph-body" class="nested"><p class="state-empty">No run selected.</p></div>
+    </div>
+  </section>
+
+  <section class="card" id="card-approvals">
+    <div class="card-head">
+      <h2>Approvals</h2>
+      <button class="btn btn-quiet" data-reload="graph" type="button">Refresh</button>
+    </div>
+    <div class="card-body" id="approvals-body">
+      <p class="state-empty">Enter a graph run id above to see approval requests.</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-declared">
+    <div class="card-head"><h2>Declared verification &amp; acceptance</h2></div>
+    <div class="card-body">
+      <p class="hint">
+        Both call existing <code>ForgeApiService</code> entry points. An
+        <code>idempotency_key</code> is required: a repeat under the same key is
+        refused by the existing ledger rather than silently re-run.
+      </p>
+      <div class="grid2">
+        <div>
+          <label for="decl-verify" class="label">Verification declaration id</label>
+          <select id="decl-verify"></select>
+          <label for="key-verify" class="label">Idempotency key</label>
+          <input id="key-verify" type="text">
+          <button id="verify-run" type="button" class="btn btn-primary">Run declared verification</button>
+        </div>
+        <div>
+          <label for="decl-accept" class="label">Acceptance declaration id</label>
+          <select id="decl-accept"></select>
+          <label for="key-accept" class="label">Idempotency key</label>
+          <input id="key-accept" type="text">
+          <button id="accept-run" type="button" class="btn btn-primary">Run accept cycle</button>
+        </div>
+      </div>
+      <div id="declared-body" class="nested"><p class="state-empty">Nothing run yet.</p></div>
+    </div>
+  </section>
+
+  <section class="card" id="card-memory">
+    <div class="card-head">
+      <h2>Project Memory</h2>
+      <div class="row">
+        <button id="memory-refresh" type="button" class="btn">Re-check freshness</button>
+        <button class="btn btn-quiet" data-reload="memory" type="button">Refresh</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div id="memory-body"><p class="state-loading">Loading…</p></div>
+      <details class="nested">
+        <summary>Record a hypothesis</summary>
+        <label for="mem-statement" class="label">Statement</label>
+        <textarea id="mem-statement" rows="2"></textarea>
+        <div class="row">
+          <label for="mem-kind" class="label">Kind</label>
+          <select id="mem-kind">
+            <option value="HYPOTHESIS">HYPOTHESIS</option>
+            <option value="UNKNOWN_DATA">UNKNOWN_DATA</option>
+          </select>
+          <input id="mem-subject" type="text" placeholder="relative path (optional)">
+          <button id="mem-submit" type="button" class="btn">Record</button>
+        </div>
+        <p class="hint">
+          Only hypotheses and unknown data can be recorded here. A confirmed fact must
+          cite evidence the understanding layer produced, so this page cannot assert one.
+        </p>
+        <div id="mem-status" class="inline-status"></div>
+      </details>
+    </div>
+  </section>
+
+  <section class="card" id="card-impact">
+    <div class="card-head">
+      <h2>Change Impact</h2>
+      <div class="row">
+        <button id="baseline-set" type="button" class="btn">Set baseline to now</button>
+        <button id="impact-load" type="button" class="btn">Compute impact</button>
+        <button id="stale-facts" type="button" class="btn">Invalidate stale facts</button>
+      </div>
+    </div>
+    <div class="card-body" id="impact-body">
+      <p class="state-empty">No baseline captured in this session.</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-evidence">
+    <div class="card-head">
+      <h2>Evidence graph</h2>
+      <div class="row">
+        <input id="evidence-run-id" type="text" placeholder="graph run id (optional)">
+        <button id="evidence-load" type="button" class="btn">Trace</button>
+        <button class="btn btn-quiet" data-reload="evidence" type="button">Refresh</button>
+      </div>
+    </div>
+    <div class="card-body" id="evidence-body">
+      <p class="state-empty">No attempt traced yet.</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-verification">
+    <div class="card-head">
+      <h2>Verification plan</h2>
+      <button class="btn btn-quiet" data-reload="verification" type="button">Refresh</button>
+    </div>
+    <div class="card-body" id="verification-body">
+      <p class="state-loading">Loading…</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-repair">
+    <div class="card-head">
+      <h2>Repair decision</h2>
+      <div class="row">
+        <input id="repair-run-id" type="text" placeholder="graph run id">
+        <input id="repair-previous-marker" type="text" placeholder="previous progress marker (optional)">
+        <button id="repair-load" type="button" class="btn">Decide</button>
+      </div>
+    </div>
+    <div class="card-body" id="repair-body">
+      <p class="state-empty">Nothing decided yet. This panel plans and refuses; it repairs nothing.</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-run-detail">
+    <div class="card-head">
+      <h2>Run detail</h2>
+      <div class="row">
+        <input id="detail-run-id" type="text" placeholder="run id">
+        <button id="detail-load" type="button" class="btn">Load</button>
+      </div>
+    </div>
+    <div class="card-body" id="run-detail-body">
+      <p class="state-empty">Select a run from the history below to see its full record.</p>
+    </div>
+  </section>
+
+  <section class="card" id="card-recovery">
+    <div class="card-head">
+      <h2>Recovery</h2>
+      <div class="row">
+        <input id="recovery-run-id" type="text" placeholder="attempt id">
+        <button id="recovery-plan-load" type="button" class="btn">Plan one</button>
+        <button class="btn btn-quiet" data-reload="recovery" type="button">Scan</button>
+      </div>
+    </div>
+    <div class="card-body" id="recovery-body"><p class="state-loading">Loading…</p></div>
+  </section>
+
+  <section class="card" id="card-runs">
+    <div class="card-head">
+      <h2>Run history</h2>
+      <button class="btn btn-quiet" data-reload="runs" type="button">Refresh</button>
+    </div>
+    <div class="card-body" id="runs-body"><p class="state-loading">Loading…</p></div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span id="foot-status">Ready.</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

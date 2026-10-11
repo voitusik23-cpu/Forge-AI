@@ -15,7 +15,7 @@ from app.context import (
 )
 from app.orchestrator.models import Event, EventType, Run, RunState, Task
 from app.runtime.run_scope import RunScope, RunScopeError, require_active_scope
-from app.runtime.run_store import RunStore, default_store_enabled as _default_store_enabled
+from app.runtime.run_store import RunStore, project_run_store_root, default_store_enabled as _default_store_enabled
 from app.orchestrator.revision import (
     RevisionAttemptResult,
     RevisionLoopExecutor,
@@ -302,7 +302,14 @@ class EngineeringRunExecutor:
         run_store: object | None = getattr(request, "run_store", None)
         store_run_id = scope_run_id or (task_id or "")
         if run_store is None and _default_store_enabled() and request.workspace is not None:
-            run_store = RunStore()
+            # Scoped to THIS request's workspace, for the same reason as the API
+            # service: an unscoped ``RunStore()`` is per USER, so a run id used in one
+            # project would be found and replayed by another. ``request.workspace`` is
+            # the trusted context already established by the caller; nothing here reads
+            # a path or project id supplied as data. A ``Workspace`` exposes ``root``;
+            # a bare path-like workspace is accepted as-is.
+            workspace_root = getattr(request.workspace, "root", request.workspace)
+            run_store = RunStore(root=project_run_store_root(workspace_root))
         if run_store is not None and run_store is not False:
             try:
                 run_store.bind_run(store_run_id, task_id=task_id)
@@ -700,7 +707,9 @@ class EngineeringRunExecutor:
                 "task_specification": specification.to_context_data()
             }
             if execution_profile is not None and "execution_profile" not in task_context["task_specification"]:
-                task_context["execution_profile"] = execution_profile.to_dict()
+                # to_context_dict(), not to_dict(): this dict reaches the model
+                # provider, and to_dict() carries the profile's environment values.
+                task_context["execution_profile"] = execution_profile.to_context_dict()
             task = Task(
                 id=specification.task_id,
                 description="Execute the supplied TaskSpecification.",
@@ -727,7 +736,9 @@ class EngineeringRunExecutor:
             if not profile_val.valid:
                 raise ValueError(f"Invalid execution_profile: {', '.join(profile_val.errors)}")
             if "execution_profile" not in request.task.context:
-                request.task.context["execution_profile"] = execution_profile.to_dict()
+                request.task.context["execution_profile"] = (
+                    execution_profile.to_context_dict()
+                )
 
         return request.task, request.acceptance_criteria, None, request.task.id, execution_profile
 

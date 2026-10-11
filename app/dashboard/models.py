@@ -18,6 +18,12 @@ class ProviderStatus(str, Enum):
     AUTH_FAILED = "AUTH_FAILED"          # API key invalid / unauthorized
     NOT_CONFIGURED = "NOT_CONFIGURED"    # Key not set in environment or secret store
     UNAVAILABLE = "UNAVAILABLE"          # Provider disabled or service error
+    # Health was deliberately not checked: no probe was attempted, so the account
+    # state is unknown. This exists so a composition that must not open a socket
+    # (a TEST runtime, ``FORGE_ENV=test``) can report the truth instead of
+    # fabricating a READY / NO_CREDITS / NETWORK_BLOCKED verdict it never
+    # observed. It is never returned when a probe actually ran.
+    NOT_CHECKED = "NOT_CHECKED"
 
 
 class AlertLevel(str, Enum):

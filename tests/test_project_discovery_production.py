@@ -366,21 +366,48 @@ class SensitiveFileTests(DiscoveryTestCase):
         self.assertTrue(
             any(w.warning_type == "SECRET_FILE_EXCLUDED" for w in snapshot.warnings)
         )
-        secret_paths = {".env", ".env.example", "server.pem", "credentials.json", "id_rsa.key"}
+        secret_paths = {".env", "server.pem", "credentials.json", "id_rsa.key"}
         excluded = {
             w.file_path
             for w in snapshot.warnings
             if w.warning_type == "SECRET_FILE_EXCLUDED"
         }
-        self.assertTrue(
+        # Every secret file must be excluded. `.env.example` is deliberately NOT in
+        # this set: it is a committed template that holds no values, this repository
+        # tracks one by design, and treating it as a secret was over-broad -- it made
+        # the execution-workspace staging step withhold a file legitimate workloads
+        # need. The recognizer is now shared and template-aware, and the distinction is
+        # pinned by the test below.
+        self.assertEqual(
+            secret_paths,
             secret_paths & excluded,
-            f"expected excluded secret paths, got {sorted(excluded)}",
+            f"every secret file must be excluded; got {sorted(excluded)}",
         )
         # No fact may ever be extracted from a secret file.
         secret_facts = [
             f for f in snapshot.facts if getattr(f, "source_path", "") in secret_paths
         ]
         self.assertEqual(secret_facts, [])
+
+    def test_a_template_is_inventoried_while_a_secret_is_not(self) -> None:
+        """The template/secret distinction, asserted in both directions.
+
+        A name filter that refuses ``.env.example`` protects nothing and breaks
+        deployments that ship one. This test fails if the filter becomes over-broad
+        again, which is the regression the shared recognizer exists to prevent.
+        """
+
+        outcome = ProjectDiscovery().observe(self.workspace, run_id="template")
+        snapshot = outcome.snapshot
+        assert snapshot is not None
+        excluded = {
+            w.file_path
+            for w in snapshot.warnings
+            if w.warning_type == "SECRET_FILE_EXCLUDED"
+        }
+        self.assertNotIn(".env.example", excluded)
+        inventoried = {f.source_path for f in snapshot.facts if f.source_path}
+        self.assertIn(".env.example", inventoried)
 
     def test_secret_content_never_appears_in_snapshot_or_history(self) -> None:
         """D: the canary content is absent from both snapshot and events."""

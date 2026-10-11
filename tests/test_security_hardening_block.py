@@ -159,6 +159,10 @@ class SecurityHardeningF02CapabilityWideningTests(unittest.TestCase):
             run_scope=scope,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
+            # F-02 is about capability widening, not approval: the empty policy
+            # requires approval for nothing dispatched here, which is what the
+            # unstated ``None`` used to mean.
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(result.stdout, "OK")
@@ -194,6 +198,9 @@ class SecurityHardeningF02CapabilityWideningTests(unittest.TestCase):
             run_scope=scope,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
+            # F-02 subset case, not about approval: the empty policy requires
+            # approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
 
@@ -411,6 +418,9 @@ class SecurityHardeningF03EnvironmentInjectionTests(unittest.TestCase):
             run_scope=scope,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
+            # F-03 is about environment injection, not approval: the empty policy
+            # requires approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(result.stdout, "VAR=hello_world_123")
@@ -444,6 +454,9 @@ class SecurityHardeningF03EnvironmentInjectionTests(unittest.TestCase):
             run_scope=scope,
             workspace_root=self.workspace_root,
             allowed_commands=frozenset({sys.executable}),
+            # F-03 inherited-environment case, not about approval: the empty policy
+            # requires approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
         )
         self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(result.stdout, "HAS_PATH=True")

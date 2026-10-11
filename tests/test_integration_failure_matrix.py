@@ -300,6 +300,11 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 declared=(sys.executable, self.cmd_happy,),
                 execution_requests=(exec_req,),
             ),
+            # Scenario A is the happy path, not an approval case. A stated policy is
+            # mandatory in the coordinator, so state the empty one: it requires
+            # approval for nothing dispatched here, which is what the unstated
+            # ``None`` used to mean.
+            approval_policy=ApprovalPolicy(),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -392,6 +397,10 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 declared=("some_disallowed_command",),
                 execution_requests=(exec_req,),
             ),
+            # Scenario B is about the *permission* layer refusing the command; the
+            # approval layer is never reached for it. The policy is stated anyway so
+            # the scenario does not depend on which guard happens to fire first.
+            approval_policy=ApprovalPolicy(),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -611,6 +620,9 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 declared=(sys.executable, self.cmd_fail,),
                 execution_requests=(exec_req,),
             ),
+            # Scenario E is about a non-zero exit, not approval: the empty policy
+            # requires approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
         )
 
         result = self.engineering_executor.execute(run_req)
@@ -677,6 +689,10 @@ class TestIntegrationFailureMatrix(unittest.TestCase):
                 declared=(sys.executable, self.cmd_exit0,),
                 execution_requests=(exec_req,),
             ),
+            # Scenario F is about verification failing after a *successful*
+            # execution, so execution must really run: the empty policy requires
+            # approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
         )
 
         result = self.engineering_executor.execute(run_req)

@@ -9,6 +9,12 @@ import urllib.request
 from typing import Any, Dict, Mapping, Optional
 
 from app.config.secrets import SecretStore
+from app.config.settings import (
+    OFFLINE_PROVIDER_NAME,
+    ApplicationEnvironment,
+    RuntimeSettings,
+    load_settings,
+)
 from app.dashboard.models import (
     AlertLevel,
     ProviderAccountStatus,
@@ -18,18 +24,95 @@ from app.dashboard.models import (
 
 
 class ProviderHealthMonitor:
-    """Monitors balance, quota, and authentication status across AI providers without invoking LLM completions."""
+    """Monitors balance, quota, and authentication status across AI providers without invoking LLM completions.
+
+    Reachability probes are the only outbound traffic this class produces, and
+    they are gated by the composition's own settings -- see
+    :meth:`_probes_suppressed`. A TEST composition therefore cannot produce a
+    live probe, and it can still report a coherent result: every provider is
+    reported as ``ProviderStatus.NOT_CHECKED``, which claims nothing about an
+    account that was never observed.
+    """
 
     def __init__(
         self,
         secret_store: Optional[SecretStore] = None,
         thresholds: Optional[Mapping[str, ProviderThresholdConfig]] = None,
         timeout_seconds: float = 3.0,
+        settings: Optional[RuntimeSettings] = None,
     ) -> None:
         self._secret_store = secret_store or SecretStore()
         self._thresholds = dict(thresholds or {})
         self._timeout = timeout_seconds
         self._cache: Dict[str, ProviderAccountStatus] = {}
+        # The composition signal. A caller that already resolved its settings
+        # (``create_runtime`` resolves them, and narrows them in test mode) can
+        # hand them in; otherwise the monitor resolves exactly the settings a
+        # bare ``create_runtime()`` would resolve, from the same function. This
+        # is deliberately not a constructor flag: it cannot be set to "probe
+        # anyway" from a request, a task, or a tool argument.
+        self._settings = settings if settings is not None else load_settings()
+
+    @property
+    def checks_enabled(self) -> bool:
+        """Whether this monitor may open a network connection at all.
+
+        ``False`` means every status it returns is ``NOT_CHECKED``, and the
+        monitor opened no socket. It is exposed so a caller (or a test) can ask
+        the question directly instead of inferring it from a result.
+        """
+
+        return not self._probes_suppressed()
+
+    def _probes_suppressed(self) -> bool:
+        """Decide, from the composition's settings alone, whether to probe.
+
+        Two structural facts each suppress every probe, and either is sufficient:
+
+        * ``environment is ApplicationEnvironment.TEST``. This is the
+          pre-existing ``FORGE_ENV=test`` signal, the same one
+          ``app.runtime.bootstrap.create_runtime`` uses to decide a composition
+          is a TEST runtime. No second switch is introduced.
+        * no live provider is enabled. In test mode ``create_runtime`` narrows
+          ``enabled_providers`` to the one offline provider, so this is the
+          *resolved* form of the same fact: a runtime that enables only
+          ``OFFLINE_PROVIDER_NAME`` has no provider whose account could be
+          probed, and its monitor must not dial one anyway.
+
+        Production is unchanged: an unset ``FORGE_ENV`` resolves to
+        ``development`` and the default ``enabled_providers`` contains a live
+        provider, so both checks are ``False`` and probing proceeds exactly as
+        before.
+        """
+
+        if self._settings.environment is ApplicationEnvironment.TEST:
+            return True
+        enabled = tuple(
+            name.strip().lower()
+            for name in self._settings.enabled_providers
+            if isinstance(name, str) and name.strip()
+        )
+        return not any(name != OFFLINE_PROVIDER_NAME for name in enabled)
+
+    def _not_checked(self, provider_name: str) -> ProviderAccountStatus:
+        """Build the explicit "no probe was attempted" result.
+
+        ``last_checked`` stays empty on purpose: this result has no observation
+        time, and filling it with "now" would imply a check that never happened.
+        """
+
+        return ProviderAccountStatus(
+            provider=provider_name,
+            status=ProviderStatus.NOT_CHECKED,
+            balance_display="NOT CHECKED",
+            balance_numeric=None,
+            alert=AlertLevel.INFO,
+            last_checked="",
+            details={
+                "reason": "test_mode_no_network_probe",
+                "environment": self._settings.environment.value,
+            },
+        )
 
     def get_thresholds(self, provider: str) -> ProviderThresholdConfig:
         return self._thresholds.get(provider, ProviderThresholdConfig.default_for_provider(provider))
@@ -58,6 +141,11 @@ class ProviderHealthMonitor:
         norm = provider_name.strip().lower()
         if not force and norm in self._cache:
             return self._cache[norm]
+
+        if self._probes_suppressed():
+            status = self._not_checked(provider_name)
+            self._cache[norm] = status
+            return status
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 

@@ -148,13 +148,46 @@ class RunExecutor:
         execution_coordinator: "ExecutionCoordinator | None" = None,
         approval_policy: "ApprovalPolicy | None" = None,
         approval_resolver: "ApprovalResolver | None" = None,
+        generate_decision: bool = True,
         _run: Run | None = None,
         _attempt_number: int = 0,
     ) -> Run:
-        """Execute through Orchestrator and retain a safe in-memory event trace."""
+        """Execute through Orchestrator and retain a safe in-memory event trace.
+
+        ``generate_decision`` separates the two jobs this method was doing at once.
+
+        * ``True`` (the default) is the historical behaviour: a generative dispatch
+          produces a decision, and the host-execution branch below runs only when
+          that dispatch succeeded.
+        * ``False`` is for a caller that already holds a decision -- an
+          operator-declared execution, where the decision *is* the declaration and
+          no model may add to, replace, or veto it. No generative dispatch is made:
+          the model is not asked, so no provider call happens and nothing that a
+          model could have said can influence the run. The run is recorded as
+          decided by its declared source, and the host-execution branch is reached
+          directly.
+
+        What is emphatically **not** skipped in either mode: the frozen ``RunScope``,
+        the mandatory ``ApprovalPolicy``, the ``ExecutionCoordinator`` (the only
+        component that may mint an ``AuthorizedExecution``), and the
+        ``LocalExecutionAdapter``. ``generate_decision=False`` removes a model call;
+        it does not remove a single authorization check. The host execution's real
+        exit code remains the only thing that decides the run's state.
+        """
         run = _run or Run(task=task, **({"id": run_id} if run_id else {}))
         started = time.perf_counter()
-        self._record(run, EventType.RUN_STARTED, task_id=getattr(task, "id", None))
+        # ``run_store`` is threaded through every record below. It used to be
+        # omitted from the three calls that precede host execution, which meant
+        # RUN_STARTED, CONTEXT_ASSEMBLED, and any decision record never reached the
+        # durable history *and* the store object was swallowed into the event's own
+        # metadata under a ``run_store`` key -- so a record that a post-mortem needs
+        # most (the run started, and what decided it) was the one silently missing.
+        self._record(
+            run,
+            EventType.RUN_STARTED,
+            run_store=run_store,
+            task_id=getattr(task, "id", None),
+        )
         run.state = RunState.RUNNING if _attempt_number == 0 else RunState.REVISING
 
         try:
@@ -174,16 +207,38 @@ class RunExecutor:
                 execution_context = self._context_assembler.assemble(
                     task, run.id, explicit_inputs
                 )
-            self._record_context_assembled(run, execution_context)
+            self._record_context_assembled(run, execution_context, run_store=run_store)
             dispatch_task = self._task_with_execution_context(task, execution_context)
-            result = self._orchestrator.dispatch(
-                dispatch_task,
-                agent_name=agent_name,
-                provider_name=provider_name,
-                observer=lambda event_type, data: self._record(
-                    run, event_type, observer, run_store, **data
-                ),
-            )
+            if generate_decision:
+                result = self._orchestrator.dispatch(
+                    dispatch_task,
+                    agent_name=agent_name,
+                    provider_name=provider_name,
+                    observer=lambda event_type, data: self._record(
+                        run, event_type, observer, run_store, **data
+                    ),
+                )
+            else:
+                # The decision already exists outside this run. It is *recorded*,
+                # never inferred from anything a model produced, and the synthetic
+                # carrier is marked so it can never be read as a generated answer.
+                self._record(
+                    run,
+                    EventType.DECISION_MADE,
+                    run_store=run_store,
+                    run_id=run.id,
+                    decision_source="declared_execution",
+                    decision_provider=None,
+                    decision_model=None,
+                    generative_dispatch=False,
+                )
+                result = TaskResult(
+                    task_id=dispatch_task.id,
+                    success=True,
+                    output="",
+                    provider=None,
+                    model_name=None,
+                )
             if result.success and result.tool_invocations:
                 permission_context = ToolExecutionContext(
                     run_id=run.id,
@@ -541,12 +596,13 @@ class RunExecutor:
 
     @classmethod
     def _record_context_assembled(
-        cls, run: Run, execution_context: ExecutionContext
+        cls, run: Run, execution_context: ExecutionContext, run_store: object | None = None
     ) -> None:
         items = execution_context.items
         cls._record(
             run,
             EventType.CONTEXT_ASSEMBLED,
+            run_store=run_store,
             item_count=len(items),
             context_fingerprint=execution_context.fingerprint,
             kinds=sorted({item.kind for item in items}),

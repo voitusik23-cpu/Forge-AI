@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Sequence
@@ -15,6 +16,7 @@ from app.execution.artifacts import (
     Artifact,
     create_artifact_from_file,
 )
+from app.execution.secret_files import is_secret_directory, is_secret_file
 
 
 class EphemeralWorkspaceManager:
@@ -33,6 +35,16 @@ class EphemeralWorkspaceManager:
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._scratch_root: Path | None = None
         self._cleaned: bool = False
+        # Names (not contents) of files refused by the secret filter during staging.
+        # Reported so an operator can see that a credential file was withheld instead of
+        # silently wondering why the run cannot find it.
+        self._secret_files_skipped: list[str] = []
+
+    @property
+    def secret_files_skipped(self) -> tuple[str, ...]:
+        """Names of files withheld from the staged tree because they hold credentials."""
+
+        return tuple(self._secret_files_skipped)
 
     @property
     def scratch_root(self) -> Path:
@@ -45,6 +57,23 @@ class EphemeralWorkspaceManager:
     def source_root(self) -> Path | None:
         """The source workspace root, if any."""
         return self._source_root
+
+    def bind_source_root(self, source_root: Path | None) -> None:
+        """Declare the workspace to stage, when the manager was built without one.
+
+        The adapter may be composed with a pre-built manager -- so a caller can choose the
+        scratch location -- and with no source root bound. In that case the isolated branch
+        used to run in an **empty** scratch directory: the child's working directory
+        contained none of the project's files, and a command referencing one failed with
+        "can't open file". Binding the root here restores staging without forcing every
+        composition to reconstruct the manager.
+
+        A root already bound is never replaced: an explicit choice made at construction
+        time outranks an adapter default.
+        """
+
+        if self._source_root is None and source_root is not None:
+            self._source_root = Path(source_root).resolve()
 
     def initialize(self) -> Path:
         """Allocate the ephemeral scratch directory and stage source files using COPY semantics."""
@@ -59,15 +88,25 @@ class EphemeralWorkspaceManager:
         self._temp_dir = tempfile.TemporaryDirectory(**dir_kwargs)
         self._scratch_root = Path(self._temp_dir.name).resolve()
         self._cleaned = False
+        self._secret_files_skipped = []
 
         if self._source_root is not None and self._source_root.is_dir():
             self._stage_inputs_copy(self._source_root, self._scratch_root)
 
         return self._scratch_root
 
-    def resolve_path(self, relative_path: str) -> Path:
-        """Resolve a path relative to the scratch root and verify it does not escape."""
-        root = self.scratch_root
+    def resolve_path(self, relative_path: str, *, root: Path | None = None) -> Path:
+        """Resolve a path relative to a root and verify it does not escape.
+
+        ``root`` defaults to the active scratch root. It is passed explicitly by
+        :meth:`harvest_artifacts` when the composition executes **without**
+        isolation, where the trusted root is the operator's own workspace carried
+        by the ``AuthorizedExecution`` token rather than a scratch directory.
+        A caller-supplied root is not authority: the only value ever passed here
+        is that frozen token root, and the traversal check below is applied to it
+        exactly as it is to the scratch root.
+        """
+        root = self.scratch_root if root is None else Path(root).resolve()
         norm = relative_path.replace("\\", "/").strip()
         if not norm or norm == ".":
             return root
@@ -90,16 +129,24 @@ class EphemeralWorkspaceManager:
         *,
         run_id: str,
         provenance_source: str = "execution",
+        root: Path | None = None,
     ) -> tuple[Artifact, ...]:
-        """Harvest declared artifact targets from the scratch root before cleanup.
+        """Harvest declared artifact targets from a trusted execution root.
 
         Enforces:
         - Relative path safety / no directory traversal (..)
         - Symlink checks (symlinks are rejected)
         - Artifact size bounds
         - Cryptographic hashing (SHA-256)
+
+        The root is the active scratch root by default. A composition that
+        executes without isolation passes the trusted workspace root from the
+        ``AuthorizedExecution`` token instead, so "the adapter harvests" is true
+        on that path too. Harvesting only *measures*: it records a relative path,
+        a size and a SHA-256, and never copies, opens for write, or relocates a
+        file, so it grants no authority and reaches no path outside the root.
         """
-        root = self.scratch_root
+        root = self.scratch_root if root is None else Path(root).resolve()
         harvested: list[Artifact] = []
 
         for target in artifact_targets:
@@ -110,7 +157,7 @@ class EphemeralWorkspaceManager:
             if not clean_target or ".." in clean_target.split("/"):
                 raise ValueError(f"Unsafe artifact target path: {target}")
 
-            resolved_path = self.resolve_path(clean_target)
+            resolved_path = self.resolve_path(clean_target, root=root)
 
             if not resolved_path.exists():
                 continue
@@ -170,18 +217,40 @@ class EphemeralWorkspaceManager:
         self.cleanup()
 
     def _stage_inputs_copy(self, src_root: Path, dst_root: Path) -> None:
-        """Stage inputs from source root into destination root using COPY semantics only."""
+        """Stage inputs from source root into destination root using COPY semantics only.
+
+        Secret files are **not** staged. The staged tree becomes the working directory
+        of the process a run starts, so a credential file copied here is a credential
+        file the admitted code can read with an ordinary relative open. Before this
+        filter existed, staging excluded only ``.git``, ``__pycache__`` and ``*.pyc``,
+        and a directory containing ``.env`` was copied verbatim.
+
+        The recognizer is shared with the project scanner
+        (:mod:`app.execution.secret_files`), so "what the scanner refuses to index" and
+        "what the execution workspace refuses to copy" cannot drift apart again.
+
+        A name-based filter is not complete -- a secret inside ``notes.txt`` is not
+        recognized by any name rule, and declared-input allow-listing remains deferred.
+        What is guaranteed here is checkable: no file whose name marks it as credential
+        material, and no credential directory, reaches the staged tree.
+        """
+
         for root_dir, dirs, files in os.walk(src_root):
             # Check for symlinks in directories
             rel_dir = Path(root_dir).relative_to(src_root)
             current_dst_dir = dst_root / rel_dir
 
-            # Filter out ignored directories (.git, __pycache__)
-            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__"}]
+            # Prune in place: ignored directories and credential directories are never
+            # descended into, so a nested secret cannot be reached by walking into it.
+            dirs[:] = [
+                d
+                for d in dirs
+                if d not in {".git", "__pycache__"} and not is_secret_directory(d)
+            ]
 
             for d in dirs:
                 dir_path = Path(root_dir) / d
-                if dir_path.is_symlink():
+                if self._is_reparse_point(dir_path):
                     raise ValueError(
                         f"Symlinks are rejected as staging mechanisms in Forge v0.1: {dir_path}"
                     )
@@ -190,11 +259,40 @@ class EphemeralWorkspaceManager:
             for f in files:
                 if f.endswith(".pyc"):
                     continue
+                if is_secret_file(f):
+                    # Refused, not an error: a repository legitimately contains such a
+                    # file, and failing the run would make the safe outcome the broken
+                    # one. The refusal is counted so a caller can report it.
+                    self._secret_files_skipped.append(f)
+                    continue
                 src_file = Path(root_dir) / f
-                if src_file.is_symlink():
+                if self._is_reparse_point(src_file):
                     raise ValueError(
                         f"Symlinks are rejected as staging mechanisms in Forge v0.1: {src_file}"
                     )
                 dst_file = current_dst_dir / f
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_file, dst_file)
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        """True for a symlink, a Windows directory junction, or any other reparse point.
+
+        ``Path.is_symlink()`` returns False for a Windows **junction**: ``os.path.islink``
+        recognizes one, ``Path.is_symlink()`` does not. Relying on ``is_symlink()`` alone
+        therefore let a junction through the check, and the subsequent
+        ``os.walk(followlinks=False)`` raised a raw ``OSError`` while descending. That is
+        not a clean refusal, and a raw ``OSError`` is not something a caller can act on.
+
+        ``st_file_attributes`` exists only on Windows, so the check is guarded and
+        degrades to the POSIX symlink test elsewhere.
+        """
+
+        try:
+            if path.is_symlink():
+                return True
+            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        except OSError:
+            # A path that cannot be inspected must be refused, not copied.
+            return True
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))

@@ -175,6 +175,16 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         self.assertEqual(len(resolver.requests[0].intent_fingerprint), 64)
 
     def test_missing_required_approval_policy_is_denied(self):
+        """A request that needs approval and is given NO policy must be refused.
+
+        ``approval_policy`` is deliberately left unstated: this test's subject is
+        the missing policy itself, so a valid policy would test something else.
+        The refusal is the coordinator's own mandatory-policy guard
+        (``POLICY_DENIED`` / ``approval_policy_required``), which is strictly
+        stronger than the previous ``APPROVAL_WAITING``: it is now the absence of
+        the policy, not the absence of a resolver, that refuses, and it refuses
+        before any adapter is reached.
+        """
         req = ExecutionRequest(
             (sys.executable,), profile=self.profile((sys.executable,)), approval_required=True
         )
@@ -182,7 +192,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             req, allowed_commands=frozenset({sys.executable}),
             run_id="test_missing_required_approval_policy_is_denied-run1",
             run_scope=self._scope_for("test_missing_required_approval_policy_is_denied-run1", tuple(req.profile.allowed_commands), request=req),)
-        self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
+        self.assertEqual(result.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
+        self.assertEqual(result.metadata.get("denial_reason"), "approval_policy_required")
 
     def test_approval_intent_changes_when_argv_changes(self):
         policy = ApprovalPolicy(approval_required_tools=(sys.executable,))
@@ -475,11 +486,20 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         self.assertEqual(res_a.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
         self.assertEqual(backend.call_count, 0)
 
-        # Case B: approval_policy is None, resolver is None
+        # Case B: approval_policy is None, resolver is None.
+        #
+        # MEANING CHANGE (deliberate, not a relaxation). This is the case whose
+        # subject IS the absent policy, so it must keep passing ``None`` rather than
+        # receive a valid policy. With no policy the coordinator now denies outright
+        # (``POLICY_DENIED`` / ``approval_policy_required``) instead of waiting for a
+        # resolver it was never told about. Asserting the reason AS WELL as the
+        # status makes this case strictly stronger than the assertion it replaces:
+        # the old form accepted any refusal whatsoever.
         res_b = coord.execute(req, allowed_commands=frozenset([sys.executable]), approval_policy=None, approval_resolver=None,
             run_id="test_approval_required_true_fail_closed_regression-run2",
             run_scope=self._scope_for("test_approval_required_true_fail_closed_regression-run2", tuple(req.profile.allowed_commands), request=req),)
-        self.assertEqual(res_b.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
+        self.assertEqual(res_b.outcome_status, ExecutionOutcomeStatus.POLICY_DENIED)
+        self.assertEqual(res_b.metadata.get("denial_reason"), "approval_policy_required")
         self.assertEqual(backend.call_count, 0)
 
         # Case C: resolver is present but has no approval for this intent
@@ -656,15 +676,33 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
             return EngineeringRunExecutor(rev_exec, execution_coordinator=coord)
 
         cases = [
-            # (name, approval_policy, approval_resolver, approval_required, intent_fp_modifier)
-            ("missing_resolver", ApprovalPolicy(approval_required_tools=(sys.executable,)), None, False, None),
-            ("missing_policy_with_approval_required", None, None, True, None),
-            ("missing_approval", ApprovalPolicy(approval_required_tools=(sys.executable,)), InMemoryApprovalResolver(), False, None),
-            ("mismatched_approval", ApprovalPolicy(approval_required_tools=(sys.executable,)), InMemoryApprovalResolver(), False, "tampered_fp"),
-            ("approval_required_without_approval", ApprovalPolicy(approval_required_tools=()), InMemoryApprovalResolver(), True, None),
+            # (name, approval_policy, approval_resolver, approval_required,
+            #  intent_fp_modifier, coordinator_status, path_status)
+            #
+            # ``path_status`` is the Harness status each path settles on. For every
+            # case where a policy IS stated the harness waits for approval, exactly
+            # as before. ``missing_policy_with_approval_required`` is the case whose
+            # subject is the absent policy: it must keep passing ``None`` (a valid
+            # policy would test something else), and the harness now settles on its
+            # terminal FAILED status instead of waiting, because the coordinator
+            # refuses before any resolver exists to wait for. The engineering path
+            # settles on LIMIT_REACHED for that case, so its assertion below is
+            # written per case rather than shared. ``coordinator_status`` records the
+            # coordinator's refusal per case so the pin is explicit rather than
+            # implied by a shared assertion.
+            ("missing_resolver", ApprovalPolicy(approval_required_tools=(sys.executable,)), None, False, None,
+             ExecutionOutcomeStatus.APPROVAL_WAITING, HarnessStatus.WAITING_FOR_APPROVAL),
+            ("missing_policy_with_approval_required", None, None, True, None,
+             ExecutionOutcomeStatus.POLICY_DENIED, HarnessStatus.FAILED),
+            ("missing_approval", ApprovalPolicy(approval_required_tools=(sys.executable,)), InMemoryApprovalResolver(), False, None,
+             ExecutionOutcomeStatus.APPROVAL_WAITING, HarnessStatus.WAITING_FOR_APPROVAL),
+            ("mismatched_approval", ApprovalPolicy(approval_required_tools=(sys.executable,)), InMemoryApprovalResolver(), False, "tampered_fp",
+             ExecutionOutcomeStatus.APPROVAL_WAITING, HarnessStatus.WAITING_FOR_APPROVAL),
+            ("approval_required_without_approval", ApprovalPolicy(approval_required_tools=()), InMemoryApprovalResolver(), True, None,
+             ExecutionOutcomeStatus.APPROVAL_WAITING, HarnessStatus.WAITING_FOR_APPROVAL),
         ]
 
-        for name, policy, resolver, app_req, fp_mod in cases:
+        for name, policy, resolver, app_req, fp_mod, coord_status, path_status in cases:
             with self.subTest(case=name):
                 # 1. ExecutionCoordinator path
                 backend_c = _Backend()
@@ -674,7 +712,10 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                     resolver.submit("run-fc", req_c.request_id, ApprovalState.APPROVED, intent_fingerprint="other_fp")
                 res_c = coord.execute(req_c, run_id="run-fc", allowed_commands=frozenset([sys.executable]), approval_policy=policy, approval_resolver=resolver,
             run_scope=self._scope_for("run-fc", tuple(req_c.profile.allowed_commands), request=req_c),)
-                self.assertEqual(res_c.outcome_status, ExecutionOutcomeStatus.APPROVAL_WAITING)
+                self.assertEqual(res_c.outcome_status, coord_status)
+                if coord_status == ExecutionOutcomeStatus.POLICY_DENIED:
+                    # The absent policy is the reason, not a downstream accident.
+                    self.assertEqual(res_c.metadata.get("denial_reason"), "approval_policy_required")
                 self.assertEqual(backend_c.call_count, 0)
 
                 # 2. AgentHarness path
@@ -696,7 +737,8 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                 (sys.executable,),
             ),)
                 res_h = harness.run(h_req)
-                self.assertEqual(res_h.final_state.status, HarnessStatus.WAITING_FOR_APPROVAL)
+                self.assertEqual(res_h.final_state.status, path_status)
+                self.assertTrue(res_h.final_state.terminal)
                 self.assertEqual(backend_h.call_count, 0)
 
                 # 3. EngineeringRun path
@@ -726,7 +768,26 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
                     ),
                 )
                 res_e = eng_exec.execute(eng_req)
-                self.assertEqual(res_e.final_status, EngineeringRunStatus.WAITING_FOR_APPROVAL)
+                if coord_status == ExecutionOutcomeStatus.POLICY_DENIED:
+                    # The engineering path keeps revising after the refusal until its
+                    # revision limit, so it settles on LIMIT_REACHED rather than
+                    # FAILED. Both are fail-closed and neither is SUCCESS, but the
+                    # terminal status alone would also be produced by an unrelated
+                    # failure -- so the refusal itself is pinned as well, and the
+                    # backend is proved never to have been reached.
+                    self.assertEqual(res_e.final_status, EngineeringRunStatus.LIMIT_REACHED)
+                    self.assertNotEqual(res_e.final_status, EngineeringRunStatus.SUCCESS)
+                    self.assertTrue(res_e.execution_results)
+                    self.assertEqual(
+                        res_e.execution_results[0].outcome_status,
+                        ExecutionOutcomeStatus.POLICY_DENIED,
+                    )
+                    self.assertEqual(
+                        res_e.execution_results[0].metadata.get("denial_reason"),
+                        "approval_policy_required",
+                    )
+                else:
+                    self.assertEqual(res_e.final_status, EngineeringRunStatus.WAITING_FOR_APPROVAL)
                 self.assertEqual(backend_e.call_count, 0)
 
 
@@ -815,7 +876,12 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         r8 = ExecutionRequest(("python", "-c", "print(1)"), profile=p8)
         res8 = coord.execute(r8, allowed_commands=(approved_cmd,),
             run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run8",
-            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run8", tuple(r8.profile.allowed_commands), request=r8),)
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run8", tuple(r8.profile.allowed_commands), request=r8),
+            # The subject here is argv authorization, not approval. A stated policy
+            # is mandatory in the coordinator, so state the empty one: it requires
+            # approval for nothing dispatched here, which is what the unstated
+            # ``None`` used to mean for this case.
+            approval_policy=ApprovalPolicy(),)
         self.assertEqual(res8.outcome_status, ExecutionOutcomeStatus.EXECUTION_SUCCESS)
         self.assertEqual(backend.call_count, 1)
 
@@ -825,7 +891,11 @@ class ExecutionAuthorizationHardeningTests(unittest.TestCase):
         r9 = ExecutionRequest(("python", "-c", "print(2)"), profile=p8)
         res9 = coord.execute(r9, allowed_commands=(approved_cmd,),
             run_id="test_mandatory_interpreter_and_shell_escape_regression_suite-run9",
-            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run9", tuple(r9.profile.allowed_commands), request=r9),)
+            run_scope=self._scope_for("test_mandatory_interpreter_and_shell_escape_regression_suite-run9", tuple(r9.profile.allowed_commands), request=r9),
+            # Same reason as case 8. The permission layer refuses this before the
+            # approval layer either way; the policy is stated so the case does not
+            # depend on which guard happens to fire first.
+            approval_policy=ApprovalPolicy(),)
         self.assertEqual(res9.outcome_status, ExecutionOutcomeStatus.PERMISSION_DENIED)
         self.assertEqual(backend.call_count, 1)  # unchanged from case 8
 

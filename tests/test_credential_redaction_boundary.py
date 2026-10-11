@@ -26,6 +26,7 @@ from app.execution.redaction import (
 from app.execution.request import ExecutionRequest, ExecutionResult, ExecutionStatus
 from app.runtime.run_scope import RunScope
 from app.tools.acceptance import AcceptanceCriterion
+from app.tools.approval import ApprovalPolicy
 from app.tools.workspace import Workspace
 
 # Realistic credential fixtures. No fixed length is assumed anywhere: the App
@@ -347,6 +348,11 @@ class TestExecutionCredentialBoundary(unittest.TestCase):
             observer=lambda event_type, data: events.append((str(event_type), data)),
             run_id=run_id,
             run_scope=scope,
+            # This boundary is about credential redaction, not approval. A stated
+            # policy is mandatory in the coordinator, so state the empty one: it
+            # requires approval for nothing this Run dispatches, which is exactly
+            # what the unstated ``None`` used to mean here.
+            approval_policy=ApprovalPolicy(),
         )
         return result, events
 

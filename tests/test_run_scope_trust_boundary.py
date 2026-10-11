@@ -26,14 +26,19 @@ from app.context.models import (
     ContextSourceType,
     ContextTrustLevel,
 )
+from app.execution.adapter import LocalExecutionAdapter
+from app.execution.authorizer import ExecutionCoordinator
 from app.execution.profile import ProjectExecutionProfile
+from app.runtime.bootstrap import create_runtime
 from app.runtime.run_scope import (
     RunScope,
     RunScopeError,
     freeze_run_scope,
     scope_for_run,
 )
+from app.runtime.run_store import RunStore
 from app.tools.acceptance import AcceptanceCriterion
+from app.tools.approval import ApprovalPolicy
 from app.tools.workspace import Workspace
 
 PROFILE = ProjectExecutionProfile("scope-profile", allowed_commands=("python", "pytest"))
@@ -326,21 +331,227 @@ class ScopeReplacementIsRejectedTests(ScopeTestCase):
             self.scope.assert_current()
 
     def test_release_has_no_production_caller(self) -> None:
-        """The freeze registry can only be cleared by the test suite itself."""
+        """Production code may not clear the freeze registry to replace a scope.
+
+        THE OLD RULE WAS WRONG IN BOTH DIRECTIONS, and it is now stated exactly.
+
+        False positive: it matched any call whose attribute was named ``release``,
+        with no check on the receiver. ``app/runtime/recovery.py`` calls
+        ``self._claims.release(graph_run_id, step_id, token=token)`` -- a release of
+        a *recovery claim token*, which has nothing to do with ``RunScope``. The
+        module is named in the failure even though it never touches the registry.
+
+        Genuine calls it did find: ``app/workflows/step_runner.py`` calls
+        ``RunScope.release(step_run_id)`` twice. Those are real, and they are *not*
+        the failure this invariant exists to prevent. The security property is that
+        the frozen registry cannot be **cleared or replaced while a dispatch is still
+        possible**, because that is what would let a second scope be substituted for
+        the frozen one. The runner creates a scope for one step, dispatches that
+        step, and releases the scope afterwards: the release is the end of the
+        scope's life, not a way around it. ``test_release_precedes_no_dispatch``
+        below proves that ordering mechanically, so the allowance is checked rather
+        than asserted.
+
+        So the rule now tests what it claims: a module that names ``RunScope`` may
+        not call ``release``/``release_all`` on it, except in the one file whose
+        release sites are proven to follow every dispatch.
+        """
+
         import ast as _ast
 
         root = Path(__file__).resolve().parents[1]
+        # The only production module permitted to release a RunScope, and only
+        # because every one of its release sites is proven post-dispatch by
+        # ``test_release_precedes_no_dispatch``.
+        permitted = {"app/workflows/step_runner.py": 2}
         offenders = []
         for path in (root / "app").rglob("*.py"):
-            tree = _ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            source = path.read_text(encoding="utf-8")
+            tree = _ast.parse(source, filename=str(path))
+            # Does this module even reference RunScope? If not, a method called
+            # `release` on some other object is none of this test's business.
+            if "RunScope" not in source:
+                continue
+            found = 0
             for node in _ast.walk(tree):
                 if not isinstance(node, _ast.Call):
                     continue
                 func = node.func
-                name = func.attr if isinstance(func, _ast.Attribute) else getattr(func, "id", "")
-                if name in {"release", "release_all"}:
-                    offenders.append(f"{path.relative_to(root).as_posix()}:{node.lineno}")
-        self.assertEqual(offenders, [], f"release() called from production code: {offenders}")
+                if not isinstance(func, _ast.Attribute):
+                    continue
+                if func.attr not in {"release", "release_all"}:
+                    continue
+                # The receiver must be RunScope (the class or the imported name),
+                # never an arbitrary object that happens to have a `release`.
+                receiver = func.value
+                if isinstance(receiver, _ast.Name) and receiver.id == "RunScope":
+                    found += 1
+                    offenders.append(
+                        f"{path.relative_to(root).as_posix()}:{node.lineno}"
+                    )
+            relative = path.relative_to(root).as_posix()
+            if relative in permitted:
+                # Remove exactly the permitted count; a new site in the same file
+                # still fails.
+                self.assertEqual(
+                    found,
+                    permitted[relative],
+                    f"{relative} has {found} RunScope.release call(s), but "
+                    f"{permitted[relative]} is the proven post-dispatch count. A new "
+                    "release site must be justified the same way, not waved through.",
+                )
+                offenders = [
+                    item
+                    for item in offenders
+                    if not item.startswith(relative + ":")
+                ]
+        self.assertEqual(
+            offenders,
+            [],
+            f"RunScope.release called from production code outside the proven "
+            f"post-dispatch sites: {offenders}",
+        )
+
+    def test_release_precedes_no_dispatch(self) -> None:
+        """Every production ``RunScope.release`` follows the dispatch it belongs to.
+
+        This is what makes the allowance in ``test_release_has_no_production_caller``
+        a measured fact instead of a claim, and it is measured on a REAL step-graph
+        run rather than by reading the source. ``RunScope.release`` and the
+        coordinator's ``execute`` are both instrumented, so the recorded order is the
+        order events actually happened.
+
+        What must hold: every dispatch is authorized against a scope that is STILL
+        FROZEN, and no dispatch happens after its run's scope was released. A release
+        that landed before the dispatch it belongs to would clear the registry and
+        let a second scope be substituted -- exactly the substitution this boundary
+        exists to prevent.
+        """
+
+        events: list[tuple[str, str]] = []
+
+        real_release = RunScope.release
+
+        def spy_release(run_id):  # noqa: ANN001
+            events.append(("release", str(run_id)))
+            return real_release(run_id)
+
+        real_execute = ExecutionCoordinator.execute
+
+        def spy_execute(self, request, **kwargs):  # noqa: ANN001
+            run_id = str(kwargs.get("run_id") or "")
+            # The registry must still hold this run's scope at the moment of dispatch.
+            events.append(
+                ("execute", f"{run_id}|frozen={RunScope.frozen_scope(run_id) is not None}")
+            )
+            return real_execute(self, request, **kwargs)
+
+        RunScope.release = staticmethod(spy_release)
+        ExecutionCoordinator.execute = spy_execute
+        try:
+            executed = self._run_one_real_graph_step()
+        finally:
+            RunScope.release = real_release
+            ExecutionCoordinator.execute = real_execute
+
+        self.assertTrue(executed, "the step graph did not run; the test proved nothing")
+        dispatches = [item for item in events if item[0] == "execute"]
+        releases = [item for item in events if item[0] == "release"]
+        self.assertTrue(dispatches, f"no dispatch was observed: {events}")
+        self.assertTrue(releases, f"no release was observed: {events}")
+
+        # (1) Every dispatch happened against a STILL-FROZEN scope. This is recorded
+        #     at the moment of dispatch, so it cannot be satisfied by ordering alone.
+        for _, payload in dispatches:
+            self.assertTrue(
+                payload.endswith("frozen=True"),
+                f"a dispatch ran with no frozen scope: {payload}",
+            )
+
+        # (2) Each dispatch came BEFORE its own run's release in the real event
+        #     sequence. Comparing positions is the point: a set-membership check
+        #     would pass even if the release had happened first.
+        release_positions = {
+            payload: index
+            for index, (kind, payload) in enumerate(events)
+            if kind == "release"
+        }
+        for index, (kind, payload) in enumerate(events):
+            if kind != "execute":
+                continue
+            run_id = payload.split("|", 1)[0]
+            if run_id not in release_positions:
+                continue
+            self.assertLess(
+                index,
+                release_positions[run_id],
+                f"run {run_id} dispatched at position {index} but its scope was "
+                f"released at position {release_positions[run_id]} -- the registry "
+                "was cleared before the dispatch it belongs to",
+            )
+
+    def _run_one_real_graph_step(self) -> bool:
+        """Run one real step-graph step and report whether it dispatched.
+
+        A minimal but genuine composition: a real ``StepGraphRunner`` over a real
+        workspace, run store and idempotency ledger, dispatching a real child
+        interpreter through the real coordinator.
+        """
+
+        import sys as _sys
+
+        from app.agent_runtime.idempotency_integration import RunIdempotencyGuard
+        from app.execution.authorizer import ExecutionCoordinator as _Coordinator
+        from app.execution.declaration import ExecutionDeclaration
+        from app.workflows.step_graph import StepAction, StepDefinition, StepGraph
+        from app.workflows.step_runner import StepGraphRunner
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        root = base / "ws"
+        root.mkdir()
+        (root / "made.txt").write_text("seed", encoding="utf-8")
+
+        profile = ProjectExecutionProfile(
+            profile_id="release-probe", allowed_commands=(_sys.executable,)
+        )
+        declaration = ExecutionDeclaration(
+            declaration_id="release-probe.step",
+            command=(
+                _sys.executable,
+                "-c",
+                "open('made.txt','a',encoding='utf-8').write('x')",
+            ),
+            profile_id="release-probe",
+            working_directory=".",
+            intent="Append one byte.",
+        )
+        runner = StepGraphRunner(
+            runtime=create_runtime(test_mode=True),
+            workspace=Workspace(root),
+            execution_profile=profile,
+            declarations={declaration.declaration_id: declaration},
+            run_store=RunStore(root=str(base / "store")),
+            idempotency_guard=RunIdempotencyGuard.create(ledger_root=str(base / "ledger")),
+            approval_policy=ApprovalPolicy(approval_required_tools=()),
+            execution_coordinator=_Coordinator(
+                LocalExecutionAdapter(workspace_root=root, isolate_workspace=False)
+            ),
+            approval_resolver=None,
+            allowed_tool_ids=frozenset(),
+            artifacts_are_harvested=False,
+        )
+        graph = StepGraph(
+            graph_id="release-probe",
+            steps=(
+                StepDefinition(
+                    step_id="s1", action=StepAction(declaration.declaration_id)
+                ),
+            ),
+        )
+        result = runner.run(graph, "release-probe.run")
+        return bool(result.executed)
 
     def test_in_place_mutation_is_detected_and_grants_nothing(self) -> None:
         """A frozen dataclass can be forced internally, but the fingerprint notices."""

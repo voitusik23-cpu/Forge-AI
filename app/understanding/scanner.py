@@ -9,6 +9,11 @@ import stat
 from typing import Sequence
 
 from app.snapshots import SnapshotFile
+from app.execution.secret_files import (
+    SECRET_FILE_NAMES,
+    is_secret_directory,
+    is_secret_file,
+)
 from app.tools.workspace import Workspace, WorkspacePathError
 from app.understanding.extractors.base import BaseExtractor
 from app.understanding.extractors.generic_extractor import GenericExtractor
@@ -49,12 +54,11 @@ class BoundedProjectScanner:
         "obj",
     })
 
-    _SECRET_PATTERNS = frozenset({
-        "credentials.json",
-        "service_account.json",
-        "serviceaccount.json",
-        "client_secret.json",
-    })
+    # Secret-file recognition lives in ``app.execution.secret_files`` so this scanner
+    # and the execution-workspace staging step cannot disagree about what is credential
+    # material. The attribute below was the scanner's private copy; it is retained as a
+    # read-only view for callers that introspect it, and is no longer the source.
+    _SECRET_PATTERNS = SECRET_FILE_NAMES
 
     _BINARY_EXTENSIONS = frozenset({
         ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp",
@@ -95,10 +99,22 @@ class BoundedProjectScanner:
         root_path = Path(workspace.root).resolve()
 
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
-            # 1. Prune ignored directories in-place
+            # 1. Prune ignored directories in-place.
+            #
+            # Credential directories are pruned through the same recognizer the execution
+            # staging step uses (`is_secret_directory`), matching how files already delegate
+            # to `is_secret_file`. Without it the walk descended into `.terraform`, `keys`,
+            # `certs`, `.ssh` and friends and inventoried files there whose names carry no
+            # secret marker ("notes.txt"), so a file-count limit could be consumed by
+            # content that is not project source at all. It is not a disclosure by itself --
+            # files the file-level rule does recognize were recorded without a fingerprint
+            # and never read -- but the two traversals disagreed about what is credential
+            # territory, and the staging side is the one that was right.
             dirnames[:] = [
                 d for d in sorted(dirnames)
-                if d not in self._IGNORED_DIRS and not d.startswith(".git")
+                if d not in self._IGNORED_DIRS
+                and not d.startswith(".git")
+                and not is_secret_directory(d)
             ]
 
             for filename in sorted(filenames):
@@ -310,16 +326,16 @@ class BoundedProjectScanner:
 
     @classmethod
     def _is_secret_file(cls, filename: str, rel_path: str) -> bool:
-        lower_name = filename.lower()
-        if lower_name == ".env" or lower_name.startswith(".env."):
-            return True
-        if lower_name in cls._SECRET_PATTERNS:
-            return True
-        if lower_name.endswith((".pem", ".key", ".pfx", ".p12", ".pkcs12", ".kdbx")):
-            return True
-        if lower_name.startswith("id_rsa") or lower_name.startswith("id_ed25519") or lower_name.startswith("id_ecdsa"):
-            return True
-        return False
+        """True when the file is credential material and must not be indexed.
+
+        Delegates to :func:`app.execution.secret_files.is_secret_file`, the recognizer
+        the execution-workspace staging step also uses. The two used to hold separate
+        lists, and the staging copy did not recognize ``.env`` at all -- which is how
+        provider keys reached the working directory of a spawned process. One recognizer
+        removes the possibility of the two answers drifting apart again.
+        """
+
+        return is_secret_file(filename)
 
     @staticmethod
     def _hash_file(file_path: Path) -> str:

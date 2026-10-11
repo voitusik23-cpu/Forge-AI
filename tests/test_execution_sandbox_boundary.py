@@ -50,6 +50,7 @@ from app.execution.sandbox import (
 )
 from app.runtime.run_scope import RunScope, RunScopeError
 from app.tools.acceptance import AcceptanceCriterion
+from app.tools.approval import ApprovalPolicy
 from app.tools.workspace import Workspace
 
 RUN_ID = "run-sandbox-1"
@@ -123,6 +124,11 @@ class SandboxTestCase(unittest.TestCase):
         orchestration layer supplies the perimeter before any dispatch.
         """
         scope = self.scope(run_id=run_id)
+        # A stated approval policy is mandatory in the coordinator: an absent one is
+        # a denial, not a permission. These cases are about the filesystem and
+        # network boundary, not approval, so state the empty policy the unstated
+        # ``None`` used to amount to. A caller that IS about approval overrides it.
+        kw.setdefault("approval_policy", ApprovalPolicy())
         return ExecutionCoordinator(self.adapter()).execute(
             request,
             workspace_root=self.root,
@@ -454,6 +460,10 @@ class LiveCwdCheckTests(SandboxTestCase):
             run_id=RUN_ID,
             allowed_commands=frozenset(scope.allowed_execution_commands),
             run_scope=scope,
+            # The subject is the adapter's last-moment live cwd check, not approval.
+            # A stated policy is mandatory now, so state the empty one: it requires
+            # approval for nothing dispatched here.
+            approval_policy=ApprovalPolicy(),
         )
 
     def test_live_check_refuses_a_cwd_that_became_external(self) -> None:

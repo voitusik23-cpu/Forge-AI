@@ -1,5 +1,6 @@
 """Explicit construction of the Forge AI runtime."""
 
+import os
 from dataclasses import replace
 from typing import Optional
 
@@ -9,7 +10,12 @@ from app.agents.providers.registry import ProviderRegistry
 from app.agents.providers.capabilities import ProviderCapabilitiesRegistry
 from app.agents.providers.model_registry import ModelRegistry
 from app.agents.registry import AgentRegistry
-from app.config.settings import RuntimeSettings, load_settings
+from app.config.settings import (
+    OFFLINE_PROVIDER_NAME,
+    ApplicationEnvironment,
+    RuntimeSettings,
+    load_settings,
+)
 from app.config.provider_accounts import load_provider_account_config
 from app.config.secrets import SecretStore
 from app.fabric.fabric import CapabilityFabric
@@ -21,14 +27,97 @@ from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
 
 
+def _test_mode_requested(explicit: bool) -> bool:
+    """Resolve whether this composition is a TEST runtime.
+
+    The signal is the existing ``FORGE_ENV`` switch, which already has a ``test``
+    member and already selects it; no second switch is invented. ``explicit`` lets
+    a caller that builds its own settings opt in without the variable. The
+    resolution is a union, so either signal turns the guarantee ON. It is never
+    the default: an unset ``FORGE_ENV`` resolves to ``development`` and an
+    explicit ``False`` stays production.
+    """
+
+    if explicit:
+        return True
+    return os.environ.get("FORGE_ENV", "").strip().lower() == ApplicationEnvironment.TEST.value
+
+
+def _offline_only_settings(settings: RuntimeSettings) -> RuntimeSettings:
+    """Return ``settings`` narrowed so no live provider can be reached.
+
+    This is the TEST-runtime invariant, applied in one place. It is deliberately a
+    *narrowing*: it can only remove reachability, so no caller can widen a
+    configuration through it, and the result is still an ordinary immutable
+    ``RuntimeSettings`` that every existing consumer already accepts.
+
+    * ``enabled_providers`` keeps only the offline provider. Any live provider a
+      caller or a developer's ``.env`` named is dropped, so it is constructed
+      disabled and can never be selected automatically. On the ambient TEST path
+      it is not constructed at all (see :func:`create_runtime`).
+    * ``default_provider`` becomes the offline provider, so the configured
+      default that automatic routing appends is itself offline.
+    * ``provider_fallback_chain`` is emptied, so a fallback attempt cannot reach
+      a live provider either.
+    * ``allow_paid_providers`` is forced off as a second, independent bound.
+    """
+
+    return replace(
+        settings,
+        default_provider=OFFLINE_PROVIDER_NAME,
+        enabled_providers=(OFFLINE_PROVIDER_NAME,),
+        provider_fallback_chain=(),
+        allow_paid_providers=False,
+    )
+
+
 def create_runtime(
     settings: Optional[RuntimeSettings] = None,
     fabric: Optional[CapabilityFabric] = None,
     model_registry: Optional[ModelRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
+    test_mode: bool = False,
 ) -> RuntimeContext:
-    """Build registries and orchestrator without making external API calls."""
-    resolved_settings = settings if settings is not None else load_settings()
+    """Build registries and orchestrator without making external API calls.
+
+    The TEST-runtime guarantee (see ``docs/SOURCE_OF_TRUTH.md``): ``test_mode=True``,
+    or ``FORGE_ENV=test`` in the environment, makes this composition a TEST runtime.
+
+    * A TEST runtime always narrows ``RuntimeSettings`` so the offline provider is
+      the only enabled one, the configured default, with no fallback chain and paid
+      providers off. That narrowing is applied to caller-supplied settings too,
+      because a caller must not be able to hand in settings that re-enable a live
+      provider in test mode.
+    * The **ambient** path -- no ``settings`` argument, so the values come from the
+      process environment and the developer's ``.env`` -- is additionally *safe by
+      construction*: a TEST runtime on that path constructs only the providers it
+      enables, so a live provider has no agent, no capabilities, no registry entry,
+      and therefore no transport.
+
+    The ambient path is the one that was dangerous, and it needs the stronger form:
+    switching off a provider's config flag is not sufficient on its own, because
+    ``tests/test_dispatcher.py::test_explicit_provider_keeps_priority_over_auto_availability``
+    pins an explicitly named provider as reaching execution *despite* being disabled
+    by configuration.
+
+    A caller that supplies its own ``settings`` keeps the historical registry shape
+    (every provider constructed, only the enabled ones switched on). That is a
+    deliberate compatibility boundary, not a gap: such a caller has stated the
+    runtime's shape explicitly, and the narrowing above has still removed every live
+    provider from ``enabled_providers``.
+
+    The default is ``test_mode=False`` and the ambient default environment is
+    ``development``, so production composition is unchanged.
+    """
+    ambient_settings = settings is None
+    resolved_settings = load_settings() if ambient_settings else settings
+    in_test_mode = _test_mode_requested(test_mode)
+    if in_test_mode:
+        # Applied to an explicitly supplied ``settings`` too: the invariant is
+        # about the runtime being a TEST runtime, not about where its settings
+        # came from. A caller cannot hand in settings that re-enable a live
+        # provider in test mode.
+        resolved_settings = _offline_only_settings(resolved_settings)
     configure_logging(resolved_settings)
 
     provider_factory = ProviderFactory()
@@ -37,7 +126,12 @@ def create_runtime(
     capabilities_registry = ProviderCapabilitiesRegistry()
     agent_registry = AgentRegistry()
     enabled_providers = set(resolved_settings.enabled_providers)
-    for provider_name in provider_factory.list_providers():
+    provider_names_to_register = (
+        [name for name in provider_factory.list_providers() if name in enabled_providers]
+        if (in_test_mode and ambient_settings)
+        else provider_factory.list_providers()
+    )
+    for provider_name in provider_names_to_register:
         provider = provider_factory.create(provider_name, secret_store=secret_store)
         configured_model = None
         if provider_name == "openrouter":

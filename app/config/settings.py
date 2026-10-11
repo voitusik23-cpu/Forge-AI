@@ -11,6 +11,15 @@ class ConfigurationError(ValueError):
     """Raised when runtime settings are invalid."""
 
 
+#: The one provider that is offline by construction. ``MockProvider.generate``
+#: returns a deterministic string and opens no socket, so a runtime whose only
+#: reachable provider is this one cannot spend money or reach the network. It is
+#: named here, beside ``RuntimeSettings.enabled_providers`` and
+#: ``RuntimeSettings.default_provider`` whose defaults already use it, so the
+#: offline provider has exactly one spelling in the configuration layer.
+OFFLINE_PROVIDER_NAME = "mock"
+
+
 class ApplicationEnvironment(str, Enum):
     """Supported application environments."""
 

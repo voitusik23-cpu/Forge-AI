@@ -168,5 +168,7 @@ class TaskSpecification:
             ],
         }
         if self.execution_profile is not None:
-            data["execution_profile"] = self.execution_profile.to_dict()
+            # The specification travels into the prompt, so the profile goes in
+            # through the redacting projection rather than the authority view.
+            data["execution_profile"] = self.execution_profile.to_context_dict()
         return data
