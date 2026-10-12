@@ -177,7 +177,7 @@ review-engine module; the reviewer exists as an agent inside
 | Wall-clock timeout enforced by process wait, not by pipe EOF; process tree terminated on timeout **and** after a normal exit | **CURRENT / VERIFIED** | `app/execution/adapter.py` — `tests/test_execution_timeout_and_tree_kill.py` |
 | Frozen `workspace_root` checked unconditionally, independent of adapter isolation | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_workspace_root_always_checked.py` |
 | Profile environment values redacted on every prompt-bound serialization | **CURRENT / VERIFIED** | `app/execution/profile.py` (`to_context_dict`) — `tests/test_profile_prompt_redaction.py` |
-| Core API exposure configuration: explicit CORS allow-list, no credentialed CORS, loopback-bound launcher with an exposure warning | **CURRENT / VERIFIED** (no authentication) | `app/api/server.py`, `app/api/main.py` — `tests/test_api_exposure.py` |
+| Core API exposure configuration: explicit CORS allow-list, no credentialed CORS, loopback-bound launcher that refuses non-loopback exposure without authentication | **CURRENT / VERIFIED** (no authentication) | `app/api/server.py`, `app/api/main.py` — `tests/test_api_exposure.py` |
 | Run-level production idempotency (durable ledger, atomic claim, terminal-state protection) | **PARTIAL** — see §4.8 | `app/agent_runtime/idempotency.py`, `app/agent_runtime/idempotency_integration.py`, `app/api/service.py` — `tests/test_idempotency_production.py` |
 | First end-to-end vertical workflow (`goal -> specification -> plan -> approval -> execution -> verification -> result`) | **CURRENT / VERIFIED**, with the scope limits in §3.5 | `app/workflows/project_workflow.py` — `tests/test_project_workflow_production.py`, `tests/test_project_factory_end_to_end.py` |
 | Controlled Project Factory slice: separated `generation_status` / `execution_status` / `harness_status` / `verification_exit_code` / `acceptance_status`, a per-invocation generation budget, and an explicit not-established state | **CURRENT / VERIFIED**; the four statuses are distinct fields with closed vocabularies — see §3.5.1 | `app/workflows/project_workflow.py` — `tests/test_project_factory_vertical_slice.py` (42 tests) |
@@ -1713,8 +1713,8 @@ this pass and one deliberately was not:
   narrowed, because an operator who wrote `*` believes the surface is open.
 - `app/api/main.py` is the launcher. There was none before: `create_api_app` existed and
   tests imported it, but nothing bound a host, which is how the permissive CORS survived
-  review. It binds to loopback by default and emits a `RuntimeWarning` when asked to bind
-  elsewhere.
+  review. It binds to loopback by default and refuses non-loopback binds because the
+  surface has no authentication.
 - Authentication was **not** invented. Adding an identity mechanism here is open decision
   O-2 and would create a second trust model alongside the Platform's. The residual risk is
   recorded here, and `tests/test_api_exposure.py::test_14` asserts that no route has gained
@@ -4261,8 +4261,8 @@ GAP-R — PARTIAL.
   молча, потому что оператор, написавший `*`, считает поверхность открытой.
 - `app/api/main.py` — launcher. Раньше его не было: `create_api_app` существовал, тесты
   его импортировали, но ничто не привязывало хост, — именно поэтому разрешающий CORS
-  пережил ревью. По умолчанию он привязывается к loopback и выдаёт `RuntimeWarning`,
-  если попросить другой адрес.
+  пережил ревью. По умолчанию он привязывается к loopback и отказывает до запуска, если
+  запрошен другой адрес, поскольку у поверхности нет аутентификации.
 - Аутентификация **не изобретена**. Добавление здесь механизма идентичности — открытое
   решение O-2, и оно создало бы вторую модель доверия рядом с моделью Platform.
   Остаточный риск зафиксирован здесь, а `tests/test_api_exposure.py::test_14` утверждает,

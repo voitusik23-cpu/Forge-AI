@@ -21,6 +21,7 @@ holds in both adapter modes, and that the refusal names the condition.
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.execution.adapter import LocalExecutionAdapter
 from app.execution.workspace_manager import EphemeralWorkspaceManager
@@ -198,6 +199,26 @@ class WorkspaceRootIsAlwaysCheckedTests(unittest.TestCase):
         scope.validate_workspace_root(self.frozen_root)
         with self.assertRaises(RunScopeError):
             scope.validate_workspace_root(self.other_root)
+
+    def test_07_resolved_path_escape_is_denied_without_absolute_path(self):
+        manager = EphemeralWorkspaceManager(source_workspace_root=self.frozen_root)
+        with manager:
+            with self.assertRaisesRegex(ValueError, "Path traversal detected") as caught:
+                manager.resolve_path("..\\other\\outside.txt", root=self.frozen_root)
+        self.assertNotIn(str(self.frozen_root), str(caught.exception))
+        self.assertNotIn(str(self.other_root), str(caught.exception))
+
+    def test_08_reparse_point_is_denied_before_resolve(self):
+        manager = EphemeralWorkspaceManager(source_workspace_root=self.frozen_root)
+        with patch.object(
+            EphemeralWorkspaceManager,
+            "_is_reparse_point",
+            staticmethod(lambda path: path.name == "junction"),
+        ):
+            with self.assertRaisesRegex(ValueError, "reparse point") as caught:
+                manager.resolve_path("junction\\outside.txt", root=self.frozen_root)
+        self.assertNotIn(str(self.frozen_root), str(caught.exception))
+        self.assertNotIn(str(self.other_root), str(caught.exception))
 
 
 if __name__ == "__main__":

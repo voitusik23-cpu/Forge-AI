@@ -106,7 +106,8 @@ class EphemeralWorkspaceManager:
         is that frozen token root, and the traversal check below is applied to it
         exactly as it is to the scratch root.
         """
-        root = self.scratch_root if root is None else Path(root).resolve()
+        root = self.scratch_root if root is None else Path(root)
+        root = root.resolve()
         norm = relative_path.replace("\\", "/").strip()
         if not norm or norm == ".":
             return root
@@ -115,11 +116,21 @@ class EphemeralWorkspaceManager:
         if ".." in parts or norm.startswith("/"):
             raise ValueError(f"Path traversal detected: {relative_path}")
 
-        resolved = (root / norm).resolve()
+        candidate = root / norm
+        # Inspect the lexical path before resolving it.  On Windows a junction is
+        # a reparse point but is not reported by ``Path.is_symlink()``; resolving
+        # first would otherwise let a path cross the trusted perimeter silently.
+        current = root
+        for component in parts:
+            current = current / component
+            if self._is_reparse_point(current):
+                raise ValueError("Workspace path crosses a reparse point")
+
+        resolved = candidate.resolve()
         try:
             resolved.relative_to(root)
         except ValueError as exc:
-            raise ValueError(f"Resolved path escapes ephemeral workspace root: {relative_path}") from exc
+            raise ValueError("Resolved path escapes ephemeral workspace root") from exc
 
         return resolved
 
@@ -251,9 +262,7 @@ class EphemeralWorkspaceManager:
             for d in dirs:
                 dir_path = Path(root_dir) / d
                 if self._is_reparse_point(dir_path):
-                    raise ValueError(
-                        f"Symlinks are rejected as staging mechanisms in Forge v0.1: {dir_path}"
-                    )
+                    raise ValueError("Reparse points are rejected as staging mechanisms")
                 (current_dst_dir / d).mkdir(parents=True, exist_ok=True)
 
             for f in files:
@@ -267,9 +276,7 @@ class EphemeralWorkspaceManager:
                     continue
                 src_file = Path(root_dir) / f
                 if self._is_reparse_point(src_file):
-                    raise ValueError(
-                        f"Symlinks are rejected as staging mechanisms in Forge v0.1: {src_file}"
-                    )
+                    raise ValueError("Reparse points are rejected as staging mechanisms")
                 dst_file = current_dst_dir / f
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_file, dst_file)
@@ -291,8 +298,15 @@ class EphemeralWorkspaceManager:
         try:
             if path.is_symlink():
                 return True
-            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+            if os.name == "nt":
+                attributes = getattr(
+                    os.stat(path, follow_symlinks=False), "st_file_attributes", 0
+                )
+                return bool(
+                    attributes
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                )
         except OSError:
             # A path that cannot be inspected must be refused, not copied.
             return True
-        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        return False

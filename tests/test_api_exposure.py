@@ -7,13 +7,12 @@ because nothing in the repository actually launched the server -- there was no p
 which a bind address had to be chosen.
 
 These tests pin the three decisions that replace it: an explicit origin allow-list, no
-credentialed CORS, and loopback-by-default with a loud warning when asked to bind wider.
+credentialed CORS, and loopback-by-default with refusal when asked to bind wider.
 They also assert the residual risk explicitly, so a future reader cannot mistake the
 absence of a 401 for an oversight that was never noticed.
 """
 
 import unittest
-import warnings
 
 from app.api import main as api_main
 from app.api.server import (
@@ -155,24 +154,16 @@ class BindAddressTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 api_main.resolve_bind(environ={"FORGE_API_PORT": bad})
 
-    def test_23_binding_beyond_loopback_warns_loudly(self):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            message = warn_if_exposed("0.0.0.0")
-        self.assertIsNotNone(message)
-        self.assertIn("NO authentication", message)
-        self.assertEqual(len(caught), 1)
-        self.assertTrue(issubclass(caught[0].category, RuntimeWarning))
+    def test_23_binding_beyond_loopback_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "refuses non-loopback"):
+            warn_if_exposed("0.0.0.0")
 
     def test_24_binding_to_loopback_is_silent(self):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            message = warn_if_exposed("127.0.0.1")
+        message = warn_if_exposed("127.0.0.1")
         self.assertIsNone(message)
-        self.assertEqual(caught, [])
 
-    def test_25_the_launcher_warns_before_it_serves(self):
-        """The warning must happen at startup, not on the first request."""
+    def test_25_the_launcher_refuses_before_it_serves(self):
+        """The refusal must happen before app construction and serving."""
 
         served: list[tuple] = []
 
@@ -190,14 +181,9 @@ class BindAddressTests(unittest.TestCase):
                 {"FORGE_API_HOST": "0.0.0.0", "FORGE_API_PORT": "9100"},
                 clear=False,
             ):
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
+                with self.assertRaisesRegex(RuntimeError, "refuses non-loopback"):
                     api_main.main([])
-        self.assertEqual(served, [("0.0.0.0", 9100)])
-        self.assertTrue(
-            any("NO authentication" in str(w.message) for w in caught),
-            f"expected an exposure warning, got {[str(w.message) for w in caught]}",
-        )
+        self.assertEqual(served, [])
 
 
 if __name__ == "__main__":

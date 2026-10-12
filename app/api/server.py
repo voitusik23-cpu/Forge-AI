@@ -10,8 +10,8 @@ does not protect these routes.
 
 What this module therefore does, and refuses to do:
 
-* binds to **loopback by default** and warns loudly if asked to bind elsewhere, so a wider
-  exposure is a deliberate, visible act rather than an accident;
+* binds to **loopback by default** and refuses non-loopback binds because the surface has
+  no authentication;
 * refuses a wildcard CORS origin, and never enables credentialed CORS, because
   ``allow_origins=["*"]`` together with ``allow_credentials=True`` is the configuration
   that turns a browser into a confused deputy for whoever can reach the port;
@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import logging
 import os
-import warnings
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -141,23 +140,13 @@ def resolve_cors_origins(
 
 
 def warn_if_exposed(host: str) -> Optional[str]:
-    """Warn when the surface is bound beyond loopback. Returns the warning text, if any.
-
-    A warning rather than a refusal: the owner may legitimately front this with a
-    reverse proxy, and failing hard would break a working deployment. The point is that
-    the exposure is never silent.
-    """
+    """Reject non-loopback binds because this surface has no authentication."""
 
     if is_loopback_host(host):
         return None
-    message = (
-        f"Forge API is binding to {host!r}, which is reachable beyond this machine, and "
-        "this surface has NO authentication. Any client that can reach the port can "
-        "dispatch runs, spend configured provider keys, and read run history. Bind to "
-        "127.0.0.1, or put an authenticating proxy in front of it, before exposing it."
+    raise RuntimeError(
+        "Forge API refuses non-loopback binding because authentication is not configured"
     )
-    warnings.warn(message, RuntimeWarning, stacklevel=2)
-    return message
 
 
 def create_api_app(
