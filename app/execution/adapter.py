@@ -7,6 +7,8 @@ import signal
 import subprocess
 import threading
 import time
+import ctypes
+from ctypes import wintypes
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +91,60 @@ SAFE_ENV_WHITELIST_KEYS: frozenset[str] = frozenset({
     "PYTHONUTF8",
     "VIRTUAL_ENV",
 })
+
+
+def _windows_process_tree(root_pid: int) -> tuple[int, ...]:
+    """Return ``root_pid`` and its descendants from a point-in-time snapshot.
+
+    ``taskkill /T`` is not available in every restricted Windows runtime.  The
+    Toolhelp snapshot is a standard OS API and lets the adapter enforce the same
+    process-tree boundary without relying on a shell command or elevated rights.
+    """
+
+    if os.name != "nt":
+        return ()
+
+    class _ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == INVALID_HANDLE_VALUE:
+        return ()
+
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+        parent_by_pid: dict[int, int] = {}
+        first = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while first:
+            parent_by_pid[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            first = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    tree = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent_pid in parent_by_pid.items():
+            if parent_pid in tree and pid not in tree:
+                tree.add(pid)
+                changed = True
+    return tuple(sorted(tree, reverse=True))
 
 
 @runtime_checkable
@@ -556,10 +612,24 @@ class LocalExecutionAdapter:
 
             # The readers are released without waiting for a descendant that still holds
             # the pipes: whatever arrived is taken, and an unbounded wait is not.
-            for stream in (proc.stdout, proc.stderr):
+            for stream_name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
                 try:
                     if stream is not None and not stream.closed:
-                        stream.close()
+                        if timed_out and os.name == "nt":
+                            # Windows may block closing a pipe while a descendant
+                            # still owns an inherited write handle. Do not let pipe
+                            # cleanup extend the execution deadline; the daemon
+                            # closer releases it when the OS permits and the Popen
+                            # attributes are cleared so the finally block below does
+                            # not repeat the blocking close.
+                            threading.Thread(
+                                target=stream.close,
+                                name=f"forge-close-{stream_name}",
+                                daemon=True,
+                            ).start()
+                            setattr(proc, stream_name, None)
+                        else:
+                            stream.close()
                 except Exception:
                     pass
 
@@ -671,15 +741,27 @@ class LocalExecutionAdapter:
         """
 
         if os.name == "nt":
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=5,
-                    check=False,
-                )
-            except Exception:
-                pass
+            # Prefer the native process snapshot.  Some managed Windows runners
+            # deny ``taskkill /T`` even for child processes, while ``os.kill``
+            # (TerminateProcess) is permitted for the same PIDs.
+            process_tree = _windows_process_tree(proc.pid)
+            for pid in process_tree:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            if not process_tree:
+                # A snapshot can fail transiently (for example during process
+                # table pressure), so retain the legacy command as a fallback.
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    pass
             try:
                 proc.kill()
             except Exception:
