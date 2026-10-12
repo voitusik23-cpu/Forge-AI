@@ -169,7 +169,7 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 - **Durable/persistent approval store with expiration.** Deferred as a separate design: a persistent, expiring approval is a standing authorization with different semantics from a single-use approval event, and must not be introduced as an incidental resolver improvement.
 - **MCP as the permission model.** Rejected: authorization belongs to Forge's Permission -> Approval -> Policy -> Execution boundaries. MCP may later be a tool transport under that authority. See [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md).
 - **Universal retries, rollback, parallelism and swarm execution.** Rejected as defaults: complexity and cost are not justified by default, and more agents do not mean better results.
-- **Unifying `app/tools/workspace.py` with `app/execution/paths.py` in this block.** Deferred: the tool boundary keeps its own validator; duplication is recorded as a known item rather than silently refactored during an authorization change.
+- **Unifying `app/tools/workspace.py` with `app/execution/paths.py` in this block.** Completed as a focused follow-up: `Workspace` delegates normalization to the shared canonical validator while retaining its tool-boundary checks.
 
 ### Open items for the next authorization block
 
@@ -209,15 +209,13 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 ### Открытые вопросы для следующего блока авторизации
 
 1. Заменить список распознавания capabilities на fail-closed модель объявленных инвокаций, чтобы нераспознанное поведение требовало явной capability.
-2. Сделать проверку fingerprint координатором безусловной (одобрение без fingerprint не должно авторизовать выполнение).
-3. Включить разрешённое окружение профиля в тело интента либо доказать, что оно не может влиять на выполнение.
-4. Решить, является ли идентичность программы именем, разрешаемым во время выполнения, или путём, закреплённым при одобрении (привязка PATH / TOCTOU).
-5. Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
+2. Решить, является ли идентичность программы именем, разрешаемым во время выполнения, или путём, закреплённым при одобрении (привязка PATH / TOCTOU).
+3. Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
 
 ## Workspace identity binding v0.1
 
 - **A frozen `RunScope` binds the workspace by filesystem identity as well as canonical path.** `WorkspaceIdentity` captures the canonical root, `st_dev`, and `st_ino`; `validate_workspace_root` rejects a directory replacement at the same pathname. This closes path-only replacement without introducing a second authorization system. The execution intent remains the authority subject for the command itself.
-- **Окончательный `RunScope` связывает workspace не только canonical path, но и идентичностью файловой системы.** `WorkspaceIdentity` сохраняет canonical root, `st_dev` и `st_ino`; `validate_workspace_root` отклоняет замену каталога по тому же пути. Это закрывает замену только по pathname без введения второй системы авторизации. Execution intent остаётся субъектом авторизации самой команды.
+- **Замороженный `RunScope` связывает workspace не только canonical path, но и идентичностью файловой системы.** `WorkspaceIdentity` сохраняет canonical root, `st_dev` и `st_ino`; `validate_workspace_root` отклоняет замену каталога по тому же пути. Это закрывает замену только по pathname без введения второй системы авторизации. Execution intent остаётся субъектом авторизации самой команды.
 
 ## Production Run Authority and RunScope v0.1
 
