@@ -306,6 +306,12 @@ class EphemeralWorkspaceManager:
                     attributes
                     & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
                 )
+        except FileNotFoundError:
+            # A declared artifact may legitimately be absent: the verifier must
+            # report ``artifact_not_produced`` after execution.  Non-existent
+            # paths are not reparse points; their existing parent components
+            # were checked above.
+            return False
         except OSError:
             # A path that cannot be inspected must be refused, not copied.
             return True
