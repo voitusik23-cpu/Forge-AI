@@ -696,6 +696,22 @@ allowlist defaults to the empty set and no production `ExecutionRequest` source
 is wired, so no process runs through an API task today. `AgentHarness` and
 `EngineeringRunExecutor` remain outside the API path.
 
+### Workspace identity binding
+
+`RunScope` captures a `WorkspaceIdentity` when the scope is created. The identity
+contains the canonical root and filesystem `st_dev`/`st_ino` values. Before execution,
+`validate_workspace_root` checks both the canonical pathname and the captured identity,
+so replacing a directory at the same pathname is denied. This is a narrow replacement
+guard; it does not introduce an OS sandbox or a second authorization system.
+
+### Привязка идентичности workspace
+
+`RunScope` сохраняет `WorkspaceIdentity` при создании scope. Идентичность содержит
+canonical root и значения `st_dev`/`st_ino` файловой системы. Перед выполнением
+`validate_workspace_root` проверяет и canonical pathname, и сохранённую идентичность,
+поэтому замена каталога по тому же пути отклоняется. Это узкая защита от замены, а не
+OS sandbox и не вторая система авторизации.
+
 ## Production Tool Execution and RunScope v0.1 — русская версия
 
 API-endpoint выполнения задач теперь диспетчеризует tools через замороженный

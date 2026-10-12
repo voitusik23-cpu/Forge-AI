@@ -190,7 +190,7 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 
 ### DEFERRED вЂ” Block 2 (workspace and isolation)
 
-- [ ] `WorkspaceIdentity` and workspace identity binding in the intent
+- [x] `WorkspaceIdentity` and workspace identity binding in the frozen run scope (the execution intent remains the command authorization subject)
 - [ ] Declared-input allow-lists and deny-by-default staging
 - [x] Secret, `.env` and VCS exclusion policy for staged workspaces (name-based denylist; declared-input allow-list remains deferred)
 - [ ] Scoped content digests for referenced inputs
@@ -506,7 +506,7 @@ workflow review/ревизии. Выполнение плана, управле�
 
 ### DEFERRED — Block 2 (workspace и изоляция)
 
-- [ ] `WorkspaceIdentity` и привязка идентичности workspace в интенте
+- [x] `WorkspaceIdentity` и привязка идентичности workspace в frozen run scope (execution intent остаётся субъектом авторизации команды)
 - [ ] Белые списки объявленных входов и deny-by-default подготовка
 - [x] Политика исключения секретов, `.env` и VCS при подготовке workspace (denylist по имени; allow-list объявленных входов остаётся отложенным)
 - [ ] Точечные digest'ы содержимого для referenced inputs

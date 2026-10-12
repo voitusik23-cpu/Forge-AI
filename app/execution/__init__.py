@@ -11,7 +11,12 @@ from app.execution.artifacts import (
     create_artifact_from_file,
 )
 from app.execution.authorizer import ExecutionCoordinator
-from app.execution.identity import CommandIdentity, canonical_executable, command_identity
+from app.execution.identity import (
+    CommandIdentity,
+    WorkspaceIdentity,
+    canonical_executable,
+    command_identity,
+)
 from app.execution.policy import (
     ExecutionPolicy,
     ExecutionPolicyDecision,
@@ -44,6 +49,7 @@ __all__ = [
     "ExecutionBackend",
     "ExecutionCoordinator",
     "CommandIdentity",
+    "WorkspaceIdentity",
     "canonical_executable",
     "command_identity",
     "ExecutionEnvironmentType",

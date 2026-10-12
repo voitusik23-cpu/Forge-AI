@@ -214,6 +214,11 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 4. Решить, является ли идентичность программы именем, разрешаемым во время выполнения, или путём, закреплённым при одобрении (привязка PATH / TOCTOU).
 5. Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
 
+## Workspace identity binding v0.1
+
+- **A frozen `RunScope` binds the workspace by filesystem identity as well as canonical path.** `WorkspaceIdentity` captures the canonical root, `st_dev`, and `st_ino`; `validate_workspace_root` rejects a directory replacement at the same pathname. This closes path-only replacement without introducing a second authorization system. The execution intent remains the authority subject for the command itself.
+- **Окончательный `RunScope` связывает workspace не только canonical path, но и идентичностью файловой системы.** `WorkspaceIdentity` сохраняет canonical root, `st_dev` и `st_ino`; `validate_workspace_root` отклоняет замену каталога по тому же пути. Это закрывает замену только по pathname без введения второй системы авторизации. Execution intent остаётся субъектом авторизации самой команды.
+
 ## Production Run Authority and RunScope v0.1
 
 Recorded at commit `451ffd1` (discovery wiring) and implemented in the production

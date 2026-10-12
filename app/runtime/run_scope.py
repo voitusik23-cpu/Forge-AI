@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from app.execution.identity import command_is_allowed
+from app.execution.identity import WorkspaceIdentity, command_is_allowed
 from app.execution.sandbox import (
     WorkspaceBoundary,
     WorkspaceContainmentError,
@@ -144,6 +144,7 @@ class RunScope:
     allowed_tool_ids: frozenset[str] = frozenset()
     allowed_execution_commands: frozenset = frozenset()
     acceptance_criteria: tuple["AcceptanceCriterion", ...] = ()
+    workspace_identity: WorkspaceIdentity | None = None
 
     # Process-local freeze registry. This is an accident/regression guard, not a
     # defence against a hostile in-process adversary; see the module docstring.
@@ -169,6 +170,14 @@ class RunScope:
             raise RunScopeError(
                 "execution_profile must declare at least one allowed command"
             )
+        try:
+            # Never accept a caller-supplied identity as authority.  Re-capture it
+            # from the validated Workspace root so dataclasses.replace or a direct
+            # constructor cannot pair one directory with another directory's token.
+            identity = WorkspaceIdentity.capture(self.workspace.root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RunScopeError("workspace identity could not be captured") from exc
+        object.__setattr__(self, "workspace_identity", identity)
 
         object.__setattr__(
             self,
@@ -237,6 +246,7 @@ class RunScope:
             "run_id": self.run_id,
             "workspace_root": str(self.workspace.root),
             "workspace_root_casefold": str(self.workspace.root).casefold(),
+            "workspace_identity": self.workspace_identity.to_dict(),
             "execution_profile": self.execution_profile.to_dict(),
             "allowed_tool_ids": sorted(self.allowed_tool_ids),
             "allowed_execution_commands": [
@@ -618,6 +628,8 @@ class RunScope:
             raise RunScopeError("workspace_root could not be resolved") from exc
         if resolved != self.workspace.root:
             raise RunScopeError("run scope cannot change the workspace root")
+        if self.workspace_identity is None or not self.workspace_identity.matches(workspace_root):
+            raise RunScopeError("run scope cannot change the workspace identity")
 
     def validate_execution_request(self, request: ExecutionRequest) -> None:
         """Reject an execution request that leaves the frozen perimeter."""

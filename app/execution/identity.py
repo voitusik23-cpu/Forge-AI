@@ -13,6 +13,51 @@ from typing import Iterable
 
 
 @dataclass(frozen=True)
+class WorkspaceIdentity:
+    """Stable identity of an authorized workspace directory.
+
+    The canonical path alone is insufficient when a directory is replaced at the
+    same pathname after a run scope is frozen. ``st_dev`` and ``st_ino`` are the
+    portable filesystem identity fields exposed by Python's stat contract; on
+    platforms that do not provide a meaningful inode, the canonical path remains
+    the conservative fallback.
+    """
+
+    canonical_root: str
+    device: int
+    inode: int
+
+    @classmethod
+    def capture(cls, root: Path) -> "WorkspaceIdentity":
+        canonical = root.resolve(strict=True)
+        info = canonical.stat()
+        if not canonical.is_dir():
+            raise ValueError("workspace root must be a directory")
+        return cls(str(canonical), int(getattr(info, "st_dev", 0)), int(getattr(info, "st_ino", 0)))
+
+    def matches(self, root: Path) -> bool:
+        try:
+            canonical = root.resolve(strict=True)
+            info = canonical.stat()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if str(canonical) != self.canonical_root:
+            return False
+        device = int(getattr(info, "st_dev", 0))
+        inode = int(getattr(info, "st_ino", 0))
+        if self.device == 0 and self.inode == 0:
+            return True
+        return device == self.device and inode == self.inode
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "canonical_root": self.canonical_root,
+            "device": self.device,
+            "inode": self.inode,
+        }
+
+
+@dataclass(frozen=True)
 class CommandIdentity:
     """Canonical executable and argv used by Permission and Approval."""
 

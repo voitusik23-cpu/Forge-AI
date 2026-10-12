@@ -226,6 +226,14 @@ class ExternalContentCannotAlterScopeTests(ScopeTestCase):
 
 
 class AuthorityExpansionIsRejectedTests(ScopeTestCase):
+    def test_workspace_replacement_at_same_path_is_rejected(self) -> None:
+        """A frozen scope must bind the directory object, not only its pathname."""
+        replacement = self.root.with_name(self.root.name + "_replacement")
+        self.root.rename(replacement)
+        self.root.mkdir()
+        with self.assertRaisesRegex(RunScopeError, "workspace identity"):
+            self.scope.validate_workspace_root(self.root)
+
     def test_tool_set_cannot_be_expanded(self) -> None:
         self.scope.validate_tool_set(("read_project_file",))
         with self.assertRaisesRegex(RunScopeError, "additional tools"):
