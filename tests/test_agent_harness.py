@@ -36,6 +36,7 @@ from app.decision.models import (
 from app.decision.provider import DecisionProvider, DeterministicDecisionProvider
 from app.execution.adapter import LocalExecutionAdapter
 from app.execution.authorizer import ExecutionCoordinator
+from app.execution.capabilities import ExecutionCapability
 from app.execution.policy import ExecutionPolicy
 from app.execution.profile import ProjectExecutionProfile
 from app.execution.request import (
@@ -237,6 +238,11 @@ class TestAgentHarness(unittest.TestCase):
                     for field in dataclasses.fields(request)
                 },
                 "run_scope": scope,
+                # The coordinator is fail-closed when approval policy is omitted.
+                # These harness fixtures exercise ordinary commands with no tool
+                # approvals, so state that policy explicitly rather than relying on
+                # the old permissive default.
+                "approval_policy": request.approval_policy or ApprovalPolicy(),
             }
         )
 
@@ -246,6 +252,7 @@ class TestAgentHarness(unittest.TestCase):
         profile = ProjectExecutionProfile(
             profile_id=self.profile.profile_id,
             allowed_commands=(*self.profile.allowed_commands, cid),
+            capabilities=frozenset({ExecutionCapability.INTERPRET_TEXT}),
         )
         return ExecutionRequest(command=command, profile=profile), cid
 
