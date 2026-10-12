@@ -131,7 +131,14 @@ def _scoped_request(request: HarnessRequest) -> HarnessRequest:
         ),
     )
     scope.freeze()
-    return dataclasses.replace(request, run_scope=scope)
+    return dataclasses.replace(
+        request,
+        run_scope=scope,
+        # The coordinator intentionally refuses an omitted policy.  Skill
+        # execution scenarios use an explicit policy with no required tools
+        # unless a test supplies a stricter one.
+        approval_policy=request.approval_policy or ApprovalPolicy(),
+    )
 
 
 class TestAgentSkillSystem(unittest.TestCase):

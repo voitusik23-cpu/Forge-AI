@@ -243,6 +243,11 @@ class TestRealAIAgentHarnessIntegration(unittest.TestCase):
                     for field in dataclasses.fields(request)
                 },
                 "run_scope": scope,
+                # The execution coordinator is fail-closed when no approval
+                # policy is supplied.  These harness scenarios exercise the
+                # execution path itself, so use the explicit no-required-tools
+                # policy unless a scenario provides a stricter one.
+                "approval_policy": request.approval_policy or ApprovalPolicy(),
             }
         )
 

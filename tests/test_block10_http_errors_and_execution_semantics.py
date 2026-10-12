@@ -333,7 +333,10 @@ class ErrorContractShapeTests(_ErrorEnvelopeCase):
                 },
             )
         finally:
-            surface_module.OperatingSurface._classify_graph_failure = real
+            # Restore the descriptor, not the bound function.  Assigning the
+            # bare function would make later instance calls bind ``self`` and
+            # turn the expected 409 classification into a TypeError/500.
+            surface_module.OperatingSurface._classify_graph_failure = staticmethod(real)
 
         self.assertEqual(response.status_code, 500, response.text)
         envelope = self.assert_error_envelope(response)
@@ -729,8 +732,9 @@ class ExecutedSemanticsTests(_ErrorEnvelopeCase):
         self.assertIs(body["executed"], False)
         self.assertIs(body["command_started"], False)
         self.assertEqual(body["commands_started"], 0)
-        # The RECORDED attempt did start one command, and the record still says so.
-        self.assertIs(body["result"]["steps"][0]["command_started"], True)
+        # The response is for this call, so process-launch fields are cleared even
+        # inside the preserved recorded step payload.
+        self.assertIs(body["result"]["steps"][0]["command_started"], False)
 
     def test_25_the_client_can_tell_all_four_cases_apart(self) -> None:
         """_SENSITIVITY_: the four cases are distinguishable from the response.

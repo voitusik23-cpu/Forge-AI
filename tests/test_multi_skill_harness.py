@@ -158,6 +158,10 @@ class TestMultiSkillHarness(unittest.TestCase):
                     for field in dataclasses.fields(request)
                 },
                 "run_scope": scope,
+                # These scenarios exercise multi-skill execution with an
+                # explicit no-required-tools policy; preserve any stricter
+                # policy supplied by the test itself.
+                "approval_policy": request.approval_policy or ApprovalPolicy(),
             }
         )
 

@@ -183,6 +183,10 @@ class TestAIDecisionProvider(unittest.TestCase):
                     for field in dataclasses.fields(request)
                 },
                 "run_scope": scope,
+                # Keep execution scenarios explicit under the coordinator's
+                # fail-closed approval contract while preserving stricter
+                # policies supplied by an individual test.
+                "approval_policy": request.approval_policy or ApprovalPolicy(),
             }
         )
 
