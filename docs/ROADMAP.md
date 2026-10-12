@@ -192,7 +192,7 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 
 - [ ] `WorkspaceIdentity` and workspace identity binding in the intent
 - [ ] Declared-input allow-lists and deny-by-default staging
-- [ ] Secret, `.env` and VCS exclusion policy for staged workspaces
+- [x] Secret, `.env` and VCS exclusion policy for staged workspaces (name-based denylist; declared-input allow-list remains deferred)
 - [ ] Scoped content digests for referenced inputs
 - [ ] Durable or persistent approval store (separate design: standing authorization semantics)
 - [~] **GAP-A PARTIAL** - filesystem containment is now enforced server-side at the authority boundary and re-proved immediately before the child process is created: traversal, absolute paths outside the workspace, drive/UNC paths, and junctions or symlinks that resolve outside are all refused. It is **not** an OS-level sandbox: a spawned process inherits the parent token and can still open any path that token may open.
@@ -508,7 +508,7 @@ workflow review/ревизии. Выполнение плана, управле�
 
 - [ ] `WorkspaceIdentity` и привязка идентичности workspace в интенте
 - [ ] Белые списки объявленных входов и deny-by-default подготовка
-- [ ] Политика исключения секретов, `.env` и VCS при подготовке workspace
+- [x] Политика исключения секретов, `.env` и VCS при подготовке workspace (denylist по имени; allow-list объявленных входов остаётся отложенным)
 - [ ] Точечные digest'ы содержимого для referenced inputs
 - [ ] Долговременное (durable) или постоянное хранилище одобрений (отдельный дизайн: семантика standing-авторизации)
 - [ ] Изоляция на уровне ОС и сетевое ограничение на уровне ядра (namespaces, cgroups, Job Objects) — отдельный проект, не часть редизайна авторизации
