@@ -171,7 +171,7 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 
 ### NEXT
 
-- [ ] Unify the two path validators (`app/execution/paths.py` and `app/tools/workspace.py`) behind one canonical implementation without weakening the tool boundary.
+- [x] Unify the two path validators (`app/execution/paths.py` and `app/tools/workspace.py`) behind one canonical implementation without weakening the tool boundary.
 - [x] Wire production **tool** execution into the API entry point with an explicitly scoped execution root (`RunScope` frozen per API run, operator-declared tool allowlist, service `Workspace` as the explicit root).
 - [x] Wire production **host process** execution into the API entry point through `ExecutionCoordinator` / `LocalExecutionAdapter` (operator-declared command allowlist, frozen `RunScope` perimeter, coordinator-minted `AuthorizedExecution`). The production request factory is not yet wired, so host execution stays disabled by default.
 - [x] Server-side `ExecutionDeclaration` mechanism: operator-declared, frozen verification executions with a pure `to_execution_request` translator, implemented and tested end-to-end (declaration → `ExecutionRequest` → `RunScope` → `ExecutionCoordinator` → `AuthorizedExecution` → `LocalExecutionAdapter`). Inert in production because no resolver is configured.
@@ -487,7 +487,7 @@ workflow review/ревизии. Выполнение плана, управле�
 
 ### NEXT
 
-- [ ] Объединить два валидатора путей (`app/execution/paths.py` и `app/tools/workspace.py`) за одной канонической реализацией без ослабления tool-границы.
+- [x] Объединить два валидатора путей (`app/execution/paths.py` и `app/tools/workspace.py`) за одной канонической реализацией без ослабления tool-границы.
 - [x] Подключить production **tool** execution к API-точке входа с явно ограниченным корнем выполнения (`RunScope`, замораживаемый на каждый API-run, объявленный оператором allowlist tools, `Workspace` сервиса как явный корень).
 - [x] Подключить production **host process** execution к API-точке входа через `ExecutionCoordinator` / `LocalExecutionAdapter` (объявленный оператором allowlist команд, замороженный периметр `RunScope`, `AuthorizedExecution` выпускается только координатором). Production-фабрика запросов пока не подключена, поэтому host execution по умолчанию выключен.
 - [x] Механизм server-side `ExecutionDeclaration`: объявленные оператором замороженные verification-выполнения с чистым транслятором `to_execution_request`, реализован и протестирован end-to-end (declaration → `ExecutionRequest` → `RunScope` → `ExecutionCoordinator` → `AuthorizedExecution` → `LocalExecutionAdapter`). В production бездействует, поскольку resolver не сконфигурирован.
