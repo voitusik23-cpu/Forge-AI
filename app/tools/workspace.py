@@ -1,9 +1,10 @@
 """Explicit filesystem boundary for workspace-scoped tools."""
 
-import re
 import stat
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
+
+from app.execution.paths import PathSecurityError, normalize_workspace_relative_path
 
 
 class WorkspacePathError(ValueError):
@@ -30,40 +31,13 @@ class Workspace:
 
     @staticmethod
     def normalize_relative_path(value: object) -> tuple[str, ...]:
-        if (
-            not isinstance(value, str)
-            or not value
-            or value.endswith(("/", "\\"))
-            or "\x00" in value
-        ):
-            raise WorkspacePathError("path must be a non-empty relative path")
-        # Treat either slash as a separator on every platform so Windows-style
-        # traversal cannot hide inside a POSIX path (or vice versa).
-        normalized = value.replace("\\", "/")
-        windows_path = PureWindowsPath(value)
-        posix_path = PurePosixPath(normalized)
-        if (
-            windows_path.drive
-            or windows_path.root
-            or posix_path.is_absolute()
-            or re.match(r"^[A-Za-z]:", normalized)
-        ):
-            raise WorkspacePathError("absolute paths are not allowed")
-        parts = posix_path.parts
-        if not parts or any(part in ("..", "") for part in parts):
-            raise WorkspacePathError("path traversal is not allowed")
-        if any(part.endswith((".", " ")) for part in parts):
-            raise WorkspacePathError("Windows-normalized path components are not allowed")
-        if any(":" in part for part in parts):
-            raise WorkspacePathError("drive and stream paths are not allowed")
-        windows_devices = {"CON", "PRN", "AUX", "NUL"}
-        windows_devices.update(f"COM{number}" for number in range(1, 10))
-        windows_devices.update(f"LPT{number}" for number in range(1, 10))
-        if any(part.split(".", 1)[0].upper() in windows_devices for part in parts):
-            raise WorkspacePathError("reserved device names are not allowed")
-        if parts[-1] in (".", ".."):
+        try:
+            normalized = normalize_workspace_relative_path(value)
+        except PathSecurityError as exc:
+            raise WorkspacePathError(str(exc)) from exc
+        if normalized == ".":
             raise WorkspacePathError("path must name a file")
-        return parts
+        return tuple(normalized.split("/"))
 
     def resolve_target(self, relative_path: object) -> tuple[Path, str, tuple[str, ...]]:
         self.assert_available()
