@@ -161,8 +161,8 @@ Changes to Git or production remain subject to explicit authorization.
 ### IN PROGRESS вЂ” Execution Authorization Contract v0.2
 
 - [ ] Replace the capability recognition list with a fail-closed declared-invocation model, so unrecognized execution behavior requires an explicit capability instead of relying on a list of known wrapper names.
-- [ ] Make the coordinator's intent-fingerprint verification unconditional: an approval that carries no fingerprint must not authorize execution.
-- [ ] Include the resolved profile environment in the intent body, or demonstrate that it cannot affect execution.
+- [x] Make the coordinator's intent-fingerprint verification unconditional: an approval that carries no fingerprint must not authorize execution.
+- [x] Include the resolved profile environment in the intent body, or demonstrate that it cannot affect execution.
 - [ ] Decide program-identity binding: a name resolved at execution time versus a path pinned at approval time (PATH / TOCTOU).
 - [ ] Decide whether declared-input content digests are mandatory for invocations that execute workspace content.
 
@@ -477,8 +477,8 @@ workflow review/ревизии. Выполнение плана, управле�
 ### IN PROGRESS — Execution Authorization Contract v0.2
 
 - [ ] Заменить список распознавания capabilities на fail-closed модель объявленных инвокаций, чтобы нераспознанное поведение выполнения требовало явной capability вместо опоры на список известных имён wrapper-программ.
-- [ ] Сделать проверку fingerprint интента координатором безусловной: одобрение без fingerprint не должно авторизовать выполнение.
-- [ ] Включить разрешённое окружение профиля в тело интента либо доказать, что оно не может влиять на выполнение.
+- [x] Сделать проверку fingerprint интента координатором безусловной: одобрение без fingerprint не должно авторизовать выполнение.
+- [x] Включить разрешённое окружение профиля в тело интента либо доказать, что оно не может влиять на выполнение.
 - [ ] Решить вопрос привязки идентичности программы: имя, разрешаемое во время выполнения, или путь, закреплённый при одобрении (PATH / TOCTOU).
 - [ ] Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
 

@@ -156,7 +156,7 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 - **`AuthorizedExecution` is an internal marker created only by the coordinator,** and `LocalExecutionAdapter` rejects anything else before touching the filesystem. Reason: the backend must not rely on developer discipline to know whether authorization happened.
 - **An explicit `workspace_root` is mandatory for local process spawning** and fails closed with `workspace_root_required` / `workspace_root_invalid`. Reason: an implicit `Path(".")` staged the process working directory into the execution workspace.
 - **The marker is an integrity check, not a cryptographic capability.** The stated threat model is accidental and refactoring-introduced bypass, not resistance to a same-process adversary.
-- **Overall status of this contract: PARTIAL, not complete.** The capability classifier remains a recognition list, the coordinator's fingerprint verification depends on the resolver returning a fingerprint, and the intent environment does not include the profile environment. These are recorded as open items in `SOURCE_OF_TRUTH.md` §4.
+- **Overall status of this contract: PARTIAL, with fingerprint and profile-environment items closed.** The coordinator requires a non-empty approval fingerprint matching the intent, and the resolved profile environment is included in the intent fingerprint while remaining an authorization declaration rather than child-process payload. The remaining open item is the capability recognition-list residual; it is recorded in `SOURCE_OF_TRUTH.md` §4.
 
 ### Rejected or deferred alternatives (with rationale)
 
@@ -174,10 +174,8 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 ### Open items for the next authorization block
 
 1. Replace the capability recognition list with a fail-closed declared-invocation model so that unrecognized execution behavior requires an explicit capability.
-2. Make the coordinator's fingerprint verification unconditional (an approval without a fingerprint must not authorize execution).
-3. Include the resolved profile environment in the intent body, or prove that it cannot affect execution.
-4. Decide whether the program identity is a name resolved at execution time or a path pinned at approval time (PATH binding / TOCTOU).
-5. Decide whether declared-input content digests are mandatory for invocations that execute workspace content.
+2. Decide whether the program identity is a name resolved at execution time or a path pinned at approval time (PATH binding / TOCTOU).
+3. Decide whether declared-input content digests are mandatory for invocations that execute workspace content.
 
 ## Execution Authorization Contract v0.2 — русская версия
 
@@ -193,7 +191,7 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 - **`AuthorizedExecution` — внутренний маркер, создаваемый только координатором,** а `LocalExecutionAdapter` отклоняет всё остальное до обращения к файловой системе. Причина: backend не должен зависеть от дисциплины разработчика в вопросе о том, была ли авторизация.
 - **Явный `workspace_root` обязателен для локального запуска процессов** и отклоняется fail-closed с `workspace_root_required` / `workspace_root_invalid`. Причина: неявный `Path(".")` копировал рабочий каталог процесса в среду выполнения.
 - **Маркер — проверка целостности, а не криптографическое полномочие.** Заявленная модель угроз: случайный и внесённый рефакторингом обход, а не сопротивление злонамеренному коду внутри процесса.
-- **Общий статус контракта: PARTIAL, а не завершено.** Классификатор capabilities остаётся списком распознавания, проверка fingerprint координатором зависит от того, вернул ли resolver fingerprint, а окружение интента не включает окружение профиля. Эти пункты зафиксированы как открытые в `SOURCE_OF_TRUTH.md` §4.
+- **Общий статус контракта: PARTIAL; пункты о fingerprint и окружении профиля закрыты.** Координатор требует непустой fingerprint одобрения, совпадающий с интентом, а разрешённое окружение профиля входит в fingerprint интента и остаётся декларацией авторизации, а не payload дочернего процесса. Открытым остаётся остаточный риск списка распознавания capabilities; он зафиксирован в `SOURCE_OF_TRUTH.md` §4.
 
 ### Отклонённые и отложенные альтернативы (с обоснованием)
 
@@ -206,7 +204,7 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 - **Долговременное (durable) хранилище одобрений с истечением срока.** Отложено как отдельный дизайн: постоянное одобрение с истечением — это standing-авторизация с иной семантикой, нежели одноразовое событие одобрения, и не должно вводиться как побочное улучшение resolver'а.
 - **MCP как модель разрешений.** Отклонено: авторизация принадлежит границам Forge Permission -> Approval -> Policy -> Execution. MCP может позже стать транспортом инструментов под этой авторизацией. См. [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md).
 - **Универсальные retries, rollback, параллелизм и swarm-исполнение.** Отклонено как поведение по умолчанию: сложность и стоимость не оправданы по умолчанию, а больше агентов не означает лучший результат.
-- **Объединение `app/tools/workspace.py` и `app/execution/paths.py` в этом блоке.** Отложено: tool-граница сохраняет собственный валидатор; дублирование зафиксировано как известный пункт, а не молча отрефакторено внутри изменения авторизации.
+- **Объединение `app/tools/workspace.py` и `app/execution/paths.py` в этом блоке.** Выполнено отдельным сфокусированным изменением: `Workspace` делегирует нормализацию общему canonical validator, сохраняя собственную проверку tool boundary.
 
 ### Открытые вопросы для следующего блока авторизации
 
