@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +14,7 @@ from app.execution.capabilities import ExecutionCapability, classify_invocation
 from app.execution.paths import (
     PathSecurityError,
     canonical_executable,
+    is_bare_executable,
     normalize_workspace_relative_path,
 )
 
@@ -33,6 +36,7 @@ class ExecutionIntent:
     network_access: bool
     capabilities: frozenset[ExecutionCapability]
     profile_environment_variables: tuple[tuple[str, str], ...] = ()
+    resolved_executable: str = ""
 
     @property
     def fingerprint(self) -> str:
@@ -51,6 +55,7 @@ class ExecutionIntent:
                 [k, v] for k, v in self.profile_environment_variables
             ],
             "profile_id": self.profile_id,
+            "resolved_executable": self.resolved_executable,
             "timeout_seconds": self.timeout_seconds,
             "working_directory": self.working_directory,
         }
@@ -70,6 +75,7 @@ class ExecutionIntent:
             "max_output_bytes": self.max_output_bytes,
             "artifact_targets": list(self.artifact_targets),
             "profile_id": self.profile_id,
+            "resolved_executable": self.resolved_executable,
             "network_access": self.network_access,
             "capabilities": sorted(
                 c.value if hasattr(c, "value") else str(c) for c in self.capabilities
@@ -171,6 +177,7 @@ class IntentBuilder:
         sorted_env = tuple(sorted(self._environment_variables.items()))
         sorted_prof_env = tuple(sorted(self._profile_environment_variables.items()))
         sorted_artifacts = tuple(sorted(self._artifact_targets))
+        resolved_executable = self._resolve_executable(sorted_env, sorted_prof_env)
 
         return ExecutionIntent(
             executable=self._executable,
@@ -184,7 +191,21 @@ class IntentBuilder:
             network_access=self._network_access,
             capabilities=detected_caps,
             profile_environment_variables=sorted_prof_env,
+            resolved_executable=resolved_executable,
         )
+
+    def _resolve_executable(
+        self,
+        environment_variables: tuple[tuple[str, str], ...],
+        profile_environment_variables: tuple[tuple[str, str], ...],
+    ) -> str:
+        """Pin a bare executable path while retaining its logical policy identity."""
+        if self._executable is None or not is_bare_executable(self._executable):
+            return self._executable or ""
+        env = dict(profile_environment_variables)
+        env.update(dict(environment_variables))
+        resolved = shutil.which(self._executable, path=env.get("PATH") or os.environ.get("PATH"))
+        return canonical_executable(resolved) if resolved else self._executable
 
     @classmethod
     def from_request(

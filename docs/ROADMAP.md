@@ -163,7 +163,7 @@ Changes to Git or production remain subject to explicit authorization.
 - [ ] Replace the capability recognition list with a fail-closed declared-invocation model, so unrecognized execution behavior requires an explicit capability instead of relying on a list of known wrapper names.
 - [x] Make the coordinator's intent-fingerprint verification unconditional: an approval that carries no fingerprint must not authorize execution.
 - [x] Include the resolved profile environment in the intent body, or demonstrate that it cannot affect execution.
-- [ ] Decide program-identity binding: a name resolved at execution time versus a path pinned at approval time (PATH / TOCTOU).
+- [x] Pin the resolved program path in the immutable execution intent while retaining the logical executable for profile matching (a small resolution-to-spawn TOCTOU window remains).
 - [ ] Decide whether declared-input content digests are mandatory for invocations that execute workspace content.
 
 Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 and in
@@ -479,7 +479,7 @@ workflow review/ревизии. Выполнение плана, управле�
 - [ ] Заменить список распознавания capabilities на fail-closed модель объявленных инвокаций, чтобы нераспознанное поведение выполнения требовало явной capability вместо опоры на список известных имён wrapper-программ.
 - [x] Сделать проверку fingerprint интента координатором безусловной: одобрение без fingerprint не должно авторизовать выполнение.
 - [x] Включить разрешённое окружение профиля в тело интента либо доказать, что оно не может влиять на выполнение.
-- [ ] Решить вопрос привязки идентичности программы: имя, разрешаемое во время выполнения, или путь, закреплённый при одобрении (PATH / TOCTOU).
+- [x] Закреплять разрешённый путь программы в неизменяемом execution intent, сохраняя логическое имя для сопоставления профиля (остаётся небольшое окно между разрешением и запуском).
 - [ ] Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
 
 Известные ограничения зафиксированы в [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §4

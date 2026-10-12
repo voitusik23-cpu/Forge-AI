@@ -174,8 +174,23 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 ### Open items for the next authorization block
 
 1. Replace the capability recognition list with a fail-closed declared-invocation model so that unrecognized execution behavior requires an explicit capability.
-2. Decide whether the program identity is a name resolved at execution time or a path pinned at approval time (PATH binding / TOCTOU).
-3. Decide whether declared-input content digests are mandatory for invocations that execute workspace content.
+2. Decide whether declared-input content digests are mandatory for invocations that execute workspace content.
+
+### Program identity binding
+
+The logical executable remains the profile and permission identity, while
+`IntentBuilder` resolves a bare executable to a concrete path and includes that
+`resolved_executable` in the immutable intent fingerprint. The adapter launches
+the pinned path. This closes PATH changes after approval; the small filesystem
+replacement window between resolution and spawn remains an OS-level residual.
+
+### Привязка идентичности программы
+
+Логическое имя executable остаётся идентичностью профиля и permission, а
+`IntentBuilder` разрешает bare executable в конкретный путь и включает
+`resolved_executable` в fingerprint неизменяемого intent. Adapter запускает
+закреплённый путь. Это закрывает изменение PATH после approval; небольшое окно
+замены файла между разрешением и запуском остаётся OS-level residual.
 
 ## Execution Authorization Contract v0.2 — русская версия
 
@@ -209,8 +224,7 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 ### Открытые вопросы для следующего блока авторизации
 
 1. Заменить список распознавания capabilities на fail-closed модель объявленных инвокаций, чтобы нераспознанное поведение требовало явной capability.
-2. Решить, является ли идентичность программы именем, разрешаемым во время выполнения, или путём, закреплённым при одобрении (привязка PATH / TOCTOU).
-3. Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
+2. Решить, обязательны ли digest'ы объявленных входов для инвокаций, исполняющих содержимое workspace.
 
 ## Workspace identity binding v0.1
 

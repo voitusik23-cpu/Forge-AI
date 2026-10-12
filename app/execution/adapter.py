@@ -444,7 +444,7 @@ class LocalExecutionAdapter:
     ) -> ExecutionResult:
         timeout = intent.timeout_seconds
         max_output_bytes = intent.max_output_bytes
-        full_command = (intent.executable,) + intent.argv
+        full_command = (intent.resolved_executable or intent.executable,) + intent.argv
 
         # Last check before the child exists, against the trusted execution root -
         # never against the path itself. The directory is re-canonicalized from the

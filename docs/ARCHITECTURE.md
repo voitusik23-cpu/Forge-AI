@@ -3632,10 +3632,12 @@ Approval, Policy and the adapter all evaluate. `IntentBody` is an alias of it.
 Fields: `executable`, `argv`, `working_directory`, `environment_variables`
 (canonical sorted tuple of pairs), `timeout_seconds`, `max_output_bytes`,
 `artifact_targets` (canonical sorted tuple), `profile_id`, `network_access`,
-`capabilities` (`frozenset[ExecutionCapability]`).
+`capabilities` (`frozenset[ExecutionCapability]`), and `resolved_executable` (the
+concrete path pinned for a bare executable).
 
 - `IntentBuilder` is the only constructor path. `with_command` canonicalizes the
-  executable through `canonical_executable`; `with_working_directory` and
+  executable through `canonical_executable` and `build()` resolves bare names to
+  `resolved_executable`; the adapter launches that pinned path. `with_working_directory` and
   `with_artifact_targets` normalize through `normalize_workspace_relative_path`;
   `build()` sorts and freezes the collections and classifies capabilities.
 - `ExecutionIntent.fingerprint` is a deterministic SHA-256 over a canonical JSON
@@ -3659,10 +3661,8 @@ Fields: `executable`, `argv`, `working_directory`, `environment_variables`
   canonical forward-slash relative path.
 
 This module is the single canonical implementation for the execution plane.
-`ExecutionPolicy`, `ExecutionRequest.validate`, `ProjectExecutionProfile.validate`
-and `IntentBuilder` all delegate to it. `app/tools/workspace.py` keeps its own
-independent validator for the **tool** boundary; the two implementations are not
-yet unified, and the physical containment check
+`ExecutionPolicy`, `ExecutionRequest.validate`, `ProjectExecutionProfile.validate`,
+`IntentBuilder` and the tool boundary all delegate to it. The physical containment check
 (`Path.relative_to` after `resolve()`) remains a second, non-redundant layer in
 the adapter and in `EphemeralWorkspaceManager`.
 
@@ -3796,10 +3796,12 @@ ExecutionRequest (предложение control plane: команда, cwd, env
 (канонический отсортированный кортеж пар), `timeout_seconds`,
 `max_output_bytes`, `artifact_targets` (канонический отсортированный кортеж),
 `profile_id`, `network_access`, `capabilities`
-(`frozenset[ExecutionCapability]`).
+(`frozenset[ExecutionCapability]`) и `resolved_executable` (закреплённый
+конкретный путь для bare executable).
 
 - `IntentBuilder` — единственный путь конструирования. `with_command`
-  канонизирует исполняемый файл через `canonical_executable`;
+  канонизирует исполняемый файл через `canonical_executable`, а `build()` разрешает
+  bare name в `resolved_executable`; adapter запускает этот закреплённый путь;
   `with_working_directory` и `with_artifact_targets` нормализуют через
   `normalize_workspace_relative_path`; `build()` сортирует и замораживает
   коллекции и классифицирует capabilities.
@@ -3824,10 +3826,8 @@ ExecutionRequest (предложение control plane: команда, cwd, env
   имена устройств; возвращает канонический относительный путь с прямыми слэшами.
 
 Этот модуль — единственная каноническая реализация для execution plane.
-`ExecutionPolicy`, `ExecutionRequest.validate`, `ProjectExecutionProfile.validate`
-и `IntentBuilder` делегируют в него. `app/tools/workspace.py` сохраняет
-собственный независимый валидатор для **tool**-границы; две реализации пока не
-объединены, а проверка физического нахождения в границах (`Path.relative_to`
+`ExecutionPolicy`, `ExecutionRequest.validate`, `ProjectExecutionProfile.validate`,
+`IntentBuilder` и tool-граница делегируют в него, а проверка физического нахождения в границах (`Path.relative_to`
 после `resolve()`) остаётся вторым, не избыточным слоем в адаптере и в
 `EphemeralWorkspaceManager`.
 

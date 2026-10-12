@@ -181,6 +181,17 @@ class ExecutionAuthorizationHardeningBlock1Tests(unittest.TestCase):
         self.assertEqual(intent1.profile_environment_variables, (("API_URL", "https://api.v1.local"),))
         self.assertEqual(intent2.profile_environment_variables, (("API_URL", "https://api.v2.local"),))
 
+    def test_program_path_is_pinned_in_the_intent(self) -> None:
+        profile = ProjectExecutionProfile(
+            profile_id="p-pinned",
+            allowed_commands=("python",),
+        )
+        request = ExecutionRequest(command=("python", "script.py"), profile=profile)
+        intent = IntentBuilder.from_request(request, profile).build()
+        self.assertTrue(intent.resolved_executable)
+        self.assertIn("python", intent.resolved_executable.lower())
+        self.assertIn("resolved_executable", intent.to_dict())
+
     def test_08_profile_environment_does_not_leak_secrets_in_fingerprint(self) -> None:
         secret_token = "sk-super-secret-auth-token-xyz-123456789"
         prof = ProjectExecutionProfile(
