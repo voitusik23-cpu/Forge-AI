@@ -1617,8 +1617,8 @@ documentation say so explicitly. GAP-B is therefore PARTIAL.
 `EphemeralWorkspaceManager` copies the supplied workspace root into a temporary
 scratch directory. What it does **not** copy is `.git`, `__pycache__`, `*.pyc`, and every
 path the shared name-based secret recognizer refuses (see §4.10 for that filter and its
-residual). There is no declared-input allow-list, no workspace-identity binding, and no
-content digest for referenced inputs. The frozen `RunScope` now binds the workspace by
+residual). There is no declared-input allow-list and no content digest for referenced
+inputs. The frozen `RunScope` now binds the workspace by
 canonical path plus `WorkspaceIdentity`; whatever the caller passes as `workspace_root` is
 what gets staged, minus those exclusions.
 
