@@ -898,9 +898,11 @@ trusted task
   choose the root, choose a scanner, change scan limits, or disable a boundary.
   The service passes its own `Workspace` through `HarnessRequest`.
 * **Bounds and redaction are the existing scanner's.** File count, per-file size,
-  total bytes, ignored directories, symlink handling, secret-file exclusion, and
-  binary handling all come from `BoundedProjectScanner`. Nothing is re-implemented
-  in the discovery layer, and there is no second discovery system.
+  total bytes, directory depth (`ScanLimits.max_depth`, default 32), ignored
+  directories, symlink handling, secret-file exclusion, and binary handling all come
+  from `BoundedProjectScanner`. Exceeding depth emits `MAX_DEPTH_EXCEEDED` and prunes
+  descent. Nothing is re-implemented in the discovery layer, and there is no second
+  discovery system.
 * **Bounded inventory, not a filesystem dump.** A snapshot carries paths and
   fingerprints plus bounded structural facts, manifests, topology, and warnings.
   It never carries file contents, and the assembler passes only the bounded
@@ -1658,9 +1660,11 @@ loop. Он выполняется внутри `AgentHarness.run` до перв�
   отключить границу. Сервис передаёт собственный `Workspace` через
   `HarnessRequest`.
 * **Bounds и redaction — существующего scanner'а.** Лимит файлов, размер файла,
-  общий объём байт, игнорируемые каталоги, обработка symlink, исключение секретных
-  файлов и обработка бинарных файлов берутся из `BoundedProjectScanner`. В слое
-  discovery ничего не переписывается, второй системы discovery нет.
+  общий объём байт, глубина каталогов (`ScanLimits.max_depth`, по умолчанию 32),
+  игнорируемые каталоги, обработка symlink, исключение секретных файлов и обработка
+  бинарных файлов берутся из `BoundedProjectScanner`. При превышении глубины выдаётся
+  `MAX_DEPTH_EXCEEDED`, и обход ниже этого уровня прекращается. В слое discovery
+  ничего не переписывается, второй системы discovery нет.
 * **Bounded inventory, а не дамп файловой системы.** Snapshot несёт пути и
   отпечатки плюс ограниченные структурные факты, манифесты, топологию и
   предупреждения. Содержимое файлов в него не попадает, а assembler передаёт в

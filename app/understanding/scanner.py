@@ -99,6 +99,21 @@ class BoundedProjectScanner:
         root_path = Path(workspace.root).resolve()
 
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+            relative_dir = Path(dirpath).relative_to(root_path)
+            depth = 0 if relative_dir == Path(".") else len(relative_dir.parts)
+            if depth >= self.limits.max_depth and dirnames:
+                warnings.append(
+                    ScanWarning(
+                        warning_type="MAX_DEPTH_EXCEEDED",
+                        message=(
+                            f"Scanner reached maximum directory depth "
+                            f"({self.limits.max_depth}); traversal stopped."
+                        ),
+                        file_path=relative_dir.as_posix() if depth else None,
+                    )
+                )
+                dirnames[:] = []
+
             # 1. Prune ignored directories in-place.
             #
             # Credential directories are pruned through the same recognizer the execution

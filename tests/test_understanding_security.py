@@ -139,6 +139,25 @@ def regular_function():
             small_symbols = [f for f in facts if f.source_path == "small_file.py"]
             self.assertTrue(len(small_symbols) > 0)
 
+    def test_directory_depth_limit_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "root.py").write_text("root = True\n", encoding="utf-8")
+            nested = root / "one" / "two" / "three"
+            nested.mkdir(parents=True)
+            (nested / "deep.py").write_text("deep = True\n", encoding="utf-8")
+
+            files, facts, _manifests, warnings = BoundedProjectScanner(
+                limits=ScanLimits(max_depth=2)
+            ).scan(Workspace(root))
+
+            paths = {item.relative_path for item in files}
+            self.assertIn("root.py", paths)
+            self.assertNotIn("one/two/three/deep.py", paths)
+            depth_warnings = [w for w in warnings if w.warning_type == "MAX_DEPTH_EXCEEDED"]
+            self.assertEqual(len(depth_warnings), 1)
+            self.assertEqual(depth_warnings[0].file_path, "one/two")
+
     def test_binary_files_and_null_bytes_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)

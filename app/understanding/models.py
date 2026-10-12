@@ -52,7 +52,20 @@ class ScanLimits:
     max_file_size_bytes: int = 512 * 1024       # 512 KB
     max_total_bytes: int = 50 * 1024 * 1024     # 50 MB
     max_file_count: int = 5000
+    max_depth: int = 32
     parse_timeout_seconds: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.max_file_size_bytes <= 0:
+            raise ValueError("max_file_size_bytes must be positive")
+        if self.max_total_bytes <= 0:
+            raise ValueError("max_total_bytes must be positive")
+        if self.max_file_count <= 0:
+            raise ValueError("max_file_count must be positive")
+        if self.max_depth < 0:
+            raise ValueError("max_depth must be non-negative")
+        if self.parse_timeout_seconds <= 0:
+            raise ValueError("parse_timeout_seconds must be positive")
 
 
 @dataclass(frozen=True)

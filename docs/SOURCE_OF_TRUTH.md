@@ -179,6 +179,7 @@ review-engine module; the reviewer exists as an agent inside
 | Profile environment values redacted on every prompt-bound serialization | **CURRENT / VERIFIED** | `app/execution/profile.py` (`to_context_dict`) — `tests/test_profile_prompt_redaction.py` |
 | Core API exposure configuration: explicit CORS allow-list, no credentialed CORS, loopback-bound launcher that refuses non-loopback exposure without authentication | **CURRENT / VERIFIED** (no authentication) | `app/api/server.py`, `app/api/main.py` — `tests/test_api_exposure.py` |
 | Frozen workspace identity binding | **CURRENT / VERIFIED** | `app/execution/identity.py`, `app/runtime/run_scope.py` — `tests/test_run_scope_trust_boundary.py` |
+| Bounded discovery includes a deterministic directory-depth limit | **CURRENT / VERIFIED** | `app/understanding/models.py`, `app/understanding/scanner.py` — `tests/test_understanding_security.py` |
 | Run-level production idempotency (durable ledger, atomic claim, terminal-state protection) | **PARTIAL** — see §4.8 | `app/agent_runtime/idempotency.py`, `app/agent_runtime/idempotency_integration.py`, `app/api/service.py` — `tests/test_idempotency_production.py` |
 | First end-to-end vertical workflow (`goal -> specification -> plan -> approval -> execution -> verification -> result`) | **CURRENT / VERIFIED**, with the scope limits in §3.5 | `app/workflows/project_workflow.py` — `tests/test_project_workflow_production.py`, `tests/test_project_factory_end_to_end.py` |
 | Controlled Project Factory slice: separated `generation_status` / `execution_status` / `harness_status` / `verification_exit_code` / `acceptance_status`, a per-invocation generation budget, and an explicit not-established state | **CURRENT / VERIFIED**; the four statuses are distinct fields with closed vocabularies — see §3.5.1 | `app/workflows/project_workflow.py` — `tests/test_project_factory_vertical_slice.py` (42 tests) |
@@ -1617,11 +1618,12 @@ documentation say so explicitly. GAP-B is therefore PARTIAL.
 scratch directory. What it does **not** copy is `.git`, `__pycache__`, `*.pyc`, and every
 path the shared name-based secret recognizer refuses (see §4.10 for that filter and its
 residual). There is no declared-input allow-list, no workspace-identity binding, and no
-content digest for referenced inputs. Whatever the caller passes as `workspace_root` is
+content digest for referenced inputs. The frozen `RunScope` now binds the workspace by
+canonical path plus `WorkspaceIdentity`; whatever the caller passes as `workspace_root` is
 what gets staged, minus those exclusions.
 
-**Status: PARTIAL** (workspace identity, declared inputs, deny-by-default
-staging are Block 2 / deferred).
+**Status: PARTIAL** (declared inputs and content digests remain deferred; workspace
+identity binding is implemented and verified).
 
 ### 4.7 The execution plane has no production entry point
 
@@ -4166,12 +4168,13 @@ IPv6 и прямые исходящие соединения по-прежнем
 `EphemeralWorkspaceManager` копирует переданный корень workspace во временный
 scratch-каталог. **Не** копируются: `.git`, `__pycache__`, `*.pyc` и каждый путь,
 который отвергает общий распознаватель секретов по именам (см. §4.10 — сам фильтр и его
-остаток). Нет белого списка объявленных входов, нет привязки идентичности workspace и нет
-digest содержимого для referenced inputs. Что вызывающий передал как `workspace_root`, то
+остаток). Нет белого списка объявленных входов и нет digest содержимого для referenced
+inputs. Frozen `RunScope` теперь связывает workspace через canonical path и
+`WorkspaceIdentity`. Что вызывающий передал как `workspace_root`, то
 и копируется, за вычетом этих исключений.
 
-**Статус: PARTIAL** (идентичность workspace, объявленные входы, deny-by-default
-подготовка относятся к Block 2 / отложены).
+**Статус: PARTIAL** (объявленные входы и digest содержимого остаются отложенными;
+привязка идентичности workspace реализована и проверена).
 
 ### 4.7 У execution plane нет production-точки входа
 
