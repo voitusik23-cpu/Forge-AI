@@ -107,6 +107,9 @@ def normalize_workspace_relative_path(value: object) -> str:
     - Rejects Alternate Data Streams (ADS) colon syntax (:).
     - Rejects Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
     - Rejects trailing dot or space forms in path components.
+    - Never trims: leading and trailing whitespace is not rewritten away. A leading
+      space is a legal filename character, and a trailing one is refused below
+      rather than silently removed, because Windows would otherwise alias the two.
     - Rejects null bytes.
     - Normalizes separators to forward slashes.
     - Returns canonical forward-slash relative path string, or '.' for root.
@@ -114,31 +117,39 @@ def normalize_workspace_relative_path(value: object) -> str:
     if not isinstance(value, str):
         raise PathSecurityError("path must be a string")
 
-    stripped = value.strip()
-    if not stripped:
+    # Deliberately NOT ``value.strip()``.  Windows rewrites a trailing space or dot
+    # away when a file is created, so trimming an edge here silently aliases two
+    # different inputs onto one file and hides the trailing form from every caller
+    # that screens the *name it was given* (credential names, ``.env``, ``.git``,
+    # protected areas).  A leading space is a legal filename character and is kept
+    # literally, as the tool boundary did before this validator was shared.  The
+    # per-component check below is what refuses the trailing form -- and it has to
+    # see the real string to do it.
+    text = value
+    if not text:
         raise PathSecurityError("path must be a non-empty relative path")
 
-    if "\x00" in stripped:
+    if "\x00" in text:
         raise PathSecurityError("path cannot contain null bytes")
 
-    if stripped == ".":
+    if text == ".":
         return "."
 
-    if stripped.endswith(("/", "\\")):
+    if text.endswith(("/", "\\")):
         raise PathSecurityError("path cannot end with a trailing separator")
 
     # Treat either slash as separator
-    normalized = stripped.replace("\\", "/")
+    normalized = text.replace("\\", "/")
 
     # Reject UNC and device paths
-    if normalized.startswith("//") or stripped.startswith(("\\\\", "//")):
+    if normalized.startswith("//") or text.startswith(("\\\\", "//")):
         raise PathSecurityError("UNC and device paths are not allowed")
 
     # Reject Windows drive letters (C:, c:\, C:foo)
     if re.match(r"^[A-Za-z]:", normalized):
         raise PathSecurityError("Windows drive paths are not allowed")
 
-    windows_path = PureWindowsPath(stripped)
+    windows_path = PureWindowsPath(text)
     posix_path = PurePosixPath(normalized)
 
     if windows_path.drive:
