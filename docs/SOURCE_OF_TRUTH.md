@@ -173,7 +173,7 @@ review-engine module; the reviewer exists as an agent inside
 | Server-side filesystem/workspace boundary (`WorkspaceBoundary`) | **PARTIAL** — see §4.4 | `app/execution/sandbox.py`, enforced in `app/runtime/run_scope.py` and `app/execution/adapter.py` — `tests/test_execution_sandbox_boundary.py` |
 | Network authority deny-by-default, frozen in the scope | **PARTIAL** — see §4.5 | `app/execution/profile.py`, `app/runtime/run_scope.py`, `app/execution/adapter.py` — `tests/test_execution_sandbox_boundary.py` |
 | Trusted task / criterion identity for the harness entry points | **CURRENT / VERIFIED** | `app/agent_runtime/criterion_identity.py` — `tests/test_criterion_identity_production.py`, `tests/test_identity_binding_hardening.py` |
-| Secret files withheld from the staged execution workspace (shared recognizer with the project scanner) | **CURRENT / VERIFIED** | `app/execution/secret_files.py`, `app/execution/workspace_manager.py` — `tests/test_execution_secret_staging.py` |
+| Secret files withheld from the staged execution workspace, and never harvested as an artifact, by the shared recognizer the project scanner also uses | **CURRENT / VERIFIED** | `app/execution/secret_files.py`, `app/execution/workspace_manager.py` — `tests/test_execution_secret_staging.py` |
 | Wall-clock timeout enforced by process wait, not by pipe EOF; process tree terminated on timeout **and** after a normal exit | **CURRENT / VERIFIED** | `app/execution/adapter.py` — `tests/test_execution_timeout_and_tree_kill.py` |
 | Frozen `workspace_root` checked unconditionally, independent of adapter isolation | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_workspace_root_always_checked.py` |
 | Profile environment values redacted on every prompt-bound serialization | **CURRENT / VERIFIED** | `app/execution/profile.py` (`to_context_dict`) — `tests/test_profile_prompt_redaction.py` |
@@ -1366,7 +1366,7 @@ derives an execution input from a memory record.
   `test_29` pin the fail-closed behaviour.
 * **Repeat protection comes from the durable record, not from an in-process flag.** Two
   routes with the same graph run id: the second returns the recorded attempt with
-  `replayed: true` and executes nothing (`test_30`). Disabling
+  `replayed: true` and executes nothing (`test_30`). **The recorded payload is returned unchanged**: a response never rewrites the record of a past attempt. The per-response fields (`replayed`, `executed`, `command_started`, `commands_started`, `recorded_result`) describe *this* call, while the step records inside `result` describe the attempt that ran, with the values it really had. Disabling
   `StepGraphRunner._claim_graph_run` did **not** break that test, and the finding is
   recorded rather than hidden: the claim is the *in-process concurrency* guard
   (`tests/test_step_graph_managed_execution.py` covers it), while a caller who asks twice
@@ -1575,7 +1575,7 @@ scope, never from a task, a request, or metadata.
 **Not implemented: OS/kernel-level isolation.** `LocalExecutionAdapter` runs local
 processes with `shell=False`, an ephemeral copy of the workspace, a scoped
 environment whitelist, timeouts with process-tree termination, output caps, and
-secret redaction. It does **not** provide namespaces, cgroups, Job Objects, or
+secret redaction. It does **not** provide namespaces, cgroups, Job Objects used as an isolation boundary, or
 filesystem confinement enforced by the kernel. A spawned process inherits the
 parent's security token and may open any path that token may open; a child that
 opens an absolute path outside the workspace is not stopped. This residual risk is
@@ -3909,7 +3909,7 @@ id, произведённый слоем understanding, а запрос не м
   строит такой guard. `test_02` и `test_29` фиксируют fail-closed поведение.
 * **Защита от повтора исходит из долговечной записи, а не из внутрипроцессного флага.**
   Два маршрута с одним graph run id: второй возвращает записанную попытку с
-  `replayed: true` и ничего не выполняет (`test_30`). Отключение
+  `replayed: true` и ничего не выполняет (`test_30`). **Записанный payload возвращается без изменений**: ответ никогда не переписывает запись прошлой попытки. Поля ответа (`replayed`, `executed`, `command_started`, `commands_started`, `recorded_result`) описывают *этот* вызов, а записи шагов внутри `result` описывают попытку, которая действительно выполнялась, с её настоящими значениями. Отключение
   `StepGraphRunner._claim_graph_run` **не** сломало этот тест, и находка зафиксирована, а
   не скрыта: claim — это защита от *внутрипроцессной конкурентности*
   (`tests/test_step_graph_managed_execution.py` покрывает её), тогда как вызывающего,
@@ -4127,7 +4127,7 @@ frozen scope и никогда — из задачи, запроса или meta
 **Не реализовано: OS/kernel-level изоляция.** `LocalExecutionAdapter` запускает
 локальные процессы с `shell=False`, временной копией workspace, ограниченным белым
 списком окружения, таймаутами с завершением дерева процессов, лимитами вывода и
-маскированием секретов. Он **не** предоставляет namespaces, cgroups, Job Objects
+маскированием секретов. Он **не** предоставляет namespaces, cgroups, Job Objects как границы изоляции
 или файловое ограничение на уровне ядра. Дочерний процесс наследует security token
 родителя и может открыть любой доступный этому токену путь; ребёнок, открывающий
 абсолютный путь вне workspace, не останавливается. Этот остаточный риск записан в

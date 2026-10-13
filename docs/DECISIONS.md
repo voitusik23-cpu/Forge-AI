@@ -165,7 +165,7 @@ Recorded at commit `ad6b82b` (`feat: reset execution authorization contract v0.2
 - **Whole-workspace and whole-profile content digests.** Rejected as default binding: they create approval churn without adding authority. Scoped digests for referenced inputs remain a deferred candidate.
 - **A declarative field registry with per-field justification strings.** Rejected in favor of the intent body being the projection plus a frozen field-name test, to avoid two sources of truth that can disagree.
 - **Storing approval authority in the resolver.** Rejected: the resolver is an untrusted proposer, not the verifier.
-- **OS-level sandboxing (namespaces, cgroups, Job Objects), kernel network enforcement, and container/VM backends.** Deferred to Block 2 or a separate project. A sandbox changes the consequences of a grant; it does not decide which invocations are admissible, and it must not be treated as a substitute for authorization.
+- **OS-level sandboxing (namespaces, cgroups, Job Objects как границы изоляции used as an isolation boundary), kernel network enforcement, and container/VM backends.** Deferred to Block 2 or a separate project. A sandbox changes the consequences of a grant; it does not decide which invocations are admissible, and it must not be treated as a substitute for authorization.
 - **Durable/persistent approval store with expiration.** Deferred as a separate design: a persistent, expiring approval is a standing authorization with different semantics from a single-use approval event, and must not be introduced as an incidental resolver improvement.
 - **MCP as the permission model.** Rejected: authorization belongs to Forge's Permission -> Approval -> Policy -> Execution boundaries. MCP may later be a tool transport under that authority. See [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md).
 - **Universal retries, rollback, parallelism and swarm execution.** Rejected as defaults: complexity and cost are not justified by default, and more agents do not mean better results.
@@ -183,6 +183,10 @@ The logical executable remains the profile and permission identity, while
 `resolved_executable` in the immutable intent fingerprint. The adapter launches
 the pinned path. This closes PATH changes after approval; the small filesystem
 replacement window between resolution and spawn remains an OS-level residual.
+
+**Пиннинг — это рубеж, а не описание.** Bare-имя, которое не удалось разрешить в абсолютный путь, остаётся с пустым `resolved_executable`, и `LocalExecutionAdapter` отказывается запускать незапинованную bare-команду до того, как процесс появится. Тотальность `IntentBuilder` намеренна: решение политики о такой команде должно по-прежнему уметь ответить «эта команда не разрешена», а не падать при её описании. `PATH`, объявленный явно пустым, соблюдается как «не искать нигде», а не подменяется `PATH` процесса.
+
+**Pinning is a gate, not a description.** A bare executable that cannot be resolved to an absolute path is left with an empty `resolved_executable`, and `LocalExecutionAdapter` refuses to launch an unpinned bare command before a process exists. Keeping `IntentBuilder` total is deliberate: a policy decision about such a command must still be able to answer "that command is not allowed" instead of failing while describing it. A `PATH` declared as explicitly empty is honoured as "search nowhere" rather than replaced by the process `PATH`.
 
 ### Привязка идентичности программы
 

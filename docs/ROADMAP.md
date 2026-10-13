@@ -197,7 +197,7 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Durable or persistent approval store (separate design: standing authorization semantics)
 - [~] **GAP-A PARTIAL** - filesystem containment is now enforced server-side at the authority boundary and re-proved immediately before the child process is created: traversal, absolute paths outside the workspace, drive/UNC paths, and junctions or symlinks that resolve outside are all refused. It is **not** an OS-level sandbox: a spawned process inherits the parent token and can still open any path that token may open.
 - [~] **GAP-B PARTIAL** - network authority is deny-by-default, frozen in the run scope, and cannot be enabled by a request profile; the adapter points the proxy variables at a closed port. It is a policy boundary, not a kernel sandbox: a process that opens a socket directly is not stopped.
-- [ ] **GAP-A / GAP-B remaining half** - OS-level isolation and kernel network enforcement (namespaces, cgroups, Job Objects) вЂ” a separate project, not part of the authorization redesign
+- [ ] **GAP-A / GAP-B remaining half** - OS-level isolation and kernel network enforcement (namespaces, cgroups, Job Objects как границы изоляции used as an isolation boundary) вЂ” a separate project, not part of the authorization redesign
 
 ## Phase 6 вЂ” Lifecycle, product surface and knowledge
 

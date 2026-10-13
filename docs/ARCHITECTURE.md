@@ -901,7 +901,7 @@ trusted task
   total bytes, directory depth (`ScanLimits.max_depth`, default 32), ignored
   directories, symlink handling, secret-file exclusion, and binary handling all come
   from `BoundedProjectScanner`. Exceeding depth emits `MAX_DEPTH_EXCEEDED` and prunes
-  descent. Nothing is re-implemented in the discovery layer, and there is no second
+  descent. The bound itself is capped at 256, and the warning is emitted only when a descent is really pruned rather than when a directory's remaining children were all ignored. Nothing is re-implemented in the discovery layer, and there is no second
   discovery system.
 * **Bounded inventory, not a filesystem dump.** A snapshot carries paths and
   fingerprints plus bounded structural facts, manifests, topology, and warnings.
@@ -1663,7 +1663,7 @@ loop. Он выполняется внутри `AgentHarness.run` до перв�
   общий объём байт, глубина каталогов (`ScanLimits.max_depth`, по умолчанию 32),
   игнорируемые каталоги, обработка symlink, исключение секретных файлов и обработка
   бинарных файлов берутся из `BoundedProjectScanner`. При превышении глубины выдаётся
-  `MAX_DEPTH_EXCEEDED`, и обход ниже этого уровня прекращается. В слое discovery
+  `MAX_DEPTH_EXCEEDED`, и обход ниже этого уровня прекращается. Сам предел ограничен сверху значением 256, а предупреждение выдаётся только тогда, когда обход действительно обрезан, а не когда все оставшиеся дочерние каталоги были проигнорированы. В слое discovery
   ничего не переписывается, второй системы discovery нет.
 * **Bounded inventory, а не дамп файловой системы.** Snapshot несёт пути и
   отпечатки плюс ограниченные структурные факты, манифесты, топологию и
@@ -3738,7 +3738,7 @@ cleanup, and deletes the scratch directory afterwards.
 
 **Not implemented (Block 2):** declared-input allow-lists, deny-by-default
 staging, workspace identity/content binding, secret-file exclusion policy, and any
-OS-level sandbox (namespaces, cgroups, Job Objects, kernel filesystem or network
+OS-level sandbox (namespaces, cgroups, Job Objects как границы изоляции used as an isolation boundary, kernel filesystem or network
 confinement). `network_access=False` is enforced only by proxy environment
 variables and is best-effort. Forge is **not** an OS-level sandbox.
 
