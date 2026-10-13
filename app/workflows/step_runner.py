@@ -1369,6 +1369,41 @@ class StepGraphRunner:
                 record.status = StepStatus.UNKNOWN
                 record.add_evidence("interrupted_after_dispatch_outcome_unproven")
                 record.updated_at = self._now()
+            if record.status is StepStatus.SUCCEEDED:
+                # A saved SUCCEEDED is a claim, not proof that a command ran. Before
+                # it may be summarised as COMPLETED, the record has to carry something
+                # that actually shows a successful execution, and it must not
+                # contradict itself. Nothing universal is demanded here: a step that
+                # declares no check is judged by its recorded execution alone, so a
+                # legitimate no-verification step is unaffected. The rule downgrades
+                # the in-memory record to UNKNOWN -- which derives INDETERMINATE --
+                # and never rewrites the saved record to hide the gap.
+                outcome = str(record.execution_outcome or "").upper()
+                contradicts = bool(outcome) and "SUCCESS" not in outcome
+                unrun_declared_check = (
+                    str(record.verification_kind or "").upper() == "EXIT_CODE"
+                    and record.verification_status is not VerificationStatus.PASSED
+                )
+                has_execution_evidence = (
+                    bool(outcome)
+                    or record.execution_exit_code is not None
+                    or record.verification_status is VerificationStatus.PASSED
+                )
+                if contradicts or unrun_declared_check or not has_execution_evidence:
+                    record.status = StepStatus.UNKNOWN
+                    if not has_execution_evidence:
+                        tag = "resumed_success_without_execution_evidence"
+                    elif contradicts:
+                        tag = "resumed_success_contradicts_recorded_execution"
+                    else:
+                        tag = "resumed_success_with_unrun_declared_verification"
+                    record.add_evidence(tag)
+                    # The original claim is preserved rather than dropped, so the
+                    # record still says what was asserted and why it is not accepted.
+                    record.add_evidence(
+                        "saved_claim_was_succeeded_and_is_not_proof"
+                    )
+                    record.updated_at = self._now()
         # The declaration is re-persisted on every resume, so a record written by
         # an earlier build gains it without the attempt's verdicts being touched.
         existing.declared_plan = declared_plan_of(declared)

@@ -1174,6 +1174,257 @@ class RecoveryTests(StepGraphCase):
         self.assertEqual(self.count_lines("b.txt"), 0)
         self.assertEqual(self.count_lines("a.txt"), 0)
 
+    def test_a_saved_success_without_execution_evidence_is_not_completion(self) -> None:
+        """_INJECTION_TARGET_: a saved status is a claim, not proof it ran.
+
+        The record is written through the same public ``RunStore`` and
+        ``StepGraphSnapshot`` codec the runner itself uses -- the state a record
+        has if it survived a crash after the durable ``SUCCEEDED`` write but
+        before anything justified it. It declares an ``EXIT_CODE`` verification
+        that never ran, carries no execution outcome and no exit code, and has
+        run nothing. Goes red if a restored ``SUCCEEDED`` alone is summarised as
+        ``COMPLETED``, which would credit work that never happened.
+        """
+
+        graph = StepGraph(
+            graph_id="unproven-success",
+            steps=(
+                StepDefinition(
+                    step_id="a",
+                    action=StepAction("a"),
+                    verification=StepVerification(VerificationKind.EXIT_CODE, 0),
+                ),
+            ),
+        )
+        snapshot = StepGraphSnapshot(
+            graph_id="unproven-success",
+            graph_run_id="unproven-success-run",
+            status=StepGraphStatus.COMPLETED,
+            steps=(
+                StepRecord(
+                    step_id="a",
+                    status=StepStatus.SUCCEEDED,
+                    action_fingerprint=graph.step("a").fingerprint(),
+                    declaration_id="a",
+                    verification_kind=VerificationKind.EXIT_CODE.value,
+                    verification_status=VerificationStatus.NOT_RUN,
+                    attempts=0,
+                ),
+            ),
+            declared_plan=declared_plan_of(graph),
+        )
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id="unproven-success-run",
+                project_state={"step_graph": snapshot.to_dict()},
+            )
+        )
+        def stored_step() -> dict:
+            state = self.run_store.read_state("unproven-success-run")
+            return dict(state.project_state["step_graph"]["steps"][0])
+
+        stored_before = stored_step()
+
+        resumed = self.runner(self.declarations()).resume(graph, "unproven-success-run")
+
+        self.assertNotEqual(resumed.status, StepGraphStatus.COMPLETED)
+        self.assertEqual(resumed.status, StepGraphStatus.INDETERMINATE)
+        record = resumed.step("a")
+        self.assertEqual(record.status, StepStatus.UNKNOWN)
+        self.assertTrue(
+            any("execution_evidence" in tag for tag in record.evidence), record.evidence
+        )
+        # Nothing was executed to obtain new proof. The saved record did claim
+        # SUCCEEDED, and restoration records that the claim is unsupported instead of
+        # letting it stand as proof or dropping what was asserted.
+        self.assertEqual(self.count_lines("a.txt"), 0)
+        self.assertEqual(stored_before["status"], StepStatus.SUCCEEDED.value)
+        stored_after = stored_step()
+        self.assertEqual(stored_after["status"], StepStatus.UNKNOWN.value)
+        self.assertTrue(
+            any("not_proof" in tag for tag in stored_after["evidence"]),
+            stored_after["evidence"],
+        )
+
+        # Resuming again answers the same way.
+        again = self.runner(self.declarations()).resume(graph, "unproven-success-run")
+        self.assertEqual(again.status, StepGraphStatus.INDETERMINATE)
+
+    def test_a_declared_exit_code_verification_that_never_ran_is_not_confirmation(self) -> None:
+        """An unrun declared check cannot be what makes a step successful."""
+
+        graph = StepGraph(
+            graph_id="unrun-check",
+            steps=(
+                StepDefinition(
+                    step_id="a",
+                    action=StepAction("a"),
+                    verification=StepVerification(VerificationKind.EXIT_CODE, 0),
+                ),
+            ),
+        )
+        snapshot = StepGraphSnapshot(
+            graph_id="unrun-check",
+            graph_run_id="unrun-check-run",
+            status=StepGraphStatus.COMPLETED,
+            steps=(
+                StepRecord(
+                    step_id="a",
+                    status=StepStatus.SUCCEEDED,
+                    action_fingerprint=graph.step("a").fingerprint(),
+                    declaration_id="a",
+                    verification_kind=VerificationKind.EXIT_CODE.value,
+                    verification_status=VerificationStatus.NOT_RUN,
+                    execution_outcome="EXECUTION_SUCCESS",
+                    execution_exit_code=0,
+                    attempts=1,
+                ),
+            ),
+            declared_plan=declared_plan_of(graph),
+        )
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id="unrun-check-run",
+                project_state={"step_graph": snapshot.to_dict()},
+            )
+        )
+
+        resumed = self.runner(self.declarations()).resume(graph, "unrun-check-run")
+
+        self.assertNotEqual(resumed.status, StepGraphStatus.COMPLETED)
+        self.assertEqual(resumed.step("a").status, StepStatus.UNKNOWN)
+
+    def test_contradictory_execution_evidence_is_not_success(self) -> None:
+        """A step cannot be SUCCEEDED while its own record says the run failed."""
+
+        graph = StepGraph(
+            graph_id="contradiction",
+            steps=(
+                StepDefinition(step_id="a", action=StepAction("a")),
+            ),
+        )
+        snapshot = StepGraphSnapshot(
+            graph_id="contradiction",
+            graph_run_id="contradiction-run",
+            status=StepGraphStatus.COMPLETED,
+            steps=(
+                StepRecord(
+                    step_id="a",
+                    status=StepStatus.SUCCEEDED,
+                    action_fingerprint=graph.step("a").fingerprint(),
+                    declaration_id="a",
+                    verification_status=VerificationStatus.NOT_RUN,
+                    execution_outcome="EXECUTION_TIMEOUT",
+                    attempts=1,
+                ),
+            ),
+            declared_plan=declared_plan_of(graph),
+        )
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id="contradiction-run",
+                project_state={"step_graph": snapshot.to_dict()},
+            )
+        )
+
+        resumed = self.runner(self.declarations()).resume(graph, "contradiction-run")
+
+        self.assertNotEqual(resumed.status, StepGraphStatus.COMPLETED)
+        self.assertEqual(resumed.step("a").status, StepStatus.UNKNOWN)
+
+    def test_a_full_record_with_consistent_evidence_resumes_as_completed(self) -> None:
+        """The positive control: complete, consistent evidence must still complete.
+
+        The step declares an ``EXIT_CODE`` check, that check passed, an execution
+        outcome and an exit code are recorded -- nothing here is a bare claim, so
+        a conservative rule must not turn it into a failure.
+        """
+
+        graph = StepGraph(
+            graph_id="proven-success",
+            steps=(
+                StepDefinition(
+                    step_id="a",
+                    action=StepAction("a"),
+                    verification=StepVerification(VerificationKind.EXIT_CODE, 0),
+                ),
+            ),
+        )
+        snapshot = StepGraphSnapshot(
+            graph_id="proven-success",
+            graph_run_id="proven-success-run",
+            status=StepGraphStatus.COMPLETED,
+            steps=(
+                StepRecord(
+                    step_id="a",
+                    status=StepStatus.SUCCEEDED,
+                    action_fingerprint=graph.step("a").fingerprint(),
+                    declaration_id="a",
+                    verification_kind=VerificationKind.EXIT_CODE.value,
+                    verification_status=VerificationStatus.PASSED,
+                    execution_outcome="EXECUTION_SUCCESS",
+                    execution_exit_code=0,
+                    attempts=1,
+                ),
+            ),
+            declared_plan=declared_plan_of(graph),
+        )
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id="proven-success-run",
+                project_state={"step_graph": snapshot.to_dict()},
+            )
+        )
+
+        resumed = self.runner(self.declarations()).resume(graph, "proven-success-run")
+
+        self.assertEqual(resumed.status, StepGraphStatus.COMPLETED)
+        self.assertEqual(resumed.step("a").status, StepStatus.SUCCEEDED)
+
+    def test_a_step_that_declares_no_check_keeps_its_execution_evidence(self) -> None:
+        """A legitimate no-verification step is not broken by a universal rule.
+
+        It declares no check, so ``NOT_RUN`` is correct for it; what makes it
+        trustworthy is the recorded execution, not the absence of a check.
+        """
+
+        graph = StepGraph(
+            graph_id="no-check",
+            steps=(
+                StepDefinition(step_id="a", action=StepAction("a")),
+            ),
+        )
+        snapshot = StepGraphSnapshot(
+            graph_id="no-check",
+            graph_run_id="no-check-run",
+            status=StepGraphStatus.COMPLETED,
+            steps=(
+                StepRecord(
+                    step_id="a",
+                    status=StepStatus.SUCCEEDED,
+                    action_fingerprint=graph.step("a").fingerprint(),
+                    declaration_id="a",
+                    verification_status=VerificationStatus.NOT_RUN,
+                    execution_outcome="EXECUTION_SUCCESS",
+                    execution_exit_code=0,
+                    evidence=("executed_without_declared_verification",),
+                    attempts=1,
+                ),
+            ),
+            declared_plan=declared_plan_of(graph),
+        )
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id="no-check-run",
+                project_state={"step_graph": snapshot.to_dict()},
+            )
+        )
+
+        resumed = self.runner(self.declarations()).resume(graph, "no-check-run")
+
+        self.assertEqual(resumed.status, StepGraphStatus.COMPLETED)
+        self.assertEqual(resumed.step("a").status, StepStatus.SUCCEEDED)
+
 
 class _InterruptingResolver:
     """An operator approval channel that is interrupted by a real KeyboardInterrupt.
