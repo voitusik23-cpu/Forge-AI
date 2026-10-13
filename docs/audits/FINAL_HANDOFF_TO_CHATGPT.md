@@ -258,3 +258,22 @@ equivalent) with the verified commands, environment limits and a documentation m
 repaired. No production code, tests, migrations or configuration were touched, and no
 technical blocker status changed: Blocker #1 stays FIXED_AND_TESTED, Blockers #2, #3
 (second half) and #4 stay open.
+
+---
+
+## Update - finalization stage 3 (Blocker #2 fixed)
+
+`resume` no longer summarises an unsupported `SUCCEEDED` as `COMPLETED`. The cause was
+that `derive_graph_status()` sees only step statuses, while `_resume_snapshot()` only
+downgraded a durable `RUNNING` record; a record saved as `SUCCEEDED` with no execution
+outcome, no exit code and a declared `EXIT_CODE` verification left `NOT_RUN` passed
+through untouched. A restored `SUCCEEDED` now requires real execution evidence, must not
+contradict its own recorded outcome, and must not leave a declared check un-run;
+otherwise it is downgraded to `UNKNOWN` (graph `INDETERMINATE`) with the original claim
+preserved as evidence.
+
+Reproduced first (`FAILED (failures=3)`, `AssertionError: COMPLETED == COMPLETED`), fixed
+in commit `a28c38a`, proven by injection with a byte-exact restore, and verified with the
+full suite: `Ran 2359 tests in 155.120s` / `OK (skipped=36)`.
+
+Blockers #3 (second half) and #4 remain open, so the overall status stays `BLOCKED`.

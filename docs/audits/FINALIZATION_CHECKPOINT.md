@@ -183,3 +183,92 @@ state verification — a contract change, deliberately not made here.
 Cross-process races between the baseline and the spawn are narrowed to the statements
 between `start_time` and `Popen`, but no concurrency test was written. `SEE`
 (no PostgreSQL/`asyncpg`) is unchanged: 32 skips remain environment-only.
+
+---
+
+## Blocker #2 — FIXED_AND_TESTED (commit `a28c38a`)
+
+Current per-blocker status (the earlier tables above stay as history):
+
+| Blocker | Status |
+|---|---|
+| #1 artifact provenance | **FIXED_AND_TESTED** — `6605e35` |
+| #2 `resume` inventing completion | **FIXED_AND_TESTED** — `a28c38a` |
+| #3 damaged record overwritten | `PARTIAL` — reader half fixed in `3b7d99e`; the writer half is not started |
+| #4 GET mutating durable state | `BLOCKED` — not started |
+
+### Exact cause
+
+`derive_graph_status()` (`app/workflows/step_graph.py`) returns `COMPLETED` when every
+record's `status` is `SUCCEEDED`, and it has nothing else to look at. `_resume_snapshot()`
+(`app/workflows/step_runner.py`) downgraded only a durable `RUNNING` record; a record
+saved as `SUCCEEDED` passed through untouched. A record carrying `status=SUCCEEDED` with
+no `execution_outcome`, no `execution_exit_code` and a declared `EXIT_CODE` verification
+still `NOT_RUN` was therefore summarised as `COMPLETED`: work that never ran was
+reported as finished.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `app/workflows/step_runner.py` (+35) | in `_resume_snapshot`, a restored `SUCCEEDED` is downgraded to `UNKNOWN` unless the record carries real execution evidence (a recorded outcome, an exit code, or a PASSED verification), unless its recorded outcome contradicts success (e.g. `EXECUTION_TIMEOUT`), and unless a **declared `EXIT_CODE` check** is left un-run. The original claim is preserved verbatim as evidence (`saved_claim_was_succeeded_and_is_not_proof`) so the gap is recorded, not hidden |
+| `tests/test_step_graph_managed_execution.py` (+251) | five tests, all writing their record through the public `RunStore` and the public `StepGraphSnapshot` codec, then resuming through the public `runner.resume(...)` |
+
+Nothing universal is demanded of every step: a step that declares no check is judged by
+its recorded execution alone, and its `NOT_RUN` verification stays legitimate.
+
+### RED → GREEN → INJECTION
+
+RED (before the fix), three failures, each `AssertionError: <StepGraphStatus.COMPLETED>
+== <StepGraphStatus.COMPLETED>`:
+
+```
+FAIL test_a_saved_success_without_execution_evidence_is_not_completion
+FAIL test_a_declared_exit_code_verification_that_never_ran_is_not_confirmation
+FAIL test_contradictory_execution_evidence_is_not_success
+Ran 37 tests   FAILED (failures=3)
+```
+
+The two positive controls passed even before the fix, which is what shows the rule
+targets unsupported claims rather than success in general.
+
+GREEN (after the fix): `Ran 37 tests in 5.777s  OK`.
+
+INJECTION: reverting only this hunk reproduced the same three failures;
+`byte-exact restore: True` (SHA-256 identical) and green again.
+
+Related suites, all OK: `test_recovery_and_project_memory` 33, `test_block10_http_errors…`
+24, `test_artifact_provenance` 9, `test_block9_evidence_and_verification` 34,
+`test_product_integration` 93, `test_run_record_classification_api` 14.
+
+Full suite after the fix: `Ran 2359 tests in 155.120s` / `OK (skipped=36)`;
+`compileall` exit 0; `git diff --check` exit 0.
+
+### The five tests
+
+1. a saved success with no execution evidence is not completion (also asserts nothing was
+   executed to obtain new proof, and that resuming twice answers the same way);
+2. a declared `EXIT_CODE` check that never ran is not confirmation;
+3. contradictory evidence (outcome `EXECUTION_TIMEOUT` with `SUCCEEDED`) is not success;
+4. the positive control: a full, consistent record still resumes as `COMPLETED`;
+5. a step that declares no check keeps its legitimate `NOT_RUN` verification and still
+   completes, so the rule is not universal.
+
+### Reading of "do not rewrite the saved record"
+
+`resume` re-persists the snapshot by design (it re-stamps the declaration and envelope),
+so whole-file byte comparison is the wrong assertion. The finding recorded here is that
+the downgrade **is** persisted: storage moves from `SUCCEEDED` to `UNKNOWN`. Two readings
+were available — leave `SUCCEEDED` in storage and re-derive on every resume, or record the
+discovery durably. The second was chosen because it matches the codebase's existing
+treatment of an interrupted `RUNNING` step, and because a durable record still asserting
+`SUCCEEDED` would keep misleading every consumer that reads storage without resuming. To
+keep that honest, the original claim is preserved verbatim as evidence rather than dropped.
+If the owner prefers the first reading, the change is small and this paragraph is the
+place to say so.
+
+### Not verified
+
+No concurrency test was written (two resumes racing on the same record). Platform
+database tests still skip: 32 skips remain environment-only, 3 are symlink-related and 1
+lacks `OPENAI_API_KEY`. SKIP is not PASS.
