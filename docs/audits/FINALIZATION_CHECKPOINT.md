@@ -598,3 +598,86 @@ Full suite: `Ran 2377 tests in 140.899s` / `OK (skipped=36)`; `compileall` exit 
   the composed manager's `max_artifact_bytes`, which the baseline now follows.
 * The TOCTOU windows (baseline→spawn, exit→harvest) and cross-process concurrency
   remain as recorded in the audit; they are out of this finding's scope.
+
+---
+
+# Master execution stage (head `865ecb2`)
+
+## The existing UI was found and launched
+
+There is a web console already in the repository -- plain HTML/CSS/JS served by the API
+itself, no frontend build step: `app/static/index.html` (10.8 KB), `app.css` (6.0 KB),
+`app.js` (71.5 KB), served by the routes at `app/api/routes.py:1360-1383` with the asset
+names declared in `app/api/server.py:78`. It states its own boundary: "every value on
+this page comes from a route that computed it on the server, and no control on this page
+can set an outcome."
+
+Started with `python -m app.api.main` (loopback, `FORGE_ENV=test`, port 8011) and
+verified by HTTP against the running instance:
+
+| Request | Measured |
+|---|---|
+| `GET /` | 200, 10 775 bytes, `text/html; charset=utf-8`; contains `Operating Console`, `card-project`, the server-authoritative banner |
+| `GET /app.css` | 200, 6 046 bytes, `text/css; charset=utf-8` |
+| `GET /app.js` | 200, 71 334 bytes, `text/javascript; charset=utf-8` |
+| `GET /api/product/onboarding` | 200, real payload with project `Forge Main Workspace`, `stage: INITIAL` |
+| `GET /api/product/verification-plan` | 200, 1 106 bytes JSON |
+
+The desktop surfaces also exist and are untouched: `app/desktop/app.py`
+(`ForgeDesktopApp`), `views.py` (Home/Projects/Agents/Runs/Costs/Settings) and
+`widget.py` (Forge Pulse, captured in `docs/images/forge-pulse-widget.png`).
+
+**Confirmed documentation defect, fixed.** The launch command written in `README.md` and
+`docs/USER_AND_DEVELOPER_GUIDE.md` was `python app\api\main.py`, which fails with
+`ModuleNotFoundError: No module named 'app'` -- running the file as a script puts
+`app/api` on `sys.path`, not the repository root. Corrected to `python -m app.api.main`
+(1 occurrence in the README, 2 in the guide) and verified by starting the server. The
+Russian half of the guide was synchronised with the English sections (§11 console,
+§12 PostgreSQL, §13 map); it had drifted.
+
+**Not captured:** a browser screenshot of the console. Microsoft Edge is the only browser
+on this host and its headless mode cannot grant its network-context sandbox inside the
+DSH sandbox (`Failed to grant sandbox access ... Отказано в доступе`) with either a
+system-temp or an in-repository profile. Verification is therefore HTTP-level. No fake
+image was produced.
+
+## Contracts settled in this stage (no new `VerificationKind`)
+
+| Question | Decision recorded |
+|---|---|
+| Prove this attempt produced/changed a file | Implemented and verified (`6605e35`, `52b376d`): baseline immediately before spawn, same root and same limit as the harvest, `changed_by_this_attempt` is the only proof |
+| Verify a state that already existed | **Not expressible** by any current `VerificationKind`; such a check reports `ERROR`, never `PASSED`. Adding a kind is a contract change and needs the owner |
+| Undeclared verification targets (Variant A) | No parallel permission system introduced. The **write** side is constrained by the step declaration, the `WorkspaceBoundary` and the credential refusal; a verification target only causes a read/hash inside the same boundary, and credential-shaped or out-of-root targets are refused (`7b66736`, `test_harvest_refuses_credentials.py`) |
+| `SUCCEEDED → UNKNOWN` semantics | Documented and tested: a restored claim without evidence is not a verdict; the original claim survives as `saved_claim_was_succeeded_and_is_not_proof`; `run()` and `resume()` now agree (`45cdcd1`) |
+
+## Residual risks, classified rather than "fixed"
+
+* **TOCTOU between baseline and spawn** (≈10 statements): a concurrent writer in that
+  window could have its change attributed to the attempt. Window is minimal; not
+  eliminated. No OS-level sandbox exists to close it.
+* **TOCTOU between process exit and harvest**: a third party's write in that window is
+  attributed to the attempt. Same class, same limitation.
+* **Cross-process concurrency**: the in-flight claim is process-local. Two processes
+  reading a damaged record both refuse (verified behaviour); two processes driving the
+  same valid run are not covered by a test.
+* Neither risk is claimed as resolved anywhere; they are recorded here and in
+  `INDEPENDENT_STAGE1_AUDIT.md`.
+
+## PostgreSQL: still blocked, steps prepared
+
+Measured on this host: no `psql`, `initdb`, `pg_ctl`, `postgres` on `PATH`; no
+`C:\Program Files\PostgreSQL`; no `docker`/`podman`; `asyncpg` not installed. The 32
+Platform skips remain **unverified**, and no stub was introduced to hide that. The
+provisioning and test commands to run once a server exists are recorded in
+`docs/USER_AND_DEVELOPER_GUIDE.md` §12.
+
+## Verdict for Stage 1
+
+**`CONDITIONAL GO`.** Every criterion that can be checked in this environment is
+confirmed: blockers #1-#4 and findings F-1/F-2 are `FIXED_AND_TESTED` with
+injection-proven regression tests, the full suite is green
+(`Ran 2377 tests / OK (skipped=36)` before this documentation stage), the security
+invariants are intact, and the existing UI runs and serves real data. The condition is
+explicit: the **Platform persistence contract (RLS, FORCE RLS, indexes, foreign keys,
+migrations) is unverified** here for environmental reasons, and the TOCTOU/concurrency
+residuals above are accepted, documented risks rather than closed ones.

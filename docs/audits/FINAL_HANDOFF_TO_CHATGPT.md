@@ -414,3 +414,24 @@ fixed in `52b376d`, proven by injection with a byte-exact restore. Full suite:
 
 Both audit findings F-1 and F-2 are now closed. The remaining Stage 1 items are the
 owner decisions and the environment-limited Platform track (32 skips).
+
+---
+
+## Update - master execution stage (UI launched, docs corrected)
+
+* The repository's existing **web console was launched and verified by HTTP**: `GET /`
+  → 200 with the real console HTML, `/app.css` and `/app.js` → 200, and
+  `/api/product/onboarding` → 200 carrying the real project record. Start command:
+  `python -m app.api.main` (loopback), then open `http://127.0.0.1:<port>/`.
+* A **documentation defect was found and fixed**: the documented launch command
+  `python app\api\main.py` fails with `ModuleNotFoundError: No module named 'app'`;
+  it is now `python -m app.api.main` in both the README and the guide, verified by
+  starting the server. The Russian half of the guide was synchronised.
+* **No browser screenshot** of the console could be produced: the only browser here
+  (Edge) cannot run headless inside the DSH sandbox. Nothing was faked.
+* **PostgreSQL remains unavailable** on this host (no server, no container runtime, no
+  driver), so the 32 Platform skips stay unverified; provisioning steps are documented.
+
+Stage 1 verdict: **`CONDITIONAL GO`** -- all in-environment criteria confirmed, the
+Platform persistence contract still unverified, TOCTOU/concurrency residuals documented
+rather than closed.
