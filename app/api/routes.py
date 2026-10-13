@@ -527,10 +527,15 @@ def envelope_from_exception(
     """Classify one exception into ``(status, body)`` -- the common mechanism.
 
     This is the single place an unhandled error becomes an HTTP answer, and the
-    only place that decides what a caller may learn about it. It never propagates
-    exception text: ``error`` carries the exception's *class name* for our own typed
-    refusals (as the surface already did) and the safe ``message`` is chosen from the
-    closed table by code.
+    only place that decides what a caller may learn about it. For our own typed
+    refusals ``error`` carries the refusal's own message -- composed by the surface
+    from a closed vocabulary plus the identifier the caller supplied -- while the
+    human-readable ``message`` is chosen from the closed table by code. Arbitrary
+    exception text never reaches a caller: an exception this function does not
+    recognise is not typed, so it is answered by the sanitized application handler
+    in :mod:`app.api.server` instead. The residual is stated rather than hidden: a
+    typed refusal's message may echo a client-supplied identifier it names, which is
+    why every such message is written to contain an identifier and nothing else.
     """
 
     handle = request_id or current_request_id()
@@ -994,10 +999,20 @@ def register_operating_routes(app: Any, surface_factory: Any) -> None:
         """
 
         _guard(payload.get("project_id", ""))
+        raw_invalidate = payload.get("invalidate", False)
+        if not isinstance(raw_invalidate, bool):
+            # A truthy string is not consent. ``bool("false")``, ``bool("no")`` and
+            # ``bool("0")`` are all True, so a caller who wrote one of them in the
+            # JSON body -- believing it disabled the flag -- triggered a durable
+            # invalidation of every file-pinned memory entry. Only a real JSON
+            # boolean means what the caller wrote; anything else is refused.
+            raise HTTPException(
+                status_code=400, detail="'invalidate' must be a JSON boolean"
+            )
         return _run_catching(
             lambda: surface.stale_facts(
                 baseline=payload.get("baseline", ""),
-                invalidate=bool(payload.get("invalidate", False)),
+                invalidate=raw_invalidate,
             )
         )
 

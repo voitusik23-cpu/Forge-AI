@@ -757,6 +757,31 @@ class ChangeImpactReasoningTests(Block9Case):
             set(payload["stale_fact_ids"]).issubset(set(payload["history_retained"]))
         )
 
+    def test_21b_a_truthy_string_is_not_consent_to_invalidate(self) -> None:
+        """_INJECTION_TARGET_: only a JSON boolean means what the caller wrote.
+
+        Goes red if ``invalidate`` is coerced with ``bool()``: the strings "false",
+        "no" and "0" are all truthy and each one would perform a durable
+        invalidation while the caller believed the flag was off.
+        """
+
+        self._seed()
+        client = self.client()
+        self.assertEqual(client.post("/api/product/baseline", json={}).status_code, 200)
+
+        for falsy_text in ("false", "no", "0"):
+            response = client.post(
+                "/api/product/stale-facts", json={"invalidate": falsy_text}
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+
+        # A real boolean still works in both directions.
+        for value in (False, True):
+            response = client.post(
+                "/api/product/stale-facts", json={"invalidate": value}
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
     def test_22_an_ambiguous_move_is_never_auto_resolved(self) -> None:
         """_SENSITIVITY_: two identical candidates must stay unresolved.
 
