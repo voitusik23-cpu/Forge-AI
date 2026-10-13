@@ -992,20 +992,16 @@ class OperatingSurface:
             # The runner would do exactly this, but stating it here lets the HTTP
             # layer answer 200-with-recorded-attempt rather than an error, and it
             # keeps the "no second execution" property visible at the boundary.
+            #
+            # The saved step records are returned AS RECORDED. They describe the
+            # attempt that ran, and an attempt record must not be rewritten per
+            # response: clearing the recorded ``command_started`` made a single step
+            # read "SUCCEEDED, exit 0, step_run_id set, command_started: false" -- a
+            # record contradicting itself. What THIS call did is stated by the fields
+            # beside it: ``replayed``, ``executed``, ``command_started`` and
+            # ``commands_started`` describe this response, and ``recorded_result``
+            # marks the payload as a past attempt rather than a claim about now.
             payload = existing.to_dict()
-            # This response describes the CURRENT request, and the current request
-            # started nothing. The saved step records carry the values of the attempt
-            # that actually ran, so returning them verbatim made each step report
-            # ``command_started: true`` while this object correctly said false -- a
-            # contradiction a client could read as "a command ran". The completed
-            # history is preserved (status, verification, evidence, timings); only the
-            # fields describing THIS attempt's process launch are cleared.
-            for step in payload.get("steps") or ():
-                if isinstance(step, dict):
-                    if "command_started" in step:
-                        step["command_started"] = False
-                    if "commands_started" in step:
-                        step["commands_started"] = 0
             return {
                 "executed": False,
                 "replayed": True,
@@ -1015,8 +1011,13 @@ class OperatingSurface:
                 # drove an attempt" and is false here for that reason too.
                 "command_started": False,
                 "commands_started": 0,
+                "recorded_result": True,
                 "result": payload,
-                "note": "a recorded attempt already exists; nothing was executed again",
+                "note": (
+                    "a recorded attempt already exists; nothing was executed again. "
+                    "The fields above describe this call; ``result`` is the recorded "
+                    "attempt, returned unchanged."
+                ),
             }
 
         try:

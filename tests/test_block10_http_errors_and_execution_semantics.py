@@ -716,8 +716,10 @@ class ExecutedSemanticsTests(_ErrorEnvelopeCase):
     def test_24_a_replay_starts_nothing_and_says_so(self) -> None:
         """A recorded attempt returned again is not a command start.
 
-        Goes red if: ``command_started``/``commands_started`` are taken from the
-        RECORDED attempt rather than from what this call did.
+        Goes red if: ``command_started``/``commands_started`` at the TOP level are
+        taken from the RECORDED attempt rather than from what this call did; or the
+        recorded step payload is rewritten per response, which would make the record
+        contradict itself.
         """
 
         client = self.client()
@@ -732,9 +734,18 @@ class ExecutedSemanticsTests(_ErrorEnvelopeCase):
         self.assertIs(body["executed"], False)
         self.assertIs(body["command_started"], False)
         self.assertEqual(body["commands_started"], 0)
-        # The response is for this call, so process-launch fields are cleared even
-        # inside the preserved recorded step payload.
-        self.assertIs(body["result"]["steps"][0]["command_started"], False)
+        # The past attempt is returned UNCHANGED. It must still report the command it
+        # really started; the fields above say this call started nothing. Clearing
+        # them here used to make one step read "SUCCEEDED, exit 0, step_run_id set,
+        # command_started: false" -- a record contradicting itself.
+        step = body["result"]["steps"][0]
+        self.assertIs(step["command_started"], True)
+        self.assertEqual(step["execution_outcome"], "EXECUTION_SUCCESS")
+        self.assertEqual(step["execution_exit_code"], 0)
+        self.assertTrue(step["step_run_id"])
+        # The response states that ``result`` is a past attempt, not a claim about
+        # this call.
+        self.assertIs(body["recorded_result"], True)
 
     def test_25_the_client_can_tell_all_four_cases_apart(self) -> None:
         """_SENSITIVITY_: the four cases are distinguishable from the response.
