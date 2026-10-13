@@ -1,0 +1,84 @@
+# The Platform persistence guarantees are PostgreSQL semantics: row-level security,
+# FORCE RLS, partial unique indexes, composite foreign keys, role boundaries. They
+# cannot be simulated, so this job runs a real server and executes the tests that
+# skip everywhere else. A skip is not a pass.
+#
+# The fixture provisions two logins, each a member of exactly one platform role,
+# both NOSUPERUSER and NOBYPASSRLS, and connects through them, so the policies are
+# enforced rather than bypassed by a superuser. scripts/check_platform_roles.py
+# re-asserts those attributes after the run and fails the job otherwise.
+
+name: Platform PostgreSQL contract
+
+# The Platform persistence guarantees -- row-level security, FORCE row-level
+# security, partial unique indexes, composite foreign keys, role boundaries -- are
+# PostgreSQL semantics. They cannot be simulated, so this job runs a real server and
+# executes the tests that skip everywhere else. A skip is not a pass: without this
+# job those 32 tests prove nothing.
+#
+# The test fixture (tests/persistence_fixture.py) provisions two logins, each a
+# member of exactly one platform role, both NOSUPERUSER and NOBYPASSRLS, and connects
+# through them -- so the policies are actually enforced rather than bypassed by a
+# superuser. scripts/check_platform_roles.py re-asserts those role attributes after
+# the run, so a fixture that ever provisioned a bypassing role would fail the job.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  platform-postgres:
+    name: Platform tests against PostgreSQL 16
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: forge-ci-admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # The administrator DSN the fixture migrates and provisions with.
+      FORGE_PLATFORM_TEST_DSN: postgresql://postgres:forge-ci-admin@127.0.0.1:5432/postgres
+      # Password for the two non-superuser logins the fixture creates.
+      FORGE_PLATFORM_TEST_APP_LOGIN_PASSWORD: persistence-test-login
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime and platform test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-platform.txt
+          python -c "import asyncpg, sys; print('asyncpg', asyncpg.__version__, '| python', sys.version.split()[0])"
+
+      - name: Confirm the server is reachable before the suite runs
+        run: python -B -X utf8 scripts/check_platform_server.py
+
+      - name: Full suite, including the PostgreSQL-dependent tests
+        run: python -B -X utf8 -m unittest discover -s tests -v
+
+      - name: Platform suite alone, so its result is visible on its own
+        run: |
+          python -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
+
+      - name: Assert the test logins cannot bypass row-level security
+        run: python -B -X utf8 scripts/check_platform_roles.py
