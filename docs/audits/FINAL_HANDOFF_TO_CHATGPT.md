@@ -390,3 +390,27 @@ Full suite: `Ran 2373 tests in 146.682s` / `OK (skipped=36)`.
 Audit finding **F-2** (baseline/harvest size limits disagree: a >1 MiB pre-existing
 artifact modified by the attempt yields `artifact_provenance_unavailable` instead of
 production) is **still open** and is the next task.
+
+---
+
+## Update - audit finding F-2 closed
+
+The provenance baseline and the harvest now measure with one limit. The baseline was
+taken with `max_output_bytes` (1 MiB, the **stream** cap) while the harvest used
+`max_artifact_bytes` (10 MiB), so a pre-existing artifact larger than 1 MiB that the
+attempt really modified was reported as
+`ERROR / artifact_provenance_unavailable` -- a real production reported as unmeasurable.
+
+`EphemeralWorkspaceManager.max_artifact_bytes` is now a public property,
+`_run_process(..., artifact_baseline_limit=...)` receives it from `execute()` (the
+composed manager's limit when isolating, `DEFAULT_MAX_ARTIFACT_BYTES` otherwise, which
+is exactly what the harvest's default manager uses), and the snapshot passes it
+through. No limit was raised; a file over the artifact cap is still refused explicitly
+by the harvest and never becomes `PASSED`.
+
+Reproduced first (through the real adapter path: `ERROR / artifact_provenance_unavailable`),
+fixed in `52b376d`, proven by injection with a byte-exact restore. Full suite:
+`Ran 2377 tests in 140.899s` / `OK (skipped=36)`.
+
+Both audit findings F-1 and F-2 are now closed. The remaining Stage 1 items are the
+owner decisions and the environment-limited Platform track (32 skips).

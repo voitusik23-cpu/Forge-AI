@@ -509,3 +509,92 @@ the claim. Records with complete evidence are unaffected, as the positive contro
 The baseline/harvest size-limit mismatch found by the same audit (a >1 MiB modified
 artifact reporting `artifact_provenance_unavailable`) is **not** addressed here, by
 explicit scope. It is the next task.
+
+---
+
+## Audit finding F-2 — FIXED_AND_TESTED (commit `52b376d`)
+
+### The measured inconsistency
+
+The provenance baseline was snapshotted with `max_bytes=max_output_bytes`
+(`adapter.py`), while the harvest measures with the manager's `max_artifact_bytes`.
+Those limits have different jobs and are not interchangeable:
+
+| Limit | Job | Default |
+|---|---|---|
+| `intent.max_output_bytes` | bounds captured **stdout/stderr** | 1 MiB |
+| `max_artifact_bytes` / `DEFAULT_MAX_ARTIFACT_BYTES` | bounds **artifact measurement** | 10 MiB |
+
+A pre-existing artifact larger than 1 MiB that the attempt really modified was
+therefore recorded as unmeasurable, and the step reported
+`ERROR / artifact_provenance_unavailable` for a production that did happen. Measured
+before the fix:
+
+```
+AssertionError: <VerificationStatus.ERROR> is not <VerificationStatus.PASSED>
+... 'artifact_provenance_unavailable=big.txt' | 'the harvest did not record whether
+    this attempt produced the artifact'
+```
+
+### The chosen contract
+
+One limit for measuring an artifact, taken from the same source the harvest uses:
+
+* `EphemeralWorkspaceManager.max_artifact_bytes` is now a public read-only property —
+  the manager owns its limit, and the baseline asks it;
+* `_run_process(..., artifact_baseline_limit=...)` receives that limit from `execute()`
+  and passes it to `snapshot_artifact_states`; when it is `None` the snapshot function
+  applies `DEFAULT_MAX_ARTIFACT_BYTES`, so the default path cannot silently diverge;
+* the isolating branch passes `ws_mgr.max_artifact_bytes` (the composed manager's own
+  limit); the non-isolating branch passes `DEFAULT_MAX_ARTIFACT_BYTES` explicitly,
+  because that is what the harvest's inline default manager uses.
+
+Limits were **not** raised: the artifact limit is unchanged at 10 MiB, and the stream
+cap is still 1 MiB. A file over the artifact limit is still refused, by the harvest's
+own explicit `ValueError` (`create_artifact_from_file`), which the adapter reports as
+`ERROR / artifact_harvest_failed` — never as `PASSED`.
+
+### Guarantees re-verified after the change
+
+* a matching path alone still cannot pass (the verifier still requires
+  `changed_by_this_attempt is True`);
+* baseline and harvest work in one boundary root;
+* missing evidence still cannot become success;
+* credential-shaped targets are still skipped by the snapshot and refused by the
+  harvest;
+* nothing outside the root is read;
+* provenance stays bound to the attempt (`baseline_recorded_for`).
+
+### RED → GREEN → INJECTION
+
+RED, before the fix, through the real adapter path (isolated run, 2 MiB pre-existing
+target appended to by the attempt): `ERROR / artifact_provenance_unavailable`.
+
+GREEN: the step reports `PASSED`, the graph `COMPLETED`
+(`Ran 51 tests` in the step-graph suite, `Ran 12 tests` in the provenance suite).
+
+INJECTION: reverting only the adapter hunk reproduced the `artifact_provenance_unavailable`
+failure; the restore was byte-exact (SHA-256 identical).
+
+### Tests added
+
+* `tests/test_artifact_provenance.py` — a >1 MiB pre-existing file changed by the
+  attempt is production; a file over the limit is refused predictably (the baseline
+  records `unreadable`/`sha256=None` and the harvest raises); a baseline with no entry
+  for the target answers nothing (never `True`).
+* `tests/test_step_graph_managed_execution.py` — the end-to-end reproduction above,
+  using a new `append_big` declaration that appends to a pre-existing file.
+
+Related suites, all OK: step-graph 51, provenance 12, local adapter 9, execution plane
+26, secret staging 32 (1 skip), recovery 33, block9 35, product integration 93 — 291.
+
+Full suite: `Ran 2377 tests in 140.899s` / `OK (skipped=36)`; `compileall` exit 0;
+`git diff --check` exit 0; secret scan 0.
+
+### Residuals
+
+* A target larger than the artifact limit cannot be verified at all — by design, and
+  now consistently on both sides. An operator who needs larger artifacts must raise
+  the composed manager's `max_artifact_bytes`, which the baseline now follows.
+* The TOCTOU windows (baseline→spawn, exit→harvest) and cross-process concurrency
+  remain as recorded in the audit; they are out of this finding's scope.
