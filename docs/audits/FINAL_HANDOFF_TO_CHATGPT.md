@@ -277,3 +277,42 @@ in commit `a28c38a`, proven by injection with a byte-exact restore, and verified
 full suite: `Ran 2359 tests in 155.120s` / `OK (skipped=36)`.
 
 Blockers #3 (second half) and #4 remain open, so the overall status stays `BLOCKED`.
+
+---
+
+## Update - documentation consolidation stage 2 (no code changes)
+
+Documents changed, and why:
+
+| Document | Change |
+|---|---|
+| `docs/ROADMAP.md` | a bilingual seven-stage plan (Stabilization, Independent Verification, Documentation & Developer Experience, Platform Foundation, Provider/Model Layer, Execution-Agents-Tools, UI/Product Experience) with goal, tasks, dependencies, exit criteria, tests, actual status and open risks for each; every pre-existing section below it is preserved |
+| `docs/SOURCE_OF_TRUTH.md` | a bilingual section defining the authority of the five sources (code and tests first, then this file, architecture, specification/vision, roadmap, decisions, audits), restating the invariants Recommendation != Permission, Permission != Execution, Report != Evidence, and recording an **open contradiction** |
+| `docs/ARCHITECTURE.md` | a bilingual section describing artifact provenance (baseline before the child is created, comparison after, attempt binding, fail-closed verdicts) and the restored-success evidence rule, matching `6605e35` and `a28c38a` |
+| `docs/USER_AND_DEVELOPER_GUIDE.md` | **new**: bilingual user and developer guide -- repository layout, the authority chain, environment requirements, verified install/run/test commands, configuration and secrets, execution/verification/recovery, a diagnostics table, known limitations, and an explicit list of screenshots that would be needed and are deliberately not mocked |
+
+Checks performed: 12 relative links in the new guide -- 0 missing; every referenced
+path exists (`app/api/main.py`, `scripts/run_forge_pulse.cmd`, `requirements.txt`,
+`.env.example`, `.forge/run_confined.py`, the test file, the widget image, the
+checkpoint); encoding clean in all four documents (0 mojibake); secret scan 0 hits;
+`git diff --check` exit 0. The full test suite was **not** re-run, because no code,
+test, migration or configuration file was touched. Last recorded suite result stands
+at `Ran 2359 tests in 155.120s` / `OK (skipped=36)`.
+
+### Open contradiction for the owner
+
+The brief commissioning this pass states that blocker #2 is open. The repository says
+otherwise: `a28c38a` fixes it, five regression tests cover it
+(`tests/test_step_graph_managed_execution.py`), injection reproduces the old failure
+when the hunk is reverted, and the full suite is green. This stage documents the
+repository's version, per the authority order recorded in `docs/SOURCE_OF_TRUTH.md`.
+The blocker list is therefore: #1 fixed, #2 fixed, #3 partial, #4 open.
+
+### Residual housekeeping, not a repository change
+
+The local (gitignored) test runner pinned its deterministic temp directory inside the
+repository, and because some tests stage the repository into a scratch tree, repeated
+runs produced a deeply nested `.forge/tmp/forge_scratch_*/...` skeleton. All files in
+it were removed (0 files, 0 bytes remain; only empty directories left behind by
+long-path limits). Nothing there was ever tracked by git. A follow-up should move that
+temp root outside the repository so the nesting cannot recur.
