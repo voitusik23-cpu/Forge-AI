@@ -4997,3 +4997,73 @@ accounting или путь исполнения не изменились. Вс�
 4. Когда ограничение из §4 исправлено, удалите это ограничение и отметьте
    исправление в `DECISIONS.md`; не оставляйте устаревший текст о «известном
    ограничении».
+
+---
+
+# Source-of-truth boundaries (documentation pass)
+
+Five sources answer five different questions. Where they disagree, the earlier rows
+win, and the disagreement is recorded as an open question rather than settled by
+editing prose.
+
+| Source | Question it answers | Authority |
+|---|---|---|
+| `app/` and the passing test suite | What does the system actually do? | **Highest.** A claim that contradicts the code or a green test is wrong, whatever a document says. |
+| `docs/SOURCE_OF_TRUTH.md` (this file) | What is the consolidated verified current state? | Verified statements only; an unverified statement must be marked as such. |
+| `docs/ARCHITECTURE.md` | How is the current implementation built? | Descriptive of the code; it must change when the code changes. |
+| `docs/TECHNICAL_SPECIFICATION.md` and `docs/FORGE_VISION.md` | What is the target, and why? | Direction, never evidence that something exists. |
+| `docs/ROADMAP.md` | What is planned, in what order, with which exit criteria? | Planning and dependency order. |
+| `docs/DECISIONS.md` | Why was a decision made, and what was rejected? | Rationale and history; a superseded decision stays visible as superseded. |
+| `docs/audits/` | What was checked, when, with what result? | Engineering evidence: commands, defects, limitations, commits. |
+
+Non-negotiable invariants, unchanged by any reorganisation of this file:
+
+* **Recommendation ≠ Permission.**
+* **Permission ≠ Execution.**
+* **Report ≠ Evidence.**
+
+Also unchanged: the Platform / Core / Fabric / Registry separation, per-project
+isolation, the requirement that secrets never enter the repository or a log, that
+execution happens only through the authorization chain, and that evidence is
+reproducible.
+
+## Open contradiction (needs the owner)
+
+The finalization brief that commissioned this pass states that blocker #2 (`resume`
+restoring an unsupported success) is **open**, while the repository says otherwise:
+commit `a28c38a` fixes it, five regression tests cover it, and the full suite is green
+at `Ran 2359 tests / OK (skipped=36)`. This document follows the repository, per the
+authority order above. If the brief is authoritative for a reason not visible here,
+the fix must be re-examined rather than the documentation adjusted to match the brief.
+
+---
+
+# Границы источников истины (документационный проход)
+
+Пять источников отвечают на пять разных вопросов. При расхождении выигрывают
+верхние строки, а расхождение фиксируется как открытый вопрос, а не «решается»
+правкой текста.
+
+* `app/` и проходящий набор тестов — что система делает фактически. **Высший
+  авторитет.** Утверждение, противоречащее коду или зелёному тесту, неверно.
+* `docs/SOURCE_OF_TRUTH.md` — сводное проверенное текущее состояние; непроверенное
+  обязано быть помечено как непроверенное.
+* `docs/ARCHITECTURE.md` — как устроена текущая реализация; меняется вместе с кодом.
+* `docs/TECHNICAL_SPECIFICATION.md`, `docs/FORGE_VISION.md` — цель и направление,
+  но не доказательство существования.
+* `docs/ROADMAP.md` — что планируется, в каком порядке и с какими критериями.
+* `docs/DECISIONS.md` — почему решение принято и что отклонено; отменённое решение
+  остаётся видимым как отменённое.
+* `docs/audits/` — инженерные доказательства: команды, дефекты, ограничения, коммиты.
+
+Инварианты, не меняющиеся ни при какой реорганизации: **Recommendation ≠
+Permission**, **Permission ≠ Execution**, **Report ≠ Evidence**; разделение
+Platform / Core / Fabric / Registry; изоляция проектов; запрет секретов в
+репозитории и логах; исполнение только через цепочку авторизации; воспроизводимость
+доказательств.
+
+**Открытое противоречие (нужно решение владельца):** задание на этот проход
+называет блокер №2 открытым, тогда как репозиторий говорит обратное — коммит
+`a28c38a`, пять регрессионных тестов, полный набор `2359 тестов / OK (skipped=36)`.
+Этот документ следует репозиторию. Если задание авторитетно по невидимой здесь
+причине, пересматривать нужно исправление, а не документацию.

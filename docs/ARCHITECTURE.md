@@ -3916,3 +3916,90 @@ Forge **не** является OS-песочницей.
 outcome status, причину отказа, код возврата, длительность, признак усечения и
 количество артефактов. Стандартный вывод, поток ошибок, значения переменных
 окружения и секреты никогда не попадают в метаданные событий.
+
+---
+
+# Artifact provenance and execution verification (documentation pass)
+
+This section reflects the implementation after commit `6605e35` (artifact
+provenance) and `a28c38a` (restoring a saved success).
+
+## Artifact provenance
+
+A declared artifact target is verified through three observations, not one:
+
+```mermaid
+sequenceDiagram
+    participant R as Step runner
+    participant A as Execution adapter
+    participant F as Filesystem (boundary root)
+    R->>A: execute(declared artifact targets)
+    Note over A,F: immediately before the child is created
+    A->>F: snapshot(exists, size, mtime_ns, sha256) per target
+    A->>A: spawn the command
+    A->>F: harvest(exists, size, mtime_ns, sha256)
+    A->>A: compare before/after, bind to this attempt
+    A-->>R: Artifact with metadata{existed_before, changed_by_this_attempt, sha256_before, baseline_recorded_for}
+    R->>R: PASSED only if changed_by_this_attempt is True
+```
+
+* The baseline is taken **inside the process launch path, immediately before the
+  child is created**, from the same root the harvest will measure -- the staged
+  scratch root in the isolating branch, the workspace root otherwise.
+* A matching `relative_path` alone never proves production.
+* `changed_by_this_attempt` is `True` only when the target was absent before and is
+  present after, or when its content digest changed. `mtime_ns` is recorded but is
+  never the proof: a copy can preserve it.
+* `False` (present before and unchanged) yields `ERROR` with
+  `artifact_preexisting_and_unchanged`; a missing or unreadable baseline yields
+  `ERROR` with `artifact_provenance_unavailable`. Neither is `PASSED`, so the graph
+  cannot become `COMPLETED` on an unproven artifact.
+* The snapshot reads only inside the boundary root and never reads a
+  credential-shaped target.
+
+**Open contract question (needs the owner).** No `VerificationKind` expresses
+"verify a state that already existed". Under the current contract such a check is
+reported as `ERROR`, which is honest but may not be what an operator intends. Adding
+a kind is a contract change and has deliberately not been made.
+
+## Restoring a saved success
+
+`derive_graph_status()` sees only step statuses, so a restored `SUCCEEDED` needed its
+own evidence check. In `_resume_snapshot` a restored `SUCCEEDED` is downgraded to
+`UNKNOWN` -- which derives `INDETERMINATE` -- unless the record carries real
+execution evidence (a recorded outcome, an exit code, or a `PASSED` verification),
+does not contradict its own recorded outcome, and does not leave a declared
+`EXIT_CODE` check un-run. The original claim is preserved as evidence rather than
+dropped, and a step that declares no check is judged by its recorded execution alone.
+
+---
+
+# Происхождение артефактов и проверка исполнения (документационный проход)
+
+Раздел соответствует реализации после коммитов `6605e35` (происхождение
+артефактов) и `a28c38a` (восстановление сохранённого успеха).
+
+* Состояние каждой объявленной цели снимается **внутри пути запуска процесса,
+  непосредственно перед созданием дочернего процесса**, из того же корня, который
+  затем измеряет харвест: staged scratch-корень в изолирующей ветке, workspace-корень
+  в остальных случаях.
+* Совпавший `relative_path` сам по себе **никогда** не доказывает производство.
+* `changed_by_this_attempt` истинно только если цель отсутствовала до и появилась
+  после, либо если изменился хеш содержимого. `mtime_ns` записывается, но
+  доказательством не является: копирование может его сохранить.
+* «Была до и не изменилась» даёт `ERROR` (`artifact_preexisting_and_unchanged`),
+  отсутствие или нечитаемость baseline — `ERROR`
+  (`artifact_provenance_unavailable`). Ни то, ни другое не `PASSED`, поэтому граф
+  не может стать `COMPLETED` на недоказанном артефакте.
+* Снимок читает только внутри корня границы и никогда не читает цель, похожую на
+  credential-материал.
+* **Открытый контрактный вопрос (нужно решение владельца):** ни один
+  `VerificationKind` не выражает «проверить состояние, существовавшее ранее»;
+  такая проверка сообщается как `ERROR`. Добавление вида проверки — изменение
+  контракта, и оно сознательно не сделано.
+* **Восстановление сохранённого успеха:** `derive_graph_status()` видит только
+  статусы, поэтому в `_resume_snapshot` восстановленный `SUCCEEDED` понижается до
+  `UNKNOWN` (что даёт `INDETERMINATE`), если в записи нет реальных свидетельств
+  исполнения, если они противоречат успеху или если объявленная проверка
+  `EXIT_CODE` не выполнялась. Исходное заявление сохраняется как свидетельство, а
+  шаг без объявленной проверки судится только по записанному исполнению.

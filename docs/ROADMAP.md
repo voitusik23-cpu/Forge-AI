@@ -628,3 +628,163 @@ workflow review/ревизии. Выполнение плана, управле�
 
 Технологические кандидаты на рассмотрении отслеживаются в
 [`TECHNOLOGY_RADAR.md`](TECHNOLOGY_RADAR.md). Ничто там не одобрено.
+
+---
+
+# Staged plan (documentation pass)
+
+Status vocabulary used by every document: **IMPLEMENTED** (present in code),
+**VERIFIED** (proven by a run), **IN PROGRESS**, **BLOCKED**, **PLANNED**,
+**DEFERRED**. IMPLEMENTED is not VERIFIED. This is a dependency order, not a
+permission to start everything.
+
+## Stage 1 — Stabilization
+
+* **Goal**: close the proven correctness defects in the execution and recovery
+  paths so that a reported success always corresponds to work that actually ran.
+* **Tasks**: artifact provenance (done), resume refusing unsupported success
+  (done), damaged-record handling (reader done, writer open), read-only GET
+  routes (open).
+* **Depends on**: nothing. Everything else depends on this.
+* **Exit criteria**: no open blocker in the four-item list; a regression test
+  exists for each and fails before its fix; the full suite is green; each fix is
+  published with its evidence.
+* **Tests/checks**: `tests/test_artifact_provenance.py`,
+  `tests/test_step_graph_managed_execution.py`, `tests/test_step_graph_record_robustness.py`,
+  `tests/test_run_store_id_containment.py`, `tests/test_harvest_refuses_credentials.py`,
+  `tests/test_workspace_identity_on_tool_path.py`, plus the full suite,
+  `compileall` and `git diff --check`.
+* **Actual status**: **IN PROGRESS** — blocker #1 `FIXED_AND_TESTED` (`6605e35`),
+  blocker #2 `FIXED_AND_TESTED` (`a28c38a`), blocker #3 `PARTIAL` (reader `3b7d99e`,
+  writer open), blocker #4 open.
+* **Open risks**: the verification contract cannot express "verify a pre-existing
+  state"; concurrency was never tested.
+
+## Stage 2 — Independent Verification
+
+* **Goal**: an outside reviewer reproduces the fixes from the repository alone.
+* **Tasks**: hand over `docs/audits/FINAL_HANDOFF_TO_CHATGPT.md` and
+  `docs/audits/FINALIZATION_CHECKPOINT.md`; answer the reproduction questions;
+  record the verdict.
+* **Depends on**: Stage 1 complete (all four blockers closed and published).
+* **Exit criteria**: an independent report that either confirms each fix or names
+  a concrete counterexample; contradictions recorded rather than argued away.
+* **Tests/checks**: the reviewer's own runs; the evidence index in the handoff.
+* **Actual status**: **PLANNED** — the handoff exists, the review has not happened.
+* **Open risks**: the audit depends on this host's environment for some checks.
+
+## Stage 3 — Documentation & Developer Experience
+
+* **Goal**: a newcomer can clone, run, test and diagnose without asking.
+* **Tasks**: the seven-stage roadmap (this document), source-of-truth boundaries,
+  architecture sync, a user and developer guide, bilingual coverage of the core
+  documents.
+* **Depends on**: Stage 1 (documenting behaviour that is still changing would
+  bake in the churn), but the guide's environment and test sections do not.
+* **Exit criteria**: verified commands only; every internal link resolves; no
+  future capability described in the present tense.
+* **Tests/checks**: link and path checks, encoding check, secret scan,
+  `git diff --check`, and running the documented commands.
+* **Actual status**: **IN PROGRESS** — README current-state section, ROADMAP
+  encoding repair, this staged plan, source boundaries, architecture sync and
+  `docs/USER_AND_DEVELOPER_GUIDE.md`.
+* **Open risks**: the guide's screenshots (the widget image is real; the API and
+  CLI have text-only documentation).
+
+## Stage 4 — Platform Foundation
+
+* **Goal**: the persistence, tenancy and application-service layer described in
+  the specification works against a real PostgreSQL.
+* **Tasks**: `asyncpg` dependency, migrations, row-level security with `FORCE RLS`,
+  Stage 1 Step 4 application services.
+* **Depends on**: Stage 1 (a persistence layer over a dishonest execution
+  verdict stores the dishonesty) and a provisioned database.
+* **Exit criteria**: the 32 database-contract tests run and pass instead of
+  skipping; RLS and composite foreign keys verified against the real engine.
+* **Tests/checks**: the currently skipping database suites, plus migration
+  round-trips.
+* **Actual status**: **BLOCKED** — no PostgreSQL server or driver on the
+  development host; nothing was simulated to hide it.
+* **Open risks**: RLS behaviour cannot be approximated by another engine.
+
+## Stage 5 — Provider / Model Layer
+
+* **Goal**: real providers behind the existing interfaces, with availability and
+  cost accounting.
+* **Tasks**: provider adapters, model selection, availability checks, cost
+  accounting, offline determinism preserved for tests.
+* **Depends on**: Stage 1 (verification of model output must be trustworthy);
+  cost accounting wants Stage 4 storage.
+* **Exit criteria**: a live provider call is exercised under a budget, and the
+  deterministic test path still needs no network.
+* **Tests/checks**: provider contract tests with recorded fixtures plus one
+  explicitly authorized live check.
+* **Actual status**: **PARTIAL** — mock/deterministic providers are implemented and
+  verified; no live provider call has been made.
+* **Open risks**: cost and rate-limit behaviour is unmeasured.
+
+## Stage 6 — Execution, Agents & Tools
+
+* **Goal**: multi-step work under explicit authorization, budgets and policies.
+* **Tasks**: agent harness, skills, tool perimeter, approval gates, project
+  isolation, memory and knowledge promotion.
+* **Depends on**: Stages 1, 4 and 5.
+* **Exit criteria**: an end-to-end project run whose every step carries
+  reproducible evidence, with the tool perimeter unbreached in adversarial tests.
+* **Tests/checks**: the harness, skill and execution-plane suites; adversarial
+  cases for the perimeter and approval paths.
+* **Actual status**: **IMPLEMENTED / PARTIALLY VERIFIED** — the pieces exist and
+  their unit and adversarial tests pass; no end-to-end run with a live model.
+* **Open risks**: cross-process races and long-run budget exhaustion are untested.
+
+## Stage 7 — UI / Product Experience
+
+* **Goal**: the product surfaces a human actually uses.
+* **Tasks**: the desktop widget (done) and, later, product flows over the API.
+* **Depends on**: Stages 1–6 for any flow that must be trustworthy.
+* **Exit criteria**: a documented, verified user path; no screen described that
+  does not exist.
+* **Tests/checks**: `tests/test_desktop_widget.py`; the documented launch command.
+* **Actual status**: **PARTIAL** — Forge Pulse is implemented and verified
+  (`tests/test_desktop_widget.py`, `docs/images/forge-pulse-widget.png`); no other
+  product UI exists.
+* **Open risks**: the widget reads the core; it is not a control surface.
+
+---
+
+# План по этапам (документационный проход)
+
+Словарь статусов един для всех документов: **IMPLEMENTED** (есть в коде),
+**VERIFIED** (подтверждено прогоном), **IN PROGRESS**, **BLOCKED**, **PLANNED**,
+**DEFERRED**. IMPLEMENTED не означает VERIFIED. Это порядок зависимостей, а не
+разрешение начинать всё сразу.
+
+* **Этап 1 — Stabilization**: цель — закрыть доказанные дефекты корректности в
+  исполнении и восстановлении, чтобы заявленный успех всегда соответствовал
+  реально выполненной работе. Задачи: происхождение артефакта (сделано),
+  отказ resume признавать недоказанный успех (сделано), повреждённые записи
+  (читатель сделан, запись открыта), read-only GET (открыто). Зависимостей нет;
+  всё остальное зависит от него. Критерий завершения: ни одного открытого
+  блокера из четырёх, на каждый — регрессионный тест, полный набор зелёный.
+  Фактический статус: **IN PROGRESS** — №1 `6605e35`, №2 `a28c38a`, №3 `PARTIAL`,
+  №4 открыт. Риски: контракт проверки не умеет «проверить существующее
+  состояние»; конкурентность не тестировалась.
+* **Этап 2 — Independent Verification**: внешний проверяющий воспроизводит
+  исправления по репозиторию. Зависит от завершённого Этапа 1. Статус:
+  **PLANNED** — пакет для аудита готов, проверка не проводилась.
+* **Этап 3 — Documentation & Developer Experience**: новый человек может
+  склонировать, запустить, протестировать и диагностировать систему сам. Статус:
+  **IN PROGRESS** — README, кодировка ROADMAP, этот план, разграничение
+  источников, синхронизация ARCHITECTURE и руководство
+  `docs/USER_AND_DEVELOPER_GUIDE.md`.
+* **Этап 4 — Platform Foundation**: persistence, RLS и application services против
+  настоящего PostgreSQL. Зависит от Этапа 1 и от живой БД. Статус: **BLOCKED** —
+  на этой машине нет сервера и драйвера; ничего не подменялось заглушками.
+* **Этап 5 — Provider / Model Layer**: реальные провайдеры за существующими
+  интерфейсами, доступность и учёт затрат. Статус: **PARTIAL** — mock-провайдеры
+  реализованы и проверены, живой вызов не выполнялся.
+* **Этап 6 — Execution, Agents & Tools**: многошаговая работа под авторизацией,
+  бюджетами и политиками. Зависит от этапов 1, 4, 5. Статус:
+  **IMPLEMENTED / PARTIALLY VERIFIED** — сквозного прогона с живой моделью нет.
+* **Этап 7 — UI / Product Experience**: продуктовые поверхности. Статус:
+  **PARTIAL** — Forge Pulse реализован и проверен, другого UI нет.
