@@ -80,7 +80,7 @@ Start the API (loopback only; the app refuses a non-loopback bind):
 
 ```powershell
 $env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='8005'
-.\.venv\Scripts\python.exe -B -X utf8 app\api\main.py
+.\.venv\Scripts\python.exe -B -X utf8 -m app.api.main
 ```
 
 Start the desktop widget (no console window):
@@ -176,7 +176,63 @@ Last recorded full run: `Ran 2359 tests in 155.120s` / `OK (skipped=36)`.
   `run()`) and #4 (GET routes mutating durable state). See
   [`audits/FINALIZATION_CHECKPOINT.md`](audits/FINALIZATION_CHECKPOINT.md).
 
-## 11. Screenshots that do not exist yet
+## 11. Web console (verified running)
+
+The repository ships a server-authoritative web console. It is plain HTML/CSS/JS
+served by the API itself -- there is no frontend build step -- and it holds no
+authority of its own: every value is computed by a route and rendered as reported.
+
+```powershell
+$env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='8005'
+.\.venv\Scripts\python.exe -B -X utf8 -m app.api.main
+# then open http://127.0.0.1:8005/
+```
+
+Measured on a running instance:
+
+| Request | Result |
+|---|---|
+| `GET /` | `200`, 10 775 bytes, `text/html; charset=utf-8`, contains the project card and the server-authoritative banner |
+| `GET /app.css` | `200`, 6 046 bytes, `text/css; charset=utf-8` |
+| `GET /app.js` | `200`, 71 334 bytes, `text/javascript; charset=utf-8` |
+| `GET /api/product/onboarding` | `200`, real payload: `{"project_id":"default","projects":[{"name":"Forge Main Workspace","path":"<repo>","status":"active"}],"stage":"INITIAL", ...}` |
+| `GET /api/product/verification-plan` | `200`, 1 106 bytes of JSON |
+
+The console calls the real product routes (`/api/product/onboarding`, `.../change-impact`,
+`.../verification-plan`, `.../memory`, `.../graph`, `.../approvals/...`, `.../accept`,
+`.../baseline`, `.../evidence-graph`, `.../goal`, `.../refresh`) -- the list is extracted
+from `app/static/app.js`, not invented.
+
+**Not captured:** a browser screenshot of this page. The only browser on this host is
+Microsoft Edge, and its headless mode cannot start inside this sandbox -- it fails to
+grant its own network-context sandbox under both the system temp directory and a
+profile inside the repository (`Failed to grant sandbox access ... Отказано в доступе`).
+Verification is therefore by HTTP response and payload inspection. The desktop
+surfaces have a real capture: `docs/images/forge-pulse-widget.png`.
+
+## 12. PostgreSQL (blocked in this environment; steps prepared)
+
+The Platform persistence contract -- RLS, `FORCE RLS`, partial unique indexes,
+composite foreign keys, migrations -- **cannot be verified here**, and 32 tests skip for
+that reason. Measured on this host: no `psql`, `initdb`, `pg_ctl` or `postgres` on
+`PATH`; no `C:\Program Files\PostgreSQL`; no `docker` or `podman`; `asyncpg` is not
+installed. This is an environment limitation, not a passing test: **SKIP is not PASS.**
+
+Once a server exists, the checks are:
+
+```powershell
+# 1. provision a throwaway cluster (never production, never real user data)
+#    e.g. with a container runtime:  docker run --rm -e POSTGRES_PASSWORD=test \
+#         -p 5432:5432 postgres:16
+# 2. install the driver
+.\.venv\Scripts\python.exe -m pip install asyncpg
+# 3. point the tests at it and run the Platform suites
+$env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
+.\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
+```
+
+Until that runs, no Platform claim in this repository is verified.
+
 
 The widget image above is real. Everything else is text-only. To document the API
 visually in the future, these specific captures would be needed, each from a running
@@ -185,7 +241,7 @@ envelope for an unauthorized command, (3) a `POST /api/product/stale-facts` with
 `invalidate: "false"` showing the `400`. They are not provided here because inventing
 or mocking them would misrepresent the product.
 
-## 12. Documentation map
+## 13. Documentation map
 
 | Document | Purpose |
 |---|---|
@@ -264,7 +320,7 @@ python -m venv .venv
 
 # API (только loopback; привязка не к loopback отклоняется)
 $env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='8005'
-.\.venv\Scripts\python.exe -B -X utf8 app\api\main.py
+.\.venv\Scripts\python.exe -B -X utf8 -m app.api.main
 
 # десктоп-виджет (без консольного окна)
 .\scripts\run_forge_pulse.cmd
@@ -331,10 +387,63 @@ API нет: привязка к loopback и отказ от не-loopback адр
   затронута при `run()`) и №4 (GET-мутации). См.
   [`audits/FINALIZATION_CHECKPOINT.md`](audits/FINALIZATION_CHECKPOINT.md).
 
-## 11. Каких скриншотов пока нет
+## 11. Веб-консоль (проверена на запущенном приложении)
 
-Изображение виджета выше — настоящее. Всё остальное описано текстом. Для визуальной
-документации API потребуются конкретные кадры с работающего экземпляра: (1) ответ
-`GET /api/runs/{run_id}` для завершённого запуска, (2) конверт отказа для
-неавторизованной команды, (3) `POST /api/product/stale-facts` с `invalidate:
-"false"` и ответом `400`. Здесь они не приведены: подделывать их нельзя.
+В репозитории есть серверно-авторитетная веб-консоль: обычные HTML/CSS/JS, которые
+отдаёт сам API — шага сборки фронтенда нет. Собственной власти у страницы нет: каждое
+значение вычислено маршрутом и показано так, как сообщено сервером.
+
+```powershell
+$env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='8005'
+.\.venv\Scripts\python.exe -B -X utf8 -m app.api.main
+# затем откройте http://127.0.0.1:8005/
+```
+
+Измерено на запущенном экземпляре:
+
+| Запрос | Результат |
+|---|---|
+| `GET /` | `200`, 10 775 байт, `text/html; charset=utf-8`, содержит карточку проекта и баннер о серверном авторитете |
+| `GET /app.css` | `200`, 6 046 байт, `text/css; charset=utf-8` |
+| `GET /app.js` | `200`, 71 334 байта, `text/javascript; charset=utf-8` |
+| `GET /api/product/onboarding` | `200`, реальные данные: `{"project_id":"default","projects":[{"name":"Forge Main Workspace","path":"<repo>","status":"active"}],"stage":"INITIAL", ...}` |
+| `GET /api/product/verification-plan` | `200`, 1 106 байт JSON |
+
+Консоль обращается к настоящим продуктовым маршрутам (`/api/product/onboarding`,
+`.../change-impact`, `.../verification-plan`, `.../memory`, `.../graph`,
+`.../approvals/...`, `.../accept`, `.../baseline`, `.../evidence-graph`, `.../goal`,
+`.../refresh`) — список извлечён из `app/static/app.js`, а не выдуман.
+
+**Чего нет:** скриншота этой страницы из браузера. Единственный браузер на машине —
+Microsoft Edge, и его headless-режим не запускается внутри этой песочницы: он не может
+выдать своему сетевому контексту sandbox-доступ ни в системном temp, ни в профиле
+внутри репозитория (`Failed to grant sandbox access ... Отказано в доступе`). Поэтому
+проверка выполнена по HTTP-ответам и содержимому. У десктопных поверхностей настоящий
+снимок есть: `docs/images/forge-pulse-widget.png`.
+
+## 12. PostgreSQL (в этой среде недоступен; шаги подготовлены)
+
+Контракт Platform — RLS, `FORCE RLS`, частичные уникальные индексы, составные внешние
+ключи, миграции — **здесь непроверяем**, и 32 теста по этой причине пропускаются.
+Измерено на машине: ни `psql`, ни `initdb`, ни `pg_ctl`, ни `postgres` нет в `PATH`;
+нет `C:\Program Files\PostgreSQL`; нет `docker` и `podman`; `asyncpg` не установлен.
+Это ограничение среды, а не пройденный тест: **SKIP ≠ PASS.**
+
+Когда сервер появится, проверки такие:
+
+```powershell
+# 1. одноразовый кластер (не production и не реальные пользовательские данные)
+#    например в контейнере:  docker run --rm -e POSTGRES_PASSWORD=test \
+#         -p 5432:5432 postgres:16
+# 2. драйвер
+.\.venv\Scripts\python.exe -m pip install asyncpg
+# 3. указать адрес и запустить наборы Platform
+$env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
+.\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
+```
+
+Пока это не выполнено, ни одно утверждение о Platform в этом репозитории не проверено.
+
+## 13. Карта документации
+
+См. таблицу в английской части §13 — состав документов и их назначение совпадают.

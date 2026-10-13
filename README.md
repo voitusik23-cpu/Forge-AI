@@ -500,7 +500,7 @@ git diff --check
 
 # start the API (loopback by default; refuses non-loopback binds)
 $env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='8005'
-.\.venv\Scripts\python.exe -B -X utf8 app\api\main.py
+.\.venv\Scripts\python.exe -B -X utf8 -m app.api.main
 
 # desktop widget
 .\scripts\run_forge_pulse.cmd
