@@ -221,6 +221,17 @@ class EphemeralWorkspaceManager:
 
         return resolved
 
+    @property
+    def max_artifact_bytes(self) -> int:
+        """The size limit this manager measures artifacts with.
+
+        Public because the provenance baseline has to use the *same* limit as the
+        harvest: measuring the "before" state under a different bound makes a real
+        change look unmeasurable.
+        """
+
+        return self._max_artifact_bytes
+
     def harvest_artifacts(
         self,
         artifact_targets: Sequence[str],

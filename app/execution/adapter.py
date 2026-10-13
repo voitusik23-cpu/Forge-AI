@@ -29,6 +29,7 @@ from app.execution.request import (
     ExecutionStatus,
 )
 from app.execution.workspace_manager import (
+    DEFAULT_MAX_ARTIFACT_BYTES,
     EphemeralWorkspaceManager,
     snapshot_artifact_states,
 )
@@ -363,7 +364,14 @@ class LocalExecutionAdapter:
                     return active_redactor.redact_result(err_res)
 
                 raw_result = self._run_process(
-                    intent, resolved_cwd, env, request_id, metadata, boundary=boundary
+                    intent,
+                    resolved_cwd,
+                    env,
+                    request_id,
+                    metadata,
+                    boundary=boundary,
+                    # The composed manager owns the limit its harvest applies.
+                    artifact_baseline_limit=ws_mgr.max_artifact_bytes,
                 )
 
                 # Harvest artifacts before workspace cleanup
@@ -383,7 +391,15 @@ class LocalExecutionAdapter:
             if err_res is not None:
                 return active_redactor.redact_result(err_res)
             raw_result = self._run_process(
-                intent, resolved_cwd, env, request_id, metadata, boundary=boundary
+                intent,
+                resolved_cwd,
+                env,
+                request_id,
+                metadata,
+                boundary=boundary,
+                # No isolation: the harvest binds a default manager, so the
+                # baseline uses that same default explicitly.
+                artifact_baseline_limit=DEFAULT_MAX_ARTIFACT_BYTES,
             )
             # No isolation, so there is no scratch directory to harvest from and no
             # cleanup to beat. When harvest is declared, the trusted token root is
@@ -585,6 +601,7 @@ class LocalExecutionAdapter:
         metadata: dict[str, object],
         *,
         boundary: WorkspaceBoundary,
+        artifact_baseline_limit: int | None = None,
     ) -> ExecutionResult:
         timeout = intent.timeout_seconds
         max_output_bytes = intent.max_output_bytes
@@ -660,10 +677,14 @@ class LocalExecutionAdapter:
         # present here cannot later be reported as produced by this attempt. The
         # snapshot only reads, inside the boundary, and never leaves the workspace.
         try:
+            # The ARTIFACT limit, never the stream cap: ``max_output_bytes`` bounds
+            # captured stdout/stderr and is unrelated to how large an artifact may
+            # be. Measuring the baseline under the wrong bound reported a real
+            # change as "provenance unavailable".
             metadata["artifact_baseline"] = snapshot_artifact_states(
                 boundary.root,
                 intent.artifact_targets,
-                max_bytes=max_output_bytes,
+                max_bytes=artifact_baseline_limit,
             )
         except Exception:  # noqa: BLE001 - a missing baseline means 'unevaluable'
             metadata["artifact_baseline"] = {}

@@ -696,7 +696,55 @@ class VerificationTests(StepGraphCase):
             "artifact": self.declaration(
                 "artifact", MAKE_ARTIFACT, artifact_targets=("made.txt",)
             ),
+            # Appends to a file that already exists, so the attempt changes content
+            # without creating anything. Paired with a file larger than the stream cap.
+            "append_big": self.declaration(
+                "append_big", append_programme("big"), artifact_targets=("big.txt",)
+            ),
         }
+
+    def test_a_large_preexisting_artifact_modified_by_the_attempt_is_production(self) -> None:
+        """_INJECTION_TARGET_: one limit for the baseline and for the harvest.
+
+        The file is 2 MiB: above the 1 MiB stream-output cap, below the 10 MiB
+        artifact cap. The attempt really appends to it, so the check must pass. Goes
+        red while the baseline is snapshotted with the stream cap -- the file is then
+        "unreadable", provenance is unavailable and a real production is reported as
+        ERROR.
+        """
+
+        # The isolating branch stages the workspace, so the child appends to the
+        # staged copy; what this test measures is the verdict, not the source file.
+        import pathlib as _pathlib
+
+        _pathlib.Path(self.root / "big.txt").write_text(
+            "a" * (2 * 1024 * 1024), encoding="utf-8"
+        )
+
+        graph = StepGraph(
+            graph_id="large-artifact",
+            steps=(
+                StepDefinition(
+                    step_id="a",
+                    action=StepAction("append_big"),
+                    verification=StepVerification(
+                        VerificationKind.ARTIFACT_PRODUCED, artifact_target="big.txt"
+                    ),
+                ),
+            ),
+        )
+        runner = self.runner(
+            self.declarations(),
+            isolate_workspace=True,
+            artifacts_are_harvested=True,
+        )
+        result = runner.run(graph, "large-artifact-run")
+
+        record = result.step("a")
+        self.assertIs(
+            record.verification_status, VerificationStatus.PASSED, record.to_dict()
+        )
+        self.assertIs(result.status, StepGraphStatus.COMPLETED, record.to_dict())
 
     def test_a_preexisting_artifact_is_never_reported_as_produced(self) -> None:
         """_INJECTION_TARGET_: existence is not production.

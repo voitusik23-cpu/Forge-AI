@@ -133,6 +133,57 @@ class ArtifactProvenanceTests(unittest.TestCase):
 
         self.assertEqual(snapshot_artifact_states(self.root, [".env"]), {})
 
+    def test_10_a_large_pre_existing_file_changed_by_the_attempt_is_production(self) -> None:
+        """Above the stream cap, below the artifact cap: content decides.
+
+        ``max_output_bytes`` (1 MiB by default) bounds captured stdout/stderr; the
+        artifact cap is 10 MiB. A file in between must be measured, not declared
+        unreadable -- this is the unit-level statement of the contract the adapter
+        has to honour.
+        """
+
+        target = self.root / "big.bin"
+        target.write_bytes(b"a" * (2 * 1024 * 1024))
+        baseline = snapshot_artifact_states(self.root, ["big.bin"])
+        target.write_bytes(b"b" * (2 * 1024 * 1024))
+
+        provenance = self._provenance("big.bin", baseline=baseline)
+
+        self.assertIs(provenance["changed_by_this_attempt"], True)
+
+    def test_11_a_file_over_the_limit_is_refused_predictably(self) -> None:
+        """Over the limit the harvest refuses outright -- it never reports production.
+
+        The baseline cannot digest such a file either, and it says so rather than
+        guessing: existence and size are recorded, ``sha256`` stays ``None`` and
+        ``unreadable`` is set. A caller that ignores that signal would compare
+        ``None != None``, so the harvest's own refusal is the safety net.
+        """
+
+        target = self.root / "huge.bin"
+        target.write_bytes(b"a" * 4096)
+        baseline = snapshot_artifact_states(self.root, ["huge.bin"], max_bytes=1024)
+        target.write_bytes(b"b" * 8192)
+
+        self.assertTrue(baseline["huge.bin"]["unreadable"])
+        self.assertIsNone(baseline["huge.bin"]["sha256"])
+
+        with self.assertRaises(ValueError):
+            EphemeralWorkspaceManager(max_artifact_bytes=1024).harvest_artifacts(
+                ["huge.bin"], run_id=RUN_ID, root=self.root, baseline=baseline
+            )
+
+    def test_12_a_baseline_without_this_target_is_not_production(self) -> None:
+        """A partial baseline answers nothing about a target it never measured."""
+
+        (self.root / "made.txt").write_text("made\n", encoding="utf-8")
+
+        provenance = self._provenance(
+            "made.txt", baseline={"other.txt": {"exists": False, "unreadable": False}}
+        )
+
+        self.assertIsNone(provenance["changed_by_this_attempt"])
+
 
 if __name__ == "__main__":
     unittest.main()
