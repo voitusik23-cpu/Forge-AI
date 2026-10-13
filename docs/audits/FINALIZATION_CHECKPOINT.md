@@ -112,3 +112,74 @@ BLOCKED
 All four blockers remain unfixed; this session produced investigation and this
 checkpoint only. The suite is green at the state above, the remote is in sync, and no
 work is at risk. Continue from `4397eea` with Blocker #1, step 1 of §2 above.
+
+---
+
+## Blocker #1 — FIXED_AND_TESTED (commit `6605e35`)
+
+The `BLOCKED` line in §5 above describes the state **before** this commit. Current
+per-blocker status:
+
+| Blocker | Status |
+|---|---|
+| #1 artifact provenance | **FIXED_AND_TESTED** — commit `6605e35` |
+| #2 `resume` false `COMPLETED` | `BLOCKED` — not started |
+| #3 damaged record overwritten | `PARTIAL` — reader half fixed in `3b7d99e`; the writer half (overwrite on `run()`) is not started |
+| #4 GET mutating durable state | `BLOCKED` — not started |
+
+### What changed (3 production files, +155/−2)
+
+| File | Change |
+|---|---|
+| `app/execution/workspace_manager.py` | new `_file_state()` (existence, size, `mtime_ns`, SHA-256) and `snapshot_artifact_states()` (reads only inside the given root; refuses absolute, traversing and credential-shaped targets); `harvest_artifacts(..., baseline=…)` compares before/after and writes `existed_before`, `changed_by_this_attempt`, `sha256_before`, `size_before`, `baseline_recorded_for` into `Artifact.metadata` |
+| `app/execution/adapter.py` | baseline taken **inside `_run_process` immediately before `subprocess.Popen`**, from `boundary.root` — the same root the harvest measures in both branches; carried through the existing `metadata` dict (no new storage, no API change) and passed to all harvest calls |
+| `app/workflows/step_runner.py` | `ARTIFACT_PRODUCED` returns `PASSED` only when `changed_by_this_attempt is True`; `False` → `ERROR` / `verification_error:artifact_preexisting_and_unchanged`; missing provenance → `ERROR` / `verification_error:artifact_provenance_unavailable`. A matching path alone is no longer success, so the graph cannot reach `COMPLETED` on this path |
+
+### Reproduction
+
+RED, before the fix — `tests/test_step_graph_managed_execution.py::VerificationTests::test_a_preexisting_artifact_is_never_reported_as_produced`
+(created before the run, step writes nothing, `isolate_workspace=True`, artifacts harvested):
+
+```
+AssertionError: <VerificationStatus.PASSED: 'PASSED'> == <VerificationStatus.PASSED: 'PASSED'>
+FAILED (failures=1)
+```
+
+GREEN, after the fix: that test passes and the suite is green.
+
+### Tests
+
+* `tests/test_artifact_provenance.py` — 9 tests: pre-existing and unchanged → not
+  production; created by this attempt → production; pre-existing and modified →
+  production; replacement decided by content even with an identical timestamp; no
+  baseline → the question is unanswered (`None`), not "yes"; a pre-existing correct
+  state is never reported as production; the recorded answer names the attempt that
+  measured it; the snapshot reads only inside its root; a credential-shaped target is
+  not even snapshotted.
+* `test_a_preexisting_artifact_is_never_reported_as_produced` — the end-to-end
+  reproduction above.
+* Related suites: `test_step_graph_managed_execution` 32, `test_local_execution_adapter`
+  9, `test_execution_plane` 26, `test_execution_secret_staging` 32 (1 skip),
+  `test_block9_evidence_and_verification` 34, `test_product_integration` 93 — all OK.
+* Full suite: `Ran 2354 tests in 177.232s` / `OK (skipped=36)`; `compileall` exit 0;
+  `git diff --check` exit 0.
+
+### Injection proof
+
+Reverting only the verifier hunk, keeping production and tests otherwise identical:
+`INJECTED exit=1` with `AssertionError: PASSED == PASSED`; restoring the patch gave
+`byte-exact restore: True` (SHA-256 identical) and the suite green again.
+
+### Contract question for the owner (unchanged, now sharper)
+
+No `VerificationKind` can express "verify a state that already existed". Under the
+current contract such a check now yields `ERROR`
+(`artifact_preexisting_and_unchanged`), which is honest but may not be what an
+operator intends. Options: (a) keep it and document; (b) add an explicit kind for
+state verification — a contract change, deliberately not made here.
+
+### Not verified
+
+Cross-process races between the baseline and the spawn are narrowed to the statements
+between `start_time` and `Popen`, but no concurrency test was written. `SEE`
+(no PostgreSQL/`asyncpg`) is unchanged: 32 skips remain environment-only.

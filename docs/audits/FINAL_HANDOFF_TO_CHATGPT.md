@@ -227,3 +227,23 @@ safe point without changing any code. See
 starting state, the exact call sites, the agreed minimal design and the precise
 next operation. All four blockers recorded above remain unfixed, so the status
 `BLOCKED` still stands.
+
+---
+
+## Update - finalization stage 2 (Blocker #1 fixed)
+
+Blocker #1 (artifact provenance) is **FIXED_AND_TESTED** in commit `6605e35`:
+`app/execution/workspace_manager.py` now snapshots each declared target's existence,
+size, `mtime_ns` and SHA-256 immediately before the child is created and compares it
+with what the harvest measures afterwards; `app/workflows/step_runner.py` accepts
+`ARTIFACT_PRODUCED` as `PASSED` only on a proven change by this attempt, and reports
+a pre-existing unchanged file or a missing provenance as `ERROR` instead.
+
+Reproduced before the fix (`AssertionError: PASSED == PASSED` for a file created
+before a step that writes nothing), fixed, and proven by injection with a byte-exact
+restore. Full suite after the fix: `Ran 2354 tests in 177.232s` / `OK (skipped=36)`.
+
+Blockers #2 (`resume` false `COMPLETED`), #3 second half (damaged record overwritten)
+and #4 (GET mutating durable state) remain unfixed, so the overall status is still
+`BLOCKED`. See [`FINALIZATION_CHECKPOINT.md`](FINALIZATION_CHECKPOINT.md) for the
+current per-blocker status and the exact next step.
