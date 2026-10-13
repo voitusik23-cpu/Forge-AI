@@ -1198,6 +1198,11 @@ def read_step_graph_record(
         return None, "no_project_state"
     payload = project_state.get(STEP_GRAPH_PROJECT_STATE_KEY)
     if payload is None:
+        if STEP_GRAPH_PROJECT_STATE_KEY in project_state:
+            # The key is there and holds null: an empty record, not an absent one. A
+            # caller that treats it as absent would start a new attempt over a file it
+            # never managed to read.
+            return None, "untrustworthy_step_graph_record:empty_payload"
         return None, "no_step_graph_record"
     if not isinstance(payload, Mapping):
         # The key is present and holds something that is not a record at all. Reporting

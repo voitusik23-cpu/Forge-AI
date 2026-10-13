@@ -1464,6 +1464,10 @@ class RecoveryTests(StepGraphCase):
     def test_an_unreadable_structure_is_not_treated_as_absent(self) -> None:
         self._assert_refused_without_rewriting("damaged-shape-run", "not-a-mapping")
 
+    def test_a_present_but_empty_record_is_not_treated_as_absent(self) -> None:
+        """A null payload under the key is an empty record, not a missing one."""
+        self._assert_refused_without_rewriting("damaged-null-run", None)
+
     def test_a_truly_absent_record_still_starts_a_new_attempt(self) -> None:
         """The positive control: absence must keep working exactly as before."""
 
