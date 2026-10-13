@@ -584,8 +584,13 @@ class StepGraphRunner:
                     finished_at=self._now(),
                 )
             if existing is not None and not resume:
+                # The same screen ``resume`` applies. A saved status is a claim, and
+                # a claim its own records do not support is not a verdict: echoing it
+                # here is exactly what let one record be COMPLETED through ``run``
+                # and INDETERMINATE through ``resume``. Screening in one place is
+                # what keeps the two entry points from disagreeing again.
                 return self._result_from_snapshot(
-                    existing,
+                    self._screen_snapshot(existing),
                     stopped_reason="already_recorded",
                     executed=False,
                     started_at=started_at,
@@ -1402,52 +1407,80 @@ class StepGraphRunner:
                     "recorded action fingerprint does not match the definition, so "
                     "resuming it would re-plan work under an old verdict"
                 )
-            if record.status is StepStatus.RUNNING:
-                # A durable RUNNING with no outcome means the process that wrote
-                # it may have died after dispatching. That is the unprovable case.
-                record.status = StepStatus.UNKNOWN
-                record.add_evidence("interrupted_after_dispatch_outcome_unproven")
-                record.updated_at = self._now()
-            if record.status is StepStatus.SUCCEEDED:
-                # A saved SUCCEEDED is a claim, not proof that a command ran. Before
-                # it may be summarised as COMPLETED, the record has to carry something
-                # that actually shows a successful execution, and it must not
-                # contradict itself. Nothing universal is demanded here: a step that
-                # declares no check is judged by its recorded execution alone, so a
-                # legitimate no-verification step is unaffected. The rule downgrades
-                # the in-memory record to UNKNOWN -- which derives INDETERMINATE --
-                # and never rewrites the saved record to hide the gap.
-                outcome = str(record.execution_outcome or "").upper()
-                contradicts = bool(outcome) and "SUCCESS" not in outcome
-                unrun_declared_check = (
-                    str(record.verification_kind or "").upper() == "EXIT_CODE"
-                    and record.verification_status is not VerificationStatus.PASSED
-                )
-                has_execution_evidence = (
-                    bool(outcome)
-                    or record.execution_exit_code is not None
-                    or record.verification_status is VerificationStatus.PASSED
-                )
-                if contradicts or unrun_declared_check or not has_execution_evidence:
-                    record.status = StepStatus.UNKNOWN
-                    if not has_execution_evidence:
-                        tag = "resumed_success_without_execution_evidence"
-                    elif contradicts:
-                        tag = "resumed_success_contradicts_recorded_execution"
-                    else:
-                        tag = "resumed_success_with_unrun_declared_verification"
-                    record.add_evidence(tag)
-                    # The original claim is preserved rather than dropped, so the
-                    # record still says what was asserted and why it is not accepted.
-                    record.add_evidence(
-                        "saved_claim_was_succeeded_and_is_not_proof"
-                    )
-                    record.updated_at = self._now()
+            self._screen_saved_record(record)
         # The declaration is re-persisted on every resume, so a record written by
         # an earlier build gains it without the attempt's verdicts being touched.
         existing.declared_plan = declared_plan_of(declared)
         existing.updated_at = self._now()
         return existing
+
+    def _screen_saved_record(self, record: StepRecord) -> None:
+        """Apply the evidence screen to one record read back from a save.
+
+        Shared by every entry point that turns a saved record into a verdict, so a
+        stored status can never be trusted on one path and distrusted on another.
+        The screen changes the in-memory record only; it never rewrites the saved
+        claim to hide the gap.
+        """
+
+        if record.status is StepStatus.RUNNING:
+            # A durable RUNNING with no outcome means the process that wrote
+            # it may have died after dispatching. That is the unprovable case.
+            record.status = StepStatus.UNKNOWN
+            record.add_evidence("interrupted_after_dispatch_outcome_unproven")
+            record.updated_at = self._now()
+        if record.status is StepStatus.SUCCEEDED:
+            # A saved SUCCEEDED is a claim, not proof that a command ran. Before
+            # it may be summarised as COMPLETED, the record has to carry something
+            # that actually shows a successful execution, and it must not
+            # contradict itself. Nothing universal is demanded here: a step that
+            # declares no check is judged by its recorded execution alone, so a
+            # legitimate no-verification step is unaffected. The rule downgrades
+            # the in-memory record to UNKNOWN -- which derives INDETERMINATE --
+            # and never rewrites the saved record to hide the gap.
+            outcome = str(record.execution_outcome or "").upper()
+            contradicts = bool(outcome) and "SUCCESS" not in outcome
+            unrun_declared_check = (
+                str(record.verification_kind or "").upper() == "EXIT_CODE"
+                and record.verification_status is not VerificationStatus.PASSED
+            )
+            has_execution_evidence = (
+                bool(outcome)
+                or record.execution_exit_code is not None
+                or record.verification_status is VerificationStatus.PASSED
+            )
+            if contradicts or unrun_declared_check or not has_execution_evidence:
+                record.status = StepStatus.UNKNOWN
+                if not has_execution_evidence:
+                    tag = "resumed_success_without_execution_evidence"
+                elif contradicts:
+                    tag = "resumed_success_contradicts_recorded_execution"
+                else:
+                    tag = "resumed_success_with_unrun_declared_verification"
+                record.add_evidence(tag)
+                # The original claim is preserved rather than dropped, so the
+                # record still says what was asserted and why it is not accepted.
+                record.add_evidence(
+                    "saved_claim_was_succeeded_and_is_not_proof"
+                )
+                record.updated_at = self._now()
+
+    def _screen_snapshot(self, snapshot: StepGraphSnapshot) -> StepGraphSnapshot:
+        """Screen a saved snapshot's records and re-derive its status from them.
+
+        The stored ``status`` is a claim made when the record was written. Deriving
+        the verdict from the screened records is what makes ``run`` and ``resume``
+        agree: a record whose steps do not justify completion comes back
+        ``INDETERMINATE`` on both, and a fully evidenced record still comes back
+        ``COMPLETED`` on both.
+        """
+
+        for record in snapshot.steps:
+            self._screen_saved_record(record)
+        snapshot.status = derive_graph_status(
+            tuple(snapshot.steps), cancelled=bool(snapshot.cancelled)
+        )
+        return snapshot
 
     def _persist(self, snapshot: StepGraphSnapshot) -> None:
         """Write the graph's progress through the existing ``RunStore``.

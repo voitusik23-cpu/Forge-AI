@@ -1464,6 +1464,198 @@ class RecoveryTests(StepGraphCase):
     def test_an_unreadable_structure_is_not_treated_as_absent(self) -> None:
         self._assert_refused_without_rewriting("damaged-shape-run", "not-a-mapping")
 
+    # ------------------------------------------------------- F-1: run() and resume()
+    #
+    # A stored status is a claim. ``resume`` screened it; ``run`` used to echo it, so
+    # the same record was "completed" through one entry point and indeterminate
+    # through the other. These tests drive the public ``run()`` over records written
+    # through the public ``RunStore`` and compare the exact stored bytes.
+
+    def _write_record(
+        self,
+        run_id: str,
+        graph: StepGraph,
+        record: StepRecord,
+        status: StepGraphStatus = StepGraphStatus.COMPLETED,
+    ) -> pathlib.Path:
+        snapshot = StepGraphSnapshot(
+            graph_id=graph.graph_id,
+            graph_run_id=run_id,
+            status=status,
+            steps=(record,),
+            declared_plan=declared_plan_of(graph),
+        )
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id=run_id, project_state={"step_graph": snapshot.to_dict()}
+            )
+        )
+        return self.run_store.state_path(run_id)
+
+    @staticmethod
+    def _checked_graph() -> StepGraph:
+        return StepGraph(
+            graph_id="f1-graph",
+            steps=(
+                StepDefinition(
+                    step_id="a",
+                    action=StepAction("a"),
+                    verification=StepVerification(VerificationKind.EXIT_CODE, 0),
+                ),
+            ),
+        )
+
+    def _unproven_record(self, graph: StepGraph) -> StepRecord:
+        """Says SUCCEEDED, declares a check, and proves nothing: no outcome, no code."""
+
+        return StepRecord(
+            step_id="a",
+            status=StepStatus.SUCCEEDED,
+            action_fingerprint=graph.step("a").fingerprint(),
+            declaration_id="a",
+            verification_kind=VerificationKind.EXIT_CODE.value,
+            verification_status=VerificationStatus.NOT_RUN,
+            attempts=0,
+        )
+
+    def test_an_unproven_saved_completion_is_not_returned_by_run(self) -> None:
+        """_INJECTION_TARGET_: the same evidence rule on every entry point.
+
+        Goes red if ``run()`` echoes the stored status: the record below claims
+        COMPLETED while its own step records no execution outcome, no exit code and an
+        unrun declared check, so ``run`` would report a completion that nothing
+        justifies.
+        """
+
+        graph = self._checked_graph()
+        state_path = self._write_record("f1-unproven-run", graph, self._unproven_record(graph))
+        before = state_path.read_bytes()
+
+        result = self.runner(self.declarations()).run(graph, "f1-unproven-run")
+
+        self.assertIsNot(result.status, StepGraphStatus.COMPLETED)
+        self.assertIs(result.status, StepGraphStatus.INDETERMINATE)
+        self.assertFalse(result.executed)
+        self.assertEqual(result.stopped_reason, "already_recorded")
+        self.assertIs(result.step("a").status, StepStatus.UNKNOWN)
+        # Reporting the gap must not rewrite the record.
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_run_and_resume_agree_about_the_same_record(self) -> None:
+        """Two entry points, one record, one answer."""
+
+        graph = self._checked_graph()
+        self._write_record("f1-agree-run", graph, self._unproven_record(graph))
+
+        by_run = self.runner(self.declarations()).run(graph, "f1-agree-run")
+        by_resume = self.runner(self.declarations()).resume(graph, "f1-agree-run")
+
+        self.assertEqual(by_run.status, by_resume.status)
+        self.assertEqual(by_run.step("a").status, by_resume.step("a").status)
+        self.assertIsNot(by_run.status, StepGraphStatus.COMPLETED)
+
+    def test_run_over_a_saved_record_is_deterministic_and_never_rewrites_it(self) -> None:
+        graph = self._checked_graph()
+        state_path = self._write_record("f1-repeat-run", graph, self._unproven_record(graph))
+        before = state_path.read_bytes()
+
+        first = self.runner(self.declarations()).run(graph, "f1-repeat-run")
+        second = self.runner(self.declarations()).run(graph, "f1-repeat-run")
+
+        self.assertEqual(first.status, second.status)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_a_fully_evidenced_record_is_still_returned_as_completed_by_run(self) -> None:
+        """The positive control: complete, consistent evidence must not be degraded."""
+
+        graph = self._checked_graph()
+        record = StepRecord(
+            step_id="a",
+            status=StepStatus.SUCCEEDED,
+            action_fingerprint=graph.step("a").fingerprint(),
+            declaration_id="a",
+            verification_kind=VerificationKind.EXIT_CODE.value,
+            verification_status=VerificationStatus.PASSED,
+            execution_outcome="EXECUTION_SUCCESS",
+            execution_exit_code=0,
+            attempts=1,
+        )
+        state_path = self._write_record("f1-proven-run", graph, record)
+        before = state_path.read_bytes()
+
+        result = self.runner(self.declarations()).run(graph, "f1-proven-run")
+
+        self.assertIs(result.status, StepGraphStatus.COMPLETED)
+        self.assertFalse(result.executed)
+        self.assertIs(result.step("a").status, StepStatus.SUCCEEDED)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_a_step_that_declares_no_check_still_completes_by_run(self) -> None:
+        """A legitimate no-command step type must not be broken by the rule."""
+
+        graph = StepGraph(
+            graph_id="f1-no-check",
+            steps=(StepDefinition(step_id="a", action=StepAction("a")),),
+        )
+        record = StepRecord(
+            step_id="a",
+            status=StepStatus.SUCCEEDED,
+            action_fingerprint=graph.step("a").fingerprint(),
+            declaration_id="a",
+            verification_status=VerificationStatus.NOT_RUN,
+            execution_outcome="EXECUTION_SUCCESS",
+            execution_exit_code=0,
+            evidence=("executed_without_declared_verification",),
+            attempts=1,
+        )
+        self._write_record("f1-no-check-run", graph, record)
+
+        result = self.runner(self.declarations()).run(graph, "f1-no-check-run")
+
+        self.assertIs(result.status, StepGraphStatus.COMPLETED)
+        self.assertIs(result.step("a").status, StepStatus.SUCCEEDED)
+
+    def test_contradictory_recorded_evidence_is_not_completed_by_run(self) -> None:
+        graph = StepGraph(
+            graph_id="f1-contradiction",
+            steps=(StepDefinition(step_id="a", action=StepAction("a")),),
+        )
+        record = StepRecord(
+            step_id="a",
+            status=StepStatus.SUCCEEDED,
+            action_fingerprint=graph.step("a").fingerprint(),
+            declaration_id="a",
+            verification_status=VerificationStatus.NOT_RUN,
+            execution_outcome="EXECUTION_TIMEOUT",
+            attempts=1,
+        )
+        self._write_record("f1-contradiction-run", graph, record)
+
+        result = self.runner(self.declarations()).run(graph, "f1-contradiction-run")
+
+        self.assertIsNot(result.status, StepGraphStatus.COMPLETED)
+        self.assertIs(result.step("a").status, StepStatus.UNKNOWN)
+
+    def test_an_unrun_declared_check_is_not_confirmation_by_run(self) -> None:
+        graph = self._checked_graph()
+        record = StepRecord(
+            step_id="a",
+            status=StepStatus.SUCCEEDED,
+            action_fingerprint=graph.step("a").fingerprint(),
+            declaration_id="a",
+            verification_kind=VerificationKind.EXIT_CODE.value,
+            verification_status=VerificationStatus.NOT_RUN,
+            execution_outcome="EXECUTION_SUCCESS",
+            execution_exit_code=0,
+            attempts=1,
+        )
+        self._write_record("f1-unrun-check-run", graph, record)
+
+        result = self.runner(self.declarations()).run(graph, "f1-unrun-check-run")
+
+        self.assertIsNot(result.status, StepGraphStatus.COMPLETED)
+        self.assertIs(result.step("a").status, StepStatus.UNKNOWN)
+
     def test_a_present_but_empty_record_is_not_treated_as_absent(self) -> None:
         """A null payload under the key is an empty record, not a missing one."""
         self._assert_refused_without_rewriting("damaged-null-run", None)
