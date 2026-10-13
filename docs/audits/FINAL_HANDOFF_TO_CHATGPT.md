@@ -316,3 +316,27 @@ runs produced a deeply nested `.forge/tmp/forge_scratch_*/...` skeleton. All fil
 it were removed (0 files, 0 bytes remain; only empty directories left behind by
 long-path limits). Nothing there was ever tracked by git. A follow-up should move that
 temp root outside the repository so the nesting cannot recur.
+
+---
+
+## Update - finalization stage 4 (Blocker #3 closed)
+
+Blocker #3 is now `FIXED_AND_TESTED` in both halves. `StepGraphRunner._attempt()` read
+the record with `recorded()`, which deliberately collapses "nothing was recorded" and
+"a record exists that this build will not trust" into `None`; the reason was discarded,
+so `run()` treated a damaged record as absent and wrote a fresh graph over it. The
+reader contributed the same conflation for a payload that was present but not a mapping
+and for an explicit `null`.
+
+Now `_attempt()` reads with `recorded_or_reason()` and refuses -- `REFUSED`,
+`executed=False`, `stopped_reason` naming the reason -- before building any snapshot,
+running any command or writing any byte; `read_step_graph_record` distinguishes a
+missing key from an invalid or empty payload. Reproduced first (`AssertionError: True is
+not false`, `'status': 'COMPLETED'` over a record that could not be read), fixed in
+`90b2af7` and `0c61092`, and proven by two isolated injection passes with byte-exact
+restores. The tests compare raw bytes and SHA-256 before and after `run()`.
+
+Full suite: `Ran 2365 tests in 133.321s` / `OK (skipped=36)`.
+
+Blocker #4 (GET routes mutating durable state) remains open, so the overall status is
+still `BLOCKED`. Next stage: blocker #4, in its own change.

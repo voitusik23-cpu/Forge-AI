@@ -272,3 +272,80 @@ place to say so.
 No concurrency test was written (two resumes racing on the same record). Platform
 database tests still skip: 32 skips remain environment-only, 3 are symlink-related and 1
 lacks `OPENAI_API_KEY`. SKIP is not PASS.
+
+---
+
+## Blocker #3 — FIXED_AND_TESTED, both halves (commits `90b2af7`, `0c61092`)
+
+Current per-blocker status (earlier tables stay as history):
+
+| Blocker | Status |
+|---|---|
+| #1 artifact provenance | **FIXED_AND_TESTED** — `6605e35` |
+| #2 `resume` inventing completion | **FIXED_AND_TESTED** — `a28c38a` |
+| #3 damaged record | **FIXED_AND_TESTED** — reader `3b7d99e`, writer `90b2af7`, empty-payload `0c61092` |
+| #4 GET mutating durable state | `BLOCKED` — not started |
+
+### Exact cause
+
+`StepGraphRunner._attempt()` read the saved record with `recorded()`, whose documented
+job is to collapse *"no attempt was recorded"* and *"an attempt was recorded in a form
+this build refuses to trust"* into the same `None`. With the reason discarded, a
+damaged record looked exactly like an absent one, so `run()` built a fresh snapshot and
+wrote it over the damaged file. The reader itself contributed: a payload that was
+present but not a mapping (and an explicit `null`) were reported as
+`no_step_graph_record`, the same reason an absent key produces.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `app/workflows/step_runner.py` | `_attempt()` now reads with `recorded_or_reason()`; if the record is absent **for a reason** -- corruption, unsupported schema, invalid types, empty payload -- it returns `StepGraphResult(status=REFUSED, stopped_reason="untrustworthy_step_graph_record:<reason>", executed=False)` **before** any snapshot is built, any command runs or any byte is written. The reason travels with the result instead of being discarded. `resume` without an explicit graph now names the untrustworthy record instead of claiming there is none |
+| `app/workflows/step_graph.py` | the reader distinguishes a missing key (`no_step_graph_record`) from a present-but-not-a-mapping payload and from an explicit `null` (`untrustworthy_step_graph_record:not_a_mapping:*` / `:empty_payload`) |
+| `tests/test_step_graph_managed_execution.py` | six tests driving the public `RunStore` and the public `run()` |
+
+### RED → GREEN → INJECTION
+
+RED (before the fix), three failures, each `AssertionError: True is not false` with
+`'status': 'COMPLETED'` -- i.e. `run()` executed and completed over a record it could
+not read:
+
+```
+FAIL test_a_damaged_record_is_never_overwritten_by_a_new_run
+FAIL test_an_unsupported_schema_version_is_not_treated_as_absent
+FAIL test_an_unreadable_structure_is_not_treated_as_absent
+```
+
+GREEN: `Ran 43 tests in 5.786s  OK`.
+
+INJECTION, in two isolated passes so each hunk is proven on its own: reverting the
+runner hunk reproduced those three failures; reverting the reader hunk reproduced
+`test_a_present_but_empty_record_is_not_treated_as_absent`. Both restores were
+byte-exact (SHA-256 identical).
+
+Full suite after both fixes: `Ran 2365 tests in 133.321s` / `OK (skipped=36)`;
+`compileall` exit 0; `git diff --check` exit 0; secret scan 0.
+
+### Preservation of the original bytes
+
+Every damaged-record test captures the state file's bytes **and** SHA-256 before
+`run()` and asserts both are unchanged afterwards, that `result.executed` is `False`,
+that the graph status is `REFUSED`, that `stopped_reason` contains `untrustworthy`, and
+that the command produced no side effect (`a.txt` was never written). A repeat call
+answers identically and still does not erase the evidence. The positive control
+(truly absent record) still starts a new attempt and completes, so absence is
+unaffected.
+
+### Residuals, stated rather than hidden
+
+* A read failure that raises `OSError` **propagates** out of `run()`; nothing is
+  executed and nothing is written, but the caller gets the exception rather than a
+  `REFUSED` result. That is deliberate -- a transient I/O problem is not evidence that
+  the record is corrupt -- and it is what the test asserts.
+* Concurrency was still not tested: two callers resuming the same damaged record in
+  different processes are not covered by a test, only by the in-process claim.
+
+### Not verified
+
+The Platform database suites still skip (32), as do the symlink tests (3) and the one
+needing `OPENAI_API_KEY`. SKIP is not PASS.
