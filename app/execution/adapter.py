@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from app.execution.intent import AuthorizedExecution, ExecutionIntent
+from app.execution.paths import is_bare_executable
 from app.execution.policy import ExecutionPolicy
 from app.execution.redaction import (
     _SENSITIVE_KEY_PATTERN,
@@ -99,6 +100,9 @@ def _windows_process_tree(root_pid: int) -> tuple[int, ...]:
     ``taskkill /T`` is not available in every restricted Windows runtime.  The
     Toolhelp snapshot is a standard OS API and lets the adapter enforce the same
     process-tree boundary without relying on a shell command or elevated rights.
+
+    This is the *fallback*: a job object, when one could be created and the child
+    could be assigned to it, terminates the tree without a snapshot at all.
     """
 
     if os.name != "nt":
@@ -120,9 +124,11 @@ def _windows_process_tree(root_pid: int) -> tuple[int, ...]:
 
     TH32CS_SNAPPROCESS = 0x00000002
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _kernel32()
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == INVALID_HANDLE_VALUE:
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+        # "Unknown" must not be reported as "the tree is just the root": the caller
+        # uses an empty result to reach the legacy taskkill fallback.
         return ()
 
     try:
@@ -145,6 +151,81 @@ def _windows_process_tree(root_pid: int) -> tuple[int, ...]:
                 tree.add(pid)
                 changed = True
     return tuple(sorted(tree, reverse=True))
+
+
+_KERNEL32: "ctypes.WinDLL | None" = None
+
+
+def _kernel32() -> "ctypes.WinDLL":
+    """Return kernel32 with the process/job prototypes declared exactly once.
+
+    The declarations matter: without ``restype`` ctypes truncates a 64-bit handle
+    to ``c_int``, so ``CreateToolhelp32Snapshot``'s failure value arrives as ``-1``
+    while the constant it was compared against is ``2**64 - 1``. That comparison
+    could never be true, the legacy ``taskkill`` fallback was unreachable, and a
+    failed snapshot silently reported "the tree is just the root".
+    """
+
+    global _KERNEL32
+    if _KERNEL32 is None:
+        library = ctypes.WinDLL("kernel32", use_last_error=True)
+        library.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        library.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        library.Process32FirstW.restype = wintypes.BOOL
+        library.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        library.Process32NextW.restype = wintypes.BOOL
+        library.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        library.CloseHandle.restype = wintypes.BOOL
+        library.CloseHandle.argtypes = [ctypes.c_void_p]
+        library.CreateJobObjectW.restype = ctypes.c_void_p
+        library.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        library.AssignProcessToJobObject.restype = wintypes.BOOL
+        library.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        library.TerminateJobObject.restype = wintypes.BOOL
+        library.TerminateJobObject.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        _KERNEL32 = library
+    return _KERNEL32
+
+
+def _create_process_tree_job() -> int | None:
+    """Create the Windows job object that will own one child's process tree."""
+
+    if os.name != "nt":
+        return None
+    try:
+        handle = _kernel32().CreateJobObjectW(None, None)
+        return int(handle) if handle else None
+    except Exception:  # noqa: BLE001 - a job is an optimisation, not a requirement
+        return None
+
+
+def _assign_process_to_job(job: int, proc: "subprocess.Popen[bytes]") -> bool:
+    """Put the child in ``job`` so every process it creates belongs to it as well."""
+
+    try:
+        return bool(
+            _kernel32().AssignProcessToJobObject(
+                ctypes.c_void_p(job), ctypes.c_void_p(int(proc._handle))
+            )
+        )
+    except Exception:  # noqa: BLE001 - fall back to the snapshot path
+        return False
+
+
+def _terminate_process_tree_job(job: int) -> None:
+    """Terminate every process in the job, which is the whole tree at once."""
+
+    try:
+        _kernel32().TerminateJobObject(ctypes.c_void_p(job), 0)
+    except Exception:  # noqa: BLE001 - best effort, the caller still kills the child
+        pass
+
+
+def _close_process_tree_job(job: int) -> None:
+    try:
+        _kernel32().CloseHandle(ctypes.c_void_p(job))
+    except Exception:  # noqa: BLE001 - a leaked handle is not worth failing a run
+        pass
 
 
 @runtime_checkable
@@ -500,6 +581,33 @@ class LocalExecutionAdapter:
     ) -> ExecutionResult:
         timeout = intent.timeout_seconds
         max_output_bytes = intent.max_output_bytes
+
+        # THE LAST GATE BEFORE A PROCESS EXISTS. A bare executable with an empty pin
+        # could only be launched by name, and the operating system resolves that name
+        # at spawn time against the child's PATH -- not the PATH the fingerprint was
+        # authorized against. Measured before this gate existed: one approved
+        # fingerprint executed two different images depending on PATH. Refusing here
+        # keeps the builder (and therefore every policy decision) total, while making
+        # the property "the launched image is the authorized image" hold where it
+        # matters.
+        if not intent.resolved_executable and is_bare_executable(intent.executable):
+            return ExecutionResult(
+                request_id=request_id,
+                status=ExecutionStatus.DENIED,
+                exit_code=None,
+                stdout="",
+                stderr=(
+                    "Execution denied: the bare executable could not be pinned to an "
+                    "absolute path, so the authorized image cannot be guaranteed: "
+                    f"{intent.executable!r}"
+                ),
+                duration_seconds=0.0,
+                metadata={
+                    "denial_reason": "executable_not_pinned",
+                    **metadata,
+                },
+            )
+
         full_command = (intent.resolved_executable or intent.executable,) + intent.argv
 
         # Last check before the child exists, against the trusted execution root -
@@ -577,6 +685,17 @@ class LocalExecutionAdapter:
                 metadata=dict(metadata),
             )
 
+        # The whole tree is owned by a Windows job object, so terminating the job
+        # terminates every descendant at once -- including one that outlived its
+        # parent -- without depending on a PID snapshot or on ``taskkill``, which a
+        # restricted runtime may refuse. Measured on this host: a grandchild that
+        # inherited the pipes kept the adapter's staged directory locked until the
+        # job object was terminated.
+        process_job = _create_process_tree_job()
+        if process_job is not None and not _assign_process_to_job(process_job, proc):
+            _close_process_tree_job(process_job)
+            process_job = None
+
         try:
             # The wall-clock deadline is enforced by ``wait``, NOT by
             # ``communicate(timeout=...)``. ``communicate`` returns when the pipes reach
@@ -598,7 +717,7 @@ class LocalExecutionAdapter:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                self._terminate_process_tree(proc)
+                self._terminate_process_tree(proc, job=process_job)
             else:
                 # The direct child is gone, but its descendants are not necessarily: a
                 # child that spawns a detached sleeper and returns leaves a running
@@ -608,20 +727,22 @@ class LocalExecutionAdapter:
                 # on the host after the adapter has reported its outcome. This is
                 # best-effort by nature -- an OS-level sandbox is what would make it a
                 # guarantee, and that remains deferred.
-                self._terminate_process_tree(proc)
+                self._terminate_process_tree(proc, job=process_job)
 
             # The readers are released without waiting for a descendant that still holds
             # the pipes: whatever arrived is taken, and an unbounded wait is not.
             for stream_name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
                 try:
                     if stream is not None and not stream.closed:
-                        if timed_out and os.name == "nt":
+                        if os.name == "nt":
                             # Windows may block closing a pipe while a descendant
-                            # still owns an inherited write handle. Do not let pipe
-                            # cleanup extend the execution deadline; the daemon
-                            # closer releases it when the OS permits and the Popen
-                            # attributes are cleared so the finally block below does
-                            # not repeat the blocking close.
+                            # still owns an inherited write handle -- measured: a
+                            # synchronous close waited 20 s for a grandchild, on the
+                            # normal-exit path as well as the timeout path, so the
+                            # adapter's wall clock was not bounded by its own timeout.
+                            # The daemon closer releases it when the OS permits and
+                            # the Popen attributes are cleared so the finally block
+                            # below does not repeat the blocking close.
                             threading.Thread(
                                 target=stream.close,
                                 name=f"forge-close-{stream_name}",
@@ -662,6 +783,8 @@ class LocalExecutionAdapter:
                 proc.stdout.close()
             if proc.stderr and not proc.stderr.closed:
                 proc.stderr.close()
+            if process_job is not None:
+                _close_process_tree_job(process_job)
 
         # Enforce output truncation limit
         truncated = False
@@ -729,7 +852,9 @@ class LocalExecutionAdapter:
                 break
             thread.join(timeout=remaining)
 
-    def _terminate_process_tree(self, proc: subprocess.Popen[bytes]) -> None:
+    def _terminate_process_tree(
+        self, proc: subprocess.Popen[bytes], *, job: int | None = None
+    ) -> None:
         """Terminate the process tree, Windows and POSIX alike.
 
         The former early return on ``proc.poll() is not None`` was a defect: when the
@@ -738,30 +863,42 @@ class LocalExecutionAdapter:
         could report ``TIMEOUT`` while the descendant kept running. ``taskkill /T`` and
         ``killpg`` both tolerate an already-exited leader, so the attempt is now
         unconditional.
+
+        ``job``, when present, is the job object the child was assigned to at spawn
+        time.  Terminating it is the only mechanism here that reaches a descendant
+        that outlived its parent without a PID lookup, and it is the one that works
+        in a runtime that refuses both ``os.kill`` on a foreign PID and
+        ``taskkill``.
         """
 
         if os.name == "nt":
-            # Prefer the native process snapshot.  Some managed Windows runners
-            # deny ``taskkill /T`` even for child processes, while ``os.kill``
-            # (TerminateProcess) is permitted for the same PIDs.
-            process_tree = _windows_process_tree(proc.pid)
-            for pid in process_tree:
+            if job is not None:
+                _terminate_process_tree_job(job)
+            else:
+                # Fallback path: enumerate the tree from a Toolhelp snapshot. A
+                # snapshot failure returns an empty tree -- never "just the root" --
+                # so the legacy command below is actually reachable.
                 try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-            if not process_tree:
-                # A snapshot can fail transiently (for example during process
-                # table pressure), so retain the legacy command as a fallback.
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                        capture_output=True,
-                        timeout=5,
-                        check=False,
-                    )
-                except Exception:
-                    pass
+                    process_tree = _windows_process_tree(proc.pid)
+                except Exception:  # noqa: BLE001 - the snapshot is best effort
+                    process_tree = ()
+                for pid in process_tree:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                if not process_tree:
+                    # A snapshot can fail transiently (for example during process
+                    # table pressure), so retain the legacy command as a fallback.
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            capture_output=True,
+                            timeout=5,
+                            check=False,
+                        )
+                    except Exception:
+                        pass
             try:
                 proc.kill()
             except Exception:
