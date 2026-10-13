@@ -461,3 +461,107 @@ Git является источником достоверной истории 
 `FORGE_ENABLED_PROVIDERS`, задайте `GEMINI_API_KEY` через игнорируемый `.env` или
 окружение процесса и выполните `python -m app.smoke_gemini`. Модель берётся из
 `FORGE_GEMINI_MODEL` (по умолчанию `gemini-3.8-flash`).
+
+---
+
+## Current state (documentation pass)
+
+This section records what the repository actually does today, as measured rather
+than planned. Status vocabulary is fixed: **IMPLEMENTED** (present in code),
+**VERIFIED** (proven by a run), **IN PROGRESS**, **BLOCKED**, **PLANNED**,
+**DEFERRED**. IMPLEMENTED does not mean VERIFIED.
+
+| Area | Status | Evidence |
+|---|---|---|
+| Core execution plane (authorization chain, at-most-once per attempt, workspace containment) | **VERIFIED** | `tests/test_execution_plane.py`, `tests/test_execution_authorization_hardening_v02.py`, `tests/test_execution_authorization_hardening_v03.py`, `tests/test_workspace_identity_on_tool_path.py` |
+| Artifact provenance (a pre-existing file is never reported as produced) | **VERIFIED** | `tests/test_artifact_provenance.py`, `tests/test_step_graph_managed_execution.py` |
+| Damaged step-graph record is reported, never raised | **VERIFIED** | `tests/test_step_graph_record_robustness.py` |
+| Run-store id containment (a run id cannot escape the store root) | **VERIFIED** | `tests/test_run_store_id_containment.py` |
+| Credential material is never harvested | **VERIFIED** | `tests/test_harvest_refuses_credentials.py` |
+| Forge Pulse desktop widget | **VERIFIED** | `tests/test_desktop_widget.py`, `docs/images/forge-pulse-widget.png` |
+| `resume` refusing to derive `COMPLETED` without execution evidence | **BLOCKED** | open defect; see `docs/audits/FINALIZATION_CHECKPOINT.md` |
+| Damaged record is not overwritten on `run()` | **IN PROGRESS** | reader half fixed; writer half open |
+| GET routes are strictly read-only | **BLOCKED** | open defect; `GET /api/product/verification-plan` still writes durable state |
+| Platform persistence, RLS and application services | **BLOCKED** (environment) | needs a live PostgreSQL; 32 tests skip here |
+| Provider layer, agents, UI product flows | **IMPLEMENTED / PARTIALLY VERIFIED** | mock providers only; no live LLM run was performed |
+
+### Verified commands
+
+```powershell
+# full test suite (works on a fresh clone)
+.\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -v
+
+# one file
+.\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_artifact_provenance.py" -v
+
+# static checks
+.\.venv\Scripts\python.exe -B -X utf8 -m compileall -q app tests
+git diff --check
+
+# start the API (loopback by default; refuses non-loopback binds)
+$env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='8005'
+.\.venv\Scripts\python.exe -B -X utf8 app\api\main.py
+
+# desktop widget
+.\scripts\run_forge_pulse.cmd
+```
+
+Last recorded full run on the tree that includes the artifact-provenance fix:
+`Ran 2354 tests` / `OK (skipped=36)`.
+
+### Environment requirements and limits
+
+* Python 3.13 with the project virtual environment at `.venv`.
+* Windows: the process-tree termination path uses a job object.
+* **No live PostgreSQL driver or server on the development host**, so the Platform
+  database contract tests (32 of them) skip. SKIP is not PASS.
+* Three tests skip because the environment forbids symlink creation; one skips
+  without `OPENAI_API_KEY` (the test runtime is deliberately offline).
+
+### Known limitations (stated, not hidden)
+
+* There is **no OS-level sandbox**: path checks are a server-side contract boundary,
+  not process isolation.
+* The API surface has **no authentication**; loopback binding plus refusal of
+  non-loopback binds is the only control.
+* Real LLM generation has not been exercised — only mock/fake providers.
+
+### Documentation map
+
+| Document | Purpose |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | how the code is built today |
+| [`docs/TECHNICAL_SPECIFICATION.md`](docs/TECHNICAL_SPECIFICATION.md) | target architecture and constraints |
+| [`docs/FORGE_VISION.md`](docs/FORGE_VISION.md) | product direction |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | staged plan, dependencies and exit criteria |
+| [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md) | consolidated verified current state |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | architectural decisions and their rationale |
+| [`docs/audits/FINAL_HANDOFF_TO_CHATGPT.md`](docs/audits/FINAL_HANDOFF_TO_CHATGPT.md) | independent-audit package |
+| [`docs/audits/FINALIZATION_CHECKPOINT.md`](docs/audits/FINALIZATION_CHECKPOINT.md) | open blockers and the exact next step |
+
+---
+
+## Текущее состояние (документационный проход)
+
+Этот раздел фиксирует, что репозиторий делает **фактически**, а не что
+запланировано. Словарь статусов фиксирован: **IMPLEMENTED** (есть в коде),
+**VERIFIED** (подтверждено прогоном), **IN PROGRESS**, **BLOCKED**, **PLANNED**,
+**DEFERRED**. IMPLEMENTED не означает VERIFIED.
+
+| Область | Статус | Доказательство |
+|---|---|---|
+| Ядро исполнения (цепочка авторизации, at-most-once на попытку, границы workspace) | **VERIFIED** | `tests/test_execution_plane.py`, `tests/test_execution_authorization_hardening_v3*`, `tests/test_workspace_identity_on_tool_path.py` |
+| Происхождение артефакта (предсуществующий файл не выдаётся за произведённый) | **VERIFIED** | `tests/test_artifact_provenance.py`, `tests/test_step_graph_managed_execution.py` |
+| Повреждённая запись step-graph сообщается, а не бросает исключение | **VERIFIED** | `tests/test_step_graph_record_robustness.py` |
+| Изоляция хранилища запусков (run id не выходит за корень) | **VERIFIED** | `tests/test_run_store_id_containment.py` |
+| Credential-материал никогда не харвестится | **VERIFIED** | `tests/test_harvest_refuses_credentials.py` |
+| Десктоп-виджет Forge Pulse | **VERIFIED** | `tests/test_desktop_widget.py`, `docs/images/forge-pulse-widget.png` |
+| `resume` не выводит `COMPLETED` без доказательств исполнения | **BLOCKED** | открытый дефект; см. `docs/audits/FINALIZATION_CHECKPOINT.md` |
+| Повреждённая запись не затирается при `run()` | **IN PROGRESS** | половина читателя закрыта, половина записи — нет |
+| GET-маршруты строго read-only | **BLOCKED** | открытый дефект: `GET /api/product/verification-plan` пишет durable state |
+| Platform: persistence, RLS, application services | **BLOCKED** (среда) | нужен живой PostgreSQL; здесь 32 теста пропускаются |
+| Провайдеры, агенты, продуктовый UI | **IMPLEMENTED / ЧАСТИЧНО VERIFIED** | только mock-провайдеры; живой прогон LLM не выполнялся |
+
+Проверенные команды, требования к окружению, известные ограничения и карта
+документации приведены выше в английской части и полностью совпадают по смыслу:
+расхождения между версиями не допускаются.

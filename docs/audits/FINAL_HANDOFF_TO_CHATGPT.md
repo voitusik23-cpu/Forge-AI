@@ -247,3 +247,14 @@ Blockers #2 (`resume` false `COMPLETED`), #3 second half (damaged record overwri
 and #4 (GET mutating durable state) remain unfixed, so the overall status is still
 `BLOCKED`. See [`FINALIZATION_CHECKPOINT.md`](FINALIZATION_CHECKPOINT.md) for the
 current per-blocker status and the exact next step.
+
+---
+
+## Update - documentation consolidation stage
+
+`README.md` gained an honest "Current state" section (English canonical, Russian
+equivalent) with the verified commands, environment limits and a documentation map;
+`docs/ROADMAP.md` had 23 encoding-corrupted sequences (`вЂ”` where an em dash belongs)
+repaired. No production code, tests, migrations or configuration were touched, and no
+technical blocker status changed: Blocker #1 stays FIXED_AND_TESTED, Blockers #2, #3
+(second half) and #4 stay open.

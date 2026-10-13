@@ -1,4 +1,4 @@
-# Forge AI вЂ” Roadmap
+# Forge AI — Roadmap
 
 > This roadmap describes the evolution of Forge AI from the current orchestration foundation into the full multi-agent project execution system described in [FORGE_VISION.md](FORGE_VISION.md).
 
@@ -7,11 +7,11 @@ The target architecture and constraints for roadmap work are defined in
 
 ## Status legend
 
-- **DONE** вЂ” implemented in the repository and verified by tests.
-- **IN PROGRESS** вЂ” partially implemented; the known gap is stated explicitly.
-- **NEXT** вЂ” the immediate next work item, not yet started.
-- **FUTURE** вЂ” planned; not yet implemented.
-- **DEFERRED** вЂ” deliberately postponed, with the reason recorded.
+- **DONE** — implemented in the repository and verified by tests.
+- **IN PROGRESS** — partially implemented; the known gap is stated explicitly.
+- **NEXT** — the immediate next work item, not yet started.
+- **FUTURE** — planned; not yet implemented.
+- **DEFERRED** — deliberately postponed, with the reason recorded.
 
 The roadmap is capability-based and has no promised release dates. The
 **CURRENT/FUTURE** markers used by the phase sections below are historical
@@ -21,7 +21,7 @@ means **FUTURE**. Verified per-area status lives in
 from an entry point is recorded in
 [`COMPONENT-REGISTRY.md`](COMPONENT-REGISTRY.md).
 
-## Phase 0 вЂ” Foundation
+## Phase 0 — Foundation
 
 **CURRENT**
 
@@ -31,7 +31,7 @@ from an entry point is recorded in
 - [x] Test infrastructure
 - [x] Git safety rules
 
-## Phase 1 вЂ” Provider Layer
+## Phase 1 — Provider Layer
 
 **CURRENT**
 
@@ -49,7 +49,7 @@ Provider adapters share the provider-neutral interface. Credentials are
 resolved locally through SecretStore and are not part of provider metadata or
 Git history.
 
-## Phase 2 вЂ” Routing
+## Phase 2 — Routing
 
 **CURRENT**
 
@@ -71,7 +71,7 @@ explicit provider selection retains priority. Automatic routing uses declared
 capabilities, configuration, and the existing cost-tier policy; it does not
 use an LLM classifier or opaque scoring.
 
-## Phase 3 вЂ” Multi-Agent Execution
+## Phase 3 — Multi-Agent Execution
 
 **CURRENT**
 
@@ -95,7 +95,7 @@ The current cycle runs at most once after `CHANGES_REQUESTED`; a second review
 that still requests changes ends with `changes_requested`. Review or revision
 failures preserve the available primary result without implying approval.
 
-## Phase 4 вЂ” Planning
+## Phase 4 — Planning
 
 **CURRENT**
 
@@ -142,7 +142,7 @@ execution, runtime dependency management, parallel execution, applying project
 changes, and deployment are not implemented.
 Changes to Git or production remain subject to explicit authorization.
 
-## Phase 5 вЂ” Execution Plane and Authorization
+## Phase 5 — Execution Plane and Authorization
 
 ### DONE
 
@@ -158,7 +158,7 @@ Changes to Git or production remain subject to explicit authorization.
 - [x] Capability classification of invocations (recognized wrappers, interpreter eval/module flags, network commands)
 - [x] Engineering-run execution integration and the offline integration failure matrix
 
-### IN PROGRESS вЂ” Execution Authorization Contract v0.2
+### IN PROGRESS — Execution Authorization Contract v0.2
 
 - [ ] Replace the capability recognition list with a fail-closed declared-invocation model, so unrecognized execution behavior requires an explicit capability instead of relying on a list of known wrapper names.
 - [x] Make the coordinator's intent-fingerprint verification unconditional: an approval that carries no fingerprint must not authorize execution.
@@ -188,7 +188,7 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] `TaskSpecification`/task-driven verification binding: the API path still has no trusted server-side verification identity (no production `VerificationExpectation`, no production `TestVerificationIntent`, and `TaskRunRequest` carries no verification field). A client-controlled selector (`context`, description, `category`, or `task_id`) is explicitly rejected, so this must not be closed by inventing one. `run_task` therefore stays execution-disabled by default.
 - [ ] Idempotent side-effect execution boundary for host processes (no automatic retry after a crash between process start and result recording).
 
-### DEFERRED вЂ” Block 2 (workspace and isolation)
+### DEFERRED — Block 2 (workspace and isolation)
 
 - [x] `WorkspaceIdentity` and workspace identity binding in the frozen run scope (the execution intent remains the command authorization subject)
 - [ ] Declared-input allow-lists and deny-by-default staging
@@ -197,9 +197,9 @@ Known limits are recorded in [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) В§4 an
 - [ ] Durable or persistent approval store (separate design: standing authorization semantics)
 - [~] **GAP-A PARTIAL** - filesystem containment is now enforced server-side at the authority boundary and re-proved immediately before the child process is created: traversal, absolute paths outside the workspace, drive/UNC paths, and junctions or symlinks that resolve outside are all refused. It is **not** an OS-level sandbox: a spawned process inherits the parent token and can still open any path that token may open.
 - [~] **GAP-B PARTIAL** - network authority is deny-by-default, frozen in the run scope, and cannot be enabled by a request profile; the adapter points the proxy variables at a closed port. It is a policy boundary, not a kernel sandbox: a process that opens a socket directly is not stopped.
-- [ ] **GAP-A / GAP-B remaining half** - OS-level isolation and kernel network enforcement (namespaces, cgroups, Job Objects как границы изоляции used as an isolation boundary) вЂ” a separate project, not part of the authorization redesign
+- [ ] **GAP-A / GAP-B remaining half** - OS-level isolation and kernel network enforcement (namespaces, cgroups, Job Objects как границы изоляции used as an isolation boundary) — a separate project, not part of the authorization redesign
 
-## Phase 6 вЂ” Lifecycle, product surface and knowledge
+## Phase 6 — Lifecycle, product surface and knowledge
 
 ### FUTURE
 
@@ -244,7 +244,7 @@ implemented and verified (see the `[x]` rows below and
 [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) §3.7). Everything still marked `[ ]` is
 direction and must not be described in the present tense.
 
-- [x] **Stage 0.1 вЂ” durable physical telemetry in Core.** Implemented. `PhysicalTelemetry`
+- [x] **Stage 0.1 — durable physical telemetry in Core.** Implemented. `PhysicalTelemetry`
   (`app/agent_runtime/physical_telemetry.py`) is the physical contract, and
   `FileTelemetrySink` is the transitional append-only local sink, one JSON line per
   terminal attempt, rooted outside the source checkout. The `AgentHarness` builds
@@ -258,10 +258,10 @@ direction and must not be described in the present tense.
   `CapabilityFabric._run_usage` and the unused `RunStateSnapshot.accounting` field
   remain; provider token measurements are only populated when the decision provider
   actually reports a `Usage`, which the default deterministic provider does not.
-- [ ] **Stage 0.2 вЂ” trusted execution port.** `TrustedExecutionRequest` in,
+- [ ] **Stage 0.2 — trusted execution port.** `TrustedExecutionRequest` in,
   `PhysicalTelemetry` out, with the six audit fields carried as data and never as
   authority. `PhysicalTelemetry` exists; the request half does not.
-- [ ] **Stage 1 вЂ” Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
+- [ ] **Stage 1 — Platform MVP.** `User`, `Organization`, `Membership`, `Project`,
   `APIKey`, `ProviderAccount.organization_id`, per-tenant persistence, BYOK
   credential storage. PostgreSQL is the durable store for platform state;
   Core keeps its file-based execution infrastructure. Ordered in
@@ -284,13 +284,13 @@ direction and must not be described in the present tense.
     implementation order. **Not started.** Several of these depend on owner
     decisions that are still open: see `SOURCE_OF_TRUTH.md` §3.6 and the open
     decisions in [`DECISIONS.md`](DECISIONS.md).
-- [ ] **Stage 2 вЂ” Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` with
+- [ ] **Stage 2 — Billing MVP.** `CostRecord`, `PricingPlan`/`PriceRule` with
   version snapshots, `Wallet` with compare-and-swap, immutable
   `CreditTransaction` ledger, prepaid top-up.
-- [ ] **Stage 3 вЂ” public Forge API.** Authenticated REST surface, API keys,
+- [ ] **Stage 3 — public Forge API.** Authenticated REST surface, API keys,
   rate limiting, webhooks.
-- [ ] **Stage 4 вЂ” partner / affiliate.** One-level referral only.
-- [ ] **Stage 5 вЂ” reseller / B2B wholesale.** Deferred until Stage 2 is stable.
+- [ ] **Stage 4 — partner / affiliate.** One-level referral only.
+- [ ] **Stage 5 — reseller / B2B wholesale.** Deferred until Stage 2 is stable.
 - [ ] Split of existing Core constructs that carry Platform or financial semantics:
   `AttemptUsageRecord` (physical vs cost fields), `RunAccountingRecord.project_id`,
   and `app/dashboard/` plus `app/dashboard/provider_health.py`.
