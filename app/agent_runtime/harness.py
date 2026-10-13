@@ -466,7 +466,11 @@ class AgentHarness:
         scope.validate_workspace(request.workspace)
         scope.validate_command_set(request.allowed_execution_commands)
         scope.validate_acceptance_criteria(request.acceptance_criteria)
-        scope.validate_tool_set(getattr(request, "allowed_tool_ids", None))
+        # NOTE: the tool perimeter is enforced by the intent check below, not by a
+        # request field. A ``validate_tool_set(getattr(request, "allowed_tool_ids",
+        # None))`` call used to sit here; ``HarnessRequest`` has no such field, so it
+        # always received ``None`` and returned without checking anything. A no-op
+        # that looks like a boundary is worse than no call at all.
         # Declared tool intents may only narrow the frozen tool perimeter. A
         # request that declares an intent for a tool the run does not authorize is
         # rejected before anything is planned, decided, or executed.

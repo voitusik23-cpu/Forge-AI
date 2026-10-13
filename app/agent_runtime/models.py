@@ -149,10 +149,6 @@ class HarnessRequest:
     # authority-relevant inputs and is validated before any context, memory,
     # knowledge, or provider output is read.
     run_scope: object | None = None
-    # Optional immutable security perimeter for this run. When present it binds
-    # the authority-relevant inputs and is validated before any context, memory,
-    # knowledge, or provider output is read.
-    run_scope: object | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id or not isinstance(self.run_id, str):
