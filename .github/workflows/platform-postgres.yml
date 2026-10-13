@@ -25,8 +25,20 @@ name: Platform PostgreSQL contract
 on:
   push:
     branches: [master]
+    # A documentation-only change cannot alter the database contract, and the full
+    # suite already runs locally for those. Deliberately narrow: anything under app/,
+    # tests/, scripts/ or requirements*.txt still runs this job.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "**/*.png"
   pull_request:
   workflow_dispatch:
+
+# One run per ref is enough: a newer push supersedes an older one.
+concurrency:
+  group: platform-postgres-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   platform-postgres:
