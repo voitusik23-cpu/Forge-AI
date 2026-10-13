@@ -168,6 +168,20 @@ class EphemeralWorkspaceManager:
             if not clean_target or ".." in clean_target.split("/"):
                 raise ValueError(f"Unsafe artifact target path: {target}")
 
+            # Credential material is never harvested. Harvesting opens the file and
+            # publishes its digest, and the target set is not purely the operator's:
+            # a step graph arrives from the client and its verification adds targets
+            # to the request. Staging withholds these names from the scratch tree and
+            # the scanner refuses to fingerprint them; harvesting now agrees with
+            # both. The rule is the name, not the existence of the file.
+            parts = clean_target.split("/")
+            if any(is_secret_directory(part) for part in parts[:-1]) or is_secret_file(
+                parts[-1]
+            ):
+                raise ValueError(
+                    f"Refusing to harvest credential material: {clean_target}"
+                )
+
             resolved_path = self.resolve_path(clean_target, root=root)
 
             if not resolved_path.exists():
