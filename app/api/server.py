@@ -36,6 +36,7 @@ from typing import Any, Mapping, Optional
 
 from app.api.models import TaskRunRequest
 from app.api.service import ForgeApiService
+from app.runtime.run_store import is_safe_run_id
 
 logger = logging.getLogger("forge.api")
 
@@ -375,6 +376,11 @@ def create_api_app(
         Read-only: this reports persisted state and never resumes, retries, or
         re-executes anything.
         """
+        # The id is a directory name in the store, so a traversal form is refused
+        # here instead of reaching the store and raising an unhandled ValueError.
+        # The sibling route in app/api/routes.py applies the same allow-list.
+        if not is_safe_run_id(run_id):
+            raise HTTPException(status_code=404, detail=f"Unknown run_id '{run_id}'")
         record = api_service.get_run_record(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"Unknown run_id '{run_id}'")

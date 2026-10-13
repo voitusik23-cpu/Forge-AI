@@ -71,8 +71,17 @@ __all__ = [
 ]
 
 # Run ids are used as directory names, so they are restricted to a conservative
-# charset. This prevents a crafted id from escaping the storage root.
-_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# charset. ``"."`` and ``".."`` satisfy a character-class pattern while naming the
+# directory itself and its parent -- which is how a crafted id escaped the storage
+# root -- so they are refused explicitly, and ``run_dir`` re-proves containment
+# instead of trusting the pattern alone.
+_SAFE_RUN_ID = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]{1,128}$")
+
+
+def is_safe_run_id(run_id: object) -> bool:
+    """True when ``run_id`` may be used as a directory name inside the store root."""
+
+    return isinstance(run_id, str) and _SAFE_RUN_ID.match(run_id) is not None
 
 _ENV_ROOT_VAR = "FORGE_RUN_STORE_ROOT"
 _ENV_ENABLE_VAR = "FORGE_RUN_STORE_ENABLED"
@@ -788,9 +797,16 @@ class RunStore:
     # paths
     # ------------------------------------------------------------------
     def run_dir(self, run_id: str) -> Path:
-        if not isinstance(run_id, str) or not _SAFE_RUN_ID.match(run_id):
+        if not is_safe_run_id(run_id):
             raise ValueError(f"unsafe run_id for storage: {run_id!r}")
-        return self._root / run_id
+        candidate = self._root / run_id
+        # Defence in depth: the pattern is the first check, containment is the
+        # second, so a later change to the pattern cannot silently reopen the escape.
+        try:
+            candidate.resolve(strict=False).relative_to(self._root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"unsafe run_id for storage: {run_id!r}") from exc
+        return candidate
 
     def events_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "events.jsonl"
