@@ -48,6 +48,7 @@ FIVE WAYS A GREEN TEST IS NOT EVIDENCE, AND WHAT IS DONE ABOUT EACH
 from __future__ import annotations
 
 import hashlib
+import pathlib
 import json
 import re
 import unittest
@@ -781,6 +782,72 @@ class ChangeImpactReasoningTests(Block9Case):
                 "/api/product/stale-facts", json={"invalidate": value}
             )
             self.assertEqual(response.status_code, 200, response.text)
+
+    @staticmethod
+    def _durable_state(store: object) -> dict:
+        """Every file in the run store, by relative name, with its exact bytes.
+
+        This is the durable state a GET could damage: the baseline record, the
+        onboarding record, step-graph records and the ledger. Names and bytes are
+        compared, so a rewrite that changed one field cannot pass unnoticed.
+        """
+
+        root = pathlib.Path(store.root)
+        state: dict = {}
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                key = str(path.relative_to(root)).replace("\\", "/")
+                state[key] = path.read_bytes()
+        return state
+
+    def test_a_verification_plan_read_does_not_write_durable_state(self) -> None:
+        """_INJECTION_TARGET_: a read is not a write.
+
+        Goes red if the read path seeds a baseline record or merges stale-fact
+        history while answering: the store then differs before and after two
+        consecutive ``GET /api/product/verification-plan`` calls, and the
+        onboarding stage can move without anybody asking for it.
+        """
+
+        service = self.service()
+        client = self.client(service)
+        store = service.run_store
+
+        # Durable state is created through the WRITE path on purpose: comparing two
+        # reads of an empty store would prove nothing. ``POST /api/product/baseline``
+        # is the documented way to record a baseline.
+        (self.root / "pkg").mkdir(parents=True, exist_ok=True)
+        (self.root / "pkg" / "core.py").write_text("VALUE = 1\n", encoding="utf-8")
+        baseline = client.post("/api/product/baseline", json={})
+        self.assertEqual(baseline.status_code, 200, baseline.text)
+        warmup = client.get("/api/product/verification-plan")
+        self.assertEqual(warmup.status_code, 200, warmup.text)
+        stage_before = client.get("/api/product/onboarding").json()
+
+        before = self._durable_state(store)
+        self.assertTrue(before, "the store must hold the seeded state by now")
+        self.assertIn("project-baseline/state.json", before)
+
+        second = client.get("/api/product/verification-plan")
+        self.assertEqual(second.status_code, 200, second.text)
+        third = client.get("/api/product/verification-plan")
+        self.assertEqual(third.status_code, 200, third.text)
+
+        after = self._durable_state(store)
+        self.assertEqual(
+            sorted(after),
+            sorted(before),
+            "a read created or removed durable files",
+        )
+        for name, content in before.items():
+            self.assertEqual(after[name], content, f"{name} was rewritten by a read")
+
+        # The plan is still returned, and it is stable across reads.
+        self.assertTrue(second.json())
+        self.assertEqual(second.json(), third.json())
+
+        # Reading the plan did not advance onboarding.
+        self.assertEqual(client.get("/api/product/onboarding").json(), stage_before)
 
     def test_22_an_ambiguous_move_is_never_auto_resolved(self) -> None:
         """_SENSITIVITY_: two identical candidates must stay unresolved.

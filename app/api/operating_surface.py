@@ -1598,7 +1598,9 @@ class OperatingSurface:
             "created_at": snapshot.created_at,
         }
 
-    def change_impact(self, *, baseline: object = "") -> dict[str, Any]:
+    def change_impact(
+        self, *, baseline: object = "", read_only: bool = True
+    ) -> dict[str, Any]:
         """Link observed file changes to dependent facts, requirements and checks.
 
         What this **does** prove, from data the server holds:
@@ -1643,14 +1645,17 @@ class OperatingSurface:
                 base = self._snapshotter.create_snapshot(
                     self._workspace, project_id=self._project_id()
                 )
-                self._persist_baseline(base)
+                if not read_only:
+                    self._persist_baseline(base)
                 seeded_now = True
             self._baseline = _Baseline(base)
 
         current = self._snapshotter.create_snapshot(
             self._workspace, project_id=self._project_id()
         )
-        analysis = self.change_analysis(base=base, current=current)
+        analysis = self.change_analysis(
+            base=base, current=current, read_only=read_only
+        )
         # ONE REPRESENTATION. The Block #8 keys and the Block #9 reasoning fields
         # are read from the same engine finding, so the report and the verification
         # plan cannot disagree about what changed or why.
@@ -1731,6 +1736,7 @@ class OperatingSurface:
         base: UnderstandingSnapshot | None = None,
         current: UnderstandingSnapshot | None = None,
         baseline: object = "",
+        read_only: bool = False,
     ) -> dict[str, Any]:
         """Run the Change Impact Engine over two snapshots.
 
@@ -1742,7 +1748,7 @@ class OperatingSurface:
         from app.analysis.impact import ChangeImpactEngine
 
         if base is None:
-            base = self._resolve_baseline(baseline)
+            base = self._resolve_baseline(baseline, persist=not read_only)
         if current is None:
             current = self._snapshotter.create_snapshot(
                 self._workspace, project_id=self._project_id()
@@ -1757,7 +1763,9 @@ class OperatingSurface:
             memory=memory,
         )
         report = engine.report(freshness=self._freshness(current))
-        staled = self.stale_facts(base=base, current=current)
+        staled = self.stale_facts(
+            base=base, current=current, record_history=not read_only
+        )
         findings_by_path = {finding.path: finding.to_dict() for finding in report.findings}
         return {
             "baseline": base,
@@ -1781,6 +1789,7 @@ class OperatingSurface:
         current: UnderstandingSnapshot | None = None,
         baseline: object = "",
         invalidate: bool = False,
+        record_history: bool = True,
     ) -> dict[str, Any]:
         """Facts that were current at baseline and are not now, and their history.
 
@@ -1798,7 +1807,7 @@ class OperatingSurface:
         """
 
         if base is None:
-            base = self._resolve_baseline(baseline)
+            base = self._resolve_baseline(baseline, persist=not record_history)
         if current is None:
             current = self._snapshotter.create_snapshot(
                 self._workspace, project_id=self._project_id()
@@ -1816,7 +1825,13 @@ class OperatingSurface:
         report = engine.report(freshness=index)
 
         ids = [item.fact_id for item in report.stale_facts]
-        retained = self._remember_stale_facts(ids)
+        if record_history:
+            retained = self._remember_stale_facts(ids)
+        else:
+            # A read reports what is already recorded and writes nothing. This is
+            # the difference the GET paths depend on: answering with history must
+            # not be the same act as extending it.
+            retained = self._recorded_stale_fact_ids()
 
         payload: dict[str, Any] = {
             "stale_facts": [item.to_dict() for item in report.stale_facts],
@@ -1855,6 +1870,23 @@ class OperatingSurface:
             payload["refresh"] = result.to_dict()
             payload["memory_history_kept"] = True
         return payload
+
+    def _recorded_stale_fact_ids(self) -> list[str]:
+        """The stale-fact ids already recorded for this surface, read-only."""
+
+        existing = self._run_store.read_state(self.BASELINE_ID)
+        if existing is None or not existing.project_state:
+            return []
+        previous = existing.project_state.get("stale_fact_history")
+        if isinstance(previous, Mapping):
+            raw = previous.get("fact_ids")
+        elif isinstance(previous, (list, tuple)):
+            raw = previous
+        else:
+            return []
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(item) for item in raw]
 
     def _remember_stale_facts(self, fact_ids: Sequence[str]) -> list[str]:
         """Merge stale fact ids into the baseline record's own ``project_state``.
@@ -1909,7 +1941,9 @@ class OperatingSurface:
 
         return datetime.now(timezone.utc).isoformat()
 
-    def _resolve_baseline(self, baseline: object = "") -> UnderstandingSnapshot:
+    def _resolve_baseline(
+        self, baseline: object = "", *, persist: bool = True
+    ) -> UnderstandingSnapshot:
         """The baseline snapshot, resolved exactly as ``change_impact`` resolves it."""
 
         if baseline:
@@ -1928,7 +1962,10 @@ class OperatingSurface:
             base = self._snapshotter.create_snapshot(
                 self._workspace, project_id=self._project_id()
             )
-            self._persist_baseline(base)
+            if persist:
+                self._persist_baseline(base)
+            # Read-only callers still get a usable in-memory baseline; they just do
+            # not create durable state as a side effect of being asked a question.
             self._baseline = _Baseline(base, seeded=True)
         else:
             self._baseline = _Baseline(base)
@@ -1948,7 +1985,7 @@ class OperatingSurface:
         """
 
         if impact is None:
-            report = self.change_analysis()
+            report = self.change_analysis(read_only=True)
             impact = report["report"]
         impact = self._as_impact_payload(impact)
         planner = self._verification_planner()
