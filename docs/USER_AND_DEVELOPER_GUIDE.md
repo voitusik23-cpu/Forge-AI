@@ -198,6 +198,15 @@ Measured on a running instance:
 | `GET /api/product/onboarding` | `200`, real payload: `{"project_id":"default","projects":[{"name":"Forge Main Workspace","path":"<repo>","status":"active"}],"stage":"INITIAL", ...}` |
 | `GET /api/product/verification-plan` | `200`, 1 106 bytes of JSON |
 
+A launcher wraps the same command with the safe defaults and prints the URL. It is
+a `.cmd` on purpose: this host's PowerShell execution policy refuses to run an
+unsigned `.ps1`, so a PowerShell launcher would not be a reproducible command, and
+the policy is not lowered to make one work:
+
+```powershell
+scripts\run_dev_console.cmd 8011
+```
+
 The console calls the real product routes (`/api/product/onboarding`, `.../change-impact`,
 `.../verification-plan`, `.../memory`, `.../graph`, `.../approvals/...`, `.../accept`,
 `.../baseline`, `.../evidence-graph`, `.../goal`, `.../refresh`) -- the list is extracted
@@ -225,13 +234,26 @@ Once a server exists, the checks are:
 #    e.g. with a container runtime:  docker run --rm -e POSTGRES_PASSWORD=test \
 #         -p 5432:5432 postgres:16
 # 2. install the driver
-.\.venv\Scripts\python.exe -m pip install asyncpg
+.\.venv\Scripts\python.exe -m pip install -r requirements-platform.txt
 # 3. point the tests at it and run the Platform suites
 $env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
 .\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
 ```
 
 Until that runs, no Platform claim in this repository is verified.
+
+**CI job (prepared, not yet executed here).** `ci/platform-postgres.yml` -- the job
+definition lives outside `.github/workflows/` because the publishing token has no
+`workflow` scope; paste it into `.github/workflows/platform-postgres.yml` through the
+GitHub web UI (or push it with a scoped token) to activate it. It
+runs exactly this contract on every push: a `postgres:16` service container, the
+driver from `requirements-platform.txt`, the full suite with a live
+`FORGE_PLATFORM_TEST_DSN`, then the Platform suites on their own, and finally
+`scripts/check_platform_roles.py`, which fails the job unless both fixture logins are
+`NOSUPERUSER`, `NOBYPASSRLS` and members of exactly one platform role -- the check
+that keeps a row-level-security test from passing because a superuser or a table
+owner bypassed the policy. It has not been executed yet; a prepared workflow is not
+an executed one.
 
 
 The widget image above is real. Everything else is text-only. To document the API
@@ -409,6 +431,15 @@ $env:FORGE_ENV='test'; $env:FORGE_API_HOST='127.0.0.1'; $env:FORGE_API_PORT='800
 | `GET /api/product/onboarding` | `200`, реальные данные: `{"project_id":"default","projects":[{"name":"Forge Main Workspace","path":"<repo>","status":"active"}],"stage":"INITIAL", ...}` |
 | `GET /api/product/verification-plan` | `200`, 1 106 байт JSON |
 
+Ту же команду с безопасными настройками и печатью адреса запускает лаунчер. Он
+сделан `.cmd` намеренно: политика выполнения PowerShell на этой машине отказывается
+запускать неподписанный `.ps1`, поэтому PowerShell-лаунчер не был бы воспроизводимой
+командой, а понижать политику ради этого нельзя:
+
+```powershell
+scripts\run_dev_console.cmd 8011
+```
+
 Консоль обращается к настоящим продуктовым маршрутам (`/api/product/onboarding`,
 `.../change-impact`, `.../verification-plan`, `.../memory`, `.../graph`,
 `.../approvals/...`, `.../accept`, `.../baseline`, `.../evidence-graph`, `.../goal`,
@@ -436,13 +467,26 @@ Microsoft Edge, и его headless-режим не запускается вну
 #    например в контейнере:  docker run --rm -e POSTGRES_PASSWORD=test \
 #         -p 5432:5432 postgres:16
 # 2. драйвер
-.\.venv\Scripts\python.exe -m pip install asyncpg
+.\.venv\Scripts\python.exe -m pip install -r requirements-platform.txt
 # 3. указать адрес и запустить наборы Platform
 $env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
 .\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
 ```
 
 Пока это не выполнено, ни одно утверждение о Platform в этом репозитории не проверено.
+
+**CI-задача (подготовлена, здесь ещё не выполнялась).** `ci/platform-postgres.yml` —
+определение задачи лежит вне `.github/workflows/`, потому что у токена публикации нет
+scope `workflow`; чтобы активировать, вставьте файл в
+`.github/workflows/platform-postgres.yml` через веб-интерфейс GitHub (или запушьте его
+токеном с этим scope). Задача прогоняет ровно этот контракт на каждый
+push: сервис-контейнер `postgres:16`, драйвер из `requirements-platform.txt`, полный
+набор с живым `FORGE_PLATFORM_TEST_DSN`, затем отдельно наборы Platform и в конце
+`scripts/check_platform_roles.py` — задача падает, если хотя бы один из логинов
+фикстуры окажется суперпользователем, получит `BYPASSRLS` или войдёт более чем в одну
+платформенную роль. Именно эта проверка не даёт тесту RLS «пройти» из-за того, что
+политику обошёл суперпользователь или владелец таблицы. Workflow ещё не запускался:
+подготовленная конфигурация — не выполненная проверка.
 
 ## 13. Карта документации
 

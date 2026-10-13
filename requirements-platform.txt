@@ -1,0 +1,8 @@
+# Optional PostgreSQL driver for the Platform persistence contract tests.
+#
+# Kept out of requirements.txt so the application runtime has no database
+# dependency it does not use: only the Platform tests need it, and they skip
+# (rather than pass) when it or a server is missing.
+#
+# Install with:  python -m pip install -r requirements-platform.txt
+asyncpg>=0.30.0,<1.0.0

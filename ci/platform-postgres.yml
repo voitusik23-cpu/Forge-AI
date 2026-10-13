@@ -1,0 +1,95 @@
+# NOTE ON LOCATION -- READ BEFORE ASSUMING THIS JOB RUNS.
+#
+# GitHub Actions only executes workflows that live under `.github/workflows/`. This
+# file is kept in `ci/` because the personal access token used to publish this
+# repository does not carry the `workflow` scope, and GitHub rejects any push whose
+# commits touch `.github/workflows/` in that case:
+#
+#   ! [remote rejected] master -> master (refusing to allow a Personal Access Token
+#     to create or update workflow `.github/workflows/platform-postgres.yml`
+#     without `workflow` scope)
+#
+# Activation, either way (no security setting is changed for this):
+#   1. GitHub web UI: Actions -> New workflow -> create
+#      `.github/workflows/platform-postgres.yml` and paste this file verbatim; or
+#   2. grant the token the `workflow` scope and run, from the repository root:
+#        git mv ci/platform-postgres.yml .github/workflows/platform-postgres.yml
+#        git commit -m 'ci(platform): activate the PostgreSQL contract job'
+#        git push origin master
+#
+# Until one of those happens, the Platform PostgreSQL contract is NOT run by CI.
+
+name: Platform PostgreSQL contract
+
+# The Platform persistence guarantees -- row-level security, FORCE row-level
+# security, partial unique indexes, composite foreign keys, role boundaries -- are
+# PostgreSQL semantics. They cannot be simulated, so this job runs a real server and
+# executes the tests that skip everywhere else. A skip is not a pass: without this
+# job those 32 tests prove nothing.
+#
+# The test fixture (tests/persistence_fixture.py) provisions two logins, each a
+# member of exactly one platform role, both NOSUPERUSER and NOBYPASSRLS, and connects
+# through them -- so the policies are actually enforced rather than bypassed by a
+# superuser. scripts/check_platform_roles.py re-asserts those role attributes after
+# the run, so a fixture that ever provisioned a bypassing role would fail the job.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  platform-postgres:
+    name: Platform tests against PostgreSQL 16
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: forge-ci-admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # The administrator DSN the fixture migrates and provisions with.
+      FORGE_PLATFORM_TEST_DSN: postgresql://postgres:forge-ci-admin@127.0.0.1:5432/postgres
+      # Password for the two non-superuser logins the fixture creates.
+      FORGE_PLATFORM_TEST_APP_LOGIN_PASSWORD: persistence-test-login
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime and platform test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-platform.txt
+          python -c "import asyncpg, sys; print('asyncpg', asyncpg.__version__, '| python', sys.version.split()[0])"
+
+      - name: Confirm the server is reachable before the suite runs
+        run: python -B -X utf8 scripts/check_platform_server.py
+
+      - name: Full suite, including the PostgreSQL-dependent tests
+        run: python -B -X utf8 -m unittest discover -s tests -v
+
+      - name: Platform suite alone, so its result is visible on its own
+        run: |
+          python -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
+
+      - name: Assert the test logins cannot bypass row-level security
+        run: python -B -X utf8 scripts/check_platform_roles.py
