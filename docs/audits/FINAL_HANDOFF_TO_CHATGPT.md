@@ -216,3 +216,14 @@ budget of the session that produced this file. No test in the suite covers them,
 this document does not claim otherwise.
 
 An independent audit has **not** been performed; this file is the input for it.
+
+---
+
+## Update - finalization stage 1 (no fixes)
+
+The next session investigated Blocker #1 (artifact provenance) and stopped at a
+safe point without changing any code. See
+[`FINALIZATION_CHECKPOINT.md`](FINALIZATION_CHECKPOINT.md) for the verified
+starting state, the exact call sites, the agreed minimal design and the precise
+next operation. All four blockers recorded above remain unfixed, so the status
+`BLOCKED` still stands.
