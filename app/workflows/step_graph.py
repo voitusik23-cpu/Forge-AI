@@ -1203,6 +1203,14 @@ def read_step_graph_record(
         return StepGraphSnapshot.from_dict(payload), ""
     except StepGraphStateError as exc:
         return None, f"untrustworthy_step_graph_record:{exc}"
+    except (ValueError, TypeError) as exc:
+        # A malformed numeric or shape field raises a plain ValueError from int()/str()
+        # deeper down. This reader's documented contract is that it REPORTS such a
+        # record rather than raising it -- the recovery scan iterates records with no
+        # ``try`` of its own, so an escaping exception aborts the whole scan and a
+        # damaged record ends up looking like a broken project. It is therefore
+        # reported exactly like an explicitly refused one.
+        return None, f"untrustworthy_step_graph_record:{type(exc).__name__}: {exc}"
 
 
 def graph_from_declared_plan(
@@ -1229,7 +1237,16 @@ def graph_from_declared_plan(
         )
     definitions: list[StepDefinition] = []
     for entry in plan:
-        definition = StepDefinition.from_dict(entry)
+        try:
+            definition = StepDefinition.from_dict(entry)
+        except StepGraphStateError:
+            raise
+        except (ValueError, TypeError) as exc:
+            # The docstring promises StepGraphStateError for every malformed entry; a
+            # plain ValueError from a non-numeric field used to escape instead.
+            raise StepGraphStateError(
+                f"a saved step in the declared plan is malformed: {type(exc).__name__}: {exc}"
+            ) from exc
         recorded = entry.get("fingerprint")
         if recorded is not None and str(recorded) != definition.fingerprint():
             raise StepGraphStateError(
