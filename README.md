@@ -482,7 +482,7 @@ than planned. Status vocabulary is fixed: **IMPLEMENTED** (present in code),
 | `resume` refusing to derive `COMPLETED` without execution evidence | **BLOCKED** | open defect; see `docs/audits/FINALIZATION_CHECKPOINT.md` |
 | Damaged record is not overwritten on `run()` | **IN PROGRESS** | reader half fixed; writer half open |
 | GET routes are strictly read-only | **BLOCKED** | open defect; `GET /api/product/verification-plan` still writes durable state |
-| Platform persistence, RLS and application services | **BLOCKED locally; CI job prepared, not yet executed** | 32 tests skip without a server; `ci/platform-postgres.yml` (paste into `.github/workflows/` to activate) runs the real contract against PostgreSQL 16 and `scripts/check_platform_roles.py` proves the fixture logins cannot bypass RLS |
+| Platform persistence, RLS and application services | **BLOCKED locally; CI job prepared, not yet executed** | 32 tests skip without a server; `.github/workflows/platform-postgres.yml` runs the real contract against PostgreSQL 16 and `scripts/check_platform_roles.py` proves the fixture logins cannot bypass RLS |
 | Provider layer, agents, UI product flows | **IMPLEMENTED / PARTIALLY VERIFIED** | mock providers only; no live LLM run was performed |
 
 ### Verified commands

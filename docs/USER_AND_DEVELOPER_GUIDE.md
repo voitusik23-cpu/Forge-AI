@@ -242,10 +242,10 @@ $env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
 
 Until that runs, no Platform claim in this repository is verified.
 
-**CI job (prepared, not yet executed here).** `ci/platform-postgres.yml` -- the job
-definition lives outside `.github/workflows/` because the publishing token has no
-`workflow` scope; paste it into `.github/workflows/platform-postgres.yml` through the
-GitHub web UI (or push it with a scoped token) to activate it. It
+**CI job (active).** `.github/workflows/platform-postgres.yml` runs on every push to
+`master` and on demand. Its first run was triggered from the publisher's browser; the
+result is **not** recorded here, and this environment cannot read the Actions API, so
+whoever reads this should open the Actions tab for the current state. It
 runs exactly this contract on every push: a `postgres:16` service container, the
 driver from `requirements-platform.txt`, the full suite with a live
 `FORGE_PLATFORM_TEST_DSN`, then the Platform suites on their own, and finally
@@ -475,11 +475,10 @@ $env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
 
 Пока это не выполнено, ни одно утверждение о Platform в этом репозитории не проверено.
 
-**CI-задача (подготовлена, здесь ещё не выполнялась).** `ci/platform-postgres.yml` —
-определение задачи лежит вне `.github/workflows/`, потому что у токена публикации нет
-scope `workflow`; чтобы активировать, вставьте файл в
-`.github/workflows/platform-postgres.yml` через веб-интерфейс GitHub (или запушьте его
-токеном с этим scope). Задача прогоняет ровно этот контракт на каждый
+**CI-задача (активна).** `.github/workflows/platform-postgres.yml` запускается на каждый
+push в `master` и по требованию. Первый запуск был инициирован из браузера публикующего;
+его результат **здесь не зафиксирован**, а из этой среды API Actions недоступен — текущее
+состояние смотрите во вкладке Actions. Задача прогоняет ровно этот контракт на каждый
 push: сервис-контейнер `postgres:16`, драйвер из `requirements-platform.txt`, полный
 набор с живым `FORGE_PLATFORM_TEST_DSN`, затем отдельно наборы Platform и в конце
 `scripts/check_platform_roles.py` — задача падает, если хотя бы один из логинов

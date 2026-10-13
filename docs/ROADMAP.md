@@ -705,8 +705,7 @@ permission to start everything.
   round-trips.
 * **Actual status**: **BLOCKED** — no PostgreSQL server or driver on the
   development host; nothing was simulated to hide it. A GitHub Actions job
-  (`ci/platform-postgres.yml`, activated by pasting it into `.github/workflows/`)
-  runs the contract against a real
+  (`.github/workflows/platform-postgres.yml`) runs the contract against a real
   PostgreSQL 16 with a non-superuser, `NOBYPASSRLS` login pair; the job has **not
   been executed yet**, so the contract remains unverified.
 * **Open risks**: RLS behaviour cannot be approximated by another engine.
