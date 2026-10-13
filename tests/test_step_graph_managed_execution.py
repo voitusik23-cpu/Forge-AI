@@ -685,10 +685,56 @@ class VerificationTests(StepGraphCase):
         return {
             "one": self.declaration("one", WRITE_ONE),
             "nothing": self.declaration("nothing", MAKE_NOTHING),
+            # Declares the artifact the step verifies but never writes it, so the
+            # check can only pass if a matching path is mistaken for production.
+            "nothing_declared": self.declaration(
+                "nothing_declared", MAKE_NOTHING, artifact_targets=("made.txt",)
+            ),
             "artifact": self.declaration(
                 "artifact", MAKE_ARTIFACT, artifact_targets=("made.txt",)
             ),
         }
+
+    def test_a_preexisting_artifact_is_never_reported_as_produced(self) -> None:
+        """_INJECTION_TARGET_: existence is not production.
+
+        The file is written BEFORE the attempt and the step writes nothing, so no
+        attempt produced it. Goes red if a matching path alone yields PASSED --
+        the graph then reports COMPLETED for work that never happened, which is
+        exactly the behaviour measured before this fix.
+        """
+
+        (self.root / "made.txt").write_text("predates the run\n", encoding="utf-8")
+        graph = StepGraph(
+            graph_id="provenance-preexisting",
+            steps=(
+                StepDefinition(
+                    step_id="checked",
+                    action=StepAction("nothing_declared"),
+                    verification=StepVerification(
+                        VerificationKind.ARTIFACT_PRODUCED, artifact_target="made.txt"
+                    ),
+                ),
+            ),
+        )
+        runner = self.runner(
+            self.declarations(),
+            isolate_workspace=True,
+            artifacts_are_harvested=True,
+        )
+        result = runner.run(graph, "provenance-preexisting-run")
+
+        record = result.step("checked")
+        self.assertNotEqual(
+            record.verification_status,
+            VerificationStatus.PASSED,
+            record.to_dict(),
+        )
+        self.assertNotEqual(
+            result.status,
+            StepGraphStatus.COMPLETED,
+            record.to_dict(),
+        )
 
     def test_a_verification_failure_while_the_command_succeeded(self) -> None:
         graph = StepGraph(

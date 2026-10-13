@@ -19,6 +19,93 @@ from app.execution.artifacts import (
 from app.execution.secret_files import is_secret_directory, is_secret_file
 
 
+def _file_state(path: Path, *, max_bytes: int) -> dict[str, object]:
+    """Observable state of one file: existence, size, mtime and content digest.
+
+    ``mtime_ns`` is recorded but is never the proof on its own: a copy can preserve
+    it. The digest is what distinguishes "the file changed" from "the file is the
+    same file that was already there".
+    """
+
+    import hashlib
+
+    state: dict[str, object] = {
+        "exists": False,
+        "size_bytes": None,
+        "mtime_ns": None,
+        "sha256": None,
+        "unreadable": False,
+    }
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return state
+    except OSError:
+        state["unreadable"] = True
+        return state
+    state["exists"] = True
+    state["size_bytes"] = int(info.st_size)
+    state["mtime_ns"] = int(getattr(info, "st_mtime_ns", 0))
+    if int(info.st_size) > max_bytes:
+        # Too large to digest under the artifact bound; existence and size are still
+        # recorded, and the comparison reports "unknown" rather than guessing.
+        state["unreadable"] = True
+        return state
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        state["unreadable"] = True
+        return state
+    state["sha256"] = digest.hexdigest()
+    return state
+
+
+def snapshot_artifact_states(
+    root: "Path | None", targets: "Sequence[str]", *, max_bytes: int | None = None
+) -> dict[str, dict[str, object]]:
+    """State of every declared artifact target, taken **before** a command starts.
+
+    This is evidence, not authority: it lets a later harvest say whether the file it
+    measured was already there, unchanged, when the attempt began. Targets that are
+    unsafe or credential-shaped are skipped here exactly as the harvest refuses
+    them, so the snapshot never reads anything the harvest would not.
+    """
+
+    limit = DEFAULT_MAX_ARTIFACT_BYTES if max_bytes is None else max_bytes
+    snapshot: dict[str, dict[str, object]] = {}
+    if root is None:
+        return snapshot
+    base = Path(root).resolve()
+    for target in targets or ():
+        if not isinstance(target, str) or not target.strip():
+            continue
+        # An absolute or drive-qualified target is refused, never reinterpreted as
+        # a relative one: silently turning ``/etc/passwd`` into ``etc/passwd`` is the
+        # aliasing class of bug this file already paid for once.
+        if target.startswith(("/", "\\\\")) or (
+            len(target) > 1 and target[1] == ":"
+        ):
+            continue
+        clean = target.replace("\\", "/").strip("/")
+        if not clean or ".." in clean.split("/"):
+            continue
+        parts = clean.split("/")
+        if any(is_secret_directory(part) for part in parts[:-1]) or is_secret_file(
+            parts[-1]
+        ):
+            continue
+        try:
+            candidate = (base / clean).resolve(strict=False)
+            candidate.relative_to(base)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        snapshot[clean] = _file_state(candidate, max_bytes=limit)
+    return snapshot
+
+
 class EphemeralWorkspaceManager:
     """Manages an isolated temporary scratch workspace for a single execution run."""
 
@@ -141,6 +228,7 @@ class EphemeralWorkspaceManager:
         run_id: str,
         provenance_source: str = "execution",
         root: Path | None = None,
+        baseline: dict[str, dict[str, object]] | None = None,
     ) -> tuple[Artifact, ...]:
         """Harvest declared artifact targets from a trusted execution root.
 
@@ -193,12 +281,34 @@ class EphemeralWorkspaceManager:
             if not resolved_path.is_file():
                 continue
 
+            # Provenance: was this file already here, unchanged, when the attempt
+            # began? ``changed_by_this_attempt is True`` is the only value the
+            # verifier accepts as production; ``None`` means the question cannot be
+            # answered and is reported as unevaluable rather than as success.
+            before = (baseline or {}).get(clean_target)
+            after = _file_state(resolved_path, max_bytes=self._max_artifact_bytes)
+            if before is None or before.get("unreadable") or after.get("unreadable"):
+                changed: bool | None = None
+            elif not before.get("exists"):
+                changed = True
+            elif before.get("sha256") != after.get("sha256"):
+                changed = True
+            else:
+                changed = False
+            provenance = {
+                "existed_before": bool(before.get("exists")) if before else None,
+                "changed_by_this_attempt": changed,
+                "sha256_before": before.get("sha256") if before else None,
+                "size_before": before.get("size_bytes") if before else None,
+                "baseline_recorded_for": str(run_id),
+            }
             art = create_artifact_from_file(
                 resolved_path,
                 relative_path=clean_target,
                 run_id=run_id,
                 provenance_source=provenance_source,
                 max_bytes=self._max_artifact_bytes,
+                metadata=provenance,
             )
             harvested.append(art)
 

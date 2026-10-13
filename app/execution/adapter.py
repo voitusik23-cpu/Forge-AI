@@ -28,7 +28,10 @@ from app.execution.request import (
     ExecutionResult,
     ExecutionStatus,
 )
-from app.execution.workspace_manager import EphemeralWorkspaceManager
+from app.execution.workspace_manager import (
+    EphemeralWorkspaceManager,
+    snapshot_artifact_states,
+)
 from app.execution.sandbox import (
     RESIDUAL_RISK,
     WorkspaceBoundary,
@@ -438,6 +441,8 @@ class LocalExecutionAdapter:
 
         run_id = str(metadata.get("run_id") or request_id)
         provenance = str(metadata.get("command_executable") or intent.executable)
+        recorded_baseline = metadata.get("artifact_baseline")
+        baseline = recorded_baseline if isinstance(recorded_baseline, dict) else None
         try:
             if manager is not None:
                 artifacts = manager.harvest_artifacts(
@@ -445,6 +450,7 @@ class LocalExecutionAdapter:
                     run_id=run_id,
                     provenance_source=provenance,
                     root=root,
+                    baseline=baseline,
                 )
             else:
                 # No manager composed: bind one to the root being measured. It is
@@ -458,6 +464,7 @@ class LocalExecutionAdapter:
                     run_id=run_id,
                     provenance_source=provenance,
                     root=root,
+                    baseline=baseline,
                 )
         except Exception as exc:
             return ExecutionResult(
@@ -648,6 +655,18 @@ class LocalExecutionAdapter:
             )
 
         start_time = time.monotonic()
+        # Provenance baseline at the last moment before the child exists, taken from
+        # the SAME root the harvest will measure (the boundary root). A file already
+        # present here cannot later be reported as produced by this attempt. The
+        # snapshot only reads, inside the boundary, and never leaves the workspace.
+        try:
+            metadata["artifact_baseline"] = snapshot_artifact_states(
+                boundary.root,
+                intent.artifact_targets,
+                max_bytes=max_output_bytes,
+            )
+        except Exception:  # noqa: BLE001 - a missing baseline means 'unevaluable'
+            metadata["artifact_baseline"] = {}
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         start_new_session = (os.name != "nt")
 

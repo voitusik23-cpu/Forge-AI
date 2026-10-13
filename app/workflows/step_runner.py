@@ -1014,13 +1014,37 @@ class StepGraphRunner:
         target = verification.artifact_target
         artifacts = tuple(getattr(result, "artifacts", ()) or ())
         for artifact in artifacts:
-            if getattr(artifact, "relative_path", None) == target:
+            if getattr(artifact, "relative_path", None) != target:
+                continue
+            # A matching path is not proof that THIS attempt produced the file. The
+            # harvest compares the state it measured against the baseline taken just
+            # before the child was created, and records the answer. Only a proven
+            # change is a PASSED; an unchanged pre-existing file and an unavailable
+            # provenance are both unevaluable, never success.
+            provenance = dict(getattr(artifact, "metadata", {}) or {})
+            changed = provenance.get("changed_by_this_attempt")
+            if changed is True:
                 return (
                     VerificationStatus.PASSED,
                     f"artifact_produced={target} sha256={str(artifact.sha256)[:16]}",
                     "",
                     (),
                 )
+            if changed is False:
+                return (
+                    VerificationStatus.ERROR,
+                    f"artifact_preexisting_and_unchanged={target}",
+                    "the declared artifact already existed before this attempt and "
+                    "was not changed by it, so production is not demonstrated",
+                    ("verification_error:artifact_preexisting_and_unchanged",),
+                )
+            return (
+                VerificationStatus.ERROR,
+                f"artifact_provenance_unavailable={target}",
+                "the harvest did not record whether this attempt produced the "
+                "artifact",
+                ("verification_error:artifact_provenance_unavailable",),
+            )
         metadata = dict(getattr(result, "metadata", {}) or {})
         if metadata.get("artifact_error"):
             return (
