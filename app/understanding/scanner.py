@@ -101,18 +101,6 @@ class BoundedProjectScanner:
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
             relative_dir = Path(dirpath).relative_to(root_path)
             depth = 0 if relative_dir == Path(".") else len(relative_dir.parts)
-            if depth >= self.limits.max_depth and dirnames:
-                warnings.append(
-                    ScanWarning(
-                        warning_type="MAX_DEPTH_EXCEEDED",
-                        message=(
-                            f"Scanner reached maximum directory depth "
-                            f"({self.limits.max_depth}); traversal stopped."
-                        ),
-                        file_path=relative_dir.as_posix() if depth else None,
-                    )
-                )
-                dirnames[:] = []
 
             # 1. Prune ignored directories in-place.
             #
@@ -131,6 +119,26 @@ class BoundedProjectScanner:
                 and not d.startswith(".git")
                 and not is_secret_directory(d)
             ]
+
+            # 2. Enforce the depth bound on what is actually left to descend into.
+            #
+            # This check used to run before the prune and against the raw
+            # ``dirnames``, so a directory whose only children are ignored still
+            # produced MAX_DEPTH_EXCEEDED: a warning about traversal that was never
+            # cut short. Warning about a truncation that did not drop anything is
+            # the kind of false signal that trains a reader to ignore the warning.
+            if depth >= self.limits.max_depth and dirnames:
+                warnings.append(
+                    ScanWarning(
+                        warning_type="MAX_DEPTH_EXCEEDED",
+                        message=(
+                            f"Scanner reached maximum directory depth "
+                            f"({self.limits.max_depth}); traversal stopped."
+                        ),
+                        file_path=relative_dir.as_posix() if depth else None,
+                    )
+                )
+                dirnames[:] = []
 
             for filename in sorted(filenames):
                 if file_count >= self.limits.max_file_count:

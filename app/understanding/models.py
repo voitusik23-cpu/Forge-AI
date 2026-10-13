@@ -45,6 +45,12 @@ class StructuralFactType(str, Enum):
     MANIFEST_INVENTORIED = "MANIFEST_INVENTORIED"
 
 
+#: The depth limit exists to stop a scan exhausting resources, so it must itself be
+#: finite. 256 is far deeper than any real project nests while still bounding a
+#: walk; a caller asking for more is asking for no bound at all.
+_MAX_SCAN_DEPTH = 256
+
+
 @dataclass(frozen=True)
 class ScanLimits:
     """Configurable boundaries protecting static analysis from resource exhaustion."""
@@ -64,6 +70,11 @@ class ScanLimits:
             raise ValueError("max_file_count must be positive")
         if self.max_depth < 0:
             raise ValueError("max_depth must be non-negative")
+        if self.max_depth > _MAX_SCAN_DEPTH:
+            raise ValueError(
+                f"max_depth must not exceed {_MAX_SCAN_DEPTH}; a larger value is not "
+                "a bound"
+            )
         if self.parse_timeout_seconds <= 0:
             raise ValueError("parse_timeout_seconds must be positive")
 

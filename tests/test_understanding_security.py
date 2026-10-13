@@ -202,6 +202,48 @@ def regular_function():
             self.assertEqual(len(good_symbols), 1)
             self.assertEqual(good_symbols[0].details["symbol_name"], "good_func")
 
+    def test_max_depth_has_a_finite_upper_bound(self) -> None:
+        """A bound a caller can set to a billion is not a bound.
+
+        The depth limit exists to stop a scan exhausting resources, so an
+        effectively unlimited value defeats it. A large but finite depth stays
+        accepted.
+        """
+
+        for absurd in (10**9, 100_000, 257):
+            with self.assertRaises(ValueError, msg=repr(absurd)):
+                ScanLimits(max_depth=absurd)
+
+        self.assertEqual(ScanLimits(max_depth=256).max_depth, 256)
+
+    def test_the_depth_warning_only_fires_when_traversal_is_really_cut(self) -> None:
+        """A directory whose only children are ignored is not a truncation.
+
+        The check used to run before the ignore-prune and against the raw
+        ``dirnames``, so ``MAX_DEPTH_EXCEEDED`` was reported even though nothing
+        that would have been traversed was dropped.
+        """
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "root.py").write_text("root = True\n", encoding="utf-8")
+            one = root / "one"
+            one.mkdir()
+            (one / "f.py").write_text("f = True\n", encoding="utf-8")
+            (one / ".git").mkdir()
+
+            files, _facts, _manifests, warnings = BoundedProjectScanner(
+                limits=ScanLimits(max_depth=1)
+            ).scan(Workspace(root))
+
+            paths = {item.relative_path for item in files}
+            self.assertIn("one/f.py", paths)
+            self.assertEqual(
+                [w for w in warnings if w.warning_type == "MAX_DEPTH_EXCEEDED"],
+                [],
+                "a directory with only ignored children is not truncated",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
