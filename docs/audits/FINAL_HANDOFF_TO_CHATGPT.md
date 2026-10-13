@@ -340,3 +340,30 @@ Full suite: `Ran 2365 tests in 133.321s` / `OK (skipped=36)`.
 
 Blocker #4 (GET routes mutating durable state) remains open, so the overall status is
 still `BLOCKED`. Next stage: blocker #4, in its own change.
+
+---
+
+## Update - finalization stage 5 (Blocker #4 closed; Stage 1 blocker list empty)
+
+`GET /api/product/verification-plan` no longer writes durable state. Two implicit
+writes lived in the read path: `_resolve_baseline()` seeded and persisted a baseline
+record when none existed, and the same analysis merged stale-fact history through
+`_remember_stale_facts`. Answering the question therefore created or rewrote
+`project-baseline/state.json` (measured: `project-baseline/state.json was rewritten by
+a read`); `GET /api/product/change-impact` had the same defect.
+
+Recording is now explicit: `change_analysis(read_only=True)` (used by both GET routes)
+resolves a baseline in memory without persisting it and reports already-recorded
+history without extending it, while `POST /api/product/stale-facts` and
+`POST /api/product/baseline` keep their documented writes. Proven by a test that seeds
+through the write path, snapshots the store's own files by name and exact bytes, calls
+the route twice, and asserts nothing changed; reverting the fix reproduces the
+rewrite, and the restore was byte-exact.
+
+Full suite: `Ran 2366 tests in 135.295s` / `OK (skipped=36)`.
+
+All four Stage 1 blockers are now `FIXED_AND_TESTED` (#1 `6605e35`, #2 `a28c38a`,
+#3 `3b7d99e`/`90b2af7`/`0c61092`, #4 `fc5b098`). Stage 1 is **not** declared complete:
+independent verification has not happened, and the verification-contract question
+("verify a pre-existing state" cannot be expressed by any `VerificationKind`) still
+needs the owner's decision.

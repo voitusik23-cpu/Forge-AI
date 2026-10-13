@@ -349,3 +349,88 @@ unaffected.
 
 The Platform database suites still skip (32), as do the symlink tests (3) and the one
 needing `OPENAI_API_KEY`. SKIP is not PASS.
+
+---
+
+## Blocker #4 — FIXED_AND_TESTED (commit `fc5b098`)
+
+### Exact cause
+
+Two durable writes sat inside the product **read** path, both implicit side effects of
+computing a change analysis:
+
+1. `change_analysis()` resolved the baseline through `_resolve_baseline()`, which
+   **seeded and persisted** a baseline record when none existed (`_persist_baseline`).
+2. The same analysis called `stale_facts()`, which merged the stale-fact ids into the
+   baseline record (`_remember_stale_facts`).
+
+`GET /api/product/verification-plan` calls `change_analysis()`, so answering the
+question created or rewrote `project-baseline/state.json` -- measured as
+`project-baseline/state.json was rewritten by a read`. `GET /api/product/change-impact`
+had the same defect through its own seeding block.
+
+### The fix (behaviour, not suppression)
+
+Recording is now something a caller asks for:
+
+| Where | Change |
+|---|---|
+| `_resolve_baseline(..., *, persist: bool = True)` | a read-only caller still gets a usable in-memory baseline and simply does not create durable state |
+| `stale_facts(..., record_history: bool = True)` | with `record_history=False` it **reads** the already-recorded ids through the new `_recorded_stale_fact_ids()` and writes nothing; the response still carries `history_retained` |
+| `change_analysis(..., read_only: bool = False)` | passes `persist=not read_only` and `record_history=not read_only` |
+| `verification_plan` | calls `change_analysis(read_only=True)` |
+| `change_impact(..., read_only: bool = True)` | read-only by default; its GET route cannot seed a baseline |
+
+The POST paths keep their documented behaviour: `POST /api/product/stale-facts` still
+records history (its own docstring requires it, and `test_21` asserts it) and
+`POST /api/product/baseline` remains the documented way to create a baseline.
+
+### Evidence
+
+RED, before the fix, driving the real route and comparing the store's own files by
+name and exact bytes (not HTTP responses):
+
+```
+AssertionError: ... : project-baseline/state.json was rewritten by a read
+```
+
+GREEN: `Ran 1 test  OK`, then the whole file `Ran 35 tests  OK`.
+
+INJECTION: reverting only this change reproduced
+`project-baseline/state.json was rewritten by a read`; the restore was byte-exact
+(SHA-256 identical).
+
+The test seeds durable state through the **write** path first
+(`POST /api/product/baseline`) and asserts the store is non-empty before comparing, so
+it cannot pass vacuously; it then checks two consecutive
+`GET /api/product/verification-plan` calls, that the plan body is stable, and that the
+onboarding stage does not move.
+
+Related suites, all OK: block9 35, product_integration 93, api 15, api_exposure 16,
+recovery_and_project_memory 33, block10_http_errors 24 -- 216 tests.
+
+Full suite: `Ran 2366 tests in 135.295s` / `OK (skipped=36)`; `compileall` exit 0;
+`git diff --check` exit 0; secret scan 0.
+
+### Residuals
+
+* `_persist_baseline` and `_remember_stale_facts` remain reachable only from write
+  paths; a caller that constructs an `OperatingSurface` directly and asks for a
+  read-only analysis gets no baseline on disk until an explicit write happens. That is
+  the intended contract, but it is a behaviour change for any out-of-tree caller.
+* Concurrency between a read and an explicit write was not tested.
+* The 32 Platform database tests still skip (no PostgreSQL); 3 skip on symlinks; 1
+  needs `OPENAI_API_KEY`. SKIP is not PASS.
+
+### Stage 1 status: no open blockers
+
+| Blocker | Status |
+|---|---|
+| #1 artifact provenance | **FIXED_AND_TESTED** — `6605e35` |
+| #2 `resume` inventing completion | **FIXED_AND_TESTED** — `a28c38a` |
+| #3 damaged record | **FIXED_AND_TESTED** — `3b7d99e`, `90b2af7`, `0c61092` |
+| #4 GET mutating durable state | **FIXED_AND_TESTED** — `fc5b098` |
+
+The four Stage 1 blockers are closed. Stage 1 itself is **not** declared complete:
+`docs/ROADMAP.md` lists its remaining exit criteria (independent verification, and the
+verification-contract question that still needs an owner decision).
