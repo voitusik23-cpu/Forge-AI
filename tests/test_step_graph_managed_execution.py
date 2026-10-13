@@ -48,6 +48,9 @@ network, reads a key, or prints a secret value.
 
 from __future__ import annotations
 
+import hashlib
+from unittest.mock import patch
+
 import tempfile
 import threading
 import time
@@ -1380,6 +1383,119 @@ class RecoveryTests(StepGraphCase):
 
         self.assertEqual(resumed.status, StepGraphStatus.COMPLETED)
         self.assertEqual(resumed.step("a").status, StepStatus.SUCCEEDED)
+
+    # ------------------------------------------------------------------ blocker #3
+    #
+    # A record that exists but cannot be trusted is NOT the same as no record. The
+    # plain accessor ``recorded()`` collapses both into ``None``, so ``run()`` used
+    # to treat a damaged record as "nothing was attempted" and write a fresh graph
+    # over it. These tests drive the public ``run()`` and compare raw bytes.
+
+    def _write_damaged_state(self, run_id: str, damaged_graph: object) -> pathlib.Path:
+        self.run_store.write_state(
+            RunStateSnapshot(
+                run_id=run_id,
+                project_state={"step_graph": damaged_graph},
+            )
+        )
+        return self.run_store.state_path(run_id)
+
+    @staticmethod
+    def _digest(path: pathlib.Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _assert_refused_without_rewriting(self, run_id: str, damaged_graph: object) -> None:
+        """Drive ``run()`` over a damaged record and prove nothing was touched."""
+
+        graph = StepGraph(
+            graph_id="damaged-graph",
+            steps=(StepDefinition(step_id="a", action=StepAction("a")),),
+        )
+        state_path = self._write_damaged_state(run_id, damaged_graph)
+        before_bytes = state_path.read_bytes()
+        before_digest = self._digest(state_path)
+
+        runner = self.runner(self.declarations())
+        result = runner.run(graph, run_id)
+
+        self.assertFalse(result.executed, result.to_dict())
+        self.assertIs(result.status, StepGraphStatus.REFUSED)
+        self.assertIn("untrustworthy", result.stopped_reason)
+        # Nothing ran, so the refusal produced no side effects.
+        self.assertEqual(self.count_lines("a.txt"), 0)
+        # The damaged record is preserved byte for byte: not repaired, not replaced.
+        self.assertEqual(self._digest(state_path), before_digest)
+        self.assertEqual(state_path.read_bytes(), before_bytes)
+
+        # Asking again answers the same way and still does not erase the evidence.
+        again = self.runner(self.declarations()).run(graph, run_id)
+        self.assertFalse(again.executed)
+        self.assertIs(again.status, StepGraphStatus.REFUSED)
+        self.assertIn("untrustworthy", again.stopped_reason)
+        self.assertEqual(self._digest(state_path), before_digest)
+
+    def test_a_damaged_record_is_never_overwritten_by_a_new_run(self) -> None:
+        """_INJECTION_TARGET_: damaged is not absent.
+
+        Goes red if the read reason is discarded: the runner then starts a fresh
+        attempt and writes a new graph over a record it could not read.
+        """
+        self._assert_refused_without_rewriting(
+            "damaged-fields-run",
+            {
+                "schema": "forge.step_graph.v1",
+                "graph_id": "damaged-graph",
+                "graph_run_id": "damaged-fields-run",
+                "steps": [{"step_id": "a", "attempts": "not-a-number"}],
+            },
+        )
+
+    def test_an_unsupported_schema_version_is_not_treated_as_absent(self) -> None:
+        self._assert_refused_without_rewriting(
+            "damaged-schema-run",
+            {
+                "schema": "forge.step_graph.v99",
+                "graph_id": "damaged-graph",
+                "graph_run_id": "damaged-schema-run",
+                "steps": [],
+            },
+        )
+
+    def test_an_unreadable_structure_is_not_treated_as_absent(self) -> None:
+        self._assert_refused_without_rewriting("damaged-shape-run", "not-a-mapping")
+
+    def test_a_truly_absent_record_still_starts_a_new_attempt(self) -> None:
+        """The positive control: absence must keep working exactly as before."""
+
+        graph = StepGraph(
+            graph_id="absent-graph",
+            steps=(StepDefinition(step_id="a", action=StepAction("a")),),
+        )
+
+        result = self.runner(self.declarations()).run(graph, "absent-record-run")
+
+        self.assertTrue(result.executed, result.to_dict())
+        self.assertIs(result.status, StepGraphStatus.COMPLETED)
+        self.assertEqual(self.count_lines("a.txt"), 1)
+
+    def test_an_io_error_does_not_start_a_run_over_the_unknown_state(self) -> None:
+        """A read failure is not evidence that there is nothing to protect."""
+
+        graph = StepGraph(
+            graph_id="io-graph",
+            steps=(StepDefinition(step_id="a", action=StepAction("a")),),
+        )
+        runner = self.runner(self.declarations())
+
+        def explode(_run_id: str):
+            raise OSError("simulated read failure")
+
+        with patch.object(runner._run_store, "read_state", explode):
+            with self.assertRaises(OSError):
+                runner.run(graph, "io-error-run")
+
+        # The command never ran, so no side effect was produced.
+        self.assertEqual(self.count_lines("a.txt"), 0)
 
     def test_a_step_that_declares_no_check_keeps_its_execution_evidence(self) -> None:
         """A legitimate no-verification step is not broken by a universal rule.

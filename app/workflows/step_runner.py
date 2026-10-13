@@ -138,6 +138,16 @@ __all__ = [
 #: ``RunScope`` requires a non-empty acceptance declaration. A step-graph run is
 #: judged by its step records, not by this criterion, which exists only so the
 #: perimeter is never silently empty. Mirrors ``API_RUN_CRITERION``.
+_ABSENT_STEP_GRAPH_RECORD_REASONS = frozenset(
+    {"no_persisted_state", "no_project_state", "no_step_graph_record"}
+)
+"""Reasons the reader returns when there genuinely is no record to protect.
+
+Anything else means a record exists in a form this build refuses to trust, which is
+a different state from "nothing was attempted" -- see ``_attempt``.
+"""
+
+
 STEP_GRAPH_CRITERION = AcceptanceCriterion(
     criterion_id="step-graph-attempt-recorded",
     description="Every declared step of a managed step-graph attempt reaches a recorded verdict",
@@ -506,8 +516,17 @@ class StepGraphRunner:
             # deliberately done **before** the in-flight claim, because a missing or
             # untrustworthy record is a refusal that needs no claim at all, and
             # because the claim's refusal path must not read the store.
-            existing_for_plan = self.recorded(graph_run_id)
+            existing_for_plan, plan_reason = self.recorded_or_reason(graph_run_id)
             if existing_for_plan is None:
+                if plan_reason not in _ABSENT_STEP_GRAPH_RECORD_REASONS:
+                    # A record is there; it just cannot be trusted. Claiming there is
+                    # none would be false and would invite a fresh attempt over
+                    # evidence that still exists on disk.
+                    raise StepGraphStateError(
+                        f"the persisted step-graph record for {graph_run_id!r} cannot "
+                        f"be trusted ({plan_reason}); a resume never starts a new "
+                        "attempt over an unreadable record"
+                    )
                 raise StepGraphStateError(
                     f"no persisted step-graph record for {graph_run_id!r}; a resume "
                     "requires one and never starts a new attempt"
@@ -543,7 +562,27 @@ class StepGraphRunner:
                 finished_at=self._now(),
             )
         try:
-            existing = self.recorded(graph_run_id)
+            # Read the record *and* the reason it is absent. ``recorded()`` collapses
+            # "no attempt was recorded" and "an attempt was recorded in a form this
+            # build refuses to trust" into the same ``None``; that collapse is what let
+            # a damaged record be treated as absent and then overwritten.
+            existing, read_reason = self.recorded_or_reason(graph_run_id)
+            if existing is None and read_reason not in _ABSENT_STEP_GRAPH_RECORD_REASONS:
+                # Refuse before any snapshot is built, any command runs or any byte is
+                # written: the existing record is preserved exactly as it is and the
+                # reason travels with the result instead of being discarded.
+                return StepGraphResult(
+                    graph_id=graph.graph_id,
+                    graph_run_id=graph_run_id,
+                    status=StepGraphStatus.REFUSED,
+                    steps=(),
+                    stopped_reason=f"untrustworthy_step_graph_record:{read_reason}",
+                    executed_steps=0,
+                    executed=False,
+                    idempotency_degraded=self._idempotency_guard.degraded,
+                    started_at=started_at,
+                    finished_at=self._now(),
+                )
             if existing is not None and not resume:
                 return self._result_from_snapshot(
                     existing,

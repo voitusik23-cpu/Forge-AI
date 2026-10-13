@@ -1197,8 +1197,15 @@ def read_step_graph_record(
     if not isinstance(project_state, Mapping):
         return None, "no_project_state"
     payload = project_state.get(STEP_GRAPH_PROJECT_STATE_KEY)
-    if not isinstance(payload, Mapping):
+    if payload is None:
         return None, "no_step_graph_record"
+    if not isinstance(payload, Mapping):
+        # The key is present and holds something that is not a record at all. Reporting
+        # this as "no record" conflated an invalid structure with an absent one, and a
+        # caller that trusts the reason would then start a new attempt over it.
+        return None, (
+            f"untrustworthy_step_graph_record:not_a_mapping:{type(payload).__name__}"
+        )
     try:
         return StepGraphSnapshot.from_dict(payload), ""
     except StepGraphStateError as exc:
