@@ -367,3 +367,26 @@ All four Stage 1 blockers are now `FIXED_AND_TESTED` (#1 `6605e35`, #2 `a28c38a`
 independent verification has not happened, and the verification-contract question
 ("verify a pre-existing state" cannot be expressed by any `VerificationKind`) still
 needs the owner's decision.
+
+---
+
+## Update - audit finding F-1 closed
+
+`run()` no longer echoes a stored `COMPLETED` that its own records do not justify.
+`_result_from_snapshot` used to return `status=snapshot.status` verbatim while the
+evidence screen introduced by `a28c38a` lived only in `_resume_snapshot`, so the same
+record was `COMPLETED` through `run` and `INDETERMINATE` through `resume` (audit probe:
+`run() -> COMPLETED | executed: False`, `resume() -> INDETERMINATE`).
+
+The screen now lives in one place, `StepGraphRunner._screen_saved_record`, and
+`_screen_snapshot` applies it to every saved record and re-derives the graph status from
+them. Both entry points use it; the screened snapshot stays in memory, and the stored
+bytes are asserted unchanged. Reproduced first (4 failures, including
+`COMPLETED != INDETERMINATE`), fixed in `45cdcd1`, proven by injection with a
+byte-exact restore.
+
+Full suite: `Ran 2373 tests in 146.682s` / `OK (skipped=36)`.
+
+Audit finding **F-2** (baseline/harvest size limits disagree: a >1 MiB pre-existing
+artifact modified by the attempt yields `artifact_provenance_unavailable` instead of
+production) is **still open** and is the next task.

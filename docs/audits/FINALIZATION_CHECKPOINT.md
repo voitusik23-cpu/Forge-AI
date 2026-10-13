@@ -434,3 +434,78 @@ Full suite: `Ran 2366 tests in 135.295s` / `OK (skipped=36)`; `compileall` exit 
 The four Stage 1 blockers are closed. Stage 1 itself is **not** declared complete:
 `docs/ROADMAP.md` lists its remaining exit criteria (independent verification, and the
 verification-contract question that still needs an owner decision).
+
+---
+
+## Audit finding F-1 — FIXED_AND_TESTED (commit `45cdcd1`)
+
+### The inconsistency the audit measured
+
+`run()` over an already-recorded snapshot echoed the stored status
+(`_result_from_snapshot` returned `status=snapshot.status`), while `resume()` screened
+the same records for execution evidence. The same record was therefore `COMPLETED`
+through one entry point and `INDETERMINATE` through the other. Measured by the audit
+probe:
+
+```
+PROBE2 run()    -> StepGraphStatus.COMPLETED | executed: False
+PROBE2 resume() -> StepGraphStatus.INDETERMINATE
+```
+
+### The fix
+
+The evidence screen was extracted from `_resume_snapshot` into
+`StepGraphRunner._screen_saved_record(record)` — one implementation, not a copy — and a
+new `_screen_snapshot(snapshot)` applies it to every saved record and **re-derives** the
+graph status from the screened records (`derive_graph_status`, with the snapshot's
+`cancelled` flag). Both entry points now go through it: `resume` via its existing loop,
+`run` via the `already_recorded` path. No new `VerificationKind`, no API change, no new
+write path: the screened snapshot is in-memory only, and the stored bytes are asserted
+unchanged.
+
+### RED → GREEN → INJECTION
+
+RED, before the fix, four failures:
+
+```
+FAIL test_an_unproven_saved_completion_is_not_returned_by_run        (COMPLETED)
+FAIL test_an_unrun_declared_check_is_not_confirmation_by_run         (COMPLETED)
+FAIL test_contradictory_recorded_evidence_is_not_completed_by_run    (COMPLETED)
+FAIL test_run_and_resume_agree_about_the_same_record
+     AssertionError: COMPLETED != INDETERMINATE
+```
+
+GREEN: `Ran 50 tests in 5.486s  OK`.
+
+INJECTION: reverting the change reproduced exactly those four failures; the restore was
+byte-exact (SHA-256 identical).
+
+### Tests added (7, all through the public store and `run()`)
+
+1. an unproven saved completion is not returned by `run()` (and the record is not
+   rewritten);
+2. `run()` and `resume()` agree about the same record;
+3. `run()` over a saved record is deterministic and never rewrites it;
+4. **positive control**: a fully evidenced record is still returned as `COMPLETED`;
+5. a step that declares no check still completes (legitimate step types unaffected);
+6. contradictory recorded evidence (`EXECUTION_TIMEOUT`) is not completed;
+7. an unrun declared `EXIT_CODE` check is not confirmation.
+
+Related suites, all OK: recovery_and_project_memory 33, artifact_provenance 9,
+step_graph_record_robustness 5, run_store_id_containment 6, block9 35,
+product_integration 93, block10_http_errors 24 — 205 tests.
+
+Full suite: `Ran 2373 tests in 146.682s` / `OK (skipped=36)`; `compileall` exit 0;
+`git diff --check` exit 0; secret scan 0.
+
+### Behaviour change to be aware of
+
+`run()` on an existing record whose evidence does not support its stored status now
+reports `INDETERMINATE` (with `stopped_reason="already_recorded"`) instead of echoing
+the claim. Records with complete evidence are unaffected, as the positive controls show.
+
+### F-2 remains open
+
+The baseline/harvest size-limit mismatch found by the same audit (a >1 MiB modified
+artifact reporting `artifact_provenance_unavailable`) is **not** addressed here, by
+explicit scope. It is the next task.
