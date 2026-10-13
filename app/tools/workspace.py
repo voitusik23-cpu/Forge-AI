@@ -1,9 +1,10 @@
 """Explicit filesystem boundary for workspace-scoped tools."""
 
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.execution.identity import WorkspaceIdentity
 from app.execution.paths import PathSecurityError, normalize_workspace_relative_path
 
 
@@ -13,9 +14,17 @@ class WorkspacePathError(ValueError):
 
 @dataclass(frozen=True)
 class Workspace:
-    """An existing absolute directory explicitly supplied for one Run."""
+    """An existing absolute directory explicitly supplied for one Run.
+
+    The boundary is bound to the directory itself, not just to its path.  A path
+    string is not an identity: renaming the directory away and creating a different
+    one at the same path leaves the path identical, and a boundary that compared
+    only the path served the replacement's files.  The identity is captured here,
+    when the boundary is opened, and re-checked on every operation.
+    """
 
     root: Path | str
+    _identity: "WorkspaceIdentity | None" = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         try:
@@ -27,7 +36,14 @@ class Workspace:
             raise WorkspacePathError("workspace root is unavailable") from exc
         if not root.is_dir():
             raise WorkspacePathError("workspace root must be a directory")
+        try:
+            identity = WorkspaceIdentity.capture(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            # No identity means no way to tell this directory from a replacement,
+            # so the boundary refuses rather than continuing unprotected.
+            raise WorkspacePathError("workspace root is unavailable") from exc
         object.__setattr__(self, "root", root)
+        object.__setattr__(self, "_identity", identity)
 
     @staticmethod
     def normalize_relative_path(value: object) -> tuple[str, ...]:
@@ -94,7 +110,8 @@ class Workspace:
         return target
 
     def assert_available(self) -> None:
-        """Fail closed if the supplied workspace root disappeared or changed type."""
+        """Fail closed if the workspace root disappeared, changed type, or was replaced."""
+
         try:
             info = self.root.lstat()
             attributes = getattr(info, "st_file_attributes", 0)
@@ -108,6 +125,11 @@ class Workspace:
                 or is_reparse_point
             ):
                 raise WorkspacePathError("workspace root is unavailable")
+            if self._identity is not None and not self._identity.matches(self.root):
+                raise WorkspacePathError(
+                    "workspace root was replaced: the directory at that path is not "
+                    "the one this boundary was opened on"
+                )
         except (OSError, RuntimeError) as exc:
             raise WorkspacePathError("workspace root is unavailable") from exc
 

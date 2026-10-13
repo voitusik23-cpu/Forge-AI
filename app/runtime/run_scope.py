@@ -486,13 +486,24 @@ class RunScope:
             )
 
     def validate_workspace(self, workspace: Workspace | None) -> None:
-        """Reject a workspace that differs from the frozen perimeter."""
+        """Reject a workspace that differs from the frozen perimeter.
+
+        Both the path and the directory identity are compared.  A workspace whose
+        path equals the frozen one but whose directory was replaced at that path is
+        a different workspace, and comparing only the path let the replacement
+        through to every tool that resolves targets through it.
+        """
         if workspace is None:
             return
         if not isinstance(workspace, Workspace):
             raise RunScopeError("workspace must be a Workspace contract")
         if workspace.root != self.workspace.root:
             raise RunScopeError("run scope cannot change the workspace root")
+        if self.workspace_identity is None or not self.workspace_identity.matches(workspace.root):
+            raise RunScopeError(
+                "run scope cannot change the workspace root identity: the directory "
+                "at that path is not the frozen one"
+            )
 
     def validate_acceptance_criteria(
         self, criteria: Sequence[AcceptanceCriterion] | None
@@ -629,7 +640,15 @@ class RunScope:
         if resolved != self.workspace.root:
             raise RunScopeError("run scope cannot change the workspace root")
         if self.workspace_identity is None or not self.workspace_identity.matches(workspace_root):
-            raise RunScopeError("run scope cannot change the workspace identity")
+            # The message names the workspace root on purpose: the coordinator maps a
+            # refusal containing "workspace root" to the dedicated
+            # ``workspace_root_mismatch`` reason, so a replaced directory is reported
+            # as the workspace disagreement it is instead of a generic scope
+            # violation. It also states the identity, which is what actually changed.
+            raise RunScopeError(
+                "run scope cannot change the workspace root: the workspace identity "
+                "at that path no longer matches the frozen one"
+            )
 
     def validate_execution_request(self, request: ExecutionRequest) -> None:
         """Reject an execution request that leaves the frozen perimeter."""
