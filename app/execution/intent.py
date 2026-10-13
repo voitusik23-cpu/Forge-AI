@@ -199,13 +199,34 @@ class IntentBuilder:
         environment_variables: tuple[tuple[str, str], ...],
         profile_environment_variables: tuple[tuple[str, str], ...],
     ) -> str:
-        """Pin a bare executable path while retaining its logical policy identity."""
+        """Pin a bare executable path while retaining its logical policy identity.
+
+        A bare name is not an identity.  The operating system resolves it at spawn
+        time against the *child's* PATH, which is built from a whitelist and need
+        not be the PATH this pin was resolved against, while the pin itself is part
+        of the fingerprint an approver signs.  Measured before this change: one
+        approved fingerprint executed two different images depending on PATH.
+
+        The builder stays total on purpose: a policy decision about a command must
+        still be able to say "that command is not allowed" instead of failing while
+        describing it.  An unresolvable bare executable therefore yields an **empty**
+        pin, and the adapter refuses to launch an unpinned bare command -- the
+        refusal happens at the last gate before a process exists, which is where the
+        property "the launched image is the authorized image" has to hold.
+        """
         if self._executable is None or not is_bare_executable(self._executable):
             return self._executable or ""
         env = dict(profile_environment_variables)
         env.update(dict(environment_variables))
-        resolved = shutil.which(self._executable, path=env.get("PATH") or os.environ.get("PATH"))
-        return canonical_executable(resolved) if resolved else self._executable
+        # A declared PATH is used exactly as declared: an empty declaration means
+        # "search nowhere", and substituting the process PATH would resolve a binary
+        # the declaration never named.
+        declared_path = env.get("PATH")
+        search_path = os.environ.get("PATH") if declared_path is None else declared_path
+        resolved = shutil.which(self._executable, path=search_path)
+        if not resolved or not os.path.isabs(resolved):
+            return ""
+        return canonical_executable(resolved)
 
     @classmethod
     def from_request(
