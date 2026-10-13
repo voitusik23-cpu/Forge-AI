@@ -10,8 +10,9 @@ whatever settings they guessed.
 This module is the one place the bind address and port are decided:
 
 * **loopback by default** (``FORGE_API_HOST`` / ``FORGE_API_PORT``);
-* a loud ``RuntimeWarning`` when asked to bind beyond loopback, because the surface has
-  no authentication and that is not something to discover later;
+* a **refusal** to bind beyond loopback: :func:`app.api.server.warn_if_exposed` raises
+  before the application is built and before ``uvicorn`` starts, because this surface
+  has no authentication and exposing it is not something this launcher does on request;
 * no deployment topology is invented. Choosing a real production serving model is the
   owner's decision, recorded as an open question, not something this file settles.
 """
