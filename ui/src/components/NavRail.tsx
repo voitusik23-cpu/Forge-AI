@@ -1,3 +1,4 @@
+import type { ReactElement } from "react";
 import { ForgeMark, IconSearch } from "./Icons";
 import {
   IconAgents,
@@ -12,10 +13,11 @@ import {
 } from "./Icons";
 import { t, type Lang } from "../i18n";
 import { StatusDot } from "./Primitives";
+import type { ThemeMode } from "../appearance";
 
-const ITEMS: Array<{ id: string; key: string; Icon: (p: { size?: number }) => JSX.Element; badge?: string }> = [
+const ITEMS: Array<{ id: string; key: string; Icon: (p: { size?: number }) => ReactElement; badge?: string }> = [
   { id: "overview", key: "nav.overview", Icon: IconOverview },
-  { id: "projects", key: "nav.projects", Icon: IconProjects, badge: "3" },
+  { id: "projects", key: "nav.projects", Icon: IconProjects, badge: "1" },
   { id: "agents", key: "nav.agents", Icon: IconAgents },
   { id: "models", key: "nav.models", Icon: IconModels },
   { id: "runs", key: "nav.runs", Icon: IconRuns },
@@ -95,15 +97,21 @@ export const TopBar = ({
   project,
   coreLabel,
   coreTone,
+  themeMode,
+  onCycleTheme,
+  onHelp,
 }: {
   lang: Lang;
   onLanguage: (lang: Lang) => void;
   project: string;
   coreLabel: string;
   coreTone: "ok" | "warn" | "danger" | "idle";
+  themeMode: ThemeMode;
+  onCycleTheme: () => void;
+  onHelp: () => void;
 }) => (
   <header className="topbar">
-    <button className="project-switch">
+    <button className="project-switch" onClick={onHelp} title={t(lang, "help.how")}>
       <span className="dot ok" />
       <span>
         <span className="title">{project}</span>
@@ -124,6 +132,12 @@ export const TopBar = ({
         <StatusDot tone={coreTone} />
         <span className="small">{coreLabel}</span>
       </span>
+      <button className="btn small" onClick={onCycleTheme} title={t(lang, "appearance.cycle")}>
+        {t(lang, `appearance.theme.${themeMode}`)}
+      </button>
+      <button className="btn small" onClick={onHelp} title={t(lang, "help.how")}>
+        ?
+      </button>
       <div className="segment">
         <button className={lang === "ru" ? "on" : ""} onClick={() => onLanguage("ru")}>
           RU

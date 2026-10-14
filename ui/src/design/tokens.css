@@ -1,6 +1,12 @@
 /* FORGE AI design tokens. One source of truth for colour, type, space and motion.
-   The palette is the agreed one: Space Navy base, Graphite surfaces, Electric Violet and
-   Cyan accents, Ice White text. Nothing here is a widget-library default. */
+
+   The palette is the agreed one -- Space Navy base, Graphite surfaces, Electric Violet and
+   Cyan accents, Ice White text -- and every theme switch below only changes variables. No
+   component knows which theme is active, which is what keeps Light and Dark both finished.
+
+   Accents deliberately redefine the *primary* variables (--violet*) instead of introducing a
+   new name: every existing rule already builds on those, so an accent change repaints the
+   whole interface without touching a single component. */
 
 :root {
   /* surfaces */
@@ -11,8 +17,20 @@
   --graphite-hi: #1f2a42;
   --hairline: rgba(148, 172, 255, 0.14);
   --hairline-strong: rgba(148, 172, 255, 0.26);
+  --aurora: 0.20;
+  --surface-rail: linear-gradient(180deg, rgba(12, 18, 34, 0.92), rgba(8, 12, 24, 0.86));
+  --surface-topbar: linear-gradient(180deg, rgba(10, 16, 32, 0.86), rgba(10, 16, 32, 0.35));
+  --surface-card: linear-gradient(180deg, rgba(24, 33, 54, 0.72), rgba(11, 17, 32, 0.72));
+  --surface-raised: rgba(18, 26, 43, 0.6);
+  --surface-hover: rgba(31, 42, 66, 0.8);
+  --surface-input: rgba(6, 9, 21, 0.55);
+  --surface-sunken: rgba(148, 172, 255, 0.08);
+  --surface-auth: linear-gradient(160deg, #080d1c, #05070f);
+  --ok-text: #b8f3dc;
+  --warn-text: #f7e2b0;
+  --danger-text: #ffd2da;
 
-  /* accents */
+  /* accents (primary pair, replaced by [data-accent]) */
   --violet: #7c5cff;
   --violet-hi: #9a80ff;
   --violet-dim: rgba(124, 92, 255, 0.16);
@@ -60,4 +78,90 @@
   --t-micro: 10.5px;
 
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --speed: 160ms;
+}
+
+/* ------------------------------------------------------------------ light appearance */
+:root[data-theme="light"] {
+  --space: #eef2fb;
+  --space-raised: #ffffff;
+  --graphite: #ffffff;
+  --graphite-raised: #f6f8ff;
+  --graphite-hi: #e9eefb;
+  --hairline: rgba(21, 34, 64, 0.14);
+  --hairline-strong: rgba(21, 34, 64, 0.26);
+  --aurora: 0.10;
+  --surface-rail: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(243, 246, 255, 0.9));
+  --surface-topbar: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.6));
+  --surface-card: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(246, 249, 255, 0.94));
+  --surface-raised: rgba(255, 255, 255, 0.78);
+  --surface-hover: rgba(232, 238, 251, 0.95);
+  --surface-input: rgba(255, 255, 255, 0.85);
+  --surface-sunken: rgba(21, 34, 64, 0.05);
+  --surface-auth: linear-gradient(160deg, #f3f6ff, #e4eaff);
+  --ok-text: #0b6b4a;
+  --warn-text: #8a5a12;
+  --danger-text: #9b2c45;
+
+  --ice: #101a33;
+  --ice-dim: #2f3d5f;
+  --muted: #5b6884;
+  --faint: #8b96b4;
+
+  --ok: #0f9d6c;
+  --warn: #b7791f;
+  --danger: #c2425c;
+
+  --shadow-panel: 0 16px 40px rgba(21, 34, 64, 0.12);
+  --glow-violet: 0 0 0 1px rgba(124, 92, 255, 0.30), 0 10px 24px rgba(124, 92, 255, 0.16);
+  --glow-cyan: 0 0 0 1px rgba(14, 165, 190, 0.30), 0 10px 24px rgba(34, 211, 238, 0.16);
+}
+
+/* ------------------------------------------------------------------------ accent sets */
+:root[data-accent="cyan"] {
+  --violet: #22d3ee;
+  --violet-hi: #67e8f9;
+  --violet-dim: rgba(34, 211, 238, 0.18);
+  --cyan: #7c5cff;
+  --cyan-hi: #9a80ff;
+  --cyan-dim: rgba(124, 92, 255, 0.14);
+  --glow-violet: 0 0 0 1px rgba(34, 211, 238, 0.35), 0 10px 30px rgba(34, 211, 238, 0.22);
+  --glow-cyan: 0 0 0 1px rgba(124, 92, 255, 0.32), 0 10px 30px rgba(124, 92, 255, 0.16);
+}
+
+:root[data-accent="amber"] {
+  --violet: #f0a63c;
+  --violet-hi: #ffc86b;
+  --violet-dim: rgba(240, 166, 60, 0.18);
+  --cyan: #5b8cff;
+  --cyan-hi: #8fb0ff;
+  --cyan-dim: rgba(91, 140, 255, 0.14);
+  --glow-violet: 0 0 0 1px rgba(240, 166, 60, 0.38), 0 10px 30px rgba(240, 166, 60, 0.22);
+}
+
+:root[data-accent="emerald"] {
+  --violet: #2fbf8f;
+  --violet-hi: #63dcb0;
+  --violet-dim: rgba(47, 191, 143, 0.18);
+  --cyan: #4f9dff;
+  --cyan-hi: #86bcff;
+  --cyan-dim: rgba(79, 157, 255, 0.14);
+  --glow-violet: 0 0 0 1px rgba(47, 191, 143, 0.38), 0 10px 30px rgba(47, 191, 143, 0.20);
+}
+
+/* --------------------------------------------------------------------------- density */
+:root[data-density="compact"] {
+  --sp-5: 16px;
+  --sp-6: 22px;
+  --sp-7: 30px;
+  --t-body: 13px;
+  --t-title: 20px;
+  --t-display: 28px;
+}
+
+/* ---------------------------------------------------------------------------- motion */
+:root[data-motion="reduced"] * {
+  animation: none !important;
+  transition-duration: 1ms !important;
+  scroll-behavior: auto !important;
 }

@@ -1,9 +1,39 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-theme="dark" data-accent="violet" data-density="comfortable" data-motion="full">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>FORGE AI — Command Center</title>
+    <script>
+      // Applied before the bundle is fetched: the stored appearance is in place for the first
+      // paint, so switching to Light never flashes a white page on start-up.
+      (function () {
+        try {
+          var stored = JSON.parse(localStorage.getItem("forge.appearance") || "{}");
+          var query = new URLSearchParams(location.search);
+          if (query.get("theme")) stored.theme = query.get("theme");
+          if (query.get("accent")) stored.accent = query.get("accent");
+          if (query.get("density")) stored.density = query.get("density");
+          if (query.get("motion") === "reduced") stored.reducedMotion = true;
+
+          var mode = stored.theme === "light" || stored.theme === "dark" || stored.theme === "system"
+            ? stored.theme
+            : "dark";
+          var dark = mode === "system"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches
+            : mode === "dark";
+          var root = document.documentElement;
+          root.dataset.theme = dark ? "dark" : "light";
+          if (["violet", "cyan", "amber", "emerald"].indexOf(stored.accent) >= 0) {
+            root.dataset.accent = stored.accent;
+          }
+          if (stored.density === "compact") root.dataset.density = "compact";
+          if (stored.reducedMotion) root.dataset.motion = "reduced";
+        } catch (error) {
+          /* defaults already set in the html tag */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
