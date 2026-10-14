@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { NavRail, TopBar } from "./components/NavRail";
 import { Overview } from "./screens/Overview";
+import { Agents } from "./screens/Agents";
 import { Auth } from "./screens/Auth";
 import { loadBackend, type BackendState } from "./api/client";
 import { t, type Lang } from "./i18n";
@@ -18,7 +19,12 @@ export const App = () => {
   const [lang, setLang] = useState<Lang>(params.get("lang") === "en" ? "en" : "ru");
   const [screen, setScreen] = useState<"app" | "auth">(params.get("screen") === "auth" ? "auth" : "app");
   const [backend, setBackend] = useState<BackendState>({ status: "loading" });
-  const [nav, setNav] = useState("overview");
+  const [nav, setNav] = useState(params.get("nav") ?? "overview");
+
+  const reload = useCallback(async () => {
+    setBackend({ status: "loading" });
+    setBackend(await loadBackend());
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -62,20 +68,20 @@ export const App = () => {
           coreLabel={live ? `core ${String(backend.core.core ?? "")}` : backend.status === "loading" ? "checking..." : "offline"}
           coreTone={coreTone}
         />
-        {nav === "overview" ? (
-          <Overview lang={lang} backend={backend} />
-        ) : (
+        {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}
+        {nav === "agents" ? <Agents lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}
+        {nav !== "overview" && nav !== "agents" ? (
           <div className="content">
             <div className="card">
               <div className="card-title">{t(lang, `nav.${nav}`)}</div>
               <p className="muted small" style={{ marginTop: 8 }}>
                 {lang === "ru"
-                  ? "Этот раздел переносится после утверждения экрана Overview."
-                  : "This section is migrated after the Overview screen is approved."}
+                  ? "Этот раздел переносится после проверки разделов Overview и Agents."
+                  : "This section is migrated after Overview and Agents are verified."}
               </p>
             </div>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
