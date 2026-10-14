@@ -559,7 +559,7 @@ Last recorded full run on the tree that includes the artifact-provenance fix:
 | `resume` не выводит `COMPLETED` без доказательств исполнения | **BLOCKED** | открытый дефект; см. `docs/audits/FINALIZATION_CHECKPOINT.md` |
 | Повреждённая запись не затирается при `run()` | **IN PROGRESS** | половина читателя закрыта, половина записи — нет |
 | GET-маршруты строго read-only | **BLOCKED** | открытый дефект: `GET /api/product/verification-plan` пишет durable state |
-| Platform: persistence, RLS, application services | **BLOCKED** (среда) | нужен живой PostgreSQL; здесь 32 теста пропускаются |
+| Platform: persistence, RLS, application services | **VERIFIED** (локальный PostgreSQL 17.11 и CI) | `Ran 328 tests` / `OK` против настоящего сервера; найден и исправлен дефект фикстуры, который прежде был недостижим; job в `.github/workflows/platform-postgres.yml` гоняет контракт на `postgres:16` |
 | Провайдеры, агенты, продуктовый UI | **IMPLEMENTED / ЧАСТИЧНО VERIFIED** | только mock-провайдеры; живой прогон LLM не выполнялся |
 
 Проверенные команды, требования к окружению, известные ограничения и карта
