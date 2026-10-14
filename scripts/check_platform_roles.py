@@ -7,6 +7,11 @@ provisions its two logins with ``NOSUPERUSER NOBYPASSRLS`` precisely for that re
 this script re-checks the attributes in the live cluster after a run, so a fixture that
 ever regressed would fail the job instead of quietly weakening the evidence.
 
+Membership is reported but NOT required: the fixture revokes it in ``__aexit__`` on
+purpose, so after a full run the logins legitimately belong to no platform role. What
+must hold is that the logins exist at all (otherwise the suite never ran) and that
+neither can bypass row-level security.
+
 Usage::
 
     FORGE_PLATFORM_TEST_DSN=postgresql://postgres:...@127.0.0.1:5432/postgres \\
@@ -67,20 +72,26 @@ async def _inspect(dsn: str) -> int:
             )
             memberships = {record["rolname"] for record in members}
             expected = EXPECTED_MEMBERSHIP[login]
-            print(f"{login}: member of {sorted(memberships)}")
-            if not expected.issubset(memberships):
-                failures.append(f"{login} is not a member of {sorted(expected)}")
-            # One login in both platform roles would let a tenant connection step
-            # into the system scope; the boundary would then exist only in prose.
-            extra = memberships - expected
-            if extra:
-                failures.append(f"{login} holds unexpected memberships {sorted(extra)}")
+            # Reported, not required: the fixture revokes membership in __aexit__.
+            # A membership that is present must still be the right one -- a login in
+            # both platform roles would let tenant traffic step into the system scope.
+            print(
+                f"{login}: member of {sorted(memberships)} "
+                f"(expected during a run: {sorted(expected)}; "
+                "revoked at teardown by design)"
+            )
+            unexpected = memberships - expected
+            if unexpected:
+                failures.append(f"{login} holds unexpected memberships {sorted(unexpected)}")
 
         if failures:
             for failure in failures:
                 print(f"FAIL: {failure}", file=sys.stderr)
             return 1
-        print("OK: both logins are NOSUPERUSER, NOBYPASSRLS and scoped to one role each")
+        print(
+            "OK: both logins exist, are NOSUPERUSER and cannot bypass row-level "
+            "security (membership is granted per test run and revoked at teardown)"
+        )
         return 0
     finally:
         await connection.close()
