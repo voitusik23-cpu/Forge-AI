@@ -38,7 +38,13 @@ LOGS = REPO / ".forge" / "logs"
 API_PORT = 8011
 UI_PORT = 8020
 API_URL = f"http://127.0.0.1:{API_PORT}/api/status"
-UI_URL = f"http://127.0.0.1:{UI_PORT}/"
+UI_BASE = f"http://127.0.0.1:{UI_PORT}/"
+
+
+def ui_url(screen: str) -> str:
+    """The entry the window opens: the workspace, or the authorization screen."""
+
+    return UI_BASE if screen != "auth" else f"{UI_BASE}?screen=auth"
 READY_TIMEOUT_SECONDS = 45
 EDGE = pathlib.Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 
@@ -105,9 +111,10 @@ def message_box(title: str, text: str) -> None:
 
 
 class Supervisor:
-    def __init__(self, journal: Journal, open_window: bool) -> None:
+    def __init__(self, journal: Journal, open_window: bool, url: str) -> None:
         self.journal = journal
         self.open_window = open_window
+        self.url = url
         self.own: list[tuple[str, subprocess.Popen]] = []
 
     def ensure(self, name: str, port: int, arguments: list[str], log_name: str, url: str) -> bool:
@@ -141,7 +148,7 @@ class Supervisor:
         process = subprocess.Popen(
             [
                 str(EDGE),
-                f"--app={UI_URL}",
+                f"--app={self.url}",
                 "--window-size=1600,1000",
                 f"--user-data-dir={profile}",
                 "--no-first-run",
@@ -149,7 +156,7 @@ class Supervisor:
             ],
             cwd=str(REPO),
         )
-        self.journal.write(f"window opened (pid {process.pid}); waiting for it to close")
+        self.journal.write(f"window opened at {self.url} (pid {process.pid}); waiting for it to close")
         process.wait()
         self.journal.write("window closed")
         return 0
@@ -180,6 +187,12 @@ class Supervisor:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Forge AI Command Center launcher")
     parser.add_argument(
+        "--screen",
+        choices=("app", "auth"),
+        default="app",
+        help="which entry to open: the workspace, or the authorization screen",
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="start, verify readiness, then stop again without opening a window",
@@ -203,7 +216,9 @@ def main() -> int:
         message_box("Forge AI -- interface not built", text)
         return 3
 
-    supervisor = Supervisor(journal, open_window=not args.selftest)
+    target = ui_url(args.screen)
+    journal.write(f"entry to open: {target}")
+    supervisor = Supervisor(journal, open_window=not args.selftest, url=target)
     try:
         api_ok = supervisor.ensure(
             "core-api",
@@ -217,7 +232,7 @@ def main() -> int:
             UI_PORT,
             ["tools/ui_preview_server.py", "--port", str(UI_PORT)],
             "ui.log",
-            UI_URL,
+            UI_BASE,
         )
         if not (api_ok and ui_ok):
             message_box(
