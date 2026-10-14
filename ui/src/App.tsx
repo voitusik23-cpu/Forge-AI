@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { NavRail, TopBar } from "./components/NavRail";
 import { Overview } from "./screens/Overview";
 import { Agents } from "./screens/Agents";
+import { Projects } from "./screens/Projects";
+import { Runs } from "./screens/Runs";
 import { Settings } from "./screens/Settings";
 import { Help } from "./screens/Help";
 import { Auth } from "./screens/Auth";
@@ -124,6 +126,22 @@ export const App = () => {
         />
         {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}
         {nav === "agents" ? <Agents lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}
+        {nav === "projects" ? (
+          <Projects
+            lang={lang}
+            backend={backend}
+            onRefresh={() => void reload()}
+            onHelp={() => openHelp(CONTEXT_TOPIC.projects)}
+          />
+        ) : null}
+        {nav === "runs" ? (
+          <Runs
+            lang={lang}
+            backend={backend}
+            onRefresh={() => void reload()}
+            onHelp={() => openHelp(CONTEXT_TOPIC.runs)}
+          />
+        ) : null}
         {nav === "settings" ? (
           <Settings
             lang={lang}
@@ -134,7 +152,7 @@ export const App = () => {
           />
         ) : null}
         {nav === "help" ? <Help lang={lang} topic={helpTopic} /> : null}
-        {["overview", "agents", "settings", "help"].indexOf(nav) < 0 ? (
+        {["overview", "agents", "projects", "runs", "settings", "help"].indexOf(nav) < 0 ? (
           <div className="content">
             <div className="row between" style={{ marginBottom: 12 }}>
               <div className="card-title">{t(lang, `nav.${nav}`)}</div>

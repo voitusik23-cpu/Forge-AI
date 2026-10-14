@@ -26,16 +26,45 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - the base class names it this way
         if self.path.startswith("/api/"):
-            self._proxy()
+            self._proxy("GET")
             return
         if self.path in ("/", "") or self.path.startswith("/?"):
             self.path = "/index.html"
         super().do_GET()
 
-    def _proxy(self) -> None:
-        request = urllib.request.Request(UPSTREAM + self.path, method="GET")
+    # Write methods must reach the Core API. Without these, POST /api/tasks/run answered
+    # 501 from the base class and the run form could never dispatch anything.
+    def do_POST(self) -> None:  # noqa: N802
+        self._proxy("POST")
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._proxy("PUT")
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._proxy("PATCH")
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._proxy("DELETE")
+
+    def _body(self) -> bytes:
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return b""
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _proxy(self, method: str = "GET") -> None:
+        body = self._body() if method in ("POST", "PUT", "PATCH") else b""
+        headers = {"accept": "application/json"}
+        if body:
+            headers["content-type"] = self.headers.get("Content-Type", "application/json")
+        request = urllib.request.Request(
+            UPSTREAM + self.path, data=body or None, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
                 payload = response.read()
                 self.send_response(response.status)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
@@ -43,15 +72,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
         except urllib.error.HTTPError as error:
+            # The backend's own refusal must reach the interface unchanged.
+            payload = error.read() or b"{}"
             self.send_response(error.code)
+            self.send_header("Content-Type", error.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
+            self.wfile.write(payload)
         except Exception as error:  # noqa: BLE001 - report, never pretend
-            body = f'{{"error": "core unreachable: {type(error).__name__}"}}'.encode()
+            body_text = f'{{"error": "core unreachable: {type(error).__name__}"}}'.encode()
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(body_text)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(body_text)
 
 
 def main() -> int:
