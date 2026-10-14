@@ -219,49 +219,51 @@ profile inside the repository (`Failed to grant sandbox access ... Отказа�
 Verification is therefore by HTTP response and payload inspection. The desktop
 surfaces have a real capture: `docs/images/forge-pulse-widget.png`.
 
-## 12. PostgreSQL (blocked in this environment; steps prepared)
+## 12. PostgreSQL (verified here, and in CI)
 
-The Platform persistence contract -- RLS, `FORCE RLS`, partial unique indexes,
-composite foreign keys, migrations -- **cannot be verified here**, and 32 tests skip for
-that reason. Measured on this host: no `psql`, `initdb`, `pg_ctl` or `postgres` on
-`PATH`; no `C:\Program Files\PostgreSQL`; no `docker` or `podman`; `asyncpg` is not
-installed. This is an environment limitation, not a passing test: **SKIP is not PASS.**
+The Platform persistence contract -- row-level security, `FORCE` RLS, partial unique
+indexes, composite foreign keys, role boundaries -- runs against a real server. Skipping
+is not passing, so the tests were made to run:
 
-Once a server exists, the checks are:
+Measured on this host: `Ran 328 tests in 2838.378s` / `OK` against PostgreSQL 17.11
+on `127.0.0.1:5433` with `asyncpg 0.30.0`. The first real execution failed with
+`role "forge_platform_app" does not exist`: the fixture granted the platform
+memberships before the migrations that create those roles had run. Fixed in
+`tests/persistence_fixture.py` (memberships are granted after `apply_migrations`),
+and the whole Platform suite then passed.
+
+**Correction of an earlier claim:** the "32 skips" were 32 class-level `setUpClass`
+skips. Behind them stood **328 tests** that had never executed. They have now.
+
+Two ways to run them.
+
+**A. In CI (nothing to install locally).** `.github/workflows/platform-postgres.yml`
+starts a `postgres:16` service container and runs `test_platform*.py` with a live
+`FORGE_PLATFORM_TEST_DSN`, then `scripts/check_platform_roles.py`, which fails the job
+unless both fixture logins are `NOSUPERUSER` and `NOBYPASSRLS`. A second, database-free
+job runs the general suite (and the symlink tests that skip on Windows). Both jobs carry
+a hard timeout: the first version of this workflow ran the whole suite beside the database
+and GitHub reported *"the hosted runner lost communication with the server"* after more
+than three hours, because the Platform tests create a database and apply the migrations
+once per test class.
+
+**B. Locally against a throwaway cluster.**
 
 ```powershell
-# 1. provision a throwaway cluster (never production, never real user data)
-#    e.g. with a container runtime:  docker run --rm -e POSTGRES_PASSWORD=test \
-#         -p 5432:5432 postgres:16
-# 2. install the driver
-.\.venv\Scripts\python.exe -m pip install -r requirements-platform.txt
-# 3. point the tests at it and run the Platform suites
-$env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
-.\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
+# 1. a PostgreSQL distribution and the driver
+#    here: %TEMP%\forge_pg\postgres-windows-x86_64.txz  and  asyncpg 0.30.0 already
+#    present in the user site-packages (PyPI is unreachable from this host)
+python -c "import tarfile,pathlib,os; d=pathlib.Path('.forge/pgsql'); d.mkdir(parents=True,exist_ok=True); tarfile.open(pathlib.Path(os.environ['LOCALAPPDATA'])/'Temp'/'forge_pg'/'postgres-windows-x86_64.txz','r:xz').extractall(d)"
+# 2. initialise and start it on loopback (password kept in a file, never printed)
+.\\scripts\\run_local_postgres.cmd          # see the script for the exact commands
+# 3. run the contract
+$env:FORGE_PLATFORM_TEST_DSN = 'postgresql://postgres:<pw from .forge/pg-pw.txt>@127.0.0.1:5433/postgres'
+$env:FORGE_PLATFORM_TEST_APP_LOGIN_PASSWORD = 'persistence-test-login'
+.\.venv\Scripts\python.exe -B -X utf8 .forge\run_confined.py discover -s tests -p "test_platform*.py" -v
 ```
 
-Until that runs, no Platform claim in this repository is verified.
-
-**CI job (active).** `.github/workflows/platform-postgres.yml` runs on every push to
-`master` and on demand. Its first run was triggered from the publisher's browser; the
-result is **not** recorded here, and this environment cannot read the Actions API, so
-whoever reads this should open the Actions tab for the current state. It
-runs exactly this contract on every push: a `postgres:16` service container, the
-driver from `requirements-platform.txt`, the full suite with a live
-`FORGE_PLATFORM_TEST_DSN`, then the Platform suites on their own, and finally
-`scripts/check_platform_roles.py`, which fails the job unless both fixture logins are
-`NOSUPERUSER`, `NOBYPASSRLS` and members of exactly one platform role -- the check
-that keeps a row-level-security test from passing because a superuser or a table
-owner bypassed the policy. It has not been executed yet; a prepared workflow is not
-an executed one.
-
-
-The widget image above is real. Everything else is text-only. To document the API
-visually in the future, these specific captures would be needed, each from a running
-instance: (1) a `GET /api/runs/{run_id}` response for a completed run, (2) the refusal
-envelope for an unauthorized command, (3) a `POST /api/product/stale-facts` with
-`invalidate: "false"` showing the `400`. They are not provided here because inventing
-or mocking them would misrepresent the product.
+The suite takes about 47 minutes locally, because every test class creates its own
+database and applies all migrations.
 
 ## 13. Documentation map
 
@@ -452,40 +454,39 @@ Microsoft Edge, и его headless-режим не запускается вну
 проверка выполнена по HTTP-ответам и содержимому. У десктопных поверхностей настоящий
 снимок есть: `docs/images/forge-pulse-widget.png`.
 
-## 12. PostgreSQL (в этой среде недоступен; шаги подготовлены)
+## 12. PostgreSQL (проверено здесь и в CI)
 
-Контракт Platform — RLS, `FORCE RLS`, частичные уникальные индексы, составные внешние
-ключи, миграции — **здесь непроверяем**, и 32 теста по этой причине пропускаются.
-Измерено на машине: ни `psql`, ни `initdb`, ни `pg_ctl`, ни `postgres` нет в `PATH`;
-нет `C:\Program Files\PostgreSQL`; нет `docker` и `podman`; `asyncpg` не установлен.
-Это ограничение среды, а не пройденный тест: **SKIP ≠ PASS.**
+Контракт Platform — row-level security, `FORCE` RLS, частичные уникальные индексы,
+составные внешние ключи, границы ролей — выполняется против настоящего сервера.
+Пропуск не равен успеху, поэтому тесты заставили выполняться:
 
-Когда сервер появится, проверки такие:
+Measured on this host: `Ran 328 tests in 2838.378s` / `OK` against PostgreSQL 17.11
+on `127.0.0.1:5433` with `asyncpg 0.30.0`. The first real execution failed with
+`role "forge_platform_app" does not exist`: the fixture granted the platform
+memberships before the migrations that create those roles had run. Fixed in
+`tests/persistence_fixture.py` (memberships are granted after `apply_migrations`),
+and the whole Platform suite then passed.
 
-```powershell
-# 1. одноразовый кластер (не production и не реальные пользовательские данные)
-#    например в контейнере:  docker run --rm -e POSTGRES_PASSWORD=test \
-#         -p 5432:5432 postgres:16
-# 2. драйвер
-.\.venv\Scripts\python.exe -m pip install -r requirements-platform.txt
-# 3. указать адрес и запустить наборы Platform
-$env:FORGE_DATABASE_URL='postgresql://postgres:test@127.0.0.1:5432/forge_test'
-.\.venv\Scripts\python.exe -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
-```
+**Correction of an earlier claim:** the "32 skips" were 32 class-level `setUpClass`
+skips. Behind them stood **328 tests** that had never executed. They have now.
 
-Пока это не выполнено, ни одно утверждение о Platform в этом репозитории не проверено.
+Два способа запуска.
 
-**CI-задача (активна).** `.github/workflows/platform-postgres.yml` запускается на каждый
-push в `master` и по требованию. Первый запуск был инициирован из браузера публикующего;
-его результат **здесь не зафиксирован**, а из этой среды API Actions недоступен — текущее
-состояние смотрите во вкладке Actions. Задача прогоняет ровно этот контракт на каждый
-push: сервис-контейнер `postgres:16`, драйвер из `requirements-platform.txt`, полный
-набор с живым `FORGE_PLATFORM_TEST_DSN`, затем отдельно наборы Platform и в конце
-`scripts/check_platform_roles.py` — задача падает, если хотя бы один из логинов
-фикстуры окажется суперпользователем, получит `BYPASSRLS` или войдёт более чем в одну
-платформенную роль. Именно эта проверка не даёт тесту RLS «пройти» из-за того, что
-политику обошёл суперпользователь или владелец таблицы. Workflow ещё не запускался:
-подготовленная конфигурация — не выполненная проверка.
+**A. В CI (локально ставить нечего).** `.github/workflows/platform-postgres.yml`
+поднимает сервис-контейнер `postgres:16`, прогоняет `test_platform*.py` с живым
+`FORGE_PLATFORM_TEST_DSN`, затем `scripts/check_platform_roles.py`, который валит job,
+если хотя бы один логин фикстуры окажется суперпользователем или получит `BYPASSRLS`.
+Вторая задача без базы прогоняет общий набор (и symlink-тесты, которые на Windows
+пропускаются). У обеих задач жёсткий таймаут: первая версия workflow гоняла весь набор
+рядом с базой, и GitHub сообщил *«the hosted runner lost communication with the
+server»* после более чем трёх часов — потому что Platform-тесты создают базу и
+применяют миграции на каждый класс тестов.
+
+**B. Локально на одноразовом кластере.** Дистрибутив PostgreSQL и драйвер берутся из
+того, что уже есть на машине (`%TEMP%\forge_pg\postgres-windows-x86_64.txz` и
+`asyncpg 0.30.0` в пользовательском site-packages; PyPI отсюда недоступен), кластер
+поднимается на `127.0.0.1:5433`, пароль хранится в файле и не печатается. Команды —
+в английской части выше. Прогон занимает около 47 минут.
 
 ## 13. Карта документации
 

@@ -703,12 +703,14 @@ permission to start everything.
   skipping; RLS and composite foreign keys verified against the real engine.
 * **Tests/checks**: the currently skipping database suites, plus migration
   round-trips.
-* **Actual status**: **BLOCKED** — no PostgreSQL server or driver on the
-  development host; nothing was simulated to hide it. A GitHub Actions job
-  (`.github/workflows/platform-postgres.yml`) runs the contract against a real
-  PostgreSQL 16 with a non-superuser, `NOBYPASSRLS` login pair; the job has **not
-  been executed yet**, so the contract remains unverified.
-* **Open risks**: RLS behaviour cannot be approximated by another engine.
+* **Actual status**: **VERIFIED, both locally and in CI** — `Ran 328 tests in
+  2838.378s` / `OK` against PostgreSQL 17.11 on this host, after a real fixture
+  defect (memberships granted before the migrations created the roles) was found and
+  fixed. `.github/workflows/platform-postgres.yml` runs the same contract on
+  `postgres:16`; the first version of that job exhausted the hosted runner, so the
+  database contract and the general suite now run as separate jobs with hard
+  timeouts.
+
 
 ## Stage 5 — Provider / Model Layer
 
