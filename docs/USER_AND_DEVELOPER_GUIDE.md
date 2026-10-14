@@ -491,3 +491,77 @@ server»* после более чем трёх часов — потому чт
 ## 13. Карта документации
 
 См. таблицу в английской части §13 — состав документов и их назначение совпадают.
+
+## 14. The desktop program
+
+`python -m app.desktop`, or the **Forge AI Desktop** shortcut on the desktop.
+
+Opening it shows a 23-second animated introduction drawn from polygons with no image
+files: deep space with a drifting starfield, a courier ship flying in, the camera passing
+through the hull, and then the interior -- two smiths at one anvil, a hammer falling,
+sparks, and a furnace burning in the distance. A click or `Esc` skips it.
+
+The timeline is real time, not frame count: a frame that takes 300 ms does not stretch the
+opening. That was measured, not assumed -- with frame counting, a sixteen-second wait
+still showed the four-second starfield phase.
+
+Then the access window:
+
+* **Language.** Two buttons under the wordmark switch between Русский and English. Every
+  control the shell owns is re-labelled: navigation, the manual, the access window, the
+  window title. Status tokens (`CONNECTED`, `PASSED`, `UNKNOWN`) are deliberately not
+  translated -- they are literals, like the statuses themselves.
+* **Registration.** Enter an email, press *Send confirmation code*. With no mail server
+  configured the code is shown in the window and goes nowhere (local mode, labelled as
+  such); set `FORGE_SMTP_HOST`, `FORGE_SMTP_PORT`, `FORGE_SMTP_USER`,
+  `FORGE_SMTP_PASSWORD` and `FORGE_SMTP_FROM` to send real mail. Only a SHA-256 hash of
+  the code is written to `%LOCALAPPDATA%\ForgeAI\accounts.json` (or
+  `.forge\accounts.json` if that directory is refused). A code expires after ten minutes
+  and stops working after five wrong attempts.
+* **Developer access.** *I am the developer* enters without confirmation and is recorded
+  as a developer account, so the reason is visible rather than hidden.
+* **Manual.** The *Manual* page explains, in the current language, how to start the
+  program, how access works, how keys are supplied, how to run a task, what the statuses
+  mean, and where the files live.
+
+The widget is the small always-on-top card: it shows a blacksmith mark drawn with the same
+vector helpers, and a double-click opens the program above.
+
+
+
+## 14. Настольная программа
+
+`python -m app.desktop` либо ярлык **Forge AI Desktop** на рабочем столе.
+
+При открытии проигрывается 23-секундная анимированная заставка, нарисованная
+полигонами, без файлов изображений: глубокий космос с дрейфующим звёздным полем,
+влетающий курьерский корабль, проход камеры сквозь корпус, а затем интерьер — двое
+кузнецов у одной наковальни, падающий молот, искры и горящий вдали горн. Щелчок или
+`Esc` пропускают заставку.
+
+Таймлайн идёт по реальному времени, а не по кадрам: кадр, который рисуется 300 мс, не
+растягивает заставку. Это измерено, а не предположено — при счёте по кадрам через
+шестнадцать секунд ожидания всё ещё показывалась четырёхсекундная фаза звёзд.
+
+Затем окно доступа:
+
+* **Язык.** Две кнопки под названием переключают Русский и English. Переименовывается
+  каждый элемент, которым владеет оболочка: навигация, руководство, окно доступа,
+  заголовок окна. Статусные токены (`CONNECTED`, `PASSED`, `UNKNOWN`) намеренно не
+  переводятся — это литералы, как и сами статусы.
+* **Регистрация.** Укажите почту и нажмите «Отправить код подтверждения». Если
+  почтовый сервер не настроен, код показывается в окне и никуда не уходит (локальный
+  режим, это указано прямо); для настоящих писем задайте `FORGE_SMTP_HOST`,
+  `FORGE_SMTP_PORT`, `FORGE_SMTP_USER`, `FORGE_SMTP_PASSWORD` и `FORGE_SMTP_FROM`. В
+  `%LOCALAPPDATA%\ForgeAI\accounts.json` (или в `.forge\accounts.json`, если этот
+  каталог недоступен) пишется только SHA-256-хеш кода. Код действует десять минут и
+  перестаёт работать после пяти неверных попыток.
+* **Доступ разработчика.** Кнопка «Я разработчик» входит без подтверждения и
+  записывается как учётная запись разработчика, поэтому причина видна, а не скрыта.
+* **Руководство.** Страница «Руководство» текущим языком объясняет, как запускать
+  программу, как устроен доступ, как задаются ключи, как запустить задачу, что означают
+  статусы и где лежат файлы.
+
+Виджет — маленькая карточка поверх окон: на ней кузнечный знак, нарисованный теми же
+векторными функциями, а двойной щелчок открывает программу.
+

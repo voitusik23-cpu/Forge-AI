@@ -28,6 +28,8 @@ from typing import Any, Callable, Optional, Sequence, Tuple
 
 from app.api.client import ForgeApiClient
 from app.api.service import ForgeApiService
+from app.desktop import art
+from app.desktop.i18n import Translator
 
 # --------------------------------------------------------------------------- #
 # Palette
@@ -251,6 +253,8 @@ class WidgetOptions:
     alpha: float = 0.96
     offset: Tuple[int, int] = (-1, -1)
     on_open_console: Optional[Callable[[], None]] = None
+    #: Interface language of the widget menus ("ru" or "en").
+    language: str = "ru"
     extra: dict = field(default_factory=dict)
 
 
@@ -271,6 +275,7 @@ class ForgePulseWidget:
         self._refresh_job: Optional[str] = None
         self._snapshot: Optional[WidgetSnapshot] = None
         self._console_opened = False
+        self._t = Translator(self.options.language)
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -394,10 +399,10 @@ class ForgePulseWidget:
         if self._root is None:
             return
         menu = tk.Menu(self._root, tearoff=0, bg=CARD_TOP, fg=TEXT, activebackground=ACCENT_DIM)
-        menu.add_command(label="Обновить", command=self.refresh)
-        menu.add_command(label="Открыть консоль", command=self.open_console)
+        menu.add_command(label=self._t.t("widget.refresh"), command=self.refresh)
+        menu.add_command(label=self._t.t("widget.open"), command=self.open_console)
         menu.add_separator()
-        menu.add_command(label="Закрыть виджет", command=self.close)
+        menu.add_command(label=self._t.t("widget.close"), command=self.close)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -416,6 +421,26 @@ class ForgePulseWidget:
 
     # -- rendering -------------------------------------------------------- #
 
+    def _draw_emblem(self) -> None:
+        """The blacksmith mark: two smiths at one anvil.
+
+        Drawn last, into the gap in the header between the subtitle and the connection
+        indicator, so it never covers a number. The art helper paints from the origin, so
+        the freshly created items are moved into place as a group.
+        """
+
+        canvas = self._canvas
+        if canvas is None:
+            return
+        size = 40.0
+        left = float(self.options.width) - 116.0 - size - 14.0
+        top = 8.0
+        before = set(canvas.find_all())
+        art.draw_emblem(canvas, size)
+        for item in canvas.find_all():
+            if item not in before:
+                canvas.move(item, left, top)
+
     def _render(self, snapshot: WidgetSnapshot) -> None:
         canvas = self._canvas
         if canvas is None:
@@ -429,6 +454,8 @@ class ForgePulseWidget:
         self._draw_stats(canvas, snapshot, x=140, y=84)
         self._draw_sparkline(canvas, snapshot, x=140, y=132, width=176, height=34)
         self._draw_pills(canvas, snapshot, width)
+
+        self._draw_emblem()
 
     def _draw_card(self, canvas: tk.Canvas, width: int, height: int) -> None:
         # A vertical "gradient" made of a few bands: tkinter has no gradient, and

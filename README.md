@@ -565,3 +565,9 @@ Last recorded full run on the tree that includes the artifact-provenance fix:
 Проверенные команды, требования к окружению, известные ограничения и карта
 документации приведены выше в английской части и полностью совпадают по смыслу:
 расхождения между версиями не допускаются.
+
+### Desktop program / Настольная программа
+
+`python -m app.desktop` opens the program: a 23-second vector introduction, a language switch (Русский / English), access by email with a confirmation code or a labelled developer entry, and a built-in manual. The widget on the desktop opens it on a double-click. See [the guide](docs/USER_AND_DEVELOPER_GUIDE.md) section 14.
+
+`python -m app.desktop` открывает программу: 23-секундная векторная заставка, переключатель языка (Русский / English), доступ по почте с кодом подтверждения или явный вход для разработчика и встроенное руководство. Виджет на рабочем столе открывает её двойным щелчком. Подробности — в разделе 14 [руководства](docs/USER_AND_DEVELOPER_GUIDE.md).
