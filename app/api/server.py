@@ -332,6 +332,15 @@ def create_api_app(
     def list_agents() -> list[dict[str, Any]]:
         return [a.to_dict() for a in api_service.list_agents()]
 
+    @app.get("/api/models")
+    def list_models() -> dict[str, Any]:
+        """Read-only model catalogue from the existing ModelRegistry.
+
+        Membership, configuration and availability stay distinct: this reports the registry,
+        never claims a model is reachable, and exposes no secret value.
+        """
+        return api_service.list_models_catalogue()
+
     @app.get("/api/dashboard")
     def get_dashboard(force_refresh: bool = False) -> dict[str, Any]:
         return api_service.get_dashboard_report(force_refresh=force_refresh).to_dict()

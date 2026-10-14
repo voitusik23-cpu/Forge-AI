@@ -25,12 +25,66 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:  # noqa: N802 - the base class names it this way
+        if self.path.startswith("/diag"):
+            self._diagnose()
+            return
         if self.path.startswith("/api/"):
             self._proxy("GET")
             return
         if self.path in ("/", "") or self.path.startswith("/?"):
             self.path = "/index.html"
         super().do_GET()
+
+    def _diagnose(self) -> None:
+        """Explain why the interface cannot reach the Core API.
+
+        Read-only and secret-free: it reports ports, processes, the build timestamp and the
+        tail of the API log. It never prints environment values or credentials.
+        """
+
+        import json
+        import pathlib
+        import socket
+        import time
+        import urllib.request
+
+        def listening(port: int) -> bool:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.4)
+                return probe.connect_ex(("127.0.0.1", port)) == 0
+
+        api_ok = False
+        try:
+            with urllib.request.urlopen(f"{UPSTREAM}/api/status", timeout=3) as response:
+                api_ok = response.status == 200
+        except Exception:  # noqa: BLE001 - the whole point is to report the failure
+            api_ok = False
+
+        log = pathlib.Path(".forge/logs/api.log")
+        tail = ""
+        if log.exists():
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-12:])
+
+        index = pathlib.Path("ui/dist/index.html")
+        payload = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "api_reachable": api_ok,
+            "api_port_listening": listening(8011),
+            "shell_port_listening": listening(8020),
+            "api_log_tail": tail,
+            "ui_built_at": (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(index.stat().st_mtime))
+                if index.exists()
+                else ""
+            ),
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # Write methods must reach the Core API. Without these, POST /api/tasks/run answered
     # 501 from the base class and the run form could never dispatch anything.

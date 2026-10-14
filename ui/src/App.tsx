@@ -4,6 +4,7 @@ import { Overview } from "./screens/Overview";
 import { Agents } from "./screens/Agents";
 import { Projects } from "./screens/Projects";
 import { Runs } from "./screens/Runs";
+import { Models } from "./screens/Models";
 import { Settings } from "./screens/Settings";
 import { Help } from "./screens/Help";
 import { Auth } from "./screens/Auth";
@@ -134,6 +135,15 @@ export const App = () => {
             onHelp={() => openHelp(CONTEXT_TOPIC.projects)}
           />
         ) : null}
+        {nav === "models" ? (
+          <Models
+            lang={lang}
+            backend={backend}
+            catalogue={(live ? (backend.catalogue as Record<string, unknown> | null) : null) as never}
+            onRefresh={() => void reload()}
+            onHelp={() => openHelp(CONTEXT_TOPIC.models)}
+          />
+        ) : null}
         {nav === "runs" ? (
           <Runs
             lang={lang}
@@ -152,7 +162,7 @@ export const App = () => {
           />
         ) : null}
         {nav === "help" ? <Help lang={lang} topic={helpTopic} /> : null}
-        {["overview", "agents", "projects", "runs", "settings", "help"].indexOf(nav) < 0 ? (
+        {["overview", "agents", "projects", "models", "runs", "settings", "help"].indexOf(nav) < 0 ? (
           <div className="content">
             <div className="row between" style={{ marginBottom: 12 }}>
               <div className="card-title">{t(lang, `nav.${nav}`)}</div>

@@ -110,6 +110,63 @@ def message_box(title: str, text: str) -> None:
         print(f"{title}: {text}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------- hygiene
+def forge_processes() -> list[int]:
+    """PIDs of Forge AI server processes, identified by their executable path.
+
+    Matching on the command line was wrong once: an ad-hoc cleanup of mine also matched the
+    harness that was running the command, because the harness command line contained the
+    pattern. The executable path cannot match a shell that merely mentions the script.
+    """
+
+    if os.name != "nt":
+        return []
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Process -ErrorAction SilentlyContinue | "
+                "Where-Object { $_.Path -like '*Forge-AI*' -and $_.Path -like '*\\Scripts\\python*' } | "
+                "Select-Object -ExpandProperty Id",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+    except subprocess.TimeoutExpired:
+        # Hygiene is best effort: a slow shell must never delay the launch.
+        return []
+    pids = []
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def report_existing(journal: Journal) -> None:
+    """Report other Forge AI server processes without terminating anything.
+
+    Terminating them was measured to be unsafe: the path-based enumeration can select a
+    process belonging to the launch that is starting, and the launch then dies. The supervisor
+    already reuses a server that answers and only ever stops the processes it started itself,
+    so hygiene here is diagnostics only.
+    """
+
+    pids = [pid for pid in forge_processes() if pid != os.getpid()]
+    if not pids:
+        journal.write("no other Forge AI server processes are running")
+        return
+    journal.write(f"other Forge AI server processes: {pids} (left untouched on purpose)")
+    if not port_is_served(API_PORT) and not port_is_served(UI_PORT):
+        journal.write(
+            "note: ports are free but those processes exist; the launcher will start fresh "
+            "servers and will not touch them"
+        )
+
+
 class Supervisor:
     def __init__(self, journal: Journal, open_window: bool, url: str) -> None:
         self.journal = journal
@@ -138,6 +195,29 @@ class Supervisor:
         self.journal.write(f"{name}: see {(LOGS / log_name)}")
         return False
 
+    def watch_api(self, stop_event: threading.Event) -> None:
+        """Keep the API alive while the window is open; one restart, then report."""
+
+        restarts = 0
+        while not stop_event.is_set():
+            if stop_event.wait(5.0):
+                return
+            if answers(API_URL):
+                continue
+            if restarts >= 1:
+                self.journal.write("core-api is not answering again; not restarting a second time")
+                return
+            restarts += 1
+            self.journal.write("core-api stopped answering; restarting it once")
+            process = start_server(["-m", "app.api.main"], "api.log")
+            self.own.append(("core-api (restarted)", process))
+            deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+            while time.monotonic() < deadline and not answers(API_URL):
+                time.sleep(0.5)
+            self.journal.write(
+                "core-api: " + ("back after restart" if answers(API_URL) else "did not come back")
+            )
+
     def close_window(self) -> int:
         """Open the WebView2 window and wait for the user to close it."""
 
@@ -156,8 +236,12 @@ class Supervisor:
             ],
             cwd=str(REPO),
         )
+        stop_event = threading.Event()
+        watchdog = threading.Thread(target=self.watch_api, args=(stop_event,), daemon=True)
+        watchdog.start()
         self.journal.write(f"window opened at {self.url} (pid {process.pid}); waiting for it to close")
         process.wait()
+        stop_event.set()
         self.journal.write("window closed")
         return 0
 
@@ -218,6 +302,8 @@ def main() -> int:
 
     target = ui_url(args.screen)
     journal.write(f"entry to open: {target}")
+    if not args.selftest:
+        report_existing(journal)
     supervisor = Supervisor(journal, open_window=not args.selftest, url=target)
     try:
         api_ok = supervisor.ensure(

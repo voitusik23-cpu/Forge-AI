@@ -115,6 +115,7 @@ export type BackendState =
       onboarding: Onboarding;
       agents: Agent[];
       tools: Tool[];
+      catalogue: Record<string, unknown> | null;
       capabilities: Capability[];
       notes: string[];
       sources: Source[];
@@ -156,6 +157,7 @@ export const loadBackend = async (): Promise<BackendState> => {
     agents = await attempt<Agent[]>("/api/agents", "agents", []);
     tools = await attempt<Tool[]>("/api/tools", "tools", []);
     capabilities = await attempt<Capability[]>("/api/capabilities", "capabilities", []);
+    const catalogue = await attempt<Record<string, unknown> | null>("/api/models", "models", null);
 
     const sources: Source[] = [
       { path: "/api/status", ok: true, detail: `core ${String(core.core ?? "?")}` },
@@ -168,6 +170,11 @@ export const loadBackend = async (): Promise<BackendState> => {
         path: "/api/agents",
         ok: !notes.some((note) => note.startsWith("agents:")),
         detail: `${agents.length} agents`,
+      },
+      {
+        path: "/api/models",
+        ok: !notes.some((note) => note.startsWith("models:")),
+        detail: `${Array.isArray((catalogue as { models?: unknown[] } | null)?.models) ? (catalogue as { models: unknown[] }).models.length : 0} models`,
       },
       {
         path: "/api/tools",
@@ -199,6 +206,7 @@ export const loadBackend = async (): Promise<BackendState> => {
       agents,
       tools,
       capabilities,
+      catalogue,
       notes,
       sources,
     };

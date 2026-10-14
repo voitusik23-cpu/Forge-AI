@@ -2178,6 +2178,92 @@ class ForgeApiService:
             "providers_checked": len(statuses),
         }
 
+    def list_models_catalogue(self) -> Dict[str, Any]:
+        """Read-only catalogue of the model registry: providers, models and accounts.
+
+        Three separate facts are kept separate here, because conflating them is how a UI ends
+        up lying:
+
+        * **membership** -- the model is defined in the registry;
+        * **configuration** -- an account references a secret (reported as a boolean, never as
+          the reference or the value);
+        * **availability** -- only ever reported by the account probe in ``/api/dashboard``,
+          not by this method.
+
+        The registry is resolved defensively: the service holder, then the runtime, then the
+        built-in default registry. When none is available the catalogue is empty rather than
+        invented.
+        """
+
+        registry = getattr(self, "_model_registry", None)
+        if registry is None:
+            runtime = getattr(self, "_runtime", None)
+            registry = getattr(runtime, "model_registry", None) if runtime is not None else None
+        if registry is None:
+            try:
+                from app.agents.providers.model_registry import create_default_registry
+
+                registry = create_default_registry()
+            except Exception:  # noqa: BLE001 - an absent registry is reported, not faked
+                registry = None
+
+        providers: List[Dict[str, Any]] = []
+        models: List[Dict[str, Any]] = []
+        accounts: List[Dict[str, Any]] = []
+        if registry is not None:
+            for provider in registry.list_providers():
+                providers.append(
+                    {
+                        "provider_id": provider.provider_id,
+                        "display_name": provider.display_name,
+                        "protocol": str(provider.protocol),
+                        "is_gateway": bool(provider.is_gateway),
+                        "model_count": len(registry.list_models(provider.provider_id)),
+                        "secret_env_name": provider.default_secret_env,
+                        "has_base_url": bool(provider.default_base_url),
+                    }
+                )
+            for model in registry.list_models():
+                models.append(
+                    {
+                        "provider_id": model.provider_id,
+                        "model_id": model.model_id,
+                        "display_name": model.display_name or model.model_id,
+                        "context_window": int(model.context_window),
+                        "max_output_tokens": int(model.max_output_tokens),
+                        "capabilities": sorted(str(item) for item in model.capabilities),
+                        "cost_tier": str(model.cost_tier),
+                        "supports_system_prompt": bool(model.supports_system_prompt),
+                    }
+                )
+            for account in registry.list_accounts():
+                accounts.append(
+                    {
+                        "account_id": account.account_id,
+                        "provider_id": account.provider_id,
+                        "enabled": bool(account.enabled),
+                        "priority": int(account.priority),
+                        # A reference is not a secret, but the value and the reference itself
+                        # are both withheld: only whether one is configured is reported.
+                        "secret_configured": bool(account.secret_ref),
+                    }
+                )
+        return {
+            "providers": providers,
+            "models": models,
+            "accounts": accounts,
+            "counts": {
+                "providers": len(providers),
+                "models": len(models),
+                "accounts": len(accounts),
+            },
+            "source": "ModelRegistry" if registry is not None else "unavailable",
+            "availability_note": (
+                "Registry membership is not availability: availability comes from the account "
+                "probe in /api/dashboard and is NOT_CHECKED until that probe runs."
+            ),
+        }
+
     def run_task(self, req: TaskRunRequest) -> TaskRunResponse:
         """Execute a task through Forge Core and return execution telemetry."""
         run_id = f"run-api-{uuid.uuid4().hex[:8]}"
