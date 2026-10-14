@@ -174,7 +174,6 @@ class PersistenceDatabase:
             raise RuntimeError(SKIP_REASON_NO_DRIVER)
 
         self._maintenance = await asyncpg.connect(**admin_kwargs(), timeout=10)
-        await self._provision_login_role()
 
         self.name = new_database_name()
         await self._maintenance.execute(f'CREATE DATABASE "{self.name}"')
@@ -188,6 +187,14 @@ class PersistenceDatabase:
             await apply_migrations(connection)
         finally:
             await connection.close()
+
+        # Membership can only be granted AFTER the migrations have run: the parent
+        # roles (``forge_platform_app``, ``forge_platform_system``) are created by
+        # ``0002_roles.sql``. Granting earlier fails with
+        # ``role "forge_platform_app" does not exist`` -- which is exactly what the
+        # first real execution of this fixture produced, because until then these
+        # tests had only ever skipped.
+        await self._provision_login_role()
 
         # The roles are cluster-wide; the grants on the new database's tables were
         # issued by the migration, because it runs in this database. The login role
