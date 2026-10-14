@@ -1,33 +1,29 @@
 # The Platform persistence guarantees are PostgreSQL semantics: row-level security,
 # FORCE RLS, partial unique indexes, composite foreign keys, role boundaries. They
-# cannot be simulated, so this job runs a real server and executes the tests that
+# cannot be simulated, so this workflow runs a real server and executes the tests that
 # skip everywhere else. A skip is not a pass.
 #
-# The fixture provisions two logins, each a member of exactly one platform role,
-# both NOSUPERUSER and NOBYPASSRLS, and connects through them, so the policies are
-# enforced rather than bypassed by a superuser. scripts/check_platform_roles.py
-# re-asserts those attributes after the run and fails the job otherwise.
-
-name: Platform PostgreSQL contract
-
-# The Platform persistence guarantees -- row-level security, FORCE row-level
-# security, partial unique indexes, composite foreign keys, role boundaries -- are
-# PostgreSQL semantics. They cannot be simulated, so this job runs a real server and
-# executes the tests that skip everywhere else. A skip is not a pass: without this
-# job those 32 tests prove nothing.
+# WHY TWO JOBS. The first version ran the entire 2377-test suite inside the job that also
+# hosts the PostgreSQL service, and GitHub reported:
 #
-# The test fixture (tests/persistence_fixture.py) provisions two logins, each a
-# member of exactly one platform role, both NOSUPERUSER and NOBYPASSRLS, and connects
-# through them -- so the policies are actually enforced rather than bypassed by a
-# superuser. scripts/check_platform_roles.py re-asserts those role attributes after
-# the run, so a fixture that ever provisioned a bypassing role would fail the job.
+#   "The hosted runner lost communication with the server. Anything in your workflow
+#    that terminates the runner process, starves it for CPU/Memory, or blocks its
+#    network access can cause this error."
+#
+# That run lasted over three hours and the runner died. The Platform tests create a
+# database and apply the migrations once per test class -- measured locally at ~10
+# minutes for the Platform files alone -- so running them beside the whole suite
+# exhausted the runner. The work is split: a focused database job for the Platform
+# contract, and a database-free job for the general suite (which also runs the symlink
+# tests that skip on Windows). Both carry a hard timeout, so a hang fails visibly
+# instead of starving the runner.
+
+name: Forge AI CI
 
 on:
   push:
     branches: [master]
-    # A documentation-only change cannot alter the database contract, and the full
-    # suite already runs locally for those. Deliberately narrow: anything under app/,
-    # tests/, scripts/ or requirements*.txt still runs this job.
+    # A documentation-only change cannot alter the database contract.
     paths-ignore:
       - "**/*.md"
       - "docs/**"
@@ -35,15 +31,15 @@ on:
   pull_request:
   workflow_dispatch:
 
-# One run per ref is enough: a newer push supersedes an older one.
 concurrency:
-  group: platform-postgres-${{ github.ref }}
+  group: forge-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   platform-postgres:
-    name: Platform tests against PostgreSQL 16
+    name: Platform contract on PostgreSQL 16
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -61,9 +57,7 @@ jobs:
           --health-retries 12
 
     env:
-      # The administrator DSN the fixture migrates and provisions with.
       FORGE_PLATFORM_TEST_DSN: postgresql://postgres:forge-ci-admin@127.0.0.1:5432/postgres
-      # Password for the two non-superuser logins the fixture creates.
       FORGE_PLATFORM_TEST_APP_LOGIN_PASSWORD: persistence-test-login
 
     steps:
@@ -85,12 +79,33 @@ jobs:
       - name: Confirm the server is reachable before the suite runs
         run: python -B -X utf8 scripts/check_platform_server.py
 
-      - name: Full suite, including the PostgreSQL-dependent tests
-        run: python -B -X utf8 -m unittest discover -s tests -v
-
-      - name: Platform suite alone, so its result is visible on its own
-        run: |
-          python -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
+      - name: Platform tests against the real server
+        run: python -B -X utf8 -m unittest discover -s tests -p "test_platform*.py" -v
 
       - name: Assert the test logins cannot bypass row-level security
         run: python -B -X utf8 scripts/check_platform_roles.py
+
+  general-suite:
+    name: Full suite without a database
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Full suite
+        # No FORGE_PLATFORM_TEST_DSN here, so the Platform tests skip and are covered by
+        # the job above. This job covers everything else, including the symlink tests
+        # that skip on Windows.
+        run: python -B -X utf8 -m unittest discover -s tests -v
