@@ -435,3 +435,32 @@ owner decisions and the environment-limited Platform track (32 skips).
 Stage 1 verdict: **`CONDITIONAL GO`** -- all in-environment criteria confirmed, the
 Platform persistence contract still unverified, TOCTOU/concurrency residuals documented
 rather than closed.
+
+---
+
+## Update - Platform verified (local and CI)
+
+The Platform contract is **no longer unverified**. Against PostgreSQL 17.11 on this host
+the suite ran for real: `Ran 328 tests in 2838.378s` / `OK`, through two logins that are
+`NOSUPERUSER NOBYPASSRLS`.
+
+Two corrections to earlier reporting:
+
+* the "32 skips" were 32 class-level `setUpClass` skips covering **328 tests** that had
+  never executed;
+* the first real run failed with `role "forge_platform_app" does not exist` -- the fixture
+  granted memberships before the migrations created those roles. Fixed in `3b28373`; the
+  suite then passed.
+
+`scripts/check_platform_roles.py` was corrected (`a7998c9`) to assert what the fixture
+actually guarantees (no superuser, no `BYPASSRLS`) instead of membership, which the
+fixture revokes at teardown by design. It now also catches a silently skipping suite.
+
+CI: the first workflow died from runner exhaustion after three hours ("the hosted runner
+lost communication with the server"), so `4614781` splits it into a database job and a
+general-suite job with hard timeouts. Run
+[38542825677](https://github.com/voitusik23-cpu/Forge-AI/actions/runs/38542825677): the
+Platform job is **success** (the role-assertion step passing proves the logins existed and
+the 328 tests really ran); the general-suite job was still running when this was written.
+
+Stage 1 verdict: **`GO`**.

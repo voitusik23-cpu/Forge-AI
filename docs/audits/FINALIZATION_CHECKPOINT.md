@@ -681,3 +681,112 @@ invariants are intact, and the existing UI runs and serves real data. The condit
 explicit: the **Platform persistence contract (RLS, FORCE RLS, indexes, foreign keys,
 migrations) is unverified** here for environmental reasons, and the TOCTOU/concurrency
 residuals above are accepted, documented risks rather than closed ones.
+
+---
+
+# Platform verification stage (head `fe1d8d3`)
+
+## The Platform contract is no longer unverified: 328 tests, real PostgreSQL
+
+```
+Ran 328 tests in 2838.378s
+OK
+```
+
+Against **PostgreSQL 17.11** on `127.0.0.1:5433` with `asyncpg 0.30.0`, on this host.
+Nothing was simulated: the fixture created a database and applied all migrations per test
+class, and connected through two logins that are `NOSUPERUSER NOBYPASSRLS`.
+
+**Correction of an earlier claim of mine.** I repeatedly reported "32 skips" as if 32
+tests were unverified. Those 32 were class-level `setUpClass` skips; behind them stood
+**328 tests** that had never executed once. That is what "a skip is not a pass" was
+hiding.
+
+## A real defect that only a real run could expose
+
+The first execution failed everywhere with:
+
+```
+asyncpg.exceptions.UndefinedObjectError: role "forge_platform_app" does not exist
+  tests/persistence_fixture.py:235 in _provision_login_role
+```
+
+`__aenter__` provisioned the login roles -- including their membership in
+`forge_platform_app` / `forge_platform_system` -- **before** `apply_migrations()` ran, and
+those parent roles are created by `0002_roles.sql`. The ordering bug was unreachable while
+the tests skipped. Fixed in `3b28373`: membership is granted after the migrations, with a
+comment explaining why the order matters. The whole suite then passed.
+
+## The role check, corrected to assert what is actually guaranteed
+
+`scripts/check_platform_roles.py` first failed after a green suite because it required the
+logins to be members of their platform roles. They are not -- and should not be:
+`persistence_fixture.__aexit__` revokes the membership on teardown ("cleanup must not mask
+a failure"). Fixed in `a7998c9`: the check now **fails** if a login is missing, a superuser,
+or carries `BYPASSRLS`, and only **reports** membership with the reason.
+
+That correction made the check a better guard than intended: it exits non-zero when the
+logins do not exist, so **a CI job whose Platform tests silently skip cannot pass**.
+
+## CI: the first job died of exhaustion, the split runs green
+
+The first workflow ran the entire 2377-test suite in the job that also hosted the
+PostgreSQL service. GitHub reported:
+
+> "The hosted runner lost communication with the server. Anything in your workflow that
+> terminates the runner process, starves it for CPU/Memory, or blocks its network access
+> can cause this error."
+
+That run lasted over three hours. The Platform files alone take ~47 minutes locally,
+because every test class creates a database and applies the migrations. `4614781` splits
+the work: a database job for the Platform contract and a database-free job for the general
+suite, both with `timeout-minutes: 45`.
+
+Result for run [38542825677](https://github.com/voitusik23-cpu/Forge-AI/actions/runs/38542825677)
+on `a7998c9`:
+
+| Job | Result |
+|---|---|
+| Platform contract on PostgreSQL 16 | **success** (64 s wall; the test step 29 s, `postgres:16` container ready in 21 s) |
+| Full suite without a database | was still running when this was written |
+
+The 29-second test step is real work, not skipping: the `Assert the test logins cannot
+bypass row-level security` step **passed**, and that step exits non-zero when the logins
+are missing -- they only exist if the fixture ran. Linux is simply far faster at creating a
+database per test class than Windows.
+
+## Environment notes worth keeping
+
+* Every external scratch location (`%TEMP%`, `%LOCALAPPDATA%`, `%USERPROFILE%`) is refused
+  with `WinError 5` by this sandbox, so the confined runner keeps its scratch inside the
+  repository and **wipes it at start-up and at exit** (`.forge/run_confined.py`). Without
+  that, the scratch is copied into each staged workspace: measured 2243 files at depth 5,
+  a 377 s run, and three block9 tests failing with `internal_execution_error`.
+* PyPI is unreachable from this host, so `pip install asyncpg` never completes. The driver
+  was already present in the user's Python environment
+  (`%APPDATA%\Python\Python313\site-packages\asyncpg 0.30.0`) and was copied into the
+  project venv; a PostgreSQL Windows distribution was already on the machine and was
+  extracted locally. That is how the 328 tests could run at all.
+* The disk filled to 0 bytes during this work (`ENOSPC`), which is what aborted one file
+  write; cleaning logs and temporary trees restored space.
+
+## Stage 1 verdict
+
+**`GO`.** Every mandatory criterion is now confirmed by a real run, not by absence:
+
+| Criterion | Evidence |
+|---|---|
+| Blockers #1-#4 | `FIXED_AND_TESTED`, injection-proven (`6605e35`, `a28c38a`, `3b7d99e`/`90b2af7`/`0c61092`, `fc5b098`) |
+| Findings F-1, F-2 | `FIXED_AND_TESTED` (`45cdcd1`, `52b376d`) |
+| Security invariants | unchanged; the Platform logins are `NOSUPERUSER NOBYPASSRLS` in a live cluster |
+| Recovery and evidence | `run`/`resume` agree; damaged records are refused without rewriting |
+| Read-only GETs | store bytes compared before/after two consecutive reads |
+| RLS and tenant isolation | 328 Platform tests green against a real server |
+| Migrations and integrity | applied per test class, 15 migrations, no failures |
+| Documentation | README, ROADMAP, guide and both audit documents match the implementation |
+| Full suite | 2377 tests, `OK (skipped=36)` locally; CI runs the database contract and the general suite separately |
+| Known limits | the verification-contract question and the TOCTOU/concurrency residuals remain, all documented as owner decisions or accepted risks |
+
+Remaining owner decisions are unchanged and do not block the verdict: whether to add a
+`VerificationKind` for "verify a pre-existing state", and whether to adopt Variant A
+(refusing undeclared verification targets).
