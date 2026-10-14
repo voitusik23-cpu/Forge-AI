@@ -1,0 +1,63 @@
+/* FORGE AI design tokens. One source of truth for colour, type, space and motion.
+   The palette is the agreed one: Space Navy base, Graphite surfaces, Electric Violet and
+   Cyan accents, Ice White text. Nothing here is a widget-library default. */
+
+:root {
+  /* surfaces */
+  --space: #060915;
+  --space-raised: #0a1020;
+  --graphite: #121a2b;
+  --graphite-raised: #182136;
+  --graphite-hi: #1f2a42;
+  --hairline: rgba(148, 172, 255, 0.14);
+  --hairline-strong: rgba(148, 172, 255, 0.26);
+
+  /* accents */
+  --violet: #7c5cff;
+  --violet-hi: #9a80ff;
+  --violet-dim: rgba(124, 92, 255, 0.16);
+  --cyan: #22d3ee;
+  --cyan-hi: #67e8f9;
+  --cyan-dim: rgba(34, 211, 238, 0.14);
+
+  /* type */
+  --ice: #eef2ff;
+  --ice-dim: #b9c4e0;
+  --muted: #8492b4;
+  --faint: #5b6b88;
+
+  /* semantic */
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #fb7185;
+
+  /* geometry */
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 22px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* depth */
+  --shadow-panel: 0 18px 48px rgba(3, 6, 18, 0.55);
+  --glow-violet: 0 0 0 1px rgba(124, 92, 255, 0.35), 0 10px 30px rgba(124, 92, 255, 0.22);
+  --glow-cyan: 0 0 0 1px rgba(34, 211, 238, 0.32), 0 10px 30px rgba(34, 211, 238, 0.16);
+
+  /* type scale */
+  --font: "Segoe UI Variable Display", "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Code", "Consolas", ui-monospace, monospace;
+  --t-display: 34px;
+  --t-title: 22px;
+  --t-heading: 16px;
+  --t-body: 13.5px;
+  --t-small: 12px;
+  --t-micro: 10.5px;
+
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
