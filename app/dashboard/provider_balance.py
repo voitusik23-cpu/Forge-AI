@@ -100,7 +100,36 @@ UNSUPPORTED_REASONS: Mapping[str, str] = {
         "Groq publishes no account balance through the API; usage is visible only in the "
         "provider's console"
     ),
+    "nvidia": (
+        "NVIDIA publishes no balance or credit endpoint: the key authenticates and lists "
+        "models, and credits are visible only in the NVIDIA console"
+    ),
+    "dashscope": (
+        "Alibaba DashScope publishes no balance, usage or billing endpoint through its API: "
+        "the prepaid amount and quotas are visible only in the Alibaba Cloud console"
+    ),
+    "nararouter": (
+        "no endpoint is known for this provider: the configured name does not resolve, so a "
+        "base URL is required before anything can be requested"
+    ),
 }
+
+#: Free, official endpoints used only to answer "does this key work?". None of them returns a
+#: balance; a 200 here means the key is valid, and nothing more is claimed.
+REACHABILITY_ENDPOINTS: Mapping[str, str] = {
+    "nvidia": "GET https://integrate.api.nvidia.com/v1/models",
+    "dashscope": "GET https://dashscope.aliyuncs.com/api/v1/models",
+}
+
+#: Secret names for the same providers, so the check above can authenticate.
+REACHABILITY_KEYS: Mapping[str, str] = {
+    "nvidia": "NVIDIA_API_KEY",
+    "dashscope": "DASHSCOPE_API_KEY",
+    "nararouter": "NARAROUTER_API_KEY",
+}
+
+#: Providers that publish no balance and are therefore answered without any money field.
+NO_BALANCE_PROVIDERS: tuple = ("nvidia", "dashscope", "nararouter")
 
 #: ``status`` values used by this layer. Deliberately not the historical verdict vocabulary,
 #: because this record only ever describes an observation or the absence of one.
@@ -111,6 +140,10 @@ STATUS_UNAUTHORIZED = "UNAUTHORIZED"
 STATUS_UNREACHABLE = "UNREACHABLE"
 STATUS_ERROR = "ERROR"
 STATUS_MALFORMED = "MALFORMED"
+#: The key works and the provider simply publishes no balance through its API.
+STATUS_NO_BALANCE_ENDPOINT = "NO_BALANCE_ENDPOINT"
+#: No endpoint is known for this provider, so nothing was attempted and nothing is claimed.
+STATUS_UNKNOWN_ENDPOINT = "UNKNOWN_ENDPOINT"
 
 
 def _minor(value: Any) -> Optional[int]:
@@ -307,6 +340,71 @@ class ProviderBalanceProbe:
         with urllib.request.urlopen(request, timeout=self._timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def _no_balance_report(self, provider: str) -> ProviderBalanceReport:
+        """A provider that publishes no balance: verify the key, claim no money."""
+
+        reason = UNSUPPORTED_REASONS.get(provider, "this provider publishes no account balance")
+        endpoint = REACHABILITY_ENDPOINTS.get(provider, "")
+        key_name = REACHABILITY_KEYS.get(provider, "")
+        if endpoint == "" or key_name == "":
+            # Nothing is known to ask, so nothing is asked and nothing is claimed. A provider
+            # that is documented as publishing no balance keeps its established status; one
+            # whose host is simply unknown is reported as an unknown endpoint.
+            status = (
+                STATUS_UNKNOWN_ENDPOINT
+                if provider in NO_BALANCE_PROVIDERS
+                else STATUS_UNSUPPORTED
+            )
+            return ProviderBalanceReport(
+                provider=provider,
+                supported=False,
+                connection_status=status,
+                error=reason,
+            )
+        key = self._secret_store.get_secret(key_name)
+        if not key:
+            return ProviderBalanceReport(
+                provider=provider,
+                supported=False,
+                connection_status=STATUS_UNAUTHORIZED,
+                source=endpoint,
+                error=f"no API key is configured ({key_name}); {reason}",
+            )
+        if not self.checks_enabled:
+            return ProviderBalanceReport(
+                provider=provider,
+                supported=False,
+                connection_status=STATUS_NOT_CHECKED,
+                source=endpoint,
+                error=f"probes are disabled in this composition; {reason}",
+            )
+        try:
+            self._get_json(endpoint.replace("GET ", ""), key)
+        except urllib.error.HTTPError as error:
+            status = STATUS_UNAUTHORIZED if error.code in (401, 403) else STATUS_ERROR
+            return ProviderBalanceReport(
+                provider=provider,
+                supported=False,
+                connection_status=status,
+                source=endpoint,
+                error=f"the provider answered HTTP {error.code}; {reason}",
+            )
+        except Exception as error:  # noqa: BLE001 - expected and reported
+            return ProviderBalanceReport(
+                provider=provider,
+                supported=False,
+                connection_status=STATUS_UNREACHABLE,
+                source=endpoint,
+                error=f"request failed: {type(error).__name__}; {reason}",
+            )
+        return ProviderBalanceReport(
+            provider=provider,
+            supported=False,
+            connection_status=STATUS_NO_BALANCE_ENDPOINT,
+            source=endpoint,
+            error=reason,
+        )
+
     def _failure(
         self, provider: str, status: str, error: str, *, now: str
     ) -> ProviderBalanceReport:
@@ -358,7 +456,7 @@ class ProviderBalanceProbe:
 
         norm = provider.strip().lower()
         if norm not in SUPPORTED_SOURCES:
-            report = unsupported_report(norm)
+            report = self._no_balance_report(norm)
             self._remember(report)
             return report
 
@@ -516,5 +614,8 @@ class ProviderBalanceProbe:
             "xai",
             "groq",
             "anthropic",
+            "nvidia",
+            "dashscope",
+            "nararouter",
         )
         return {name: self.report(name, force=force) for name in order}

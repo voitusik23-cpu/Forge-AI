@@ -113,6 +113,32 @@ visible cause, and no paid completion is ever used to obtain a balance — both 
 Sixteen tests, all offline. The single real network call in this work was the free balance query
 above; no completion was requested and no paid call was made.
 
+## 7. The three newest credentials (added after the first verification)
+
+All three are visible in the application's balances section. None of them can report a balance, and
+none is presented with a zero.
+
+| Provider | Key name | Key works? | Balance endpoint | What the application shows |
+|---|---|---|---|---|
+| **NVIDIA NIM** | `NVIDIA_API_KEY` | yes — `GET https://integrate.api.nvidia.com/v1/models` answers 200 (81 models observed) | none: `/v1/credits` and `/v1/balance` answer **404** | `NO_BALANCE_ENDPOINT` + "credits are visible only in the NVIDIA console", source recorded as the models endpoint |
+| **Alibaba DashScope (CN)** | `DASHSCOPE_API_KEY` | yes — `GET https://dashscope.aliyuncs.com/api/v1/models` answers 200; the international host answers 401, so the key is region-bound | none: `/usage`, `/account` and `/billing` answer **404** | `NO_BALANCE_ENDPOINT` + "prepaid amount and quotas are visible only in the Alibaba Cloud console" |
+| **Router configured as `NARAROUTER_API_KEY`** | `NARAROUTER_API_KEY` | not verifiable | **unknown**: no host of that name resolves | `UNKNOWN_ENDPOINT` + "a base URL is required"; nothing is requested and nothing is claimed |
+
+A configuration defect was found and corrected in the same change: that DashScope entry was stored
+under the variable name `CN | dashscope.aliyuncs.com` (a pasted note instead of a name), so the key
+could never be resolved and the provider was unusable. The entry is now `DASHSCOPE_API_KEY`; the
+value was not read, printed or copied, every other line is byte-identical, and `.env` is gitignored
+and untracked.
+
+**Regional access.** No proxy is required for any of the three from this machine: NVIDIA, DashScope
+(CN) and the checked router hosts were all reachable directly. DashScope's credentials are
+region-bound — the CN host accepted this key and the international host rejected it — so the
+correct fix for a region mismatch is the provider's own regional endpoint, not an intermediary.
+Public "free proxy" services must not be used for provider API keys: the traffic, including the
+`Authorization` header, passes through the operator, which is exactly how keys leak. If a region
+block is ever measured, the safe options are the provider's regional endpoint, a paid VPS or VPN
+under the owner's control, or the provider's own gateway — not an anonymous proxy.
+
 ---
 
 # Прозрачность балансов провайдеров — кратко по-русски
@@ -130,3 +156,16 @@ above; no completion was requested and no paid call was made.
 * Ключ читается через `SecretStore`, передаётся только в заголовке `Authorization` и никогда не
   попадает в отчёт, журнал, документ или Git. Сессии и cookies провайдеров не читаются.
 * История обновлений — в пределах текущего процесса и помечена как таковая, а не как архив биллинга.
+
+**Дополнение по трём новым ключам.** NVIDIA NIM и Alibaba DashScope (CN) добавлены в раздел балансов
+как «провайдер не публикует баланс»: у NVIDIA `/v1/credits` и `/v1/balance` дают 404, у DashScope
+`/usage`, `/account` и `/billing` — 404, то есть кредиты и предоплата видны только в консолях
+провайдеров. Ключ NVIDIA рабочий (список моделей отдаётся), ключ DashScope тоже рабочий и привязан к
+CN‑региону: международный хост его отвергает. Испорченная строка в `.env` исправлена — переменная
+теперь называется `DASHSCOPE_API_KEY`; значение не читалось, не выводилось и не копировалось, а файл
+не попадает в Git. Для роутера `NARAROUTER` хост не разрешается, поэтому он показан как
+`UNKNOWN_ENDPOINT` — до появления base URL ничего не запрашивается и ничего не утверждается.
+Прокси для этих ключей не нужен: все три провайдера доступны напрямую. При региональном
+ограничении правильное решение — собственный региональный endpoint провайдера или VPS/VPN под
+контролем владельца, но **не** публичные «бесплатные» прокси: трафик и заголовок авторизации идут
+через оператора, и именно так утекают ключи.

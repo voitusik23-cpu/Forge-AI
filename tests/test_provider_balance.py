@@ -414,5 +414,93 @@ class FailureStateTests(unittest.TestCase):
         self.assertEqual(set(payload), set(BALANCE_PAYLOAD_KEYS))
 
 
+class NoBalanceProviderTests(unittest.TestCase):
+    """The three newest credentials: no balance endpoint, an honest status, and never a zero."""
+
+    def _probe(self) -> ProviderBalanceProbe:
+        return ProviderBalanceProbe(
+            secret_store=_FakeSecretStore(
+                {"NVIDIA_API_KEY": FAKE_KEY, "DASHSCOPE_API_KEY": FAKE_KEY}
+            )
+        )
+
+    def test_27_every_new_provider_reports_no_money(self) -> None:
+        probe = self._probe()
+        for name in ("nvidia", "dashscope", "nararouter"):
+            report = probe.report(name)
+            self.assertFalse(report.supported, name)
+            for field in ("available_minor", "granted_minor", "topped_up_minor", "usage_minor"):
+                self.assertIsNone(getattr(report, field), f"{name}.{field}")
+            self.assertTrue(report.error, name)
+            self.assertEqual(set(report.to_dict()), set(BALANCE_PAYLOAD_KEYS), name)
+
+    def test_28_a_valid_key_without_a_balance_endpoint_is_its_own_state(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: _FakeResponse({"data": [{"id": "m"}]})):
+            nvidia = probe.report("nvidia")
+            dashscope = probe.report("dashscope")
+        self.assertEqual(nvidia.connection_status, "NO_BALANCE_ENDPOINT")
+        self.assertEqual(dashscope.connection_status, "NO_BALANCE_ENDPOINT")
+        self.assertIn("nvidia", nvidia.source)
+        self.assertIn("dashscope.aliyuncs.com", dashscope.source)
+        self.assertIsNone(nvidia.available_minor)
+
+    def test_29_a_rejected_key_is_unauthorized_and_still_has_no_money(self) -> None:
+        import urllib.error
+
+        probe = self._probe()
+
+        def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise urllib.error.HTTPError("https://integrate.api.nvidia.com/v1/models", 401, "no", {}, None)
+
+        with patch("urllib.request.urlopen", forbidden):
+            report = probe.report("nvidia")
+        self.assertEqual(report.connection_status, STATUS_UNAUTHORIZED)
+        self.assertIsNone(report.available_minor)
+        self.assertIn("401", report.error)
+
+    def test_30_an_unreachable_provider_does_not_become_zero(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("down"))):
+            report = probe.report("dashscope")
+        self.assertEqual(report.connection_status, STATUS_UNREACHABLE)
+        self.assertIsNone(report.available_minor)
+
+    def test_31_a_provider_with_no_known_endpoint_is_never_queried(self) -> None:
+        probe = self._probe()
+        calls: list = []
+
+        def refuse(*args, **kwargs):  # noqa: ANN002, ANN003
+            calls.append(args)
+            raise AssertionError("no request may be made without a known endpoint")
+
+        with patch("urllib.request.urlopen", refuse):
+            report = probe.report("nararouter")
+        self.assertEqual(report.connection_status, "UNKNOWN_ENDPOINT")
+        self.assertEqual(calls, [])
+        self.assertIsNone(report.available_minor)
+
+    def test_32_a_test_composition_queries_nothing_for_the_new_providers(self) -> None:
+        with patch.dict(os.environ, {"FORGE_ENV": "test"}, clear=False):
+            probe = ProviderBalanceProbe(
+                secret_store=_FakeSecretStore(
+                    {"NVIDIA_API_KEY": FAKE_KEY, "DASHSCOPE_API_KEY": FAKE_KEY}
+                )
+            )
+            with _SocketSpy() as spy:
+                for name in ("nvidia", "dashscope", "nararouter"):
+                    probe.report(name)
+        self.assertEqual(spy.outbound(), [])
+        self.assertFalse(probe.checks_enabled)
+
+    def test_33_the_new_providers_appear_in_the_full_report(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: _FakeResponse({"data": []})):
+            reports = probe.reports()
+        for name in ("nvidia", "dashscope", "nararouter"):
+            self.assertIn(name, reports)
+            self.assertFalse(reports[name].supported)
+
+
 if __name__ == "__main__":
     unittest.main()
