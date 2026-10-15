@@ -1544,8 +1544,8 @@ class ForgeApiService:
             success=succeeded,
             output=output or "(Agent loop produced no process output)",
             error=error,
-            tokens=0,
-            cost=0.0,
+            tokens=None,
+            cost=None,
             duration_seconds=round(duration, 3),
             provider_used="",
             model_used="",
@@ -1910,8 +1910,8 @@ class ForgeApiService:
             ),
             output=output or "(Accepted task produced no process output)",
             error=error,
-            tokens=0,
-            cost=0.0,
+            tokens=None,
+            cost=None,
             duration_seconds=round(duration, 3),
             provider_used="",
             model_used="",
@@ -2185,6 +2185,9 @@ class ForgeApiService:
             success=run.state == RunState.COMPLETED,
             output=output or "(Declared verification execution produced no output)",
             error=error,
+            # A proven zero, not an invention: measured by
+            # test_the_declared_verification_makes_no_provider_call and its two siblings,
+            # this path performs no provider call, so nothing was consumed.
             tokens=0,
             cost=0.0,
             duration_seconds=round(duration, 3),
@@ -2424,8 +2427,8 @@ class ForgeApiService:
 
         run_id = getattr(record, "run_id", "") or ""
         state = ""
-        tokens = 0
-        cost = 0.0
+        tokens: Optional[int] = None
+        cost: Optional[float] = None
         provider = ""
         model = ""
         record_payload = self.get_run_record(run_id) if run_id else None
@@ -2437,8 +2440,19 @@ class ForgeApiService:
                 state = str(record_payload.get("state") or record_payload.get("status") or "")
             accounting = record_payload.get("accounting")
             if isinstance(accounting, dict):
-                tokens = int(accounting.get("total_tokens") or 0)
-                cost = float(accounting.get("total_cost") or 0.0)
+                # An absent field is unknown, not zero; a present one is preserved.
+                recorded_tokens = accounting.get("total_tokens")
+                recorded_cost = accounting.get("total_cost")
+                tokens = (
+                    int(recorded_tokens)
+                    if isinstance(recorded_tokens, (int, float))
+                    else None
+                )
+                cost = (
+                    float(recorded_cost)
+                    if isinstance(recorded_cost, (int, float))
+                    else None
+                )
                 provider = str(accounting.get("provider") or "")
                 model = str(accounting.get("model") or "")
         return TaskRunResponse(
@@ -2480,16 +2494,36 @@ class ForgeApiService:
         if idempotency_key:
             # Fail closed: a paid dispatch must not proceed unprotected because the ledger is
             # unusable. A request without a key keeps the legacy behaviour.
-            try:
-                identity = self._operation_identity(req, project_id, idempotency_key)
-                record, claimed = self._idempotency_ledger_instance().claim(
-                    identity, run_id=run_id
-                )
-            except Exception as error:  # noqa: BLE001 - the class of failure is what matters
+            import time as _time
+
+            from app.agent_runtime.idempotency import IdempotencyError
+
+            identity = self._operation_identity(req, project_id, idempotency_key)
+            record = None
+            claimed = False
+            last_error: Optional[BaseException] = None
+            for attempt in range(6):
+                try:
+                    record, claimed = self._idempotency_ledger_instance().claim(
+                        identity, run_id=run_id
+                    )
+                    break
+                except IdempotencyError as race:
+                    # The ledger writes its record with O_EXCL and parses it on the losing path, so
+                    # a racing claim can read the file mid-write. That is an expected race, not an
+                    # unavailable ledger: wait briefly for the winner to finish writing.
+                    last_error = race
+                    _time.sleep(0.05 * (attempt + 1))
+                except Exception as error:  # noqa: BLE001 - an unusable ledger fails closed now
+                    # Anything else (a denied directory, for example) cannot be fixed by waiting.
+                    last_error = error
+                    break
+            if record is None and not claimed:
                 raise IdempotencyUnavailable(
                     "idempotency protection is unavailable, so the dispatch was refused "
-                    f"({type(error).__name__}); set FORGE_RUN_STORE_ROOT to a writable directory"
-                ) from error
+                    f"({type(last_error).__name__ if last_error else 'unknown'}); "
+                    "set FORGE_RUN_STORE_ROOT to a writable directory"
+                ) from last_error
             if not claimed:
                 if getattr(record, "operation_fingerprint", "") != identity.fingerprint:
                     raise RunIdempotencyConflict(
@@ -2672,8 +2706,9 @@ class ForgeApiService:
             success=success,
             output=output or "(Task execution completed)",
             error=error,
-            tokens=run_acc.total_tokens,
-            cost=round(run_acc.total_cost, 6),
+            # Only a basis backed by evidence may produce a number; pure silence is None.
+            tokens=None if usage_basis == "UNKNOWN" else int(run_acc.total_tokens),
+            cost=None if cost_basis == "UNKNOWN" else round(run_acc.total_cost, 6),
             duration_seconds=round(duration, 3),
             provider_used=provider_used,
             model_used=model_used,

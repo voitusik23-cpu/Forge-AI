@@ -83,8 +83,11 @@ class TaskRunResponse:
     success: bool
     output: str
     error: Optional[str] = None
-    tokens: int = 0
-    cost: float = 0.0
+    #: ``None`` means the usage is **unknown**, which is not the same as zero. A zero
+    #: appears only when nothing was consumed or a provider reported zero, and the
+    #: dispatch basis (X-Forge-Usage-Basis) says which kind of value this is.
+    tokens: Optional[int] = None
+    cost: Optional[float] = None
     duration_seconds: float = 0.0
     provider_used: str = ""
     model_used: str = ""

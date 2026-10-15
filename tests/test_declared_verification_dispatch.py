@@ -212,6 +212,8 @@ class DeclaredVerificationDispatchTests(unittest.TestCase):
         self.assertIn(MARKER, response.output or "")
         self.assertEqual(response.provider_used, "")
         self.assertEqual(response.model_used, "")
+        # A proven zero: this path makes no provider call, which three other tests measure
+        # directly, so nothing was consumed and zero is the finding rather than a default.
         self.assertEqual(response.tokens, 0)
         self.assertEqual(response.cost, 0.0)
 

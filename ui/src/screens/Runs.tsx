@@ -206,8 +206,16 @@ export const Runs = ({
               />
               <div className="grid cols-4" style={{ marginBottom: 12 }}>
                 {[
-                  [t(lang, "runs.result.tokens"), String(result.tokens ?? "—")],
-                  [t(lang, "runs.result.cost"), fixed(result.cost ?? 0, 4)],
+                  [
+                    t(lang, "runs.result.tokens"),
+                    result.tokens === null || result.tokens === undefined
+                      ? t(lang, "runs.unknown")
+                      : String(result.tokens),
+                  ],
+                  [
+                    t(lang, "runs.result.cost"),
+                    typeof result.cost === "number" ? `$${fixed(result.cost, 4)}` : t(lang, "runs.unknown"),
+                  ],
                   [t(lang, "runs.result.duration"), fixed(result.duration_seconds ?? 0, 2)],
                   [t(lang, "runs.result.provider"), text(result.provider_used)],
                 ].map(([label, value]) => (

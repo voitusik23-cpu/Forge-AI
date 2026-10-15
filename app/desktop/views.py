@@ -126,7 +126,14 @@ class HomeView(BaseView):
         status_str = "SUCCESS" if res.success else "FAILED"
         self.txt_output.insert("end", f"\n[Result: {status_str}]\n")
         self.txt_output.insert("end", f"Run ID: {res.run_id}\n")
-        self.txt_output.insert("end", f"Tokens: {res.tokens} | Cost: ${res.cost:.4f} | Duration: {res.duration_seconds:.2f}s\n")
+        # Unknown telemetry is rendered as unknown: the contract uses None, not zero.
+        tokens_text = "unknown" if res.tokens is None else str(res.tokens)
+        cost_text = "unknown" if res.cost is None else f"${res.cost:.4f}"
+        self.txt_output.insert(
+            "end",
+            f"Tokens: {tokens_text} | Cost: {cost_text} | "
+            f"Duration: {res.duration_seconds:.2f}s\n",
+        )
         self.txt_output.insert("end", f"Provider: {res.provider_used} ({res.model_used})\n\n")
         self.txt_output.insert("end", f"Output:\n{res.output}\n")
         if res.error:
