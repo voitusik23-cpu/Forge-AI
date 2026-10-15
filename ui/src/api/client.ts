@@ -61,6 +61,71 @@ export type Agent = {
   capabilities?: string[];
 };
 
+/** One agent's attributed usage, as /api/dashboard reports it. */
+export type AgentUsage = {
+  agent?: string;
+  provider?: string;
+  model?: string;
+  total_requests?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_tokens?: number;
+  total_tokens?: number;
+  effective_cost?: number;
+  total_runs?: number;
+};
+
+/**
+ * One provider's balance, exactly as GET /api/providers/balance reports it.
+ *
+ * ``supported === false`` means the provider publishes no balance at all; ``available_minor`` and
+ * every other amount are then absent. A null amount is unknown, never zero. ``stale === true``
+ * means the figure is the last confirmed value kept after a failed refresh.
+ */
+export type ProviderBalance = {
+  provider?: string;
+  supported?: boolean;
+  connection_status?: string;
+  currency?: string;
+  minor_unit_exponent?: number;
+  available_minor?: number | null;
+  available_display?: string | null;
+  granted_minor?: number | null;
+  granted_display?: string | null;
+  topped_up_minor?: number | null;
+  topped_up_display?: string | null;
+  usage_minor?: number | null;
+  usage_display?: string | null;
+  billing_period?: string;
+  last_updated?: string;
+  stale?: boolean;
+  age_seconds?: number | null;
+  source?: string;
+  error?: string;
+};
+
+/** One recorded observation in this session's balance history (not a billing archive). */
+export type ProviderBalanceObservation = {
+  at?: string;
+  status?: string;
+  source?: string;
+  currency?: string;
+  available_minor?: number | null;
+  granted_minor?: number | null;
+  topped_up_minor?: number | null;
+  usage_minor?: number | null;
+  stale?: boolean;
+  error?: string;
+};
+
+export type ProviderBalances = {
+  providers?: Record<string, ProviderBalance>;
+  history?: Record<string, ProviderBalanceObservation[]>;
+  probes_enabled?: boolean;
+  checked_at?: string;
+  history_scope?: string;
+};
+
 export type Tool = { id?: string; name?: string; description?: string };
 
 export type Capability = {
@@ -74,7 +139,7 @@ export type Capability = {
 export type Dashboard = {
   providers?: Provider[];
   models?: unknown[];
-  agents?: unknown[];
+  agents?: AgentUsage[];
   projects?: unknown[];
   runs?: unknown[];
   today_totals?: Totals;
@@ -128,6 +193,24 @@ const getJson = async <T>(path: string): Promise<T> => {
     throw new Error(`${path} → HTTP ${response.status}`);
   }
   return (await response.json()) as T;
+};
+
+/**
+ * Provider balances from the providers' own official endpoints.
+ *
+ * Read on demand, deliberately not as part of the `BackendState` poll: `loadBackend` runs every
+ * 15 seconds, and every balance read dials the provider. ``force`` asks for a fresh, free refresh
+ * (`refresh=1`) and is used by the per-provider Refresh button.
+ */
+export const loadProviderBalances = async (
+  provider?: string,
+  force = false
+): Promise<ProviderBalances> => {
+  const params = new URLSearchParams();
+  if (provider) params.set("provider", provider);
+  if (force) params.set("refresh", "1");
+  const query = params.toString();
+  return getJson<ProviderBalances>(`/api/providers/balance${query === "" ? "" : `?${query}`}`);
 };
 
 export const loadBackend = async (): Promise<BackendState> => {

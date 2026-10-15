@@ -262,6 +262,14 @@ IDENTITY_LOOP_POLICY = AgentHarnessPolicy(
 from pathlib import Path
 
 
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO string, without relying on how ``datetime`` was imported."""
+
+    import datetime as _datetime
+
+    return _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+
+
 class RunIdempotencyConflict(RuntimeError):
     """The same idempotency key arrived with a materially different request."""
 
@@ -2205,6 +2213,40 @@ class ForgeApiService:
         return {
             "refreshed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "providers_checked": len(statuses),
+        }
+
+    def provider_balance(
+        self, provider: Optional[str] = None, *, force: bool = True
+    ) -> Dict[str, Any]:
+        """Balance reports from official provider endpoints, with session history.
+
+        Every figure here is either observed at the named source and timestamped, or
+        explicitly absent. A provider with no balance endpoint is reported as such and
+        never with a zero.
+        """
+
+        from app.dashboard.provider_balance import ProviderBalanceProbe
+
+        probe = getattr(self, "_balance_probe", None)
+        if probe is None:
+            probe = ProviderBalanceProbe()
+            self._balance_probe = probe
+        if provider:
+            report = probe.report(provider, force=force)
+            return {
+                "providers": {report.provider: report.to_dict()},
+                "history": {report.provider: probe.history(report.provider)},
+                "probes_enabled": probe.checks_enabled,
+                "checked_at": _utc_now_iso(),
+                "history_scope": "this process only; not a billing archive",
+            }
+        reports = probe.reports(force=force)
+        return {
+            "providers": {name: item.to_dict() for name, item in reports.items()},
+            "history": {name: probe.history(name) for name in reports},
+            "probes_enabled": probe.checks_enabled,
+            "checked_at": _utc_now_iso(),
+            "history_scope": "this process only; not a billing archive",
         }
 
     def list_models_catalogue(self) -> Dict[str, Any]:

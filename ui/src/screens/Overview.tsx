@@ -189,7 +189,22 @@ export const Overview = ({ lang, backend }: { lang: Lang; backend: BackendState 
                     <span style={{ minWidth: 0 }}>
                       <span style={{ display: "block", fontWeight: 600 }}>{text(item.provider)}</span>
                       <span className="small muted">
-                        {text(account.status, "NOT_CHECKED")} · {lang === "ru" ? "баланс" : "balance"}: {text(account.balance_display)}
+                        {/* The status is the legacy record's historical verdict, and it is labelled as such.
+                  Its balance_display is deliberately not rendered: for several providers that value
+                  is hardcoded rather than observed. The sourced balances live in their own section. */}
+              <span
+                title={
+                  lang === "ru"
+                    ? "исторический вердикт записи, не текущее наблюдение"
+                    : "the record's historical verdict, not a current observation"
+                }
+              >
+                {text(account.status, "NOT_CHECKED")}
+              </span>{" "}
+              ·{" "}
+              <a href="?nav=models" title={t(lang, "balance.section.hint")}>
+                {t(lang, "balance.section.title")}
+              </a>
                       </span>
                     </span>
                   </div>

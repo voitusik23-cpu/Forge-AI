@@ -133,12 +133,12 @@ export const HELP_TOPICS: HelpTopic[] = [
     body: {
       ru: [
         "Показатели не взаимозаменяемы и называются точно: estimated_cost — оценка Forge; provider_reported_cost — то, что сообщил провайдер; effective_cost — учтённая сумма; forge_spent — расход Forge с этим провайдером; all_time_totals.total_spent — итог по всем записанным запускам.",
-        "Баланс и квота относятся к провайдеру (account_status.balance_display, quota_limit, quota_usage), а не к агенту. В этом режиме они не опрашиваются: NOT CHECKED, причина test_mode_no_network_probe.",
+        "Баланс и квота относятся к провайдеру, а не к агенту. Раздел «Балансы провайдеров» читает официальные endpoint'ы: DeepSeek GET /user/balance и OpenRouter GET /api/v1/auth/key. Доступный остаток, подаренные кредиты (granted) и пополнение (topped_up) показываются раздельно, с валютой, источником и временем получения. Провайдеры без официального баланса (OpenAI, Anthropic, Gemini, xAI, Groq) помечены как «Недоступно у провайдера» — без нулей и оценок. При сбое обновления сохраняется последнее подтверждённое значение с пометкой «устарело» и возрастом.",
         "Отдельного баланса агента, лимита агента и агентского леджера в системе нет — это прямо указано в карточке агента. Остаток не вычисляется, потому что подтверждённого лимита не существует.",
       ],
       en: [
         "The measures are not interchangeable and are named exactly: estimated_cost (Forge's estimate), provider_reported_cost (what the provider reported), effective_cost (accounted), forge_spent (Forge spend with that provider), all_time_totals.total_spent (all recorded runs).",
-        "Balance and quota belong to the provider (account_status.balance_display, quota_limit, quota_usage), not to an agent. In this mode they are not probed: NOT CHECKED, reason test_mode_no_network_probe.",
+        "Balance and quota belong to the provider, not to an agent. The provider balances section reads the official endpoints: DeepSeek GET /user/balance and OpenRouter GET /api/v1/auth/key. Available balance, granted credit and topped-up credit are shown separately, with currency, source and the time the value was obtained. Providers with no official balance (OpenAI, Anthropic, Gemini, xAI, Groq) are marked as not available at the provider -- no zeros and no estimates. After a failed refresh the last confirmed value is kept, marked stale with its age.",
         "There is no agent balance, no agent limit and no agent ledger — the agent card says so directly. No remainder is computed, because no confirmed limit exists.",
       ],
     },

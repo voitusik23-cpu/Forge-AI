@@ -364,6 +364,16 @@ def create_api_app(
         """List the tools currently registered for execution."""
         return api_service.list_tools()
 
+    @app.get("/api/providers/balance")
+    def provider_balance(provider: Optional[str] = None, refresh: int = 0) -> Any:
+        """Read-only balances from the providers' own official endpoints.
+
+        Free endpoints only: no completion is requested, and a provider without a balance
+        endpoint is reported as unsupported rather than as zero.
+        """
+
+        return api_service.provider_balance(provider, force=bool(refresh))
+
     @app.post("/api/tasks/run")
     def run_task(
         payload: dict[str, Any],

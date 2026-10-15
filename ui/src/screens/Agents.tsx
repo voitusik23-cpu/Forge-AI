@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
 import { Badge, Button, Card, CardHead, StatusDot } from "../components/Primitives";
 import { IconRefresh, IconSearch } from "../components/Icons";
+import { providerBalanceHref } from "../components/ProviderBalance";
 import { t, type Lang } from "../i18n";
-import type { Agent, BackendState, Capability, Provider } from "../api/client";
+import type { Agent, AgentUsage, BackendState, Capability, Provider } from "../api/client";
 
 const money = (value: unknown): string => {
   if (typeof value !== "number" || !Number.isFinite(value)) return "—";
@@ -48,6 +49,14 @@ export const Agents = ({
   const providerOf = (name: unknown): Provider | undefined =>
     providers.find((item) => String(item.provider ?? "") === String(name ?? ""));
 
+  // An agent's own confirmed figures come from /api/dashboard agents[]. When the dashboard carries
+  // no row for the agent, the figure is unknown -- never rendered as 0.
+  const dashboardAgents: AgentUsage[] = live && Array.isArray(backend.dashboard.agents)
+    ? backend.dashboard.agents
+    : [];
+  const usageOf = (name: unknown): AgentUsage | undefined =>
+    dashboardAgents.find((item) => String(item.agent ?? "") === String(name ?? ""));
+
   const rows: Row[] = useMemo(() => {
     const filtered = agents.filter((agent) => {
       const haystack = [
@@ -79,6 +88,8 @@ export const Agents = ({
   }, [agents, query, status, provider, model, sort, providers]);
 
   const selectedRow = rows.find((row) => String(row.agent.name ?? "") === selected) ?? null;
+  const selectedUsage = selectedRow === null ? undefined : usageOf(selectedRow.agent.name);
+  const selectedProvider = String(selectedRow?.agent.provider ?? "");
   const available = agents.filter((agent) => String(agent.status ?? "") === "available").length;
   const failing = agents.filter((agent) => {
     const state = String(agent.status ?? "").toLowerCase();
@@ -239,12 +250,15 @@ export const Agents = ({
                   <th>{t(lang, "agents.col.status")}</th>
                   <th>{t(lang, "agents.col.capabilities")}</th>
                   <th>{t(lang, "agents.col.spend")}</th>
+                  <th>{t(lang, "agents.col.tokens")}</th>
+                  <th>{t(lang, "agents.col.balance")}</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row) => {
                   const name = String(row.agent.name ?? "");
-                  const balance = row.provider?.account_status?.balance_display;
+                  const usage = usageOf(name);
+                  const providerId = String(row.agent.provider ?? "");
                   return (
                     <tr
                       key={name}
@@ -262,10 +276,19 @@ export const Agents = ({
                       </td>
                       <td className="small muted">{(row.agent.capabilities ?? []).join(", ") || "—"}</td>
                       <td className="mono small">
-                        {money(row.provider?.forge_spent)}
-                        <span className="muted" style={{ marginLeft: 6 }}>
-                          {balance && String(balance).toUpperCase() !== "NOT CHECKED" ? balance : ""}
-                        </span>
+                        {usage === undefined ? t(lang, "runs.unknown") : money(usage.effective_cost)}
+                      </td>
+                      <td className="mono small">
+                        {usage === undefined ? t(lang, "runs.unknown") : integer(usage.total_tokens)}
+                      </td>
+                      <td className="small">
+                        <a
+                          href={providerBalanceHref(providerId)}
+                          style={{ color: "var(--cyan-hi)" }}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          {t(lang, "agents.balance.link")}
+                        </a>
                       </td>
                     </tr>
                   );
@@ -418,12 +441,26 @@ export const Agents = ({
               </div>
               <div className="stack small" style={{ marginTop: 8 }}>
                 <div className="row between">
-                  <span className="muted">{t(lang, "agents.detail.finance.balance")}</span>
+                  <span className="muted">{t(lang, "agents.detail.finance.agent_spend")}</span>
                   <span className="mono small">
-                    {String(selectedRow.provider?.account_status?.balance_display ?? "—")}
+                    {selectedUsage === undefined ? t(lang, "runs.unknown") : money(selectedUsage.effective_cost)}
                   </span>
                 </div>
-                <div className="small muted">{t(lang, "agents.reason.not_checked")}</div>
+                <div className="row between">
+                  <span className="muted">{t(lang, "agents.detail.finance.agent_tokens")}</span>
+                  <span className="mono small">
+                    {selectedUsage === undefined ? t(lang, "runs.unknown") : integer(selectedUsage.total_tokens)}
+                  </span>
+                </div>
+                <div className="row between">
+                  <span className="muted">{t(lang, "agents.detail.finance.balance")}</span>
+                  <span className="small">
+                    <a href={providerBalanceHref(selectedProvider)} style={{ color: "var(--cyan-hi)" }}>
+                      {t(lang, "agents.balance.link")}
+                    </a>
+                  </span>
+                </div>
+                <div className="small muted">{t(lang, "agents.balance.note")}</div>
                 <div className="row between">
                   <span className="muted">{t(lang, "agents.detail.finance.forge_spent")}</span>
                   <span className="mono small">{money(selectedRow.provider?.forge_spent)}</span>
@@ -440,6 +477,7 @@ export const Agents = ({
                   <span className="muted">{t(lang, "agents.detail.finance.accounted")}</span>
                   <span className="mono small">{money(selectedRow.provider?.effective_cost)}</span>
                 </div>
+                <div className="small muted">{t(lang, "agents.detail.finance.provider_scope")}</div>
                 <div className="row between">
                   <span className="muted">{t(lang, "agents.detail.finance.total")}</span>
                   <span className="mono small">{money(totalSpent)}</span>
