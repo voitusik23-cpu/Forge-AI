@@ -286,5 +286,133 @@ class TestCompositionTests(unittest.TestCase):
         self.assertEqual(set(entry), set(BALANCE_PAYLOAD_KEYS))
 
 
+class FailureStateTests(unittest.TestCase):
+    """The matrix the owner asked for: every way a refresh can fail, each with its own state."""
+
+    def _probe(self) -> ProviderBalanceProbe:
+        return ProviderBalanceProbe(secret_store=_FakeSecretStore({"DEEPSEEK_API_KEY": FAKE_KEY}))
+
+    def test_17_no_key_makes_no_request(self) -> None:
+        probe = ProviderBalanceProbe(secret_store=_FakeSecretStore({}))
+        calls: list = []
+
+        def refuse(*args, **kwargs):  # noqa: ANN002, ANN003
+            calls.append(args)
+            raise AssertionError("no request may be made without a key")
+
+        with patch("urllib.request.urlopen", refuse):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, STATUS_UNAUTHORIZED)
+        self.assertEqual(calls, [])
+        self.assertIn("no API key", report.error)
+
+    def test_18_http_403_is_unauthorized(self) -> None:
+        import urllib.error
+
+        probe = self._probe()
+
+        def forbidden(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise urllib.error.HTTPError("https://api.deepseek.com/user/balance", 403, "Forbidden", {}, None)
+
+        with patch("urllib.request.urlopen", forbidden):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, STATUS_UNAUTHORIZED)
+        self.assertIn("403", report.error)
+        self.assertIsNone(report.available_minor)
+
+    def test_19_http_5xx_is_an_error_not_unauthorized(self) -> None:
+        import urllib.error
+
+        probe = self._probe()
+
+        def broken(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise urllib.error.HTTPError("https://api.deepseek.com/user/balance", 503, "Unavailable", {}, None)
+
+        with patch("urllib.request.urlopen", broken):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, "ERROR")
+        self.assertIn("503", report.error)
+
+    def test_20_a_timeout_is_unreachable(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(TimeoutError())):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, STATUS_UNREACHABLE)
+        self.assertIn("TimeoutError", report.error)
+
+    def test_21_a_non_json_body_is_malformed_not_a_network_failure(self) -> None:
+        class _NotJson:
+            def read(self) -> bytes:
+                return b"<html>gateway error: some sensitive detail</html>"
+
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: _NotJson()):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, "MALFORMED")
+        # The body is never quoted or logged.
+        self.assertNotIn("sensitive", report.error)
+        self.assertNotIn("gateway error", report.error)
+
+    def test_22_a_json_body_of_the_wrong_shape_is_malformed(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: _FakeResponse(["not", "an", "object"])):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, "MALFORMED")
+        self.assertTrue(report.error)
+
+    def test_23_a_json_object_without_documented_fields_is_malformed(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: _FakeResponse({"unexpected": 1})):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, "MALFORMED")
+        self.assertIsNone(report.available_minor)
+
+    def test_24_an_answer_without_any_amount_is_incomplete(self) -> None:
+        probe = self._probe()
+        with patch(
+            "urllib.request.urlopen",
+            lambda *a, **k: _FakeResponse({"is_available": True, "balance_infos": []}),
+        ):
+            report = probe.report("deepseek")
+        self.assertEqual(report.connection_status, "MALFORMED")
+        self.assertIn("no amount", report.error)
+
+    def test_25_tls_verification_is_never_disabled(self) -> None:
+        source = pathlib.Path("app/dashboard/provider_balance.py").read_text(encoding="utf-8")
+        for forbidden in (
+            "_create_unverified_context",
+            "verify=False",
+            "CERT_NONE",
+            "check_hostname = False",
+            "ssl._create_default_https_context =",
+        ):
+            self.assertNotIn(forbidden, source, f"{forbidden} must never appear in the balance probe")
+        # Every endpoint is https.
+        from app.dashboard.provider_balance import SUPPORTED_SOURCES
+
+        for url in SUPPORTED_SOURCES.values():
+            self.assertTrue(url.endswith("/") is False)
+            self.assertIn("https://", url)
+
+    def test_26_a_stale_report_explains_what_is_known_and_when(self) -> None:
+        probe = self._probe()
+        with patch("urllib.request.urlopen", lambda *a, **k: _FakeResponse(DEEPSEEK_REAL)):
+            probe.report("deepseek")
+        with patch("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("down"))):
+            stale = probe.report("deepseek")
+        self.assertTrue(stale.stale)
+        payload = stale.to_dict()
+        self.assertIsNotNone(payload["last_updated"], "a stale value must carry when it was obtained")
+        self.assertIsNotNone(payload["age_seconds"])
+        self.assertTrue(payload["error"])
+        self.assertEqual(set(payload), set(BALANCE_PAYLOAD_KEYS))
+
+
 if __name__ == "__main__":
     unittest.main()

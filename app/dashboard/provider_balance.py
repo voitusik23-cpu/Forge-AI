@@ -110,6 +110,7 @@ STATUS_UNSUPPORTED = "UNSUPPORTED_BY_PROVIDER"
 STATUS_UNAUTHORIZED = "UNAUTHORIZED"
 STATUS_UNREACHABLE = "UNREACHABLE"
 STATUS_ERROR = "ERROR"
+STATUS_MALFORMED = "MALFORMED"
 
 
 def _minor(value: Any) -> Optional[int]:
@@ -403,6 +404,14 @@ class ProviderBalanceProbe:
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             payload = self._get_json(SUPPORTED_SOURCES[norm].replace("GET ", ""), key)
+        except json.JSONDecodeError:
+            # The provider answered, but not with JSON. That is not a network failure, and the
+            # body itself is never quoted: it could contain anything.
+            report = self._failure(
+                norm, STATUS_MALFORMED, "the provider's answer was not valid JSON", now=now
+            )
+            self._remember(report)
+            return report
         except urllib.error.HTTPError as error:
             status = (
                 STATUS_UNAUTHORIZED
@@ -422,11 +431,47 @@ class ProviderBalanceProbe:
             self._remember(report)
             return report
 
+        # A JSON body of the wrong shape is a damaged answer, not an empty account: report the
+        # state explicitly instead of returning a record whose amounts are all absent.
+        if not isinstance(payload, Mapping):
+            report = self._failure(
+                norm,
+                STATUS_MALFORMED,
+                "the provider's answer was not a JSON object",
+                now=now,
+            )
+            self._remember(report)
+            return report
+        expected = (
+            ("is_available", "balance_infos")
+            if norm == "deepseek"
+            else ("data", "limit", "limit_remaining", "usage")
+        )
+        if not any(field in payload for field in expected):
+            report = self._failure(
+                norm,
+                STATUS_MALFORMED,
+                "the provider's answer carried none of the fields this endpoint documents",
+                now=now,
+            )
+            self._remember(report)
+            return report
         report = (
             parse_deepseek_balance(payload, observed_at=now)
             if norm == "deepseek"
             else parse_openrouter_key(payload, observed_at=now)
         )
+        if report.error == "" and report.available_minor is None and report.usage_minor is None:
+            # A well-formed answer that still carries no amount is incomplete, and saying so is
+            # more useful than presenting an account whose balance is merely absent.
+            report = self._failure(
+                norm,
+                STATUS_MALFORMED,
+                "the provider's answer contained no amount",
+                now=now,
+            )
+            self._remember(report)
+            return report
         if report.error:
             # The call succeeded but the provider reports the account as unavailable/disabled.
             # Keep the figures it did return, and mark the condition explicitly.
