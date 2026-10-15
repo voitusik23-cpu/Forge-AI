@@ -166,7 +166,21 @@ export const App = () => {
           />
         ) : null}
         {nav === "help" ? <Help lang={lang} topic={helpTopic} /> : null}
-        {["overview", "agents", "projects", "models", "runs", "settings", "help"].indexOf(nav) < 0 ? (
+        {/* Every section in the navigation rail now has a screen. This single list is the only
+            place that says so, so it is kept in step with NavRail.ITEMS: a section that is mapped
+            here must never also render the "not migrated yet" fallback below, and an unknown id
+            still gets an honest explanation instead of an empty area. */}
+        {[
+          "overview",
+          "projects",
+          "agents",
+          "models",
+          "runs",
+          "tools",
+          "usage",
+          "settings",
+          "help",
+        ].indexOf(nav) < 0 ? (
           <div className="content">
             <div className="row between" style={{ marginBottom: 12 }}>
               <div className="card-title">{t(lang, `nav.${nav}`)}</div>
