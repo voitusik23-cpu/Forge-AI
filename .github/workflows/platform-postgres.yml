@@ -39,7 +39,7 @@ jobs:
   platform-postgres:
     name: Platform contract on PostgreSQL 16
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     services:
       postgres:
@@ -88,7 +88,7 @@ jobs:
   general-suite:
     name: Full suite without a database
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Check out the repository

@@ -4,6 +4,7 @@ import { Overview } from "./screens/Overview";
 import { Agents } from "./screens/Agents";
 import { Projects } from "./screens/Projects";
 import { Runs } from "./screens/Runs";
+import { Tools } from "./screens/Tools";
 import { Costs } from "./screens/Costs";
 import { Models } from "./screens/Models";
 import { Settings } from "./screens/Settings";
@@ -153,6 +154,7 @@ export const App = () => {
             onHelp={() => openHelp(CONTEXT_TOPIC.runs)}
           />
         ) : null}
+        {nav === "tools" ? <Tools lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}
         {nav === "usage" ? <Costs lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}
         {nav === "settings" ? (
           <Settings
