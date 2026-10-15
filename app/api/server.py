@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from app.api.models import TaskRunRequest
-from app.api.service import ForgeApiService
+from app.api.service import ForgeApiService, RunIdempotencyConflict, IdempotencyUnavailable
 from app.runtime.run_store import is_safe_run_id
 
 logger = logging.getLogger("forge.api")
@@ -169,7 +169,7 @@ def create_api_app(
     directory. It defaults to the repository's own ``app/static``.
     """
 
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request, Header
     from fastapi.exceptions import RequestValidationError
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
@@ -365,7 +365,14 @@ def create_api_app(
         return api_service.list_tools()
 
     @app.post("/api/tasks/run")
-    def run_task(payload: dict[str, Any]) -> dict[str, Any]:
+    def run_task(
+        payload: dict[str, Any],
+        idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    ) -> Any:
+        # The typed body parameter must stay: the project's request-schema guard matches a body
+        # against it, and without it every POST here is refused as an unknown shape. The
+        # idempotency key therefore arrives through FastAPI's declared Header mechanism, which
+        # adds no Request object and no field to the byte-pinned request model.
         if not payload.get("description"):
             raise HTTPException(status_code=400, detail="Missing required field 'description'")
         req = TaskRunRequest(
@@ -376,7 +383,21 @@ def create_api_app(
             project_id=payload.get("project_id"),
             context=payload.get("context", {}),
         )
-        return api_service.run_task(req).to_dict()
+        try:
+            outcome = api_service.run_task_detailed(req, idempotency_key=idempotency_key)
+        except RunIdempotencyConflict as conflict:
+            raise HTTPException(status_code=409, detail=str(conflict)) from conflict
+        except IdempotencyUnavailable as unavailable:
+            # Fail closed: nothing was executed, and the caller is told why.
+            raise HTTPException(status_code=503, detail=str(unavailable)) from unavailable
+        response = JSONResponse(outcome.response.to_dict())
+        response.headers["X-Forge-Idempotent-Replay"] = "true" if outcome.idempotent_replay else "false"
+        response.headers["X-Forge-History-Recorded"] = "true" if outcome.history_recorded else "false"
+        response.headers["X-Forge-Usage-Basis"] = outcome.usage_basis
+        response.headers["X-Forge-Cost-Basis"] = outcome.cost_basis
+        if outcome.history_error:
+            response.headers["X-Forge-History-Error"] = outcome.history_error
+        return response
 
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:

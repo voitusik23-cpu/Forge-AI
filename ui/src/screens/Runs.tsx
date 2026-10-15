@@ -39,6 +39,12 @@ export const Runs = ({
   const [error, setError] = useState("");
   const [dispatched, setDispatched] = useState<RunResult[]>([]);
   const [record, setRecord] = useState<{ id: string; body: string } | null>(null);
+  // One key per logical operation, kept across retries so a timeout cannot pay twice.
+  const [idempotencyKey, setIdempotencyKey] = useState(() =>
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `key-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
 
   useEffect(() => {
     if (!projectId && projects.length > 0) setProjectId(String(projects[0].project_id ?? ""));
@@ -69,6 +75,7 @@ export const Runs = ({
           category,
           project_id: projectId || undefined,
           provider_name: provider || undefined,
+          idempotency_key: idempotencyKey,
         }),
       });
       const payload = (await response.json()) as RunResult;
@@ -77,6 +84,14 @@ export const Runs = ({
       } else {
         setResult(payload);
         setDispatched((previous) => [payload, ...previous].slice(0, 20));
+        if (payload.idempotent_replay !== true) {
+          // The operation finished: the next submit is a new logical operation.
+          setIdempotencyKey(
+            typeof crypto !== "undefined" && "randomUUID" in crypto
+              ? crypto.randomUUID()
+              : `key-${Date.now()}`
+          );
+        }
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -207,6 +222,22 @@ export const Runs = ({
               </pre>
               {result.error ? (
                 <div className="notice danger" style={{ marginTop: 10 }}>{String(result.error)}</div>
+              ) : null}
+              <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                <Badge tone={String(result.usage_basis) === "ACTUAL" ? "ok" : String(result.usage_basis) === "MOCK" ? "warn" : "neutral"}>
+                  {t(lang, "runs.basis.usage")}: {String(result.usage_basis ?? "UNKNOWN")}
+                </Badge>
+                <Badge tone={String(result.cost_basis) === "ACTUAL" ? "ok" : String(result.cost_basis) === "MOCK" ? "warn" : "neutral"}>
+                  {t(lang, "runs.basis.cost")}: {String(result.cost_basis ?? "UNKNOWN")}
+                </Badge>
+                {result.idempotent_replay === true ? (
+                  <Badge tone="info">{t(lang, "runs.basis.replay")}</Badge>
+                ) : null}
+              </div>
+              {result.history_recorded === false ? (
+                <div className="notice warn" style={{ marginTop: 10 }}>
+                  {t(lang, "runs.history.failed")}: {text(result.history_error)}
+                </div>
               ) : null}
               <div className="small muted" style={{ marginTop: 8 }}>
                 {t(lang, "runs.result.model")}: {text(result.model_used)} · task {text(result.task_id)} · project{" "}

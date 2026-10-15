@@ -87,6 +87,10 @@ def start_server(arguments: list[str], log_name: str) -> subprocess.Popen:
             "FORGE_API_HOST": "127.0.0.1",
             "FORGE_API_PORT": str(API_PORT),
             "PYTHONPATH": str(REPO),
+            # An explicit, writable run store. The default lives under the user profile,
+            # which some platforms (and this sandbox) refuse to create; the store honours
+            # this variable, so persistence works either way and the location is visible.
+            "FORGE_RUN_STORE_ROOT": str(REPO / ".forge" / "run-store"),
         }
     )
     handle = (LOGS / log_name).open("a", encoding="utf-8")

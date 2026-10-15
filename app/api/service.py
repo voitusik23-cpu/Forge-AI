@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import datetime
 import time
 import uuid
@@ -258,6 +260,30 @@ IDENTITY_LOOP_POLICY = AgentHarnessPolicy(
 
 
 from pathlib import Path
+
+
+class RunIdempotencyConflict(RuntimeError):
+    """The same idempotency key arrived with a materially different request."""
+
+
+class IdempotencyUnavailable(RuntimeError):
+    """A key was supplied but the durable ledger cannot be used, so nothing was dispatched."""
+
+
+@dataclass(frozen=True)
+class RunDispatchResult:
+    """A dispatch response plus the facts that do not belong to the HTTP contract.
+
+    The response model is byte-pinned by the repository's guard tests, so these travel as
+    ``X-Forge-*`` headers instead of new body fields. A header cannot express authority.
+    """
+
+    response: "TaskRunResponse"
+    idempotent_replay: bool = False
+    history_recorded: bool = True
+    history_error: str = ""
+    usage_basis: str = "UNKNOWN"
+    cost_basis: str = "UNKNOWN"
 
 
 class ForgeApiService:
@@ -2264,8 +2290,180 @@ class ForgeApiService:
             ),
         }
 
+    def _run_store_write_reason(self) -> str:
+        """A short, path-free reason why a run record could not be persisted.
+
+        Deliberately does not leak a filesystem path or an internal traceback: the caller only
+        needs to know which class of problem it is. Writability is probed directly, because the
+        original failure happens inside a ``try/except`` whose contract is to let the run finish.
+        """
+
+        root = None
+        for attribute in ("root", "_root"):
+            candidate = getattr(self._run_store, attribute, None)
+            if candidate:
+                root = candidate
+                break
+        if root is None:
+            return "run history was not persisted (store root unknown)"
+        try:
+            directory = Path(root)
+            directory.mkdir(parents=True, exist_ok=True)
+            probe = directory / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return "run history was not persisted (store rejected the write)"
+        except PermissionError:
+            return (
+                "run history was not persisted: the run store root is not writable here; "
+                "set FORGE_RUN_STORE_ROOT to a writable directory"
+            )
+        except OSError as error:  # noqa: BLE001 - the class of failure is the useful part
+            return f"run history was not persisted: {type(error).__name__}"
+
+    # ------------------------------------------------------------------ usage basis
+    @staticmethod
+    def derive_usage_basis(attempts, *, mock_provider: str = "mock") -> tuple[str, str]:
+        """``(usage_basis, cost_basis)`` from the evidence a finished run actually holds.
+
+        Never guesses: a value that is not supported by evidence is reported as ``UNKNOWN`` so a
+        caller can render "unknown" instead of a confident zero. The attempt sequence is read
+        defensively because several providers and legacy records populate different attributes.
+        """
+
+        if not attempts:
+            return "UNKNOWN", "UNKNOWN"
+        latest = attempts[-1]
+        provider = str(
+            getattr(latest, "provider", "")
+            or getattr(latest, "provider_name", "")
+            or getattr(latest, "provider_id", "")
+        )
+        is_mock = bool(provider) and provider.lower() == mock_provider.lower()
+
+        def first_present(*names):
+            for name in names:
+                value = getattr(latest, name, None)
+                if value not in (None, "", 0):
+                    return value
+            return None
+
+        reported_tokens = first_present(
+            "input_tokens", "prompt_tokens", "total_tokens", "tokens_reported", "usage"
+        )
+        reported_cost = first_present("provider_reported_cost", "actual_cost", "cost_reported")
+        estimated_cost = first_present("estimated_cost", "cost", "total_cost")
+
+        if is_mock:
+            # A mock execution is labelled as such even though its numbers are internally real.
+            return "MOCK", "MOCK"
+        if reported_tokens is not None or reported_cost is not None:
+            return "ACTUAL", "ACTUAL" if reported_cost is not None else "UNKNOWN"
+        if estimated_cost is not None:
+            return "ESTIMATED", "ESTIMATED"
+        return "UNKNOWN", "UNKNOWN"
+
+    # ------------------------------------------------------------------ idempotency
+    def _idempotency_ledger_instance(self):
+        """The durable ledger, rooted beside the run store so it survives a restart."""
+
+        ledger = getattr(self, "_idempotency", None)
+        if ledger is not None:
+            return ledger
+        from app.agent_runtime.idempotency import IdempotencyLedger
+
+        root = None
+        for attribute in ("root", "_root"):
+            candidate = getattr(self._run_store, attribute, None)
+            if candidate:
+                root = candidate
+                break
+        self._idempotency = IdempotencyLedger(
+            root=(Path(root) / "idempotency") if root else None
+        )
+        return self._idempotency
+
+    @staticmethod
+    def _request_fingerprint(req: "TaskRunRequest", project_id: str) -> str:
+        """A stable fingerprint of the logical request, used to detect a real conflict."""
+
+        import hashlib
+
+        material = "\u0000".join(
+            (
+                str(req.description or "").strip(),
+                str(req.category or ""),
+                str(project_id or ""),
+                str(req.provider_name or ""),
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _operation_identity(
+        self, req: "TaskRunRequest", project_id: str, idempotency_key: str
+    ):
+        from app.agent_runtime.criterion_identity import TaskIdentity
+        from app.agent_runtime.idempotency import OperationClass, OperationIdentity
+
+        fingerprint = self._request_fingerprint(req, project_id)
+        scoped_key = f"{project_id}:{idempotency_key}"
+        # The ledger derives the canonical operation fingerprint from the identity, and rejects a
+        # caller-supplied one that disagrees. The request fingerprint therefore lives inside the
+        # task identity, which participates in that derivation: a different request produces a
+        # different identity, which is what the conflict check relies on.
+        return OperationIdentity(
+            operation_class=OperationClass.TASK_RUN,
+            idempotency_key=scoped_key,
+            task_identity=TaskIdentity(
+                task_id=req.task_id or scoped_key, task_fingerprint=fingerprint
+            ),
+        )
+
+    def _replay_response(self, record, req: "TaskRunRequest", project_id: str) -> "TaskRunResponse":
+        """Answer a replay with the original identity, and start nothing."""
+
+        run_id = getattr(record, "run_id", "") or ""
+        state = ""
+        tokens = 0
+        cost = 0.0
+        provider = ""
+        model = ""
+        record_payload = self.get_run_record(run_id) if run_id else None
+        if isinstance(record_payload, dict):
+            summary = record_payload.get("summary")
+            if isinstance(summary, dict):
+                state = str(summary.get("state") or summary.get("status") or "")
+            else:
+                state = str(record_payload.get("state") or record_payload.get("status") or "")
+            accounting = record_payload.get("accounting")
+            if isinstance(accounting, dict):
+                tokens = int(accounting.get("total_tokens") or 0)
+                cost = float(accounting.get("total_cost") or 0.0)
+                provider = str(accounting.get("provider") or "")
+                model = str(accounting.get("model") or "")
+        return TaskRunResponse(
+            run_id=run_id,
+            task_id=req.task_id or "",
+            project_id=project_id,
+            state=state or str(getattr(record, "state", "") or "UNKNOWN"),
+            success=state.upper() == "COMPLETED",
+            output="",
+            error=None,
+            tokens=tokens,
+            cost=cost,
+            provider_used=provider,
+            model_used=model,
+        )
+
     def run_task(self, req: TaskRunRequest) -> TaskRunResponse:
-        """Execute a task through Forge Core and return execution telemetry."""
+        """Backwards-compatible entry point: the response alone."""
+
+        return self.run_task_detailed(req).response
+
+    def run_task_detailed(
+        self, req: TaskRunRequest, *, idempotency_key: Optional[str] = None
+    ) -> "RunDispatchResult":
+        """Execute a task and return the response with its dispatch facts."""
         run_id = f"run-api-{uuid.uuid4().hex[:8]}"
         task_id = req.task_id or f"task-{uuid.uuid4().hex[:6]}"
         project_id = req.project_id or self._active_project_id
@@ -2275,6 +2473,36 @@ class ForgeApiService:
             category = TaskCategory(req.category.lower())
         except ValueError:
             category = TaskCategory.CODE
+
+        # Idempotency is decided before anything is dispatched, so a replay cannot start a
+        # second execution even in principle.
+        identity = None
+        if idempotency_key:
+            # Fail closed: a paid dispatch must not proceed unprotected because the ledger is
+            # unusable. A request without a key keeps the legacy behaviour.
+            try:
+                identity = self._operation_identity(req, project_id, idempotency_key)
+                record, claimed = self._idempotency_ledger_instance().claim(
+                    identity, run_id=run_id
+                )
+            except Exception as error:  # noqa: BLE001 - the class of failure is what matters
+                raise IdempotencyUnavailable(
+                    "idempotency protection is unavailable, so the dispatch was refused "
+                    f"({type(error).__name__}); set FORGE_RUN_STORE_ROOT to a writable directory"
+                ) from error
+            if not claimed:
+                if getattr(record, "operation_fingerprint", "") != identity.fingerprint:
+                    raise RunIdempotencyConflict(
+                        "idempotency_key was already used for a different request"
+                    )
+                return RunDispatchResult(
+                    response=self._replay_response(record, req, project_id),
+                    idempotent_replay=True,
+                    history_recorded=True,
+                    history_error="",
+                    usage_basis="UNKNOWN",
+                    cost_basis="UNKNOWN",
+                )
 
         context = dict(req.context)
         context.update({"run_id": run_id, "project_id": project_id})
@@ -2347,6 +2575,27 @@ class ForgeApiService:
         # Determine output
         output = ""
         error = None
+        # A persisted record is what makes the run auditable; a silent failure would show an
+        # empty history and call it normal. Derive the truth from the store itself.
+        usage_basis, cost_basis = self.derive_usage_basis(
+            getattr(run_acc, "attempt_records", ()) or ()
+        )
+        history_recorded = bool(api_run_store is not None and self._run_store.exists(run_id))
+        history_error = "" if history_recorded else self._run_store_write_reason()
+        if identity is not None:
+            try:
+                from app.agent_runtime.idempotency import RunLifecycleState
+
+                self._idempotency_ledger_instance().update(
+                    identity,
+                    lifecycle=(
+                        RunLifecycleState.COMPLETED if success else RunLifecycleState.FAILED
+                    ),
+                    attempt_number=int(getattr(run_acc, "total_attempts", 0) or 0),
+                )
+            except Exception:  # noqa: BLE001 - the dispatch outcome is already decided
+                pass
+
         success = (run.state == RunState.COMPLETED)
 
         last_att = run_acc.attempt_records[-1] if run_acc.attempt_records else None
@@ -2415,7 +2664,7 @@ class ForgeApiService:
         if not output and run.result is not None:
             output = run.result.output
 
-        return TaskRunResponse(
+        response = TaskRunResponse(
             run_id=run_id,
             task_id=task_id,
             project_id=project_id,
@@ -2428,4 +2677,12 @@ class ForgeApiService:
             duration_seconds=round(duration, 3),
             provider_used=provider_used,
             model_used=model_used,
+        )
+        return RunDispatchResult(
+            response=response,
+            idempotent_replay=False,
+            history_recorded=history_recorded,
+            history_error=history_error,
+            usage_basis=usage_basis,
+            cost_basis=cost_basis,
         )
