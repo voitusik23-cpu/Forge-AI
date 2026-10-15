@@ -171,6 +171,90 @@ def report_existing(journal: Journal) -> None:
         )
 
 
+def window_title(handle: int) -> str:
+    """The current title of a window handle."""
+
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(handle, buffer, 512)
+    return buffer.value
+
+
+def window_handles(title_fragment: str) -> list:
+    """Handles of visible windows whose title contains the fragment."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    handles: list[int] = []
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def collect(hwnd, _lparam):  # noqa: ANN001 - Win32 callback signature
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buffer = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buffer, 512)
+        if title_fragment.lower() in buffer.value.lower():
+            handles.append(hwnd)
+        return True
+
+    user32.EnumWindows(callback_type(collect), 0)
+    return handles
+
+
+def bring_to_front(title_fragment: str, journal: "Journal", timeout: float = 20.0) -> bool:
+    """Restore and foreground the application window, whatever state it opened in.
+
+    A window can be created minimised when the process that spawned it was started hidden or
+    minimised -- measured on this machine, the launcher's own window arrived at ``-16000,-16000``
+    with ``iconic=True`` and was invisible to the owner. Asking for it explicitly is the smallest
+    reliable fix and works for every launch path.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    SW_RESTORE = 9
+    SW_SHOW = 5
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        handles: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def collect(hwnd, _lparam):  # noqa: ANN001 - Win32 callback signature
+            buffer = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, buffer, 512)
+            if title_fragment.lower() in buffer.value.lower():
+                handles.append(hwnd)
+            return True
+
+        user32.EnumWindows(callback_type(collect), 0)
+        for hwnd in handles:
+            iconic = bool(user32.IsIconic(hwnd))
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.ShowWindow(hwnd, SW_SHOW)
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.3)
+            still_minimised = bool(user32.IsIconic(hwnd))
+            journal.write(
+                f"window '{title_fragment}': was_minimised={iconic}, "
+                f"still_minimised={still_minimised}"
+            )
+            if not still_minimised:
+                return True
+            journal.write(
+                "that window did not restore; it may belong to another application, so it is not "
+                "reused"
+            )
+            return False
+        time.sleep(0.5)
+    journal.write(f"window '{title_fragment}' was not found within {int(timeout)}s")
+    return False
+
+
 class Supervisor:
     def __init__(self, journal: Journal, open_window: bool, url: str) -> None:
         self.journal = journal
@@ -225,6 +309,31 @@ class Supervisor:
     def close_window(self) -> int:
         """Open the WebView2 window and wait for the user to close it."""
 
+        if window_handles("FORGE AI"):
+            # Only a window this launcher can actually bring back to the screen may be reused: a
+            # foreign or ghost window with the same title would otherwise absorb the launch and the
+            # owner would see nothing.
+            self.journal.write("an application window is already open; trying to bring it forward")
+            # A window owned by a different browser can carry the same title (measured: a Chrome
+            # window titled "FORGE AI — Command Center - Google Chrome" that ignores SW_RESTORE),
+            # so those are skipped instead of absorbing the launch attempt.
+            foreign = [
+                handle
+                for handle in window_handles("FORGE AI")
+                if "google chrome" in window_title(handle).lower()
+                or "microsoft edge" in window_title(handle).lower()
+            ]
+            for handle in foreign:
+                self.journal.write(
+                    f"skipping a window belonging to another browser: {window_title(handle)!r}"
+                )
+            if not foreign and bring_to_front("FORGE AI", self.journal):
+                while window_handles("FORGE AI"):
+                    time.sleep(1.0)
+                self.journal.write("window closed")
+                return
+            self.journal.write("starting a fresh browser window instead")
+
         if not EDGE.exists():
             self.journal.write(f"edge not found at {EDGE}")
             return 2
@@ -243,8 +352,30 @@ class Supervisor:
         stop_event = threading.Event()
         watchdog = threading.Thread(target=self.watch_api, args=(stop_event,), daemon=True)
         watchdog.start()
-        self.journal.write(f"window opened at {self.url} (pid {process.pid}); waiting for it to close")
-        process.wait()
+        self.journal.write(f"window opened at {self.url} (pid {process.pid})")
+        # A browser holding this profile makes a second launch exit at once, so wait for the
+        # window to become usable rather than for the process, and report honestly if it does not.
+        deadline = time.monotonic() + 15.0
+        restored = False
+        while time.monotonic() < deadline:
+            if window_handles("FORGE AI") and bring_to_front("FORGE AI", self.journal):
+                restored = True
+                break
+            if process.poll() is not None:
+                self.journal.write(
+                    f"the browser exited with code {process.returncode} before a usable window "
+                    "appeared; another instance may hold the profile "
+                    f"{(REPO / '.forge' / 'webview-profile')}"
+                )
+                break
+            time.sleep(0.5)
+        if not restored:
+            self.journal.write(
+                "no usable window appeared; the application window could not be shown"
+            )
+        while window_handles("FORGE AI") and restored:
+            time.sleep(1.0)
+        self.journal.write("window closed")
         stop_event.set()
         self.journal.write("window closed")
         return 0
