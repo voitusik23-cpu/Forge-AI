@@ -85,6 +85,30 @@ jobs:
       - name: Assert the test logins cannot bypass row-level security
         run: python -B -X utf8 scripts/check_platform_roles.py
 
+  full-suite-timing:
+    name: Full suite timing (diagnostic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    # Evidence only: this job exists to name the tests that consume CI time. It can never gate
+    # a change, and the mandatory "Full suite without a database" job is untouched by it.
+    continue-on-error: true
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Per-module timings for the whole suite
+        run: python -B -X utf8 scripts/run_test_shard.py --index 1 --count 1
+
   general-suite:
     name: Full suite without a database
     runs-on: ubuntu-latest

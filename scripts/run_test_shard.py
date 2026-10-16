@@ -43,6 +43,19 @@ if str(ROOT) not in sys.path:
 os.chdir(ROOT)
 
 
+def announce(line: str) -> None:
+    """Also publish the line as a GitHub annotation when running inside Actions.
+
+    Annotations are readable through the public API without a token, while job logs are not, so this
+    is what makes the timings reachable after a cancelled run. Locally it is a no-op.
+    """
+
+    print(line, flush=True)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        safe = line.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::notice title=test timing::{safe}", flush=True)
+
+
 def test_files(root: pathlib.Path) -> list[pathlib.Path]:
     """Every test module under ``root``, in a stable order."""
 
@@ -117,6 +130,12 @@ def main() -> int:
         total_errors += len(result.errors)
         total_skipped += len(result.skipped)
         timings.append((elapsed, path.stem, result.testsRun, len(result.failures), len(result.errors)))
+        # Printed per module, immediately: a run cancelled at the job's cap must still name the
+        # tests that consumed the time, which is the whole point of this instrument.
+        announce(
+            f"{elapsed:8.1f}s  {result.testsRun:4} tests  fail={len(result.failures)} "
+            f"err={len(result.errors)}  {path.stem}"
+        )
         if result.failures or result.errors:
             print(f"  FAIL {path.as_posix()} ({elapsed:.1f}s)", flush=True)
             for case, trace in list(result.failures) + list(result.errors):
