@@ -2215,6 +2215,50 @@ class ForgeApiService:
             "providers_checked": len(statuses),
         }
 
+    def cost_states(self) -> Dict[str, Any]:
+        """The six distinguishable states of every provider's reported cost.
+
+        Read-only and additive: the protected provider summary is not changed, and the
+        states are derived from it on demand.
+        """
+
+        from app.dashboard.cost_truth import NO_USAGE_API, cost_state_report, state_counts
+
+        report = self.get_dashboard_report(force_refresh=False)
+        # The dashboard returns a DashboardReport dataclass whose providers are typed summaries,
+        # so each one is serialised with its own to_dict before the states are derived.
+        providers = {
+            str(entry.get("provider", "")): entry
+            for entry in (item.to_dict() for item in report.providers)
+            if isinstance(entry, dict)
+        }
+        # Providers the dashboard does not carry (they are outside the pinned registry) are still
+        # part of the answer: they publish no cost through any API, so their state is stated
+        # explicitly instead of being left out.
+        for name in NO_USAGE_API:
+            providers.setdefault(
+                name, {"provider": name, "total_runs": None, "provider_reported_cost": None}
+            )
+        entries = cost_state_report(providers)
+        return {
+            "providers": entries,
+            "counts": state_counts(entries),
+            "source": "/api/dashboard providers[].provider_reported_cost",
+            "states": [
+                "KNOWN_ZERO",
+                "KNOWN_NONZERO",
+                "UNKNOWN",
+                "ERROR",
+                "MALFORMED",
+                "UNSUPPORTED",
+            ],
+            "note": (
+                "a zero in the numeric field alone cannot tell a reported zero from silence; "
+                "this endpoint states which of the six conditions applies"
+            ),
+            "checked_at": _utc_now_iso(),
+        }
+
     def provider_balance(
         self, provider: Optional[str] = None, *, force: bool = True
     ) -> Dict[str, Any]:

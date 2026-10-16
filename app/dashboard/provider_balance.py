@@ -105,8 +105,11 @@ UNSUPPORTED_REASONS: Mapping[str, str] = {
         "models, and credits are visible only in the NVIDIA console"
     ),
     "dashscope": (
-        "Alibaba DashScope publishes no balance, usage or billing endpoint through its API: "
-        "the prepaid amount and quotas are visible only in the Alibaba Cloud console"
+        "Alibaba DashScope publishes no balance, usage or billing endpoint through its API. "
+        "The official route to the account balance is Alibaba Cloud BssOpenApi "
+        "QueryAccountBalance (business.aliyuncs.com), which requires a signed request with "
+        "an Alibaba Cloud AccessKey ID and secret -- not the DashScope API key the models "
+        "are called with"
     ),
     "nararouter": (
         "no endpoint is known for this provider: the configured name does not resolve, so a "

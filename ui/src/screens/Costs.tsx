@@ -24,11 +24,12 @@
 // Layout uses the existing component system (Card, CardHead, Badge, Button and the established
 // grid/kpi classes) so the screen belongs to the product instead of introducing a second style.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Card, CardHead } from "../components/Primitives";
 import { IconRefresh } from "../components/Icons";
 import { providerBalanceHref } from "../components/ProviderBalance";
 import { t, type Lang } from "../i18n";
+import { loadCostStates, type CostStateEntry, type CostStates } from "../api/client";
 import type { BackendState, Provider } from "../api/client";
 
 /** Forge's own accounting figures are USD; a figure is never printed without its currency. */
@@ -80,6 +81,23 @@ export const Costs = ({ lang, backend, onRefresh }: CostsProps) => {
   const generatedAt =
     live && typeof backend.dashboard.generated_at === "string" ? backend.dashboard.generated_at : "";
   const [showLegend, setShowLegend] = useState(false);
+  // Reads /api/dashboard through the server: this call dials no provider, so unlike the
+  // balances it is safe to run on mount.
+  const [states, setStates] = useState<CostStates | null>(null);
+  const [statesError, setStatesError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    loadCostStates()
+      .then((payload) => {
+        if (!cancelled) setStates(payload);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setStatesError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // The three provider-level figures measure the same work differently, so they are shown side by
   // side and never merged into one number.
@@ -105,6 +123,21 @@ export const Costs = ({ lang, backend, onRefresh }: CostsProps) => {
   }, [providers]);
 
   const unknown = t(lang, "runs.unknown");
+  const stateTone = (state?: string): "ok" | "warn" | "danger" | "info" | "neutral" => {
+    switch (state) {
+      case "KNOWN_NONZERO":
+        return "info";
+      case "KNOWN_ZERO":
+        return "ok";
+      case "UNKNOWN":
+        return "warn";
+      case "ERROR":
+      case "MALFORMED":
+        return "danger";
+      default:
+        return "neutral";
+    }
+  };
   const cell = (text: string | null) =>
     text === null ? <span className="muted">{unknown}</span> : <>{text}</>;
 
@@ -180,6 +213,11 @@ export const Costs = ({ lang, backend, onRefresh }: CostsProps) => {
         <span className="mono">{generatedAt === "" ? unknown : generatedAt}</span>
       </div>
 
+      <div className="notice" style={{ marginBottom: 16 }}>
+        {t(lang, "costs.state.explain")}
+        {statesError ? ` · ${t(lang, "costs.state.error")}: ${statesError}` : ""}
+      </div>
+
       <Card>
         <CardHead
           title={t(lang, "costs.table.title")}
@@ -190,6 +228,7 @@ export const Costs = ({ lang, backend, onRefresh }: CostsProps) => {
             <tr>
               <th>{t(lang, "costs.col.provider")}</th>
               <th>{t(lang, "costs.col.reported")}</th>
+              <th>{t(lang, "costs.col.state")}</th>
               <th>{t(lang, "costs.col.estimated")}</th>
               <th>{t(lang, "costs.col.effective")}</th>
               <th>{t(lang, "costs.col.tokens")}</th>
@@ -200,6 +239,7 @@ export const Costs = ({ lang, backend, onRefresh }: CostsProps) => {
           <tbody>
             {providers.map((item) => {
               const name = String(item.provider ?? "");
+              const entry: CostStateEntry | undefined = states?.providers?.[name];
               const runs = typeof item.total_runs === "number" ? item.total_runs : null;
               // Rules 1 and 2: silence from the provider is unknown; only "no runs" is a confirmed
               // zero.
@@ -218,6 +258,11 @@ export const Costs = ({ lang, backend, onRefresh }: CostsProps) => {
                     <Badge tone="neutral">{name === "" ? unknown : name}</Badge>
                   </td>
                   <td className="mono">{cell(reportedCell)}</td>
+                  <td>
+                    <Badge tone={stateTone(entry?.reported_cost_state)}>
+                      {entry?.reported_cost_state ?? t(lang, "costs.state.absent")}
+                    </Badge>
+                  </td>
                   <td className="mono">{cell(estimatedCell)}</td>
                   <td className="mono">{cell(effectiveCell)}</td>
                   <td className="mono">{cell(integer(item.total_tokens))}</td>

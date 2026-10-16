@@ -213,6 +213,33 @@ export const loadProviderBalances = async (
   return getJson<ProviderBalances>(`/api/providers/balance${query === "" ? "" : `?${query}`}`);
 };
 
+/** One provider's cost condition, exactly as GET /api/costs/states reports it. */
+export type CostStateEntry = {
+  provider?: string;
+  reported_cost_state?: string;
+  reason?: string;
+  provider_reported_cost?: number | null;
+  estimated_cost?: number | null;
+  effective_cost?: number | null;
+  total_runs?: number | null;
+  total_tokens?: number | null;
+};
+
+export type CostStates = {
+  providers?: Record<string, CostStateEntry>;
+  counts?: Record<string, number>;
+  source?: string;
+  states?: string[];
+  note?: string;
+  checked_at?: string;
+};
+
+/**
+ * The six cost conditions per provider. This reads /api/dashboard through the server, so it dials
+ * no provider and is safe to call on mount, unlike the balances loader.
+ */
+export const loadCostStates = async (): Promise<CostStates> => getJson<CostStates>("/api/costs/states");
+
 export const loadBackend = async (): Promise<BackendState> => {
   try {
     // /api/status is the authority on whether the core answers at all.

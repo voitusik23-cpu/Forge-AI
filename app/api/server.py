@@ -364,6 +364,12 @@ def create_api_app(
         """List the tools currently registered for execution."""
         return api_service.list_tools()
 
+    @app.get("/api/costs/states")
+    def cost_states() -> Any:
+        """Which of the six cost conditions applies to each provider (read-only)."""
+
+        return api_service.cost_states()
+
     @app.get("/api/providers/balance")
     def provider_balance(provider: Optional[str] = None, refresh: int = 0) -> Any:
         """Read-only balances from the providers' own official endpoints.
