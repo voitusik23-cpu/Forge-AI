@@ -98,6 +98,79 @@ SAFE_ENV_WHITELIST_KEYS: frozenset[str] = frozenset({
 })
 
 
+def _has_valid_multibyte_utf8(raw: bytes) -> bool:
+    """Whether ``raw`` contains at least one valid multi-byte UTF-8 sequence.
+
+    This is the discriminator between "UTF-8 with a few damaged bytes" and "some single-byte
+    encoding": cp1251 has no multi-byte structure, so a cp1251 stream cannot contain a valid UTF-8
+    sequence, while damaged UTF-8 almost always still does.
+    """
+
+    index = 0
+    length = len(raw)
+    while index < length:
+        byte = raw[index]
+        if 0xC2 <= byte <= 0xDF:
+            need = 1
+        elif 0xE0 <= byte <= 0xEF:
+            need = 2
+        elif 0xF0 <= byte <= 0xF4:
+            need = 3
+        else:
+            index += 1
+            continue
+        chunk = raw[index + 1 : index + 1 + need]
+        if len(chunk) == need and all(0x80 <= item <= 0xBF for item in chunk):
+            return True
+        index += 1
+    return False
+
+
+def _platform_fallback_encodings() -> tuple[str, ...]:
+    """Encodings to try after strict UTF-8, most likely first, without duplicates."""
+
+    import locale as _locale
+
+    candidates: list[str] = []
+    try:
+        preferred = _locale.getpreferredencoding(False)
+    except Exception:  # noqa: BLE001 - a missing locale answer must not break execution
+        preferred = ""
+    if preferred:
+        candidates.append(preferred)
+    if os.name == "nt":
+        # A child writing Cyrillic through the console codepage produces cp1251 (or cp866 in an
+        # older console); both are tried before any information is discarded.
+        candidates.extend(["cp1251", "cp866"])
+    return tuple(dict.fromkeys(name for name in candidates if name))
+
+
+def decode_process_output(raw: bytes) -> tuple[str, str]:
+    """Decode a child's bytes with an ordered, platform-aware strategy.
+
+    Returns ``(text, encoding_used)``. ``encoding_used`` names the encoding that produced the text
+    and ends with ``"+replace"`` when even the platform encodings failed -- that means bytes were
+    genuinely lost, and the caller can say so instead of presenting the text as exact.
+    """
+
+    if not raw:
+        return "", "utf-8"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    if _has_valid_multibyte_utf8(raw):
+        # The payload really is UTF-8 and merely damaged: replacement keeps every readable
+        # character, while a single-byte guess would turn correct Russian into mojibake.
+        return raw.decode("utf-8", errors="replace"), "utf-8+replace"
+    for encoding in _platform_fallback_encodings():
+        try:
+            return raw.decode(encoding), encoding
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8+replace"
+
+
 def _windows_process_tree(root_pid: int) -> tuple[int, ...]:
     """Return ``root_pid`` and its descendants from a point-in-time snapshot.
 
@@ -802,8 +875,8 @@ class LocalExecutionAdapter:
             if timed_out:
                 exit_code = None
                 status = ExecutionStatus.TIMEOUT
-                raw_stdout = stdout_bytes.decode("utf-8", errors="replace")
-                raw_stderr = stderr_bytes.decode("utf-8", errors="replace")
+                raw_stdout, stdout_encoding = decode_process_output(stdout_bytes)
+                raw_stderr, stderr_encoding = decode_process_output(stderr_bytes)
                 raw_stderr = (
                     f"{raw_stderr}\nProcess timed out after {timeout} seconds".strip()
                     if raw_stderr
@@ -816,8 +889,8 @@ class LocalExecutionAdapter:
                     if exit_code == 0
                     else ExecutionStatus.FAILURE
                 )
-                raw_stdout = stdout_bytes.decode("utf-8", errors="replace")
-                raw_stderr = stderr_bytes.decode("utf-8", errors="replace")
+                raw_stdout, stdout_encoding = decode_process_output(stdout_bytes)
+                raw_stderr, stderr_encoding = decode_process_output(stderr_bytes)
         finally:
             if proc.stdout and not proc.stdout.closed:
                 proc.stdout.close()
@@ -846,7 +919,18 @@ class LocalExecutionAdapter:
             stderr=raw_stderr,
             duration_seconds=duration,
             truncated=truncated,
-            metadata=dict(metadata),
+            metadata={
+                **metadata,
+                # Evidence, not decoration: which encoding produced the text, and whether
+                # any byte had to be replaced (in which case the text is not exact).
+                "output_decoding": {
+                    "stdout": stdout_encoding,
+                    "stderr": stderr_encoding,
+                    "undecodable_output": stdout_encoding.endswith("+replace")
+                    or stderr_encoding.endswith("+replace"),
+                    "strict_utf8": stdout_encoding == "utf-8" and stderr_encoding == "utf-8",
+                },
+            },
         )
 
     @staticmethod
