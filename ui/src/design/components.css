@@ -351,3 +351,114 @@
   box-shadow: inset 0 0 0 1px var(--hairline-strong);
 }
 select.input { cursor: pointer; }
+
+/* Forge AI identity and state helpers, added by the brand layer. */
+.forge-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.forge-state {
+  border: 1px dashed var(--border, #333a43);
+  border-radius: var(--radius, 10px);
+  padding: 18px;
+  color: var(--text-muted, #9aa4ae);
+}
+
+.forge-state[data-tone="error"] { border-color: #cf6b5f; color: var(--text, #e8ebee); }
+.forge-state[data-tone="ok"] { border-color: #6fae7a; color: var(--text, #e8ebee); }
+
+:focus-visible { outline: 2px solid var(--accent, #e0a33a); outline-offset: 2px; }
+
+/* ---------------------------------------------------------------------------------------------
+ * Кузница — the desktop workspace.
+ *
+ * A local palette for the workspace only: the anvil's gold and the technical blue, over the
+ * graphite surfaces the rest of the app already uses. Nothing here restyles an existing screen:
+ * every rule is scoped under `.forge-workbench`.
+ * ------------------------------------------------------------------------------------------- */
+.forge-workbench {
+  --forge-gold: #e0a33a;
+  --forge-gold-dim: rgba(224, 163, 58, 0.22);
+  --forge-blue: #4a86c8;
+}
+
+.forge-workbench .forge-anvil { color: var(--forge-gold); flex: 0 0 auto; }
+
+/* The workshop's own accent: the anvil's gold for the action, the technical blue for "live"
+   information. Scoped here so no existing screen changes colour. */
+.forge-workbench .btn.primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #e8b65f, var(--forge-gold) 55%, #b97f22);
+  color: #1a1204;
+  box-shadow: 0 10px 26px rgba(224, 163, 58, 0.28);
+}
+
+.forge-workbench .btn.primary:hover { box-shadow: 0 14px 34px rgba(224, 163, 58, 0.42); }
+
+.forge-workbench .badge.info {
+  color: #a8c8ee;
+  background: rgba(74, 134, 200, 0.16);
+  border-color: rgba(74, 134, 200, 0.4);
+}
+
+.forge-facts {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.forge-fact {
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  border-left: 2px solid var(--forge-gold-dim);
+  background: var(--surface-sunken);
+}
+
+.forge-fact .label { color: var(--muted); }
+
+.forge-project {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  color: inherit;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-input);
+  transition: border-color var(--speed) var(--ease), box-shadow var(--speed) var(--ease);
+}
+
+.forge-project:hover { border-color: rgba(224, 163, 58, 0.45); }
+
+.forge-project.selected {
+  border-color: rgba(224, 163, 58, 0.7);
+  box-shadow: inset 0 0 0 1px rgba(224, 163, 58, 0.22);
+}
+
+.forge-agent {
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-input);
+}
+
+.forge-output {
+  margin: 8px 0 0;
+  padding: 12px;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-sunken);
+  color: var(--ice);
+}

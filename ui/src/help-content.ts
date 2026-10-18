@@ -184,6 +184,7 @@ export const HELP_TOPIC_BY_ID = (id: string): HelpTopic | undefined =>
 
 // Which topic each screen should offer through its "How does this work?" link.
 export const CONTEXT_TOPIC: Record<string, string> = {
+  forge: "run",
   overview: "status",
   agents: "agents",
   settings: "appearance",

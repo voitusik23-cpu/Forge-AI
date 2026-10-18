@@ -42,6 +42,15 @@ export const IconModels = ({ size = 20, className }: IconProps) => (
   </svg>
 );
 
+export const IconAnvil = ({ size = 20, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <path d="M5 9h14l-2.6 4H7.6z" />
+    <path d="M9.5 13v4.5" />
+    <path d="M7 19.5h10" />
+    <path d="M12 9V5.5" />
+  </svg>
+);
+
 export const IconRuns = ({ size = 20, className }: IconProps) => (
   <svg {...base(size)} className={className}>
     <path d="M4 12h4l2.5-6 3 12L16 12h4" />

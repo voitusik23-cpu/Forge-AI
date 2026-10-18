@@ -10,6 +10,15 @@ export type Status = {
   providers_total?: number;
   active_project?: string;
   timestamp?: string;
+  /**
+   * `SystemStatusResponse.details`: `enabled_providers` (list) and `default_provider` (string).
+   * Declared here because the Кузница workspace grounds its provider choice in these two real
+   * values instead of offering a catalogue entry that the Core does not route to.
+   */
+  details?: {
+    enabled_providers?: unknown;
+    default_provider?: unknown;
+  };
 };
 
 export type AccountStatus = {

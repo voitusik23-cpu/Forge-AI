@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { NavRail, TopBar } from "./components/NavRail";
+import { Forge } from "./screens/Forge";
 import { Overview } from "./screens/Overview";
 import { Agents } from "./screens/Agents";
 import { Projects } from "./screens/Projects";
@@ -35,7 +36,7 @@ const toneOf = (value: unknown): "ok" | "warn" | "danger" | "idle" => {
 
 export const App = () => {
   const params = new URLSearchParams(window.location.search);
-  const startSection = params.get("nav") ?? "overview";
+  const startSection = params.get("nav") ?? "forge";
   const [lang, setLang] = useState<Lang>(params.get("lang") === "en" ? "en" : "ru");
   const [screen, setScreen] = useState<"app" | "auth">(params.get("screen") === "auth" ? "auth" : "app");
   const [backend, setBackend] = useState<BackendState>({ status: "loading" });
@@ -127,6 +128,15 @@ export const App = () => {
           }
           onHelp={() => openHelp()}
         />
+        {nav === "forge" ? (
+          <Forge
+            lang={lang}
+            backend={backend}
+            onRefresh={() => void reload()}
+            onLanguage={setLang}
+            onHelp={() => openHelp(CONTEXT_TOPIC.forge)}
+          />
+        ) : null}
         {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}
         {nav === "agents" ? <Agents lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}
         {nav === "projects" ? (
@@ -171,6 +181,7 @@ export const App = () => {
             here must never also render the "not migrated yet" fallback below, and an unknown id
             still gets an honest explanation instead of an empty area. */}
         {[
+          "forge",
           "overview",
           "projects",
           "agents",

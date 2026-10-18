@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import { ForgeMark, IconSearch } from "./Icons";
 import {
   IconAgents,
+  IconAnvil,
   IconHelp,
   IconModels,
   IconOverview,
@@ -16,6 +17,7 @@ import { StatusDot } from "./Primitives";
 import type { ThemeMode } from "../appearance";
 
 const ITEMS: Array<{ id: string; key: string; Icon: (p: { size?: number }) => ReactElement; badge?: string }> = [
+  { id: "forge", key: "nav.forge", Icon: IconAnvil },
   { id: "overview", key: "nav.overview", Icon: IconOverview },
   { id: "projects", key: "nav.projects", Icon: IconProjects, badge: "1" },
   { id: "agents", key: "nav.agents", Icon: IconAgents },

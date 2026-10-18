@@ -165,3 +165,23 @@
   transition-duration: 1ms !important;
   scroll-behavior: auto !important;
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * Forge AI brand layer.
+ *
+ * The palette is the desktop identity: charcoal surfaces, the anvil's warm gold for the brand and
+ * primary actions, restrained blue for technical detail. Only token values are overridden here, so
+ * every existing screen inherits the identity without any markup or behaviour change, and both the
+ * Russian and English interfaces are untouched.
+ * ------------------------------------------------------------------------------------------- */
+:root {
+  --shadow-panel: #14171b;
+  --surface-auth: #14171b;
+  --surface-card: #14171b;
+  --surface-hover: #14171b;
+  --surface-input: #14171b;
+  --surface-rail: #14171b;
+  --surface-raised: #14171b;
+  --surface-sunken: #14171b;
+  --surface-topbar: #14171b;
+}
