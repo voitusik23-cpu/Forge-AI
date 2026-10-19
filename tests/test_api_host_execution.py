@@ -697,11 +697,20 @@ class ExecutionTokenBoundaryTests(HostExecutionTestCase):
             self.assertIn("AuthorizedExecution", str(ctx.exception))
 
     def test_api_never_holds_an_execution_token(self) -> None:
-        """The API surface exposes no execution token."""
+        """The API surface exposes no execution token.
+
+        ``bind_authorized_project`` is named here instead of being excluded by a pattern: it binds the
+        project the composition authorized and neither carries nor mints an execution token. The
+        pattern still applies to every other name, so a real token added later fails this test.
+        """
         service = self._service()
+        composition_methods = {"bind_authorized_project"}
         for name in dir(service):
+            if name in composition_methods:
+                continue
             self.assertNotIn("authorized", name.lower())
             self.assertNotIn("_token", name)
+        self.assertFalse(hasattr(service, "authorized_execution"))
 
 
 class LegacyCompatibilityTests(HostExecutionTestCase):

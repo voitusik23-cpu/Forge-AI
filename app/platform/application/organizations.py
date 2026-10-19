@@ -41,7 +41,7 @@ from app.platform.application.authorization import (
 )
 from app.platform.application.context import AuthorizedContext
 from app.platform.application.errors import translate_persistence_error
-from app.platform.models import Organization
+from app.platform.models import Organization, new_id
 from app.platform.principal import AuthenticatedPrincipal
 
 __all__ = [
@@ -235,6 +235,48 @@ class DiscoveryService:
                 status=project.status.value,
             )
             for project in projects
+        )
+
+    # -- AS-3 --------------------------------------------------------------- #
+    async def create_project(
+        self,
+        principal: Optional[AuthenticatedPrincipal],
+        organization_id: Optional[str],
+        name: str,
+        *,
+        slug: str = "",
+        workspace_ref: str = "",
+    ) -> ProjectSummary:
+        """AS-3: create a project in the organization the caller selected.
+
+        The caller supplies a **name** and nothing authoritative. ``organization_id`` is
+        the same claim AS-2 checks, so a claim outside the caller's candidate set is
+        answered ``not_found`` rather than ``not_permitted`` and another tenant stays
+        indistinguishable from a non-existent one. The project is created inside the
+        tenant transaction opened by :meth:`_authorized`, so it lands in the caller's own
+        tenant with no ``organization_id`` parameter to get wrong.
+
+        ``workspace_ref`` is the server's opaque reference, stored as given and
+        interpreted nowhere; it is never a filesystem path and never comes from a client
+        (the domain contract asserts exactly that).
+        """
+
+        try:
+            async with self._authorized(principal, organization_id) as (_, unit):
+                project = await unit.projects.create(
+                    new_id(),
+                    name,
+                    slug=slug,
+                    workspace_ref=workspace_ref,
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise translate_persistence_error(exc) from exc
+
+        return ProjectSummary(
+            project_id=str(project.id),
+            name=project.name,
+            slug=project.slug,
+            status=project.status.value,
         )
 
     # -- for the next slice ------------------------------------------------- #

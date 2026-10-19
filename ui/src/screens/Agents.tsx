@@ -284,7 +284,7 @@ export const Agents = ({
                       <td className="small">
                         <a
                           href={providerBalanceHref(providerId)}
-                          style={{ color: "var(--cyan-hi)" }}
+                          style={{ color: "var(--info-text)" }}
                           onClick={(event) => event.stopPropagation()}
                         >
                           {t(lang, "agents.balance.link")}
@@ -455,7 +455,7 @@ export const Agents = ({
                 <div className="row between">
                   <span className="muted">{t(lang, "agents.detail.finance.balance")}</span>
                   <span className="small">
-                    <a href={providerBalanceHref(selectedProvider)} style={{ color: "var(--cyan-hi)" }}>
+                    <a href={providerBalanceHref(selectedProvider)} style={{ color: "var(--info-text)" }}>
                       {t(lang, "agents.balance.link")}
                     </a>
                   </span>

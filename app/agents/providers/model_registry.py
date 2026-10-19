@@ -13,6 +13,11 @@ from app.agents.providers.models import (
     ProviderModelInfo,
     ProviderProtocol,
 )
+from app.agents.providers.radox_catalogue import CATALOGUE_SOURCE_NOTE as RADOX_SOURCE_NOTE
+from app.agents.providers.radox_catalogue import (
+    CURATED_CATALOGUE as RADOX_CURATED_CATALOGUE,
+)
+from app.agents.providers.radox_catalogue import MODEL_IDS as RADOX_MODEL_IDS
 
 
 class ModelRegistryError(Exception):
@@ -695,7 +700,73 @@ def create_default_registry() -> ModelRegistry:
         )
     )
 
-    # 9. Mock (Offline testing)
+    # 9. Radox AI (OpenAI-compatible API at https://radoxai.com/v1)
+    #
+    # One row per model of the owner's curated 10-model set, generated from
+    # ``radox_catalogue.CURATED_CATALOGUE`` -- the same tuple
+    # ``RadoxProvider.MODEL_IDS`` comes from, so the provider's list and these
+    # rows cannot drift apart. The owner pruned the advertised set; the rest of
+    # the 33-model catalogue is kept in ``radox_catalogue.CATALOGUE`` as an
+    # archive and is deliberately not registered here.
+    #
+    # Four things are deliberately kept separate from the catalogue facts:
+    #
+    # * context window, input and output price per 1M tokens are the owner's
+    #   figures, and every row's ``metadata["limits_source"]`` says where they
+    #   came from. They are a declaration of 2026-10-18, not a probed fact;
+    # * ``max_output_tokens`` is absent from the catalogue, so the rows keep the
+    #   ``ProviderModelInfo`` default (4096) instead of an invented figure;
+    # * ``cost_tier`` is PAID for every row: a price above zero must never enter
+    #   automatic routing while ``allow_paid_providers`` is false;
+    # * the technical capabilities are the catalogue's own tags. ``web`` has no
+    #   ``ModelCapability`` member, so it is preserved in the catalogue data and
+    #   not invented here. The ``code``/``analysis``/``review`` task intents are
+    #   declared on every row because ``capabilities.py`` already declares those
+    #   task categories for the provider as a whole.
+    _radox_catalogue_metadata = {"limits_source": RADOX_SOURCE_NOTE}
+    _radox_task_intents = frozenset({
+        ModelCapability.CODE,
+        ModelCapability.ANALYSIS,
+        ModelCapability.REVIEW,
+    })
+    _radox_capability_map = {
+        "reasoning": ModelCapability.REASONING,
+        "vision": ModelCapability.VISION,
+        "tools": ModelCapability.TOOL_CALLING,
+        "streaming": ModelCapability.STREAMING,
+        "json": ModelCapability.STRUCTURED_OUTPUT,
+    }
+    registry.register_provider(
+        ProviderInfo(
+            provider_id="radox",
+            display_name="Radox AI",
+            protocol=ProviderProtocol.OPENAI_CHAT,
+            default_base_url="https://radoxai.com/v1",
+            default_secret_env="RADOX_API_KEY",
+            supported_models=RADOX_MODEL_IDS,
+        )
+    )
+    for _radox_entry in RADOX_CURATED_CATALOGUE:
+        registry.register_model(
+            ProviderModelInfo(
+                provider_id="radox",
+                model_id=_radox_entry.model_id,
+                display_name=_radox_entry.display_name,
+                context_window=_radox_entry.context_window,
+                capabilities=_radox_task_intents
+                | {
+                    _radox_capability_map[tag]
+                    for tag in _radox_entry.provider_capabilities
+                    if tag in _radox_capability_map
+                },
+                cost_tier=CostTier.PAID,
+                input_cost_per_1m=_radox_entry.input_cost_per_1m,
+                output_cost_per_1m=_radox_entry.output_cost_per_1m,
+                metadata=_radox_catalogue_metadata,
+            )
+        )
+
+    # 10. Mock (Offline testing)
     registry.register_provider(
         ProviderInfo(
             provider_id="mock",

@@ -145,9 +145,44 @@ def _parse_int(name: str, value: Optional[str], default: int) -> int:
         raise ConfigurationError(f"{name} must be an integer") from exc
 
 
+def _repo_env_values() -> dict:
+    """Values from the repository's own ``.env``, for the ``FORGE_*`` settings only.
+
+    Only names starting with ``FORGE_`` are returned, so a credential that happens to live in the same
+    file is never copied into the settings mapping, logged, or returned in an error. A line that is not a
+    simple ``NAME=value`` pair is ignored instead of raising: a malformed file must not stop the app.
+    """
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env_path = os.path.join(root, ".env")
+    values = {}
+    try:
+        with open(env_path, "r", encoding="utf-8-sig") as handle:
+            raw = handle.read()
+    except OSError:
+        return values
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        name = name.strip()
+        if not name.startswith("FORGE_"):
+            continue
+        values[name] = value.strip().strip('"').strip("'")
+    return values
+
+
 def load_settings(environ: Optional[Mapping[str, str]] = None) -> RuntimeSettings:
     """Load only Forge runtime variables; provider credentials are never read."""
-    source = os.environ if environ is None else environ
+    if environ is not None:
+        source: Mapping[str, str] = environ
+    else:
+        # The repository's ``.env`` supplies defaults; the real process environment always wins, so a
+        # shell or service definition can still override a value written in the file.
+        merged = _repo_env_values()
+        merged.update(os.environ)
+        source = merged
     defaults = RuntimeSettings()
     return RuntimeSettings(
         environment=source.get("FORGE_ENV", defaults.environment.value),

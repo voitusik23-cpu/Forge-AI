@@ -231,13 +231,23 @@ class PersistenceDatabase:
                 f"DO $$ BEGIN "
                 f"IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
                 f"'{login}') THEN "
-                f"CREATE ROLE {login} LOGIN PASSWORD "
-                f"'{PERSISTENCE_LOGIN_PASSWORD}' NOSUPERUSER NOCREATEDB "
+                f"CREATE ROLE {login} LOGIN NOSUPERUSER NOCREATEDB "
                 f"NOCREATEROLE NOBYPASSRLS; "
                 f"END IF; END $$;"
             )
+            # Idempotent password synchronisation. The role lives in the shared cluster catalogue and
+            # outlives a single fixture, so creating it only when absent would freeze the password of the
+            # first run and every later run would fail to authenticate. PostgreSQL accepts no bind
+            # parameter inside role DDL, so the statement is quoted by the server itself: the value
+            # travels as a parameter and never appears in SQL text built by Python.
+            password_statement = await self._maintenance.fetchval(
+                "SELECT format('ALTER ROLE %I PASSWORD %L', $1::text, $2::text)",
+                login,
+                PERSISTENCE_LOGIN_PASSWORD,
+            )
+            await self._retry_catalog_conflict(password_statement)
             await self._retry_catalog_conflict(
-                f"ALTER ROLE {login} LOGIN NOSUPERUSER NOBYPASSRLS"
+                f"ALTER ROLE {login} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS"
             )
             await self._retry_catalog_conflict(f"GRANT {parent} TO {login}")
 

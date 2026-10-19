@@ -44,12 +44,35 @@ input { font: inherit; }
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: auto 1fr;
+  /* The single row is pinned to the window height. With the default `auto` row the row grew to
+     the tallest screen's content, so `.main` was as tall as the page, the content area never
+     overflowed, and the overflowing part was clipped by `body { overflow: hidden }`: the page
+     could not be scrolled at all. `minmax(0, 1fr)` bounds the row instead, which is what lets the
+     content area below scroll on its own. */
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
   height: 100%;
 }
 
-.main { display: flex; flex-direction: column; min-width: 0; height: 100%; }
-.content { padding: var(--sp-5) var(--sp-6) var(--sp-6); overflow: auto; }
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* The only scrolling region of the shell: the navigation rail and the top bar stay in place. */
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--sp-5) var(--sp-6) var(--sp-6);
+  overflow-y: auto;
+  overflow-x: auto;
+  overscroll-behavior: contain;
+}
 
 .grid { display: grid; gap: var(--sp-4); }
 .grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }

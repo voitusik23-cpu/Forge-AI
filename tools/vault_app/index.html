@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>АИ — ключи и балансы</title>
+<style>
+  :root {
+    --bg: #0a0a0c;
+    --tile: #121216;
+    --line: #24242c;
+    --text: #f2f2f5;
+    --dim: #8b8b96;
+    --gold: #e0a33a;
+    --ok: #5ad18c;
+  }
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 560px at 18% -12%, #17171f 0, rgba(10, 10, 12, 0) 62%),
+      radial-gradient(900px 500px at 105% 0%, #14141a 0, rgba(10, 10, 12, 0) 55%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.45 "Segoe UI", system-ui, -apple-system, "Segoe UI Emoji", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: rgba(224, 163, 58, .35); }
+  .top {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; padding: 22px 24px 16px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark {
+    width: 58px; height: 58px; border-radius: 17px; display: grid; place-items: center;
+    font-weight: 800; font-size: 24px; letter-spacing: -1px; color: #16130a;
+    background: linear-gradient(140deg, #f2cc7d, #e0a33a);
+    box-shadow: 0 10px 30px rgba(224, 163, 58, .22);
+  }
+  h1 { margin: 0; font-size: 36px; letter-spacing: 3px; font-weight: 700; }
+  .sub { margin: 2px 0 0; color: var(--dim); font-size: 13px; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font: inherit; color: var(--text); background: #1a1a21;
+    border: 1px solid #2c2c36; border-radius: 12px; padding: 9px 14px;
+    cursor: pointer; transition: background .15s, border-color .15s, transform .15s;
+  }
+  button:hover { background: #22222b; border-color: #3a3a47; }
+  button:active { transform: translateY(1px); }
+  button.gold {
+    background: linear-gradient(140deg, #e8b95f, #e0a33a); color: #16130a;
+    border-color: transparent; font-weight: 600;
+  }
+  button.gold:hover { filter: brightness(1.06); }
+  button.ghost { background: transparent; }
+  .notice {
+    margin: 0 24px 18px; padding: 10px 14px; border: 1px solid #2b2618;
+    background: #151308; border-radius: 12px; color: #d9c79a; font-size: 13px;
+  }
+  .notice b { color: #f0d9a6; font-weight: 600; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px; padding: 0 24px 28px; align-items: stretch;
+  }
+  .tile {
+    position: relative; display: flex; flex-direction: column; gap: 9px;
+    background: linear-gradient(158deg, #17171d 0%, #101014 100%);
+    border: 1px solid var(--line); border-radius: 20px; padding: 15px;
+    min-height: 244px; cursor: default;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, .32), inset 0 1px 0 rgba(255, 255, 255, .03);
+    transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+  }
+  .tile:hover {
+    transform: translateY(-2px); border-color: #34343f;
+    box-shadow: 0 20px 42px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .04);
+  }
+  .tile-head { display: flex; align-items: flex-start; gap: 11px; }
+  .logo {
+    width: 46px; height: 46px; flex: 0 0 46px; border-radius: 14px;
+    display: grid; place-items: center; font-size: 22px; line-height: 1;
+    background: #17171e; border: 1px solid #2b2b35;
+    background: color-mix(in srgb, var(--c, #4a86c8) 24%, #14141a);
+    border-color: color-mix(in srgb, var(--c, #4a86c8) 42%, #24242c);
+    color: #eef0f5;
+  }
+  .names { min-width: 0; flex: 1; }
+  .name {
+    font-size: 16px; font-weight: 650; line-height: 1.2; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .model {
+    margin-top: 3px; color: var(--dim); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tile-actions { display: flex; gap: 4px; }
+  .icon {
+    width: 26px; height: 26px; padding: 0; border-radius: 8px;
+    background: transparent; border-color: transparent; color: #6f6f7c;
+    font-size: 13px; line-height: 1;
+  }
+  .icon:hover { color: var(--text); background: #22222b; border-color: #2f2f3a; }
+  .icon.danger:hover { color: #ff8b8b; border-color: #532626; }
+  .pill {
+    flex: 0 0 auto; margin-left: auto; font-size: 9.5px; letter-spacing: .4px;
+    text-transform: uppercase; color: #b9a06a; border: 1px solid #3a3220;
+    background: #191505; border-radius: 999px; padding: 1px 6px; line-height: 1.5;
+  }
+  .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .cap { color: #6f6f7c; font-size: 11px; text-transform: lowercase; flex: 0 0 auto; width: 52px; }
+  .key {
+    flex: 1; min-width: 0; font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+    font-size: 12.5px; color: #d2d2da; background: #0b0b0f; border: 1px solid #23232c;
+    border-radius: 8px; padding: 4px 8px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .key.empty { color: #62626d; }
+  .copy {
+    flex: 0 0 auto; padding: 5px 9px; font-size: 11.5px; border-radius: 9px;
+    border-color: #3a3220; color: #e7c98f; background: #17130a;
+  }
+  .copy:hover { background: #221b0d; border-color: #5a4a28; color: #f4dca9; }
+  .value {
+    flex: 1; min-width: 0; color: #c3c3cc; font-size: 12.5px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .balance {
+    margin-top: auto; display: flex; align-items: baseline; gap: 8px;
+    padding-top: 10px; border-top: 1px dashed #23232c;
+  }
+  .balance .cap { width: auto; }
+  .amount { font-size: 20px; font-weight: 650; letter-spacing: .2px; }
+  .amount.ok { color: var(--ok); }
+  .amount.muted { color: var(--dim); font-size: 15px; font-weight: 500; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #33333d; flex: 0 0 7px; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 9px rgba(90, 209, 140, .55); }
+  .tile.add {
+    align-items: center; justify-content: center; gap: 8px; cursor: pointer;
+    background: transparent; border: 1px dashed #33333f; color: #85858f;
+    box-shadow: none; min-height: 244px;
+  }
+  .tile.add:hover {
+    transform: translateY(-2px); border-color: var(--gold); color: var(--gold);
+    background: #12100a; box-shadow: none;
+  }
+  .plus { font-size: 40px; line-height: 1; font-weight: 300; }
+  .add-label { font-size: 13.5px; }
+  .empty-hint {
+    grid-column: 1 / -1; color: var(--dim); font-size: 14px; padding: 6px 2px;
+  }
+  .foot {
+    padding: 4px 24px 24px; color: #61616c; font-size: 12px;
+    display: flex; gap: 18px; flex-wrap: wrap;
+  }
+  .foot code { color: #8f8f9b; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+  .overlay {
+    position: fixed; inset: 0; z-index: 20; display: grid; place-items: center;
+    padding: 20px; background: rgba(5, 5, 8, .74); backdrop-filter: blur(3px);
+  }
+  .overlay[hidden] { display: none; }
+  .sheet {
+    width: min(580px, 100%); max-height: 92vh; overflow: auto;
+    background: #101014; border: 1px solid #2a2a34; border-radius: 20px;
+    padding: 22px; box-shadow: 0 30px 90px rgba(0, 0, 0, .65);
+  }
+  .sheet h2 { margin: 0 0 4px; font-size: 20px; }
+  .hint { margin: 0 0 16px; color: var(--dim); font-size: 12.5px; }
+  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .field.wide { grid-column: 1 / -1; }
+  .field label { color: #7c7c88; font-size: 11.5px; }
+  .field input {
+    background: #0b0b0f; border: 1px solid #262630; border-radius: 10px;
+    padding: 9px 11px; color: var(--text); font: inherit; font-size: 14px; min-width: 0;
+  }
+  .field input:focus { outline: none; border-color: #5a4a28; box-shadow: 0 0 0 3px rgba(224, 163, 58, .12); }
+  .form-error { margin: 12px 0 0; color: #ff9b9b; font-size: 12.5px; min-height: 16px; }
+  .sheet-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+  .fine { margin: 12px 0 0; color: #5f5f6a; font-size: 11.5px; }
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 30;
+    background: linear-gradient(140deg, #e8b95f, #e0a33a); color: #16130a;
+    font-weight: 600; padding: 10px 18px; border-radius: 999px;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, .55);
+  }
+  .toast[hidden] { display: none; }
+  @media (max-width: 560px) {
+    h1 { font-size: 28px; }
+    .fields { grid-template-columns: 1fr; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="mark" aria-hidden="true">АИ</div>
+    <div>
+      <h1>АИ</h1>
+      <p class="sub" id="sub">почты, пароли и ключи агентов · балансы провайдеров</p>
+    </div>
+  </div>
+  <div class="actions">
+    <button id="refresh" type="button">Обновить балансы</button>
+    <button id="purge-demo" type="button" class="ghost" hidden>Убрать примеры</button>
+    <button id="add" type="button" class="gold">+ Добавить</button>
+  </div>
+</header>
+
+<div class="notice">
+  <b>Локальный файл, не в git.</b> Ключи и пароли лежат в
+  <code>.forge/vault/vault.json</code> открытым текстом — не используйте эту папку на чужой
+  машине. Балансы приходят из Forge API (<code>127.0.0.1:8011</code>) по провайдеру, а не по
+  ключу из плитки.
+</div>
+
+<main class="grid" id="grid" aria-live="polite"></main>
+
+<footer class="foot">
+  <span>хранилище: <code id="vault-path">.forge/vault/vault.json</code></span>
+  <span id="balance-stamp">балансы: —</span>
+  <span>Forge AI · локально, 127.0.0.1</span>
+</footer>
+
+<div class="overlay" id="overlay" hidden>
+  <form class="sheet" id="form" autocomplete="off">
+    <h2 id="form-title">Новый агент</h2>
+    <p class="hint" id="form-hint">Ключ и пароль сохраняются в локальный файл открытым текстом.</p>
+    <div class="fields">
+      <div class="field">
+        <label for="f-label">Название</label>
+        <input id="f-label" name="label" maxlength="120" placeholder="DeepSeek main">
+      </div>
+      <div class="field">
+        <label for="f-provider">Провайдер</label>
+        <input id="f-provider" name="provider" maxlength="32" list="providers" placeholder="deepseek" required>
+        <datalist id="providers">
+          <option value="deepseek"></option>
+          <option value="openrouter"></option>
+          <option value="openai"></option>
+          <option value="gemini"></option>
+          <option value="anthropic"></option>
+          <option value="nvidia"></option>
+          <option value="groq"></option>
+          <option value="xai"></option>
+          <option value="dashscope"></option>
+          <option value="radox"></option>
+          <option value="nararouter"></option>
+        </datalist>
+      </div>
+      <div class="field wide">
+        <label for="f-model">Модель</label>
+        <input id="f-model" name="model" maxlength="120" placeholder="deepseek-chat">
+      </div>
+      <div class="field">
+        <label for="f-email">Почта</label>
+        <input id="f-email" name="email" type="email" maxlength="200" placeholder="owner@example.com">
+      </div>
+      <div class="field">
+        <label for="f-password">Пароль</label>
+        <input id="f-password" name="password" type="password" maxlength="400" placeholder="пароль от кабинета">
+      </div>
+      <div class="field wide">
+        <label for="f-key">API-ключ</label>
+        <input id="f-key" name="api_key" maxlength="400" spellcheck="false" placeholder="sk-...">
+      </div>
+      <div class="field">
+        <label for="f-emoji">Логотип (эмодзи или 2 буквы)</label>
+        <input id="f-emoji" name="emoji" maxlength="16" placeholder="🐋">
+      </div>
+      <div class="field">
+        <label for="f-color">Цвет (#hex)</label>
+        <input id="f-color" name="color" maxlength="16" placeholder="#4a86c8">
+      </div>
+    </div>
+    <p class="form-error" id="form-error"></p>
+    <div class="sheet-actions">
+      <button type="button" class="ghost" id="cancel">Отмена</button>
+      <button type="submit" class="gold" id="save">Сохранить</button>
+    </div>
+    <p class="fine">Файл: .forge/vault/vault.json · права только для владельца · вне git.</p>
+  </form>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var PROVIDERS = [
+    { id: "deepseek", name: "DeepSeek", color: "#4a86c8", emoji: "🐋" },
+    { id: "openrouter", name: "OpenRouter", color: "#7b6ad6", emoji: "🌐" },
+    { id: "openai", name: "OpenAI", color: "#2fb37a", emoji: "◆" },
+    { id: "gemini", name: "Google Gemini", color: "#c9a227", emoji: "✦" },
+    { id: "anthropic", name: "Anthropic", color: "#c96f45", emoji: "✳" },
+    { id: "nvidia", name: "NVIDIA", color: "#76b900", emoji: "▣" },
+    { id: "groq", name: "Groq", color: "#e0592a", emoji: "⚡" },
+    { id: "xai", name: "xAI", color: "#9aa0a6", emoji: "✕" },
+    { id: "dashscope", name: "DashScope", color: "#a86ad6", emoji: "☁" },
+    { id: "radox", name: "Radox", color: "#5ad1c8", emoji: "◈" },
+    { id: "nararouter", name: "NaraRouter", color: "#d67ab0", emoji: "⧉" }
+  ];
+
+  var state = { accounts: [], balances: null, balancesError: "", vaultPath: ".forge/vault/vault.json" };
+
+  var grid = document.getElementById("grid");
+  var overlay = document.getElementById("overlay");
+  var form = document.getElementById("form");
+  var formTitle = document.getElementById("form-title");
+  var formHint = document.getElementById("form-hint");
+  var formError = document.getElementById("form-error");
+  var toastEl = document.getElementById("toast");
+  var sub = document.getElementById("sub");
+  var stamp = document.getElementById("balance-stamp");
+  var vaultPathEl = document.getElementById("vault-path");
+  var purgeButton = document.getElementById("purge-demo");
+
+  var fields = {
+    label: document.getElementById("f-label"),
+    provider: document.getElementById("f-provider"),
+    model: document.getElementById("f-model"),
+    email: document.getElementById("f-email"),
+    password: document.getElementById("f-password"),
+    api_key: document.getElementById("f-key"),
+    emoji: document.getElementById("f-emoji"),
+    color: document.getElementById("f-color")
+  };
+
+  var editingId = null;
+  var toastTimer = null;
+
+  function meta(provider) {
+    for (var i = 0; i < PROVIDERS.length; i += 1) {
+      if (PROVIDERS[i].id === provider) return PROVIDERS[i];
+    }
+    return null;
+  }
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+
+  function initials(text) {
+    var clean = String(text || "?").trim();
+    return clean ? clean.slice(0, 2).toUpperCase() : "?";
+  }
+
+  function toast(message) {
+    toastEl.textContent = message;
+    toastEl.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.hidden = true; }, 1900);
+  }
+
+  function api(path, options) {
+    var opts = options || {};
+    var headers = { "Content-Type": "application/json" };
+    var merged = { cache: "no-store", method: opts.method || "GET", headers: headers };
+    if (opts.body !== undefined) merged.body = opts.body;
+    return fetch(path, merged).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (payload) {
+        if (!response.ok || !payload || payload.ok === false) {
+          var message = (payload && payload.error) || ("HTTP " + response.status);
+          throw new Error(message);
+        }
+        return payload;
+      });
+    });
+  }
+
+  function balanceInfo(provider) {
+    if (!state.balances) {
+      return {
+        text: state.balancesError ? "Forge недоступен" : "…",
+        cls: "muted",
+        title: state.balancesError || "баланс ещё не загружен",
+        ok: false
+      };
+    }
+    var row = (state.balances.providers || {})[provider] || null;
+    if (!row) {
+      return { text: "—", cls: "muted", title: "провайдер не найден в отчёте Forge", ok: false };
+    }
+    if (row.available_display !== null && row.available_display !== undefined && row.available_display !== "") {
+      var text = row.currency === "USD" || !row.currency
+        ? "$" + row.available_display
+        : row.available_display + " " + row.currency;
+      return { text: text, cls: "ok", title: row.source || "Forge API", ok: true };
+    }
+    if (row.status === "UNSUPPORTED_BY_PROVIDER" || row.status === "NO_BALANCE_ENDPOINT") {
+      return { text: "нет эндпоинта", cls: "muted", title: row.error || "провайдер не отдаёт баланс", ok: false };
+    }
+    return {
+      text: "—",
+      cls: "muted",
+      title: row.error || row.status || "баланс не получен",
+      ok: false
+    };
+  }
+
+  function copySecret(id, field, button) {
+    api("/api/accounts/" + id + "/reveal", {
+      method: "POST",
+      body: JSON.stringify({ field: field })
+    }).then(function (payload) {
+      var value = field === "password" ? payload.password : payload.api_key;
+      return writeClipboard(value).then(function () {
+        toast(field === "password" ? "Пароль скопирован" : "Ключ скопирован");
+        if (button) {
+          button.textContent = "✓";
+          setTimeout(function () { button.textContent = "Копировать"; }, 1200);
+        }
+      });
+    }).catch(function (error) {
+      toast("Не удалось: " + error.message);
+    });
+  }
+
+  function writeClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        if (document.execCommand("copy")) resolve();
+        else reject(new Error("буфер обмена недоступен"));
+      } catch (error) {
+        reject(error);
+      } finally {
+        area.remove();
+      }
+    });
+  }
+
+  function removeAccount(account) {
+    if (!window.confirm("Удалить «" + (account.label || account.provider) + "» из хранилища?")) return;
+    api("/api/accounts/" + account.id, { method: "DELETE" }).then(function () {
+      toast("Удалено");
+      return reloadAccounts();
+    }).then(render).catch(function (error) {
+      toast("Не удалось: " + error.message);
+    });
+  }
+
+  function tile(account) {
+    var info = meta(account.provider);
+    var color = account.color || (info && info.color) || "#4a86c8";
+    var card = el("article", "tile");
+    card.style.setProperty("--c", color);
+
+    var head = el("div", "tile-head");
+    var logo = el("div", "logo", account.emoji || initials(account.label || account.provider));
+    logo.setAttribute("aria-hidden", "true");
+    head.appendChild(logo);
+
+    var names = el("div", "names");
+    names.appendChild(el("div", "name", account.label || account.provider));
+    names.appendChild(el("div", "model", account.model || "модель не указана"));
+    head.appendChild(names);
+
+    var actions = el("div", "tile-actions");
+    var edit = el("button", "icon", "✎");
+    edit.type = "button";
+    edit.title = "Изменить";
+    edit.setAttribute("aria-label", "Изменить " + (account.label || account.provider));
+    edit.addEventListener("click", function () { openForm(account); });
+    var del = el("button", "icon danger", "🗑");
+    del.type = "button";
+    del.title = "Удалить";
+    del.setAttribute("aria-label", "Удалить " + (account.label || account.provider));
+    del.addEventListener("click", function () { removeAccount(account); });
+    actions.appendChild(edit);
+    actions.appendChild(del);
+    head.appendChild(actions);
+    card.appendChild(head);
+
+    var keyRow = el("div", "row");
+    keyRow.appendChild(el("span", "cap", "ключ"));
+    var key = el("code", "key" + (account.has_key ? "" : " empty"), account.api_key_masked || "не задан");
+    key.title = account.has_key ? "полный ключ — только по кнопке «Копировать»" : "ключ не задан";
+    keyRow.appendChild(key);
+    if (account.has_key) {
+      var copyKey = el("button", "copy", "Копировать");
+      copyKey.type = "button";
+      copyKey.addEventListener("click", function () { copySecret(account.id, "api_key", copyKey); });
+      keyRow.appendChild(copyKey);
+    }
+    card.appendChild(keyRow);
+
+    if (account.email) {
+      var mailRow = el("div", "row");
+      mailRow.appendChild(el("span", "cap", "почта"));
+      var mail = el("span", "value", account.email);
+      mail.title = account.email;
+      mailRow.appendChild(mail);
+      card.appendChild(mailRow);
+    }
+
+    if (account.has_password) {
+      var passRow = el("div", "row");
+      passRow.appendChild(el("span", "cap", "пароль"));
+      passRow.appendChild(el("span", "value", "••••••••"));
+      var copyPass = el("button", "copy", "Копировать");
+      copyPass.type = "button";
+      copyPass.addEventListener("click", function () { copySecret(account.id, "password", copyPass); });
+      passRow.appendChild(copyPass);
+      card.appendChild(passRow);
+    }
+
+    var balance = balanceInfo(account.provider);
+    var balanceRow = el("div", "balance");
+    var dot = el("span", "dot" + (balance.ok ? " ok" : ""));
+    dot.setAttribute("aria-hidden", "true");
+    balanceRow.appendChild(dot);
+    balanceRow.appendChild(el("span", "cap", "баланс"));
+    var amount = el("span", "amount " + balance.cls, balance.text);
+    if (balance.title) amount.title = balance.title;
+    balanceRow.appendChild(amount);
+    if (account.demo) balanceRow.appendChild(el("span", "pill", "пример"));
+    card.appendChild(balanceRow);
+
+    return card;
+  }
+
+  function addTile() {
+    var card = el("button", "tile add");
+    card.type = "button";
+    card.appendChild(el("div", "plus", "+"));
+    card.appendChild(el("div", "add-label", "Добавить агента"));
+    card.addEventListener("click", function () { openForm(null); });
+    return card;
+  }
+
+  function render() {
+    grid.textContent = "";
+    if (!state.accounts.length) {
+      grid.appendChild(el("p", "empty-hint",
+        "Пока пусто. Нажмите «+ Добавить» и впишите провайдера, ключ, почту и пароль — плитка появится здесь."));
+    }
+    state.accounts.forEach(function (account) {
+      grid.appendChild(tile(account));
+    });
+    grid.appendChild(addTile());
+
+    var demos = state.accounts.filter(function (a) { return a.demo; }).length;
+    purgeButton.hidden = demos === 0;
+    purgeButton.textContent = "Убрать примеры (" + demos + ")";
+
+    sub.textContent = state.accounts.length
+      ? state.accounts.length + " агент(ов) · почты, ключи и балансы провайдеров"
+      : "почты, пароли и ключи агентов · балансы провайдеров";
+  }
+
+  function updateStamp() {
+    if (!state.balances) {
+      stamp.textContent = "балансы: " + (state.balancesError || "не загружены");
+      return;
+    }
+    if (!state.balances.available) {
+      stamp.textContent = "балансы: " + (state.balances.reason || "Forge API недоступен");
+      return;
+    }
+    var when = state.balances.checked_at || "";
+    if (when.indexOf("T") > 0) when = when.slice(0, 19).replace("T", " ");
+    stamp.textContent = "балансы из Forge API · " + (when || "только что");
+  }
+
+  function reloadAccounts() {
+    return api("/api/accounts").then(function (payload) {
+      state.accounts = payload.accounts || [];
+      if (payload.vault) {
+        state.vaultPath = payload.vault;
+        vaultPathEl.textContent = payload.vault;
+      }
+    });
+  }
+
+  function loadBalances() {
+    return api("/api/balances").then(function (payload) {
+      state.balances = payload.available ? payload : null;
+      state.balancesError = payload.available ? "" : (payload.reason || "Forge API недоступен");
+    }).catch(function (error) {
+      state.balances = null;
+      state.balancesError = error.message;
+    }).then(function () {
+      updateStamp();
+    });
+  }
+
+  function boot() {
+    reloadAccounts().then(render).catch(function (error) {
+      grid.textContent = "";
+      grid.appendChild(el("p", "empty-hint", "Не удалось загрузить хранилище: " + error.message));
+    });
+    loadBalances().then(render);
+  }
+
+  function openForm(account) {
+    editingId = account ? account.id : null;
+    formTitle.textContent = account ? "Изменить агента" : "Новый агент";
+    formHint.textContent = account
+      ? "Пустое поле ключа или пароля оставляет сохранённое значение."
+      : "Ключ и пароль сохраняются в локальный файл открытым текстом.";
+    formError.textContent = "";
+    fields.label.value = account ? account.label : "";
+    fields.provider.value = account ? account.provider : "";
+    fields.model.value = account ? account.model : "";
+    fields.email.value = account ? account.email : "";
+    fields.password.value = "";
+    fields.api_key.value = "";
+    fields.emoji.value = account ? account.emoji : "";
+    fields.color.value = account ? account.color : "";
+    fields.password.placeholder = account && account.has_password ? "сохранён, оставьте пустым" : "пароль от кабинета";
+    fields.api_key.placeholder = account && account.has_key ? "сохранён, оставьте пустым" : "sk-...";
+    overlay.hidden = false;
+    fields.label.focus();
+  }
+
+  function closeForm() {
+    overlay.hidden = true;
+    editingId = null;
+  }
+
+  function fillProviderDefaults() {
+    var provider = fields.provider.value.trim().toLowerCase();
+    var info = meta(provider);
+    if (!info) return;
+    if (!fields.color.value.trim()) fields.color.value = info.color;
+    if (!fields.emoji.value.trim()) fields.emoji.value = info.emoji;
+    if (!fields.label.value.trim()) fields.label.value = info.name;
+  }
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var provider = fields.provider.value.trim().toLowerCase();
+    if (!provider) {
+      formError.textContent = "Укажите провайдера, например deepseek.";
+      fields.provider.focus();
+      return;
+    }
+    var body = {
+      provider: provider,
+      label: fields.label.value.trim(),
+      model: fields.model.value.trim(),
+      email: fields.email.value.trim(),
+      emoji: fields.emoji.value.trim(),
+      color: fields.color.value.trim()
+    };
+    if (fields.api_key.value.trim()) body.api_key = fields.api_key.value.trim();
+    if (fields.password.value.trim()) body.password = fields.password.value.trim();
+    if (!editingId) body.api_key = body.api_key || "";
+
+    var request = editingId
+      ? api("/api/accounts/" + editingId, { method: "PUT", body: JSON.stringify(body) })
+      : api("/api/accounts", { method: "POST", body: JSON.stringify(body) });
+
+    request.then(function () {
+      var wasEditing = Boolean(editingId);
+      closeForm();
+      toast(wasEditing ? "Сохранено" : "Добавлено");
+      return reloadAccounts().then(render);
+    }).catch(function (error) {
+      formError.textContent = error.message;
+    });
+  });
+
+  document.getElementById("add").addEventListener("click", function () { openForm(null); });
+  document.getElementById("cancel").addEventListener("click", closeForm);
+  overlay.addEventListener("mousedown", function (event) {
+    if (event.target === overlay) closeForm();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !overlay.hidden) closeForm();
+  });
+
+  ["provider", "label", "color", "emoji"].forEach(function (name) {
+    fields[name].addEventListener("change", fillProviderDefaults);
+  });
+
+  document.getElementById("refresh").addEventListener("click", function () {
+    var button = this;
+    button.disabled = true;
+    loadBalances().then(function () {
+      render();
+      toast("Балансы обновлены");
+    }).finally(function () {
+      button.disabled = false;
+    });
+  });
+
+  purgeButton.addEventListener("click", function () {
+    var demos = state.accounts.filter(function (a) { return a.demo; });
+    if (!demos.length) return;
+    if (!window.confirm("Удалить " + demos.length + " пример(ов) из хранилища?")) return;
+    Promise.all(demos.map(function (account) {
+      return api("/api/accounts/" + account.id, { method: "DELETE" }).catch(function () { return null; });
+    })).then(function () {
+      toast("Примеры убраны");
+      return reloadAccounts();
+    }).then(render);
+  });
+
+  setInterval(function () {
+    loadBalances().then(render);
+  }, 60000);
+
+  boot();
+}());
+</script>
+</body>
+</html>

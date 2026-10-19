@@ -113,6 +113,8 @@ class DeclaredExecutionTestCase(unittest.TestCase):
         kwargs.setdefault("workspace", self.workspace)
         kwargs.setdefault("tool_registry", build_default_tool_registry(self.root))
         kwargs.setdefault("execution_profile", api_profile())
+        # The composition authorizes one project; a run cannot be created without it.
+        kwargs.setdefault("authorized_project_id", "declared-execution")
         if declarations is not None:
             kwargs.setdefault("declarations", declarations)
         if resolver == "default":
@@ -272,13 +274,32 @@ class ServerSideDeclarationTests(DeclaredExecutionTestCase):
 
 class NoHttpAuthorityTests(DeclaredExecutionTestCase):
     def test_taskrunrequest_has_no_execution_fields(self) -> None:
-        """C: the HTTP contract cannot express command authority."""
+        """C: the HTTP contract cannot express command authority.
+
+        ``write_mode`` is present since the guarded code-writing path, and it is not
+        an execution field: no command, no declaration, no workspace, no profile, no
+        environment, no timeout, and no allowlist can be named through it. It only
+        opts the request into applying the provider's answer inside the run's own
+        frozen workspace, under the code writer's path rails.
+        """
+
         import dataclasses
 
         fields = {f.name for f in dataclasses.fields(TaskRunRequest)}
         self.assertEqual(
             fields,
-            {"description", "category", "task_id", "provider_name", "project_id", "context"},
+            {
+                "description",
+                "category",
+                "task_id",
+                "provider_name",
+                "project_id",
+                "context",
+                "write_mode",
+                # The model for this one dispatch. Like write_mode it names no
+                # command, workspace, profile, environment, or allowlist.
+                "model_name",
+            },
         )
         for banned in (
             "command",

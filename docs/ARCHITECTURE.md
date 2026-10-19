@@ -4003,3 +4003,196 @@ dropped, and a step that declares no check is judged by its recorded execution a
   исполнения, если они противоречат успеху или если объявленная проверка
   `EXIT_CODE` не выполнялась. Исходное заявление сохраняется как свидетельство, а
   шаг без объявленной проверки судится только по записанному исполнению.
+
+## Guarded Code-Writing Path v0.1
+
+**Status: CURRENT / VERIFIED.** `app/agent_runtime/code_writer.py`,
+`tests/test_code_writer.py` (23 tests). The provider branch is exercised with a
+local fake only - see the limitation at the end of this section.
+
+### What it is
+
+The one path in the product where a model answer becomes files on disk. Before
+it, nothing applied model output: the offline harness is read-only and no
+executor wrote workspace files.
+
+```
+POST /api/tasks/run  { category: "code", write_mode: true }
+        |
+        +-- RunScope frozen, project binding checked, idempotency claimed (unchanged)
+        |
+        +-- live provider selected? -> existing RunExecutor dispatch -> model answer
+        |   offline provider?       -> deterministic plan text is the "answer"
+        |
+        +-- code_writer.apply_changes(answer, workspace=scope.workspace, run_id=...)
+        |      parse -> validate paths/deny list/caps -> backup -> atomic write
+        |      -> py_compile every touched .py -> rollback all on failure -> diff
+        |
+        +-- run record: project_state["code_write"] = {status, files, diff, verification, reason}
+        |
+        +-- success == (status == "applied" and verification passed)
+```
+
+### The module
+
+- `apply_changes(answer, *, workspace, run_id)` returns a frozen `WriteResult`
+  (`status`, `files`, `diff`, `reason`, `verification`). Statuses:
+  `applied`, `no_changes`, `rejected`, `verification_failed`.
+- Parsing: fenced blocks with a path header (fence info string `path=...`/`file=...`
+  or a preceding `**File: path**` line) and unified diffs (`--- a/path`,
+  `+++ b/path`, `@@` hunks). A unified diff wins when both are present. A hunk is
+  bounded by its declared counts, so trailing prose is not read as hunk content;
+  a hunk whose context does not match the file is refused, never fuzzy-applied.
+- Rails, all applied before the first byte:
+  - `normalize_workspace_relative_path` (rejects `..`, absolute, drive-qualified,
+    UNC, ADS, reserved names) followed by `WorkspaceBoundary.resolve_relative`
+    (canonical, symlink/junction-aware) - the same containment check the
+    execution sandbox uses. A canonical target that differs from its lexical form
+    is refused;
+  - deny list: `.env`, `.env.*`, `.git/**`, `.venv/**`, `node_modules/**`,
+    `dist/**`, `app/platform/persistence/postgres/migrations/**`, `authorizer.py`,
+    names carrying `secret`/`credential`/`token`, secret directories, and anything
+    `app/execution/secret_files.py` recognizes;
+  - caps: `MAX_FILES = 20`, `MAX_TOTAL_BYTES = 200 * 1024`;
+  - duplicate paths, a target that is a symlink/directory/non-regular file, and a
+    diff that would delete a file are all refused.
+- Apply: per file, `<path>.forge-new` then `os.replace`; a modified file's bytes
+  are backed up to `.forge/backups/<run_id>/<relative path>` first. Parents are
+  created only inside the workspace. No shell, no subprocess, no network.
+- Verify: every touched `.py` is compiled with `py_compile` in-process (bytecode
+  to the system temp dir, removed afterwards). One failure rolls back every file
+  of the run - updated files from their backups, created files removed - and
+  reports `verification_failed`.
+- Report: the diff is computed with `difflib` from the before/after bytes, per
+  file (`--- /dev/null` for a creation), along with exact added/removed counts.
+
+### The request field and the run record
+
+- `TaskRunRequest.write_mode: bool = False`, read from `write_mode` in the
+  `POST /api/tasks/run` body; `to_dict()` carries it. Active only when the flag is
+  true **and** the parsed category is `code`. `write_mode` participates in the
+  idempotency fingerprint only when set, so every existing fingerprint is
+  unchanged.
+- In write mode the model is sent the task text plus
+  `build_workspace_context(...)`: a bounded, sorted list of workspace file names
+  that skips secret-shaped paths, `.git`, `.venv`, dependencies, build output and
+  the run store. Contents are not sent.
+- The outcome is merged into the run's own durable snapshot under
+  `project_state["code_write"]` (status, files, diff, verification, reason) and
+  marked by a bounded `PROJECT_STATE_UPDATED` event, so `GET /api/runs/{run_id}`
+  reports it. `TaskRunResponse` is unchanged; the human-readable report (status,
+  files, verification, diff) is appended to `output`.
+- `success` is true only for `applied` with passing verification; every other
+  status fails the run with its reason. The idempotency lifecycle write on the
+  provider path now happens after write mode, so a keyed run cannot be recorded
+  `COMPLETED` while nothing was written.
+- On the offline provider the "answer" is the deterministic plan text, which
+  names no file: the pipeline runs end to end and reports `no_changes`.
+
+### Verified limitation
+
+No live provider is enabled in this environment, so the provider branch is
+verified with a local fake at the executor seam
+(`tests/test_code_writer.py::ServiceWriteModeTests`), and an end-to-end demo runs
+a new in-process service over a throwaway workspace. Writing real project code
+end to end therefore still requires an enabled provider whose answer uses one of
+the two supported shapes. Nothing else is missing: with such an answer the write,
+the verification, the rollback and the record are implemented and tested.
+
+## Guarded Code-Writing Path v0.1 — русская версия
+
+**Статус: ТЕКУЩЕЕ / ПРОВЕРЕНО.** `app/agent_runtime/code_writer.py`,
+`tests/test_code_writer.py` (23 теста). Ветка провайдера проверена только
+локальным фейком — см. ограничение в конце раздела.
+
+### Что это
+
+Единственный путь в продукте, где ответ модели становится файлами на диске. До
+него ничего не применяло вывод модели: offline-цикл только читает, и ни один
+исполнитель не писал файлы рабочей области.
+
+```
+POST /api/tasks/run  { category: "code", write_mode: true }
+        |
+        +-- RunScope заморожен, привязка проекта проверена, идемпотентность
+        |   заявлена (без изменений)
+        |
+        +-- выбран живой провайдер?  -> существующая диспетчеризация RunExecutor -> ответ модели
+        |   offline-провайдер?       -> детерминированный текст плана как «ответ»
+        |
+        +-- code_writer.apply_changes(answer, workspace=scope.workspace, run_id=...)
+        |      parse -> проверка путей/deny-list/лимитов -> backup -> атомарная запись
+        |      -> py_compile каждого затронутого .py -> откат всех при ошибке -> diff
+        |
+        +-- запись запуска: project_state["code_write"] = {status, files, diff, verification, reason}
+        |
+        +-- success == (status == "applied" и проверка пройдена)
+```
+
+### Модуль
+
+- `apply_changes(answer, *, workspace, run_id)` возвращает неизменяемый
+  `WriteResult` (`status`, `files`, `diff`, `reason`, `verification`). Статусы:
+  `applied`, `no_changes`, `rejected`, `verification_failed`.
+- Разбор: фенсед-блоки с заголовком пути (info-строка `path=...`/`file=...` или
+  строка `**File: path**` перед блоком) и unified diff (`--- a/path`,
+  `+++ b/path`, хунки `@@`). При наличии обоих побеждает diff. Хунк ограничен
+  объявленными счётчиками, поэтому текст после diff не читается как содержимое
+  хунка; хунк с несовпадающим контекстом отклоняется, а не применяется «примерно».
+- Рамки, все до первого записанного байта:
+  - `normalize_workspace_relative_path` (отклоняет `..`, абсолютные, с буквой
+    диска, UNC, ADS, зарезервированные имена), затем
+    `WorkspaceBoundary.resolve_relative` (каноническая, с учётом symlink/junction) —
+    та же проверка вложенности, что в execution sandbox. Каноническая цель,
+    отличающаяся от лексической формы, отклоняется;
+  - deny-list: `.env`, `.env.*`, `.git/**`, `.venv/**`, `node_modules/**`,
+    `dist/**`, `app/platform/persistence/postgres/migrations/**`, `authorizer.py`,
+    имена с `secret`/`credential`/`token`, secret-каталоги и всё, что распознаёт
+    `app/execution/secret_files.py`;
+  - лимиты: `MAX_FILES = 20`, `MAX_TOTAL_BYTES = 200 * 1024`;
+  - дубли путей, цель-symlink/каталог/не-обычный файл и diff, удаляющий файл,
+    отклоняются.
+- Применение: по каждому файлу `<path>.forge-new`, затем `os.replace`; байты
+  изменяемого файла сначала копируются в `.forge/backups/<run_id>/<relative path>`.
+  Родительские каталоги создаются только внутри рабочей области. Ни shell, ни
+  subprocess, ни сети.
+- Проверка: каждый затронутый `.py` компилируется `py_compile` в процессе
+  (байткод во временный каталог системы, затем удаляется). Одна ошибка откатывает
+  все файлы запуска — изменённые из резервных копий, созданные удаляются — и
+  сообщает `verification_failed`.
+- Отчёт: diff вычисляется `difflib` по байтам до и после, по каждому файлу
+  (`--- /dev/null` для создания), вместе с точными счётчиками добавленных и
+  удалённых строк.
+
+### Поле запроса и запись запуска
+
+- `TaskRunRequest.write_mode: bool = False`, читается из `write_mode` тела
+  `POST /api/tasks/run`; `to_dict()` его содержит. Активен только когда флаг
+  истинен **и** разобранная категория — `code`. `write_mode` участвует в
+  fingerprint идемпотентности только при установке, поэтому все существующие
+  fingerprint не меняются.
+- В write mode модели отправляется текст задачи плюс
+  `build_workspace_context(...)`: ограниченный отсортированный список имён файлов
+  рабочей области, пропускающий похожие на секреты пути, `.git`, `.venv`,
+  зависимости, вывод сборки и run store. Содержимое не отправляется.
+- Результат добавляется в собственную durable-запись запуска под
+  `project_state["code_write"]` (status, files, diff, verification, reason) и
+  отмечается ограниченным событием `PROJECT_STATE_UPDATED`, поэтому
+  `GET /api/runs/{run_id}` его сообщает. `TaskRunResponse` не изменён;
+  человекочитаемый отчёт (статус, файлы, проверка, diff) добавляется в `output`.
+- `success` истинен только для `applied` с пройденной проверкой; любой другой
+  статус проваливает запуск с его причиной. Запись lifecycle идемпотентности на
+  пути провайдера теперь происходит после write mode, поэтому ключевой запуск не
+  может быть записан как `COMPLETED` при отсутствии записи.
+- На offline-провайдере «ответ» — это детерминированный текст плана, который не
+  называет ни одного файла: конвейер проходит целиком и сообщает `no_changes`.
+
+### Проверенное ограничение
+
+В этой среде ни один живой провайдер не включён, поэтому ветка провайдера
+проверена локальным фейком на стыке исполнителя
+(`tests/test_code_writer.py::ServiceWriteModeTests`), а сквозная демонстрация
+запускает новый in-process сервис на одноразовой рабочей области. Сквозная запись
+реального кода проекта поэтому всё ещё требует включённого провайдера, чей ответ
+использует одну из двух поддерживаемых форм. Больше ничего не отсутствует: при
+таком ответе запись, проверка, откат и запись результата реализованы и проверены.

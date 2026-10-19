@@ -2432,6 +2432,30 @@ execution path changed. `app/dashboard/**` and this file are the whole of it;
 `app/api/service.py`, `app/runtime/bootstrap.py`, and `app/config/settings.py`
 were not modified.
 
+### 4.20 Write mode applies a model answer, but only a live provider can produce real code
+
+**Status: IMPLEMENTED / VERIFIED with a local fake; the live-provider half is not
+verified here.** `app/agent_runtime/code_writer.py`, `tests/test_code_writer.py`
+(23 tests). `POST /api/tasks/run` with `write_mode: true` and `category: "code"`
+passes the provider's answer through the guarded writer, which parses a fenced
+block with a path header or a unified diff, validates every path against the run's
+frozen workspace boundary and a deny list, writes atomically with backups,
+compiles every touched `.py`, and rolls the whole run back on a compile failure.
+Measured on a new in-process service over a throwaway workspace: two files created,
+the real diff returned and persisted under `project_state["code_write"]`, and
+`py_compile` passing; a second answer naming `../escape.txt` was refused with
+`rejected` and wrote nothing.
+
+**Honest boundary.** No live provider is enabled in this environment, so the
+provider branch is exercised through a local fake at the executor seam and the
+offline provider's write mode honestly reports `no_changes` (its deterministic
+plan text names no file). End-to-end writing of real project code therefore still
+needs an enabled provider whose answer uses a supported shape. Also unverified by
+design: an answer that patches a file it never saw is refused
+(`unified_diff_not_applicable:diff_context_mismatch`) because only file *names*,
+not contents, are sent; deletions are refused; and write mode has no separate
+approval gate (an open owner decision).
+
 
 ## 5. Planning, deferred and rejected
 
@@ -4962,6 +4986,29 @@ production-конструированием и всё равно делает п
 accounting или путь исполнения не изменились. Всё ограничивается `app/dashboard/**` и этим
 файлом; `app/api/service.py`, `app/runtime/bootstrap.py` и `app/config/settings.py` не
 изменялись.
+
+### 4.20 Write mode применяет ответ модели, но реальный код может дать только живой провайдер
+
+**Статус: РЕАЛИЗОВАНО / ПРОВЕРЕНО локальным фейком; половина с живым провайдером
+здесь не проверена.** `app/agent_runtime/code_writer.py`, `tests/test_code_writer.py`
+(23 теста). `POST /api/tasks/run` с `write_mode: true` и `category: "code"` передаёт
+ответ провайдера защищённому писателю, который разбирает фенсед-блок с заголовком пути
+или unified diff, проверяет каждый путь по замороженной границе рабочей области запуска
+и по deny-list, пишет атомарно с резервными копиями, компилирует каждый затронутый `.py`
+и откатывает весь запуск при ошибке компиляции. Измерено на новом in-process сервисе на
+одноразовой рабочей области: созданы два файла, настоящий diff возвращён и сохранён под
+`project_state["code_write"]`, `py_compile` прошёл; второй ответ с `../escape.txt`
+отклонён со статусом `rejected` и ничего не записал.
+
+**Честная граница.** В этой среде ни один живой провайдер не включён, поэтому ветка
+провайдера проверена локальным фейком на стыке исполнителя, а write mode offline-провайдера
+честно сообщает `no_changes` (его детерминированный текст плана не называет ни одного
+файла). Сквозная запись реального кода проекта поэтому всё ещё требует включённого
+провайдера, чей ответ использует поддерживаемую форму. Также не проверено намеренно: ответ,
+патчащий файл, которого модель не видела, отклоняется
+(`unified_diff_not_applicable:diff_context_mismatch`), потому что передаются только имена
+файлов, а не содержимое; удаления отклоняются; у write mode нет отдельного гейта одобрения
+(открытое решение владельца).
 
 ## 5. Планируемое, отложенное и отклонённое
 

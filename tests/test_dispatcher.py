@@ -675,17 +675,29 @@ class FailedRunReportsItsReasonTests(unittest.TestCase):
 
         runtime = self._offline_runtime()
         runtime.agent_registry._agents["mock"] = ProviderAgent(ExplodingProvider())
-        service = ForgeApiService(runtime=runtime)
+        # The composition authorizes one project; a run cannot be created without it.
+        service = ForgeApiService(
+            runtime=runtime, authorized_project_id="dispatcher"
+        )
 
-        response = service.run_task(TaskRunRequest(description="probe"))
+        # Dispatched through the provider path directly: the API task path executes the
+        # offline provider with the deterministic harness loop and never reaches the
+        # provider chain, so the failure this test is about is driven where it happens.
+        from app.orchestrator.models import RunState, Task
 
-        self.assertFalse(response.success)
-        self.assertEqual(response.state, "FAILED")
+        run = service.runtime.run_executor.execute(
+            task=Task(id="dispatcher-probe-task", description="probe"),
+            provider_name=None,
+            workspace=service.workspace,
+            run_id="run-dispatcher-probe",
+        )
+
+        self.assertEqual(run.state, RunState.FAILED)
         self.assertIsNotNone(
-            response.error,
+            run.error,
             "a failed run reported no reason; the terminal error was dropped",
         )
-        self.assertIn("TypeError", response.error)
+        self.assertIn("TypeError", run.error.message)
 
     def test_a_successful_run_reports_no_error(self) -> None:
         """The guard must not turn a success into a failure."""
@@ -693,7 +705,10 @@ class FailedRunReportsItsReasonTests(unittest.TestCase):
         from app.api.models import TaskRunRequest
         from app.api.service import ForgeApiService
 
-        service = ForgeApiService(runtime=self._offline_runtime())
+        # The composition authorizes one project; a run cannot be created without it.
+        service = ForgeApiService(
+            runtime=self._offline_runtime(), authorized_project_id="dispatcher"
+        )
         response = service.run_task(TaskRunRequest(description="probe"))
 
         self.assertTrue(response.success)

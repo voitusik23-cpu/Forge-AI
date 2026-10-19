@@ -70,13 +70,40 @@ class OpenAICompatibleProvider(Provider):
             raise ProviderNotConfiguredError(
                 f"Set {api_key_env_var} in the local environment to use {self.PROVIDER_NAME}"
             )
+        model_name = self._resolve_model_name(request)
+
+        sdk = self._load_sdk()
+        try:
+            return self._perform_request(request, api_key, model_name, sdk)
+        except Exception as exc:
+            self._translate_sdk_error(exc, sdk)
+            raise
+
+    def _resolve_model_name(self, request: ProviderRequest) -> str:
+        """The model this request runs on, or a safe refusal when none is configured."""
+
         model_name = request.model_name or self.model_name
         if not model_name or model_name == "unconfigured":
             raise ProviderNotConfiguredError(
                 f"{self.PROVIDER_NAME} model is not configured"
             )
+        return model_name
 
-        sdk = self._load_sdk()
+    def _perform_request(
+        self,
+        request: ProviderRequest,
+        api_key: str,
+        model_name: str,
+        sdk: Any,
+    ) -> ProviderResponse:
+        """One Chat Completions request with one explicit key.
+
+        SDK errors propagate **untranslated**: the single-key path translates them
+        in :meth:`generate`, while the Radox adapter has to classify a 429/402/401/
+        403 or a transport failure *before* deciding whether the same request may be
+        retried with another account. Translation happens exactly once either way.
+        """
+
         client = self._client or self._create_client(sdk, api_key)
         prompt = request.prompt
         if request.context:
@@ -84,17 +111,13 @@ class OpenAICompatibleProvider(Provider):
                 request.context, ensure_ascii=False, sort_keys=True
             )
 
-        try:
-            kwargs = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            if self._timeout is not None:
-                kwargs["timeout"] = self._timeout
-            response = client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            self._translate_sdk_error(exc, sdk)
-            raise
+        kwargs = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self._timeout is not None:
+            kwargs["timeout"] = self._timeout
+        response = client.chat.completions.create(**kwargs)
 
         output = self._extract_output(response)
         if not output:

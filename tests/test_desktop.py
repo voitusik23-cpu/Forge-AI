@@ -33,7 +33,8 @@ class DesktopShellTests(unittest.TestCase):
         patcher = patch("app.api.service.create_runtime", offline_runtime)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.service = ForgeApiService()
+        # The composition authorizes one project; a run cannot be created without it.
+        self.service = ForgeApiService(authorized_project_id="desktop-shell")
         self.client = ForgeApiClient(api_service=self.service)
         self.app = ForgeDesktopApp(client=self.client, headless=True)
         self.app.initialize()
@@ -73,11 +74,13 @@ class DesktopShellTests(unittest.TestCase):
         output_text = home_view.txt_output.get("1.0", "end")
         self.assertIn("Result: SUCCESS", output_text)
         self.assertIn("Run ID: run-api-", output_text)
-        # No error line, and the offline provider's own response text is what the view
-        # renders. `setUp` restricts the runtime to mock, so the dispatch cannot reach an
-        # external provider; both facts are asserted rather than assumed.
+        # The offline provider's dispatch runs the deterministic harness loop, so the
+        # view renders the loop's own report rather than the provider call's fixed
+        # sentence. `setUp` restricts the runtime to mock, so the dispatch cannot reach
+        # an external provider; both facts are asserted rather than assumed.
         self.assertNotIn("Error:", output_text)
-        self.assertIn("MockProvider response:", output_text)
+        self.assertNotIn("MockProvider response:", output_text)
+        self.assertIn("OFFLINE TASK EXECUTION", output_text)
 
     def test_05_costs_view_dashboard_render(self) -> None:
         self.app.show_view("costs")

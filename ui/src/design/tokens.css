@@ -37,6 +37,10 @@
   --cyan: #22d3ee;
   --cyan-hi: #67e8f9;
   --cyan-dim: rgba(34, 211, 238, 0.14);
+  /* Informational text on a tinted badge/link. Separate from --cyan-hi, which is a *fill* colour
+     used by gradients: on a light surface #67e8f9 as text is unreadable, so Light redefines only
+     this one and every gradient keeps its hue. */
+  --info-text: #67e8f9;
 
   /* type */
   --ice: #eef2ff;
@@ -108,9 +112,18 @@
   --muted: #5b6884;
   --faint: #8b96b4;
 
-  --ok: #0f9d6c;
-  --warn: #b7791f;
-  --danger: #c2425c;
+  /* Semantic colours are used as *text* on their own 9-12% tint, which a light surface washes out:
+     the same hue is therefore darker here than in Dark, where it sits on graphite. Measured on the
+     tinted badge background these reach 4.5:1 or better instead of 3.0-3.6:1. */
+  --ok: #0a7350;
+  --warn: #8a5a12;
+  --danger: #a5283f;
+
+  --info-text: #0b6a86;
+
+  /* The Кузница blue, darkened for a light surface: #a8c8ee on white is about 1.7:1 at badge size.
+     A separate name because `.forge-workbench` sets --forge-blue locally. */
+  --forge-info-text: #27588c;
 
   --shadow-panel: 0 16px 40px rgba(21, 34, 64, 0.12);
   --glow-violet: 0 0 0 1px rgba(124, 92, 255, 0.30), 0 10px 24px rgba(124, 92, 255, 0.16);

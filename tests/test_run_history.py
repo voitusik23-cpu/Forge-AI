@@ -38,7 +38,10 @@ class RunHistoryTests(unittest.TestCase):
         from app.runtime.run_store import RunStore
 
         self.store = RunStore(root=self.root)
-        self.service = ForgeApiService(run_store=self.store)
+        # The composition authorizes one project; a run cannot be created without it.
+        self.service = ForgeApiService(
+            run_store=self.store, authorized_project_id="run-history"
+        )
 
     def _dispatch(self, description: str):
         # The dispatch facts live on the result, not on the byte-pinned response model.
@@ -68,7 +71,9 @@ class RunHistoryTests(unittest.TestCase):
         result = self._dispatch("C1: restart")
         from app.runtime.run_store import RunStore
 
-        fresh = ForgeApiService(run_store=RunStore(root=self.root))
+        fresh = ForgeApiService(
+            run_store=RunStore(root=self.root), authorized_project_id="run-history"
+        )
         self.assertIsNotNone(fresh.get_run_record(result.response.run_id))
 
     def test_04_a_missing_run_is_reported_as_missing(self) -> None:
@@ -84,7 +89,9 @@ class RunHistoryTests(unittest.TestCase):
         other_root.mkdir(parents=True, exist_ok=True)
         from app.runtime.run_store import RunStore
 
-        other = ForgeApiService(run_store=RunStore(root=other_root))
+        other = ForgeApiService(
+            run_store=RunStore(root=other_root), authorized_project_id="run-history"
+        )
         self.assertIsNone(other.get_run_record(result.response.run_id))
 
     def test_07_concurrent_dispatches_all_persist_and_read(self) -> None:
@@ -100,7 +107,9 @@ class RunHistoryTests(unittest.TestCase):
         blocked = pathlib.Path(os.environ.get("SystemRoot", "C:\\Windows")) / "ForgeAI-not-writable"
         from app.runtime.run_store import RunStore
 
-        service = ForgeApiService(run_store=RunStore(root=blocked))
+        service = ForgeApiService(
+            run_store=RunStore(root=blocked), authorized_project_id="run-history"
+        )
         outcome = service.run_task_detailed(
             TaskRunRequest(description="C1: unwritable root", category="code", provider_name="mock")
         )

@@ -228,6 +228,7 @@ def create_agent_harness(
     tool_executor: object | None = None,
     tool_registry: object | None = None,
     telemetry_sink: object | None = None,
+    verifier: object | None = None,
 ) -> "AgentHarness":
     """Build the canonical production orchestration loop.
 
@@ -265,6 +266,12 @@ def create_agent_harness(
     kwargs = {
         "decision_provider": decision_provider or DeterministicDecisionProvider(),
         "policy": policy or AgentHarnessPolicy(),
+        # Optional verifier port. The harness verifies whatever expectations the
+        # trusted request carries; supplying a verifier changes *how* a declared
+        # expectation is evaluated, never *what* is verified, and the default
+        # stays the workspace-file verifier. The offline task path supplies a
+        # read-only observation verifier through this same port.
+        **({"verifier": verifier} if verifier is not None else {}),
         # Server-side observation layer, created at composition time with
         # composition-owned limits. Nothing per-run can replace it.
         "project_discovery": (

@@ -103,7 +103,7 @@ class ForgeApiClient:
         """List available workspace projects."""
         if self._service is not None:
             return self._service.list_projects()
-        return [ProjectInfo(project_id="default", name="Forge Main Workspace", path="", status="active")]
+        return []
 
     def list_agents(self) -> List[AgentInfo]:
         """List configured agents."""

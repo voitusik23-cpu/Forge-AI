@@ -155,6 +155,8 @@ def create_api_app(
     *,
     cors_origins: Optional[tuple[str, ...]] = None,
     ui_assets_directory: Optional[Path] = None,
+    idempotency_guard: Optional[object] = None,
+    authorized_project_id: Optional[str] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -185,6 +187,8 @@ def create_api_app(
     from app.tools.approval import ApprovalPolicy
 
     api_service = service or ForgeApiService(
+        idempotency_guard=idempotency_guard,
+        authorized_project_id=authorized_project_id,
         # THE COMPOSITION SUPPLIES THE POLICY. `RunExecutor` treats an absent policy
         # as an unconditional denial, so without this a service built by the HTTP
         # factory could not execute a declared command at all. `ApprovalPolicy()`
@@ -199,6 +203,10 @@ def create_api_app(
         approval_policy=ApprovalPolicy()
     )
     app = FastAPI(title="Forge AI API", version="0.1.0")
+
+
+
+
 
     # ------------------------------------------------------------------
     # THE ERROR CONTRACT (Block #10): one shape for every failure.
@@ -312,9 +320,31 @@ def create_api_app(
     # One operating surface over this exact service instance. Its project boundary
     # is fixed here, from the service's own composition, and is never read from a
     # request.
-    register_operating_routes(
-        app, lambda: build_operating_surface(api_service)
-    )
+    def _authorized_surface():
+        """Build the operating surface, then bind the service to the project that surface resolved.
+
+        The surface is built lazily by the route registration below, so binding must happen here, at the
+        moment the project actually exists — not earlier, when no project has been resolved yet. The value
+        is the server's own: `project_overview()` is what `app.state.forge_project_id` is taken from, so
+        there is one authority, not two. The binding runs once, because the surface is built once.
+        """
+
+        surface = build_operating_surface(api_service)
+        project = ""
+        if surface is not None:
+            project = str(surface.project_overview().get("project_id") or "")
+        if project:
+            api_service.bind_authorized_project(project)
+        return surface
+
+    # The composition is the sole authority for the project. When the caller supplies the
+    # server-derived project, bind it here, before any route exists and before any run can be
+    # created. A request can never supply this value; a missing value leaves the service
+    # unbound, and project-sensitive execution then fails closed.
+    if authorized_project_id:
+        api_service.bind_authorized_project(str(authorized_project_id))
+
+    register_operating_routes(app, _authorized_surface)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -380,6 +410,18 @@ def create_api_app(
 
         return api_service.provider_balance(provider, force=bool(refresh))
 
+    @app.get("/api/providers/radox/keys")
+    def radox_key_pool() -> Any:
+        """Read-only counters for the Radox key pool, per position.
+
+        The keys themselves are re-read from the environment/``.env`` by the service
+        and only counted: this route can report how many accounts exist, which one is
+        next in the rotation and how each has behaved, and it never returns a key, a
+        hash, a prefix or a length.
+        """
+
+        return api_service.radox_keys_status()
+
     @app.post("/api/tasks/run")
     def run_task(
         payload: dict[str, Any],
@@ -396,8 +438,15 @@ def create_api_app(
             category=payload.get("category", "code"),
             task_id=payload.get("task_id"),
             provider_name=payload.get("provider_name"),
+            # The model the caller named for THIS dispatch. It used to be missing
+            # here, so the field never reached the service and a caller's model was
+            # silently replaced by the provider's configured one.
+            model_name=payload.get("model_name"),
             project_id=payload.get("project_id"),
             context=payload.get("context", {}),
+            # Opt-in, and false when absent: a caller that never sends it keeps the
+            # read-only task path unchanged.
+            write_mode=bool(payload.get("write_mode", False)),
         )
         try:
             outcome = api_service.run_task_detailed(req, idempotency_key=idempotency_key)

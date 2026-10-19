@@ -20,6 +20,7 @@ This module is the one place the bind address and port are decided:
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
 from typing import Any, Optional, Sequence
 
@@ -50,6 +51,45 @@ def resolve_bind(environ: Optional[dict[str, str]] = None) -> tuple[str, int]:
     return host, port
 
 
+def build_idempotency_guard() -> Any:
+    """Create the durable guard the standard composition uses.
+
+    The ledger root is derived from the run-store root -- the repository's existing durable-location
+    contract (``FORGE_RUN_STORE_ROOT``, resolved by ``app.runtime.run_store.default_run_store_root``).
+    Two rules are deliberate:
+
+    * the **process-wide default guard is not used**: its own docstring records that it shares one
+      ledger root across every caller, and this project has already measured false failures from
+      shared default roots;
+    * nothing here converts a failure into permission. The guard's ``begin`` degrades a ledger
+      failure to a refusal, and the surface composes no step-graph runner without a guard, so both
+      paths stay fail-closed.
+    """
+
+    from app.agent_runtime.idempotency_integration import RunIdempotencyGuard
+    from app.runtime.run_store import default_run_store_root
+
+    return RunIdempotencyGuard.create(
+        ledger_root=str(pathlib.Path(default_run_store_root()) / "idempotency")
+    )
+
+
+def resolve_workspace_project_id(workspace_root: Optional[pathlib.Path] = None) -> str:
+    """Return the stable project id that belongs to this workspace.
+
+    The id is not invented here: ``app.runtime.run_store.project_run_store_root`` already derives one
+    per canonical workspace path (``ws-<digest>``) and every run, snapshot and artifact is stored under
+    it, so two workspaces can never resolve to the same id and one workspace always resolves to the
+    same one. Reusing that mechanism keeps the project id stable across restarts, bound to exactly one
+    workspace, and independent of anything a request can supply.
+    """
+
+    from app.runtime.run_store import project_run_store_root
+
+    root = pathlib.Path(workspace_root) if workspace_root is not None else pathlib.Path(__file__).resolve().parents[2]
+    return project_run_store_root(root).name
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Serve the Core API. Returns a process exit code."""
 
@@ -57,7 +97,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     host, port = resolve_bind()
     warn_if_exposed(host)
-    app: Any = create_api_app()
+    # One guard, created here from the durable root, so every task path this server exposes
+    # shares one ledger while the process-wide default stays untouched.
+    guard = build_idempotency_guard()
+    # The composition, not a request, decides which project this server acts for. ``list_projects``
+    # already models this workspace as exactly one project, so the service must be told its id here;
+    # without that the service stays unbound and every task is refused (which is the correct
+    # fail-closed behaviour, but it also means the application can never run anything).
+    project_id = resolve_workspace_project_id()
+    app: Any = create_api_app(idempotency_guard=guard, authorized_project_id=project_id)
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
 

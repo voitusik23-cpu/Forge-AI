@@ -65,6 +65,11 @@ _DECLARATIONS = {
     # trial, so it is a paid provider and is excluded from automatic routing
     # unless FORGE_ALLOW_PAID_PROVIDERS is enabled.
     "together": (True, True, CostTier.PAID, False),
+    # Radox AI's per-model price is not established in this project, so it is
+    # declared at the conservative PAID tier: an unknown price is never treated
+    # as free, and the provider stays out of automatic routing unless
+    # FORGE_ALLOW_PAID_PROVIDERS is enabled.
+    "radox": (True, True, CostTier.PAID, False),
     "mock": (False, False, CostTier.FREE, False),
 }
 
@@ -80,6 +85,9 @@ _TASK_CATEGORIES = {
     # Together serves text chat models across the three text task intents; the
     # concrete model is selected through the existing model_name mechanism.
     "together": ("code", "analysis", "review"),
+    # Radox AI serves text chat models across the three text task intents; the
+    # concrete model is selected through the existing model_name mechanism.
+    "radox": ("code", "analysis", "review"),
     "mock": (),
 }
 

@@ -11,6 +11,7 @@ from app.agents.providers.groq import GroqProvider
 from app.agents.providers.mock import MockProvider
 from app.agents.providers.openai import OpenAIProvider
 from app.agents.providers.openrouter import OpenRouterProvider
+from app.agents.providers.radox import RadoxProvider
 from app.agents.providers.together import TogetherProvider
 from app.agents.providers.xai import XAIProvider
 from app.config.secrets import SecretStore
@@ -32,6 +33,7 @@ class ProviderFactory:
         "openrouter": OpenRouterProvider,
         "groq": GroqProvider,
         "together": TogetherProvider,
+        "radox": RadoxProvider,
         "mock": MockProvider,
     }
 

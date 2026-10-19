@@ -224,14 +224,59 @@ export const ProviderBalanceCard = ({
           <div className="small muted">{reason === "" ? t(lang, "balance.value.none") : reason}</div>
         </div>
       ) : probeMissing ? (
-        <div className="stack" style={{ gap: 4 }}>
-          <div className="notice">{t(lang, "balance.no_probe")}</div>
+        <div className="stack" style={{ gap: 6 }}>
+          <div className="notice">
+            {t(lang, "balance.no_probe")}
+            {/* The endpoint's own sentence, so the reason is the backend's and not the UI's. */}
+            {reason === "" ? null : (
+              <div className="small mono" style={{ marginTop: 4, whiteSpace: "pre-wrap" }}>
+                {reason}
+              </div>
+            )}
+          </div>
           {stale ? (
             <div className="small muted">{`${t(lang, "balance.stale")}: ${staleAge(
               lang,
               report.age_seconds
             )}`}</div>
-          ) : null}
+          ) : (
+            // The four amounts are still named, each explicitly "not reported by the backend",
+            // instead of leaving the money area empty.
+            <>
+              <AmountRow
+                lang={lang}
+                label={t(lang, "balance.available")}
+                report={report}
+                display={report.available_display}
+                minor={report.available_minor}
+                probesEnabled={probesEnabled}
+              />
+              <AmountRow
+                lang={lang}
+                label={t(lang, "balance.granted")}
+                report={report}
+                display={report.granted_display}
+                minor={report.granted_minor}
+                probesEnabled={probesEnabled}
+              />
+              <AmountRow
+                lang={lang}
+                label={t(lang, "balance.topped_up")}
+                report={report}
+                display={report.topped_up_display}
+                minor={report.topped_up_minor}
+                probesEnabled={probesEnabled}
+              />
+              <AmountRow
+                lang={lang}
+                label={t(lang, "balance.usage")}
+                report={report}
+                display={report.usage_display}
+                minor={report.usage_minor}
+                probesEnabled={probesEnabled}
+              />
+            </>
+          )}
         </div>
       ) : (
         <>

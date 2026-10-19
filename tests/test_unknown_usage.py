@@ -31,7 +31,10 @@ class UnknownUsageTests(unittest.TestCase):
         self.root.mkdir(parents=True, exist_ok=True)
         os.environ["FORGE_RUN_STORE_ROOT"] = str(self.root)
         self.store = RunStore(root=self.root)
-        self.service = ForgeApiService(run_store=self.store)
+        # The composition authorizes one project; a run cannot be created without it.
+        self.service = ForgeApiService(
+            run_store=self.store, authorized_project_id="unknown-usage"
+        )
         self.addCleanup(lambda: shutil.rmtree(self._base, ignore_errors=True))
 
     def test_01_a_mock_dispatch_reports_a_real_zero_with_a_mock_basis(self) -> None:

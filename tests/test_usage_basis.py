@@ -51,7 +51,10 @@ class UsageBasisTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
         os.environ["FORGE_RUN_STORE_ROOT"] = str(root)
-        service = ForgeApiService(run_store=RunStore(root=root))
+        # The composition authorizes one project; a run cannot be created without it.
+        service = ForgeApiService(
+            run_store=RunStore(root=root), authorized_project_id="usage-basis"
+        )
         outcome = service.run_task_detailed(
             TaskRunRequest(description="C3: basis", category="code", provider_name="mock")
         )

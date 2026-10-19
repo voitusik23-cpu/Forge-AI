@@ -195,7 +195,7 @@ class ModelCapabilityAndFilteringTests(unittest.TestCase):
 
     def test_default_catalog_providers_loaded(self) -> None:
         expected_providers = {
-            "openai", "anthropic", "google", "deepseek", "openrouter", "groq", "together", "xai", "mock"
+            "openai", "anthropic", "google", "deepseek", "openrouter", "groq", "together", "radox", "xai", "mock"
         }
         registered = {p.provider_id for p in self.registry.list_providers()}
         self.assertEqual(registered, expected_providers)

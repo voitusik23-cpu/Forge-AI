@@ -60,6 +60,20 @@ class TaskRunRequest:
     provider_name: Optional[str] = None
     project_id: Optional[str] = None
     context: Dict[str, Any] = field(default_factory=dict)
+    #: Opt-in write mode. When true *and* the category is ``code``, the model answer
+    #: the live provider produced is passed to the guarded code writer
+    #: (``app/agent_runtime/code_writer.py``), which applies it inside the run's own
+    #: workspace after validating every path. Default false, so every existing caller
+    #: keeps the read-only behaviour it had.
+    write_mode: bool = False
+    #: The model to run THIS dispatch on, for the provider named above. It is a
+    #: per-run override of that provider's configured model and nothing more: it
+    #: selects no provider, grants no capability, and defaults to ``None``, which
+    #: keeps the configured model (and therefore every existing caller byte-for-byte
+    #: unchanged). Before this field existed the HTTP layer dropped a caller's
+    #: ``model_name`` entirely, so every non-default model reached the provider as
+    #: ``"unconfigured"`` and failed as "model is not configured".
+    model_name: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -67,8 +81,10 @@ class TaskRunRequest:
             "category": self.category,
             "task_id": self.task_id,
             "provider_name": self.provider_name,
+            "model_name": self.model_name,
             "project_id": self.project_id,
             "context": dict(self.context),
+            "write_mode": bool(self.write_mode),
         }
 
 

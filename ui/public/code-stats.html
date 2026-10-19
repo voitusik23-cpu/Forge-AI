@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Code Stats</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 24px; background: #f5f5f7; color: #1d1d1f; }
+  h1 { font-size: 24px; margin: 0 0 20px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .card .label { font-size: 12px; color: #6e6e73; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .table-wrap { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e8e8ed; vertical-align: top; }
+  th { font-size: 11px; color: #6e6e73; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
+  .muted { color: #6e6e73; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #e8e8ed; }
+  .badge.applied { background: #d6f5d6; color: #1a7a1a; }
+  .file-list { list-style: none; margin: 0; padding: 0; }
+  .file-list li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; padding: 2px 0; }
+  .error { background: #ffdddd; color: #a00; padding: 12px; border-radius: 8px; margin-bottom: 16px; display: none; }
+</style>
+</head>
+<body>
+<h1>Статистика записи кода</h1>
+<div id="error" class="error"></div>
+<div class="stats">
+  <div class="card"><div class="label">Всего запусков</div><div class="value" id="stat-total">0</div></div>
+  <div class="card"><div class="label">С записью кода</div><div class="value" id="stat-with">0</div></div>
+  <div class="card"><div class="label">Без записи кода</div><div class="value" id="stat-without">0</div></div>
+  <div class="card"><div class="label">Applied</div><div class="value" id="stat-applied">0</div></div>
+  <div class="card"><div class="label">Файлов</div><div class="value" id="stat-files">0</div></div>
+  <div class="card"><div class="label">Добавлено строк</div><div class="value" id="stat-added">0</div></div>
+  <div class="card"><div class="label">Удалено строк</div><div class="value" id="stat-removed">0</div></div>
+</div>
+
+<div class="table-wrap">
+  <table id="runs-table">
+    <thead>
+      <tr>
+        <th>Run ID</th>
+        <th>Статус запуска</th>
+        <th>Code write статус</th>
+        <th>Файлы</th>
+        <th>+ added</th>
+        <th>- removed</th>
+        <th>Verification</th>
+      </tr>
+    </thead>
+    <tbody id="runs-body">
+      <tr><td colspan="7" class="muted">Загрузка...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+async function loadStats() {
+  const errorEl = document.getElementById('error');
+  const tbody = document.getElementById('runs-body');
+  try {
+    const res = await fetch('/api/product/runs');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    // API может вернуть массив напрямую или объект с полем runs/items/data
+    const runs = Array.isArray(data) ? data : (data.runs || data.items || data.data || []);
+    
+    let total = runs.length;
+    let withCodeWrite = 0;
+    let withoutCodeWrite = 0;
+    let applied = 0;
+    let totalFiles = 0;
+    let totalAdded = 0;
+    let totalRemoved = 0;
+
+    const rows = [];
+
+    for (const run of runs) {
+      const runId = run.run_id || run.id || '-';
+      const runStatus = run.status || run.state || '-';
+      
+      // Данные записи кода лежат ТОЛЬКО в project_state.code_write
+      const projectState = run.project_state;
+      const codeWrite = projectState && projectState.code_write ? projectState.code_write : null;
+
+      if (!codeWrite) {
+        withoutCodeWrite++;
+        rows.push(`
+          <tr>
+            <td><code>${escapeHtml(runId)}</code></td>
+            <td>${escapeHtml(String(runStatus))}</td>
+            <td><span class="muted">— нет записи кода</span></td>
+            <td class="muted">—</td>
+            <td class="muted">0</td>
+            <td class="muted">0</td>
+            <td class="muted">—</td>
+          </tr>
+        `);
+        continue;
+      }
+
+      withCodeWrite++;
+
+      // Считаем applied по code_write.status
+      const cwStatus = codeWrite.status || '-';
+      if (cwStatus === 'applied') applied++;
+
+      // Суммируем added/removed по code_write.files
+      const files = Array.isArray(codeWrite.files) ? codeWrite.files : [];
+      totalFiles += files.length;
+
+      let runAdded = 0;
+      let runRemoved = 0;
+      for (const f of files) {
+        runAdded += Number(f.added || 0);
+        runRemoved += Number(f.removed || 0);
+      }
+      totalAdded += runAdded;
+      totalRemoved += runRemoved;
+
+      const verification = codeWrite.verification != null ? String(codeWrite.verification) : (codeWrite.reason != null ? String(codeWrite.reason) : '-');
+      const badgeClass = cwStatus === 'applied' ? 'badge applied' : 'badge';
+
+      // В таблице показываем файлы оттуда же — из code_write.files
+      let filesHtml = '<span class="muted">—</span>';
+      if (files.length > 0) {
+        filesHtml = '<ul class="file-list">' + files.map(f => {
+          const p = f.path || '-';
+          const a = f.action ? ` <span class="muted">(${escapeHtml(String(f.action))})</span>` : '';
+          return `<li>${escapeHtml(String(p))}${a} <span class="muted">+${Number(f.added||0)}/-${Number(f.removed||0)}</span></li>`;
+        }).join('') + '</ul>';
+      }
+
+      rows.push(`
+        <tr>
+          <td><code>${escapeHtml(runId)}</code></td>
+          <td>${escapeHtml(String(runStatus))}</td>
+          <td><span class="${badgeClass}">${escapeHtml(String(cwStatus))}</span></td>
+          <td>${filesHtml}</td>
+          <td>+${runAdded}</td>
+          <td>-${runRemoved}</td>
+          <td>${escapeHtml(verification)}</td>
+        </tr>
+      `);
+    }
+
+    // без записи кода = запуски где project_state null или нет code_write
+    // уже посчитано, но для консистентности пересчитаем если нужно
+    // withoutCodeWrite уже инкрементирован выше
+    // total = with + without, проверим
+    withoutCodeWrite = total - withCodeWrite;
+
+    document.getElementById('stat-total').textContent = String(total);
+    document.getElementById('stat-with').textContent = String(withCodeWrite);
+    document.getElementById('stat-without').textContent = String(withoutCodeWrite);
+    document.getElementById('stat-applied').textContent = String(applied);
+    document.getElementById('stat-files').textContent = String(totalFiles);
+    document.getElementById('stat-added').textContent = String(totalAdded);
+    document.getElementById('stat-removed').textContent = String(totalRemoved);
+
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">Нет запусков</td></tr>';
+    } else {
+      tbody.innerHTML = rows.join('');
+    }
+  } catch (e) {
+    errorEl.textContent = 'Ошибка загрузки: ' + (e && e.message ? e.message : String(e));
+    errorEl.style.display = 'block';
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">Ошибка загрузки</td></tr>';
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+loadStats();
+</script>
+</body>
+</html>

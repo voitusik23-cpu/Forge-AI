@@ -115,6 +115,11 @@ UNSUPPORTED_REASONS: Mapping[str, str] = {
         "no endpoint is known for this provider: the configured name does not resolve, so a "
         "base URL is required before anything can be requested"
     ),
+    "radox": (
+        "this project establishes no account-balance endpoint for Radox AI; the provider is "
+        "OpenAI-compatible for chat completions only, and a balance visible solely in its own "
+        "console cannot be read from here without harvesting a session"
+    ),
 }
 
 #: Free, official endpoints used only to answer "does this key work?". None of them returns a
@@ -620,5 +625,6 @@ class ProviderBalanceProbe:
             "nvidia",
             "dashscope",
             "nararouter",
+            "radox",
         )
         return {name: self.report(name, force=force) for name in order}

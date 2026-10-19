@@ -20,8 +20,8 @@ const mergeBalances = (
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
 
-const money = (value: unknown): string =>
-  typeof value === "number" && Number.isFinite(value) ? `$${value.toFixed(4)}` : "—";
+const money = (value: unknown): string | null =>
+  typeof value === "number" && Number.isFinite(value) ? `$${value.toFixed(4)}` : null;
 
 type Catalogue = {
   providers?: Array<Record<string, unknown>>;
@@ -180,6 +180,13 @@ export const Models = ({
           <div className="notice" style={{ marginBottom: 12 }}>
             {t(lang, "balance.section.note")}
           </div>
+          {/* The backend's own statement about this composition is repeated here, so an empty
+              amount area is never mistaken for an interface failure. */}
+          {balances !== null && balances.probes_enabled === false ? (
+            <div className="notice warn" style={{ marginBottom: 12 }}>
+              {t(lang, "balance.section.noprobe")}
+            </div>
+          ) : null}
           {balanceError === "" ? null : (
             <div className="notice danger" style={{ marginBottom: 12 }}>
               {`${t(lang, "balance.error.read")}: ${balanceError}`}
@@ -253,7 +260,7 @@ export const Models = ({
                   </tr>
                 </thead>
                 <tbody>
-                  {models.slice(0, 40).map((model, index) => {
+                  {models.map((model, index) => {
                     const providerId = String(model.provider_id ?? "");
                     const probe = probeFor(providerId);
                     const state = String(probe?.account_status ? (probe.account_status as Record<string, unknown>).status ?? "NOT_CHECKED" : "NO_PROBE");
@@ -297,7 +304,7 @@ export const Models = ({
               action={<Badge tone="neutral">REGISTRY</Badge>}
             />
             <div className="stack" style={{ gap: 10 }}>
-              {registryProviders.slice(0, 9).map((provider) => {
+              {registryProviders.map((provider) => {
                 const providerId = String(provider.provider_id ?? "");
                 const probe = probeFor(providerId);
                 const account = probe?.account_status as Record<string, unknown> | undefined;
@@ -325,22 +332,34 @@ export const Models = ({
                     <div className="small muted">{t(lang, "models.secret.note")}</div>
                     <div className="row between small">
                       <span className="muted">{t(lang, "models.finance.forge_spent")}</span>
-                      <span className="mono">{money(probe?.forge_spent)}</span>
+                      <span className="mono">
+                        {probe === undefined
+                          ? t(lang, "models.finance.absent")
+                          : money(probe.forge_spent) ?? t(lang, "models.finance.absent")}
+                      </span>
                     </div>
                     <div className="row between small">
                       <span className="muted">{t(lang, "models.finance.estimate")}</span>
-                      <span className="mono">{money(probe?.estimated_cost)}</span>
+                      <span className="mono">
+                        {probe === undefined
+                          ? t(lang, "models.finance.absent")
+                          : money(probe.estimated_cost) ?? t(lang, "models.finance.unreported")}
+                      </span>
                     </div>
                     <div className="row between small">
                       <span className="muted">{t(lang, "models.finance.reported")}</span>
-                      <span className="mono">{money(probe?.provider_reported_cost)}</span>
+                      <span className="mono">
+                        {probe === undefined
+                          ? t(lang, "models.finance.absent")
+                          : money(probe.provider_reported_cost) ?? t(lang, "models.finance.unreported")}
+                      </span>
                     </div>
                     <div className="row between small">
                       <span className="muted">{t(lang, "models.finance.balance")}</span>
                       <a
                         href={`#balance-${providerId}`}
                         className="small"
-                        style={{ color: "var(--cyan-hi)" }}
+                        style={{ color: "var(--info-text)" }}
                         onClick={() => setBalanceDetail(providerId)}
                       >
                         {t(lang, "balance.detail.show")}
@@ -350,6 +369,9 @@ export const Models = ({
                 );
               })}
             </div>
+            {registryProviders.length === 0 ? (
+              <div className="small muted">{t(lang, "models.providers.empty")}</div>
+            ) : null}
           </Card>
 
           <Card className="rise d2" tight>

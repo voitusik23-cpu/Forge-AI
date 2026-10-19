@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Code Stats — Vault</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a2332; --border:#2a3a4d; --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background:var(--bg); color:var(--text); padding:24px; }
+  .container { max-width:980px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:16px; }
+  .muted { color:var(--muted); font-size:13px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; }
+  .card .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px; }
+  .card .value { font-size:24px; font-weight:600; }
+  .card .sub { color:var(--muted); font-size:11px; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  th, td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--border); font-size:13px; }
+  th { background:#1e2d42; color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; }
+  tr:last-child td { border-bottom:none; }
+  .badge { display:inline-block; padding:2px 6px; border-radius:10px; font-size:11px; background:#1f3a5f; color:var(--accent); }
+  .error { background:#3d1f1f; border:1px solid #6e2a2a; color:#ffb3b3; padding:12px; border-radius:6px; margin-bottom:16px; display:none; }
+  .warn { background:#3d3520; border:1px solid #6e5a1f; color:#ffd88a; padding:8px 12px; border-radius:6px; margin-bottom:16px; display:none; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Code Stats</h1>
+  <p class="muted">Статистика по последним запускам — данные из <code>/api/product/runs</code></p>
+  <div id="error" class="error"></div>
+  <div id="truncatedWarn" class="warn"></div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Total recorded</div>
+      <div class="value" id="totalRecorded">—</div>
+      <div class="sub" id="shownInfo"></div>
+    </div>
+    <div class="card">
+      <div class="label">Всего файлов</div>
+      <div class="value" id="totalFiles">0</div>
+      <div class="sub">в последних 20 запусках</div>
+    </div>
+    <div class="card">
+      <div class="label">Создано (create)</div>
+      <div class="value" id="createdCount">0</div>
+      <div class="sub">action = 'create'</div>
+    </div>
+    <div class="card">
+      <div class="label">Обновлено (update)</div>
+      <div class="value" id="updatedCount">0</div>
+      <div class="sub">action = 'update'</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Run ID</th>
+        <th>Дата</th>
+        <th>Файлов</th>
+        <th>create / update</th>
+      </tr>
+    </thead>
+    <tbody id="runsBody">
+      <tr><td colspan="5" style="text-align:center;color:var(--muted);">Загрузка...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+async function loadStats() {
+  const errorEl = document.getElementById('error');
+  const warnEl = document.getElementById('truncatedWarn');
+  try {
+    const res = await fetch('/api/product/runs');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    // API возвращает объект {project_id, runs:[...], total_recorded, truncated}, а не массив
+    const runs = Array.isArray(data) ? data : (data.runs || []);
+    const totalRecorded = data.total_recorded ?? runs.length;
+    const truncated = !!data.truncated;
+
+    // Список runs отсортирован от новых к старым, поэтому последние 20 — это slice(0,20)
+    const last20 = runs.slice(0, 20);
+
+    let totalFiles = 0;
+    let createCount = 0;
+    let updateCount = 0;
+
+    last20.forEach(run => {
+      const files = run.files || run.changes || [];
+      files.forEach(f => {
+        totalFiles++;
+        // поле action принимает значения 'create' и 'update'
+        if (f.action === 'create') createCount++;
+        else if (f.action === 'update') updateCount++;
+      });
+    });
+
+    document.getElementById('totalRecorded').textContent = String(totalRecorded);
+    document.getElementById('shownInfo').textContent = 'показано ' + last20.length + ' из ' + runs.length;
+    document.getElementById('totalFiles').textContent = String(totalFiles);
+    document.getElementById('createdCount').textContent = String(createCount);
+    document.getElementById('updatedCount').textContent = String(updateCount);
+
+    if (truncated) {
+      warnEl.textContent = 'Данные усечены (truncated=true), показано ' + runs.length + ' из ' + totalRecorded;
+      warnEl.style.display = 'block';
+    } else {
+      warnEl.style.display = 'none';
+    }
+
+    const tbody = document.getElementById('runsBody');
+    tbody.innerHTML = '';
+    if (last20.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);">Нет данных</td></tr>';
+      return;
+    }
+    last20.forEach((run, idx) => {
+      const files = run.files || run.changes || [];
+      let c = 0, u = 0;
+      files.forEach(f => {
+        if (f.action === 'create') c++;
+        else if (f.action === 'update') u++;
+      });
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + (idx+1) + '</td>' +
+        '<td><span class="badge">' + (run.run_id || run.id || '—') + '</span></td>' +
+        '<td>' + (run.created_at || run.timestamp || run.date || '—') + '</td>' +
+        '<td>' + files.length + '</td>' +
+        '<td>' + c + ' / ' + u + '</td>';
+      tbody.appendChild(tr);
+    });
+
+  } catch (e) {
+    errorEl.textContent = 'Ошибка загрузки: ' + (e && e.message ? e.message : String(e));
+    errorEl.style.display = 'block';
+    document.getElementById('runsBody').innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);">Ошибка</td></tr>';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', loadStats);
+</script>
+</body>
+</html>

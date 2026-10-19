@@ -135,6 +135,8 @@ class AgentLoopSliceTestCase(unittest.TestCase):
             execution_profile=api_profile(),
             declarations=declarations,
             approval_policy=kwargs.pop("approval_policy", ApprovalPolicy()),
+            # The composition authorizes one project; a run cannot be created without it.
+            authorized_project_id="agent-loop-production",
             **kwargs,
         )
 
@@ -471,11 +473,32 @@ class LoopObservabilityTests(AgentLoopSliceTestCase):
 
 class BackwardCompatibilityTests(AgentLoopSliceTestCase):
     def test_taskrunrequest_is_unchanged_and_authority_neutral(self) -> None:
-        """H/I/J: the HTTP contract has no authority fields."""
+        """H/I/J: the HTTP contract has no authority fields.
+
+        ``write_mode`` is the one addition since this guard was written, and it is
+        deliberately not an authority field: it cannot name a path, a command, a
+        tool, a workspace, an execution profile, an environment, an approval, or a
+        file body. It only selects whether the answer the provider already produced
+        is passed to the guarded writer, which validates every path against the
+        run's frozen workspace boundary and its own deny list. The banned list below
+        is unchanged, so the property this test protects still holds.
+        """
+
         fields = {f.name for f in dataclasses.fields(TaskRunRequest)}
         self.assertEqual(
             fields,
-            {"description", "category", "task_id", "provider_name", "project_id", "context"},
+            {
+                "description",
+                "category",
+                "task_id",
+                "provider_name",
+                "project_id",
+                "context",
+                "write_mode",
+                # The model for this dispatch only: it selects no provider and
+                # carries no tool, workspace, or execution authority.
+                "model_name",
+            },
         )
         for banned in (
             "allowed_tool_ids", "allowed_execution_commands", "declaration_id",

@@ -57,6 +57,7 @@ LIVE_PROVIDERS = (
     "openrouter",
     "groq",
     "together",
+    "radox",
 )
 
 #: Names of the environment variables a live provider would look for. Only the
@@ -70,6 +71,7 @@ LIVE_KEY_NAMES = (
     "OPENROUTER_API_KEY",
     "GROQ_API_KEY",
     "TOGETHER_API_KEY",
+    "RADOX_API_KEY",
 )
 
 #: Hosts a provider adapter would dial. Named so a failure message can say which
@@ -83,6 +85,7 @@ LIVE_HOST_SUFFIXES = (
     "api.x.ai",
     "api.groq.com",
     "api.together.xyz",
+    "radoxai.com",
 )
 
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "0.0.0.0", ""}
@@ -366,7 +369,9 @@ class TestRuntimeGuaranteeTests(unittest.TestCase):
             runtime = create_runtime(settings=settings)
 
             # The full provider set is still registered, exactly as before.
-            self.assertEqual(len(runtime.provider_registry.list_providers()), 9)
+            # (10 canonical providers: openai, anthropic, deepseek, google, xai,
+            # openrouter, groq, together, radox, mock.)
+            self.assertEqual(len(runtime.provider_registry.list_providers()), 10)
             self.assertIn("openrouter", runtime.provider_registry.list_providers())
             self.assertEqual(
                 runtime.settings.enabled_providers, ("mock", "openrouter")
@@ -466,7 +471,10 @@ class TestRuntimeGuaranteeTests(unittest.TestCase):
 
                 from app.api.service import ForgeApiService
 
-                service = ForgeApiService(runtime=runtime)
+                # The composition authorizes one project; a run cannot be created without it.
+                service = ForgeApiService(
+                    runtime=runtime, authorized_project_id="offline-runtime"
+                )
                 response = service.run_task(
                     TaskRunRequest(description="offline service dispatch")
                 )
@@ -568,7 +576,10 @@ class TestRuntimeGuaranteeTests(unittest.TestCase):
                     from app.api.service import ForgeApiService
 
                     runtime = create_runtime()
-                    service = ForgeApiService(runtime=runtime)
+                    # The composition authorizes one project; a run cannot exist without it.
+                    service = ForgeApiService(
+                        runtime=runtime, authorized_project_id="offline-runtime"
+                    )
                     response = service.run_task(
                         TaskRunRequest(description="log hygiene probe")
                     )

@@ -109,6 +109,8 @@ class ExecutionWiringTestCase(unittest.TestCase):
             workspace=self.workspace,
             tool_registry=self._registry(),
             allowed_tool_ids=allowed_tool_ids,
+            # The composition authorizes one project; a run cannot be created without it.
+            authorized_project_id="api-execution-scope",
             **kwargs,
         )
 

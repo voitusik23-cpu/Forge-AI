@@ -9,6 +9,10 @@
   display: flex;
   flex-direction: column;
   gap: var(--sp-5);
+  min-height: 0;
+  /* The rail itself never moves with the page; only a window too short for its own items makes
+     the rail scroll, so no navigation entry is ever clipped away. */
+  overflow-y: auto;
   background: var(--surface-rail);
   border-right: 1px solid var(--hairline);
   backdrop-filter: blur(14px);
@@ -69,6 +73,7 @@
 /* ------------------------------------------------------------------------- top bar */
 .topbar {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: var(--sp-4);
   padding: var(--sp-4) var(--sp-6);
@@ -181,7 +186,7 @@
 .badge.ok { color: var(--ok); background: rgba(52, 211, 153, 0.12); border-color: rgba(52, 211, 153, 0.32); }
 .badge.warn { color: var(--warn); background: rgba(251, 191, 36, 0.12); border-color: rgba(251, 191, 36, 0.3); }
 .badge.danger { color: var(--danger); background: rgba(251, 113, 133, 0.12); border-color: rgba(251, 113, 133, 0.3); }
-.badge.info { color: var(--cyan-hi); background: var(--cyan-dim); border-color: rgba(34, 211, 238, 0.3); }
+.badge.info { color: var(--info-text); background: var(--cyan-dim); border-color: rgba(34, 211, 238, 0.3); }
 .badge.neutral { color: var(--ice-dim); background: rgba(148, 172, 255, 0.1); border-color: var(--hairline); }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 12px currentColor; }
@@ -333,6 +338,9 @@
 .auth-card { width: 100%; max-width: 430px; }
 .slogan { font-size: 30px; line-height: 1.25; font-weight: 700; letter-spacing: -0.01em; max-width: 12ch; }
 .slogan em { font-style: normal; background: linear-gradient(120deg, var(--cyan-hi), var(--violet-hi)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+/* Gradient-filled text is painted from the accent hues, so Light needs contrast-friendly stops:
+   the Dark cyan (#67e8f9) is nearly invisible on the light auth surface. */
+:root[data-theme="light"] .slogan em { background: linear-gradient(120deg, #0e7490, #6d4bd0); -webkit-background-clip: text; background-clip: text; }
 
 .segment { display: inline-flex; padding: 3px; border-radius: 999px; border: 1px solid var(--hairline); background: var(--surface-input); }
 .segment button { padding: 5px 14px; border-radius: 999px; font-size: var(--t-small); color: var(--muted); }
@@ -400,7 +408,8 @@ select.input { cursor: pointer; }
 .forge-workbench .btn.primary:hover { box-shadow: 0 14px 34px rgba(224, 163, 58, 0.42); }
 
 .forge-workbench .badge.info {
-  color: #a8c8ee;
+  /* Light surfaces need the darker blue: the pale one used in Dark sits at about 1.7:1 on white. */
+  color: var(--forge-info-text, #a8c8ee);
   background: rgba(74, 134, 200, 0.16);
   border-color: rgba(74, 134, 200, 0.4);
 }
@@ -461,4 +470,28 @@ select.input { cursor: pointer; }
   border-radius: var(--r-md);
   background: var(--surface-sunken);
   color: var(--ice);
+}
+
+/* The write-mode switch: a plain checkbox next to the submit button, and its warning under it. */
+.forge-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-small);
+  color: var(--ice);
+  cursor: pointer;
+}
+
+.forge-toggle input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--forge-gold, #e0a33a);
+  cursor: pointer;
+}
+
+.forge-write-warning {
+  display: block;
+  max-width: 720px;
+  margin-top: -6px;
 }

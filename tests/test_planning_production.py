@@ -199,6 +199,8 @@ class PlannerTestCase(unittest.TestCase):
             },
             approval_policy=ApprovalPolicy(),
             harness_factory=lambda **kw: create_agent_harness(**factory_kwargs, **kw),
+            # The composition authorizes one project; a run cannot be created without it.
+            authorized_project_id="planning-production",
             **kwargs,
         )
 

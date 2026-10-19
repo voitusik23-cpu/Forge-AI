@@ -162,6 +162,7 @@ export const App = () => {
             backend={backend}
             onRefresh={() => void reload()}
             onHelp={() => openHelp(CONTEXT_TOPIC.runs)}
+            onOpenForge={() => setNav("forge")}
           />
         ) : null}
         {nav === "tools" ? <Tools lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}

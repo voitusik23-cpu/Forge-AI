@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import json
 import pathlib
 import socketserver
+import sys
 import urllib.error
 import urllib.request
 
 UPSTREAM = "http://127.0.0.1:8011"
+
+#: The repository root, so ``app.config.settings`` imports even when this file is started by hand
+#: (the launcher already passes PYTHONPATH=REPO, a manual ``python tools/ui_preview_server.py``
+#: does not).
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -28,12 +37,46 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path.startswith("/diag"):
             self._diagnose()
             return
+        if self.path.split("?", 1)[0] == "/ui-defaults.json":
+            self._ui_defaults()
+            return
         if self.path.startswith("/api/"):
             self._proxy("GET")
             return
         if self.path in ("/", "") or self.path.startswith("/?"):
             self.path = "/index.html"
         super().do_GET()
+
+    def _ui_defaults(self) -> None:
+        """The provider and model the installed configuration defaults to.
+
+        ``FORGE_DEFAULT_MODEL`` is resolved inside the Core by ``app/config/settings.py``, and the
+        Core has no route that publishes it (``/api/status.details`` carries ``default_provider``
+        only). The workspace has to preselect the model the Core would actually use, so the shell
+        reads the two routing defaults from that same settings loader instead of hard-coding them
+        into the bundle, where they would go stale the moment ``.env`` changes.
+
+        Read-only and secret-free: only ``default_provider``/``default_model`` leave this handler,
+        and ``load_settings`` itself only reads ``FORGE_``-prefixed names. A failure is reported as
+        the exception type, never as a value, and the screen then falls back to the first model of
+        the provider.
+        """
+        payload: dict[str, str] = {"source": "app.config.settings.load_settings"}
+        try:
+            from app.config.settings import load_settings
+
+            settings = load_settings()
+            payload["default_provider"] = str(settings.default_provider)
+            payload["default_model"] = str(settings.default_model)
+        except Exception as error:  # noqa: BLE001 - report the failure, never invent a default
+            payload["error"] = f"{type(error).__name__}: {error}"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _diagnose(self) -> None:
         """Explain why the interface cannot reach the Core API.
@@ -142,6 +185,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body_text)
 
 
+class _Server(socketserver.ThreadingTCPServer):
+    """Handle each connection in its own thread.
+
+    ``TCPServer`` handles one connection at a time, and the ``/api`` proxy waits up to 300s for the
+    Core to answer (``_proxy``). One slow or stuck request - for example the request the open
+    application window itself holds - therefore froze every other client, which is exactly what
+    measured as "port 8020 listens but '/' never answers". The threads are daemons so stopping the
+    server never waits on a client, and the address is reusable so a restart does not fail on a socket
+    left in TIME_WAIT.
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8020)
@@ -149,7 +207,7 @@ def main() -> int:
     if not pathlib.Path("ui/dist/index.html").exists():
         print("ui/dist is missing: run the frontend build first")
         return 2
-    with socketserver.TCPServer(("127.0.0.1", args.port), Handler) as httpd:
+    with _Server(("127.0.0.1", args.port), Handler) as httpd:
         print(f"command center on http://127.0.0.1:{args.port}/")
         httpd.serve_forever()
     return 0

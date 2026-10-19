@@ -5444,3 +5444,417 @@ contract. Contract document:
    остаются открытыми; Q-2 (первая матрица ролей), Q-3 (механизм R-6), Q-4 (где
    записывается идемпотентность Platform) и Q-5 (как аутентифицируется приём результата)
    требуют решения владельца.
+
+## Offline Task Execution Path v0.1
+
+Status: **IMPLEMENTED** (2026-10-18). Verified by
+`tests/test_offline_task_execution.py` plus the existing task, idempotency,
+history, dashboard, desktop and launcher suites.
+
+### Context
+
+`POST /api/tasks/run` with the offline provider (`mock`, the only provider this
+composition may use without credentials) answered with one canned sentence from
+`MockProvider.generate` -- `MockProvider response: <prompt>` -- and recorded a
+fixed five events. The owner asked for real work on that path instead of a stub,
+in an offline/deterministic/zero-cost form ("хочу реальной работы, хотя бы в
+тестовом режиме").
+
+### Accepted decisions
+
+- **The offline selection runs the canonical harness loop.** When the resolved
+  provider for a task is the offline provider, `ForgeApiService.run_task_detailed`
+  delegates to `ForgeApiService._run_offline_task`, which executes the task with
+  `AgentHarness.run` -- the same loop, `Planner`, `ProjectDiscovery`,
+  `AcceptanceGate` and durable `RunStore` writer the production entry points use.
+  No second loop was written.
+- **The work is derived from the task text, deterministically.**
+  `app/agent_runtime/offline_task.py` turns the description into at most six
+  read-only checks (list a directory, read the first N lines of a file, prove a
+  path exists, count entries, summarise the workspace). Keyword and path parsing
+  only: no model, no network, no randomness, no clock. One
+  `AcceptanceCriterion` is derived per check, so the run is judged by checks it
+  actually performed.
+- **The observation is real and read-only.** `OfflineWorkspaceVerifier`
+  implements the harness's existing verifier port and reads the service's own
+  `Workspace` (bounded listing, bounded walk, bounded excerpt). It never writes,
+  starts a process, or opens a socket, and it refuses credential-shaped paths
+  through the canonical `app/execution/secret_files.py` recognizer.
+- **The offline decision provider can only verify and conclude.**
+  `OfflineTaskDecisionProvider` proposes `RUN_VERIFICATION`, then `COMPLETE_RUN`
+  on a passing acceptance or `FAIL_RUN` otherwise. It never proposes `EXECUTE`,
+  `INVOKE_TOOL`, `REQUEST_REVISION`, or an approval wait, so no command, tool, or
+  unbounded retry is reachable on this path.
+- **No authority was widened.** The offline run builds its own frozen `RunScope`
+  from the service's own workspace and execution profile with
+  `allowed_tool_ids=frozenset()` and `allowed_execution_commands=frozenset()`, and
+  carries no `execution_requests` and no tool intents. The fail-closed
+  "no authorized project" guard, the idempotency claim, `RunScope`, the project
+  binding, and workspace isolation are unchanged.
+- **Named providers are unchanged.** The branch is taken only when the resolved
+  provider is the offline provider; any other provider still dispatches through
+  `RunExecutor` -> `Orchestrator` -> provider chain exactly as before.
+- **Telemetry stays honest.** The path makes no provider call, so it reports
+  `tokens=0`, `cost=0.0` with the existing `MOCK` basis (a measured zero), a
+  measured wall-clock duration, `provider_used="mock"` and
+  `model_used="deterministic-offline"` (no model produced anything).
+- **The response model is unchanged.** `TaskRunResponse.to_dict()` keeps its
+  byte-pinned key set; the task-derived result travels in the existing `output`
+  text, and the per-check steps are in the durable event trail that
+  `GET /api/runs/{run_id}` already exposes. No UI shape change was needed.
+- **The observation bound is narrower, not wider.** The offline loop supplies a
+  `ProjectDiscovery` with reduced `ScanLimits` (300 files, 4 MB, depth 6) because
+  one interactive task must finish inside a request budget; a narrower bound can
+  only observe less.
+
+### Rejected alternatives
+
+- **Letting the mock provider "answer" with the task text.** That is what the
+  canned string already did: text in, text out, no observed work.
+- **Deriving a host command from the description.** Rejected: it would let client
+  text select a command, which the declared-execution decision explicitly
+  refuses.
+- **Granting a read tool to the run scope.** Rejected: the tool perimeter is
+  operator composition, and a client-reachable path must not widen it. Read-only
+  observation is performed inside the verifier port, which holds no execution
+  authority.
+- **Fabricating a passing acceptance for tasks with nothing to check.** A check
+  that cannot be performed is `FAILED`/`DENIED`, and the run reports it; an empty
+  or unusable description still gets one honest workspace summary.
+
+### Consequences and open items
+
+1. **Read-only by design.** The offline path inspects the workspace; it does not
+   change it. Producing code offline still requires a real provider and the
+   operator-declared execution/permission chain.
+2. **No provider-attempt accounting for offline runs.** Nothing was consumed, so
+   no attempt is recorded; the dashboard's provider tables legitimately show no
+   row for such a run. Task history and acceptance history are recorded.
+3. **The task text selects what is observed.** The boundary is
+   `Workspace.normalize_relative_path` plus the secret recognizer; a path outside
+   the workspace is refused with `workspace_or_path_rejected` and fails the run.
+4. **`MockProvider` itself is unchanged.** Its canned sentence is still what a
+   direct `Orchestrator.dispatch` through the mock provider returns; only the API
+   task path was redirected.
+
+## Offline Task Execution Path v0.1 -- русская версия
+
+Статус: **РЕАЛИЗОВАНО** (2026-10-18). Проверено
+`tests/test_offline_task_execution.py` и существующими наборами тестов задачи,
+идемпотентности, истории запусков, дашборда, desktop и launcher.
+
+### Контекст
+
+`POST /api/tasks/run` с offline-провайдером (`mock` -- единственный провайдер,
+доступный без credentials) отвечал одной заготовленной фразой из
+`MockProvider.generate` (`MockProvider response: <prompt>`) и записывал
+фиксированные пять событий. Владелец попросил реальную работу на этом пути вместо
+заглушки, в offline/детерминированном/нулевом по стоимости виде.
+
+### Принятые решения
+
+- **Offline-выбор запускает канонический цикл harness.** Если выбранный
+  провайдер задачи -- offline, `ForgeApiService.run_task_detailed` передаёт
+  выполнение в `ForgeApiService._run_offline_task`, который исполняет задачу
+  через `AgentHarness.run` -- тот же цикл, `Planner`, `ProjectDiscovery`,
+  `AcceptanceGate` и тот же durable-писатель `RunStore`, что и production-точки
+  входа. Второй цикл не написан.
+- **Работа выводится из текста задачи детерминированно.**
+  `app/agent_runtime/offline_task.py` превращает описание не более чем в шесть
+  read-only проверок (перечислить каталог, прочитать первые N строк файла,
+  подтвердить существование пути, посчитать записи, дать сводку рабочей области).
+  Только разбор ключевых слов и путей: без модели, сети, случайности и часов.
+  На каждую проверку выводится `AcceptanceCriterion`, поэтому запуск судится по
+  фактически выполненным проверкам.
+- **Наблюдение реальное и read-only.** `OfflineWorkspaceVerifier` реализует
+  существующий порт верификатора harness и читает собственную `Workspace`
+  сервиса (ограниченный листинг, ограниченный обход, ограниченная выдержка).
+  Он ничего не пишет, не запускает процессы и не открывает сокеты, а
+  пути, похожие на credentials, отклоняет через канонический распознаватель
+  `app/execution/secret_files.py`.
+- **Offline decision provider умеет только проверять и завершать.**
+  `OfflineTaskDecisionProvider` предлагает `RUN_VERIFICATION`, затем
+  `COMPLETE_RUN` при пройденной приёмке либо `FAIL_RUN`. Он никогда не
+  предлагает `EXECUTE`, `INVOKE_TOOL`, `REQUEST_REVISION` или ожидание
+  approval, поэтому ни команда, ни инструмент, ни неограниченный повтор на этом
+  пути недостижимы.
+- **Ни одна authority не расширена.** Offline-запуск строит собственный
+  замороженный `RunScope` из собственной workspace и execution profile сервиса с
+  `allowed_tool_ids=frozenset()` и `allowed_execution_commands=frozenset()`, без
+  `execution_requests` и tool intents. Fail-closed проверка "нет
+  авторизованного проекта", заявка идемпотентности, `RunScope`, привязка
+  проекта и изоляция workspace не изменены.
+- **Именованные провайдеры не изменены.** Ветка выбирается только когда
+  выбранный провайдер -- offline; любой другой по-прежнему идёт через
+  `RunExecutor` -> `Orchestrator` -> цепочку провайдеров.
+- **Телеметрия остаётся честной.** Путь не вызывает провайдера, поэтому
+  сообщает `tokens=0`, `cost=0.0` с существующим basis `MOCK` (измеренный ноль),
+  измеренную длительность, `provider_used="mock"` и
+  `model_used="deterministic-offline"` (ни одна модель ничего не произвела).
+- **Модель ответа не изменена.** Набор ключей `TaskRunResponse.to_dict()`
+  остаётся прежним; результат задачи передаётся в существующем тексте `output`, а
+  пошаговые проверки -- в durable-журнале событий, который уже отдаёт
+  `GET /api/runs/{run_id}`. Изменение формы UI не потребовалось.
+- **Граница наблюдения сужена, а не расширена.** Offline-цикл передаёт
+  `ProjectDiscovery` с уменьшенными `ScanLimits` (300 файлов, 4 МБ, глубина 6),
+  потому что одна интерактивная задача должна укладываться в бюджет запроса;
+  более узкая граница может только наблюдать меньше.
+
+### Отклонённые альтернативы
+
+- **Позволить mock-провайдеру "отвечать" текстом задачи.** Это и делала
+  заготовленная строка: текст на входе, текст на выходе, никакой наблюдённой
+  работы.
+- **Выводить host-команду из описания.** Отклонено: это дало бы клиентскому
+  тексту выбор команды, что решение о declared execution прямо запрещает.
+- **Выдавать read-инструмент в run scope.** Отклонено: периметр инструментов --
+  это композиция оператора, и клиентский путь не должен его расширять.
+  Read-only наблюдение выполняется внутри порта верификатора, у которого нет
+  authority на исполнение.
+- **Фабриковать пройденную приёмку для задач, где нечего проверять.** Проверка,
+  которую невозможно выполнить, даёт `FAILED`/`DENIED`, и запуск сообщает об
+  этом; пустое или непригодное описание всё равно получает одну честную сводку
+  рабочей области.
+
+### Следствия и открытые пункты
+
+1. **Только чтение по замыслу.** Offline-путь исследует рабочую область, но не
+   изменяет её. Генерация кода offline по-прежнему требует реального провайдера и
+   объявленной оператором цепочки исполнения/разрешений.
+2. **Нет учёта попыток провайдера для offline-запусков.** Ничего не потрачено,
+   поэтому попытка не записывается; таблицы провайдеров в дашборде законно не
+   показывают строку для такого запуска. История задач и приёмки записывается.
+3. **Текст задачи выбирает, что наблюдать.** Граница --
+   `Workspace.normalize_relative_path` плюс распознаватель секретов; путь вне
+   рабочей области отклоняется с `workspace_or_path_rejected` и проваливает
+   запуск.
+4. **Сам `MockProvider` не изменён.** Его заготовленная фраза по-прежнему
+   возвращается при прямом `Orchestrator.dispatch` через mock-провайдера;
+   перенаправлен только API-путь задачи.
+
+## Guarded Code-Writing Path v0.1
+
+### Context
+
+The repository could plan, verify, report and (with an operator declaration)
+execute a command, but **no path turned a model answer into a change on disk**.
+The offline harness is read-only by construction
+(`app/agent_runtime/offline_task.py`), and no executor applied model output to
+files. Every "write code" request therefore had to leave the product: the owner
+had to copy the answer into the tree by hand.
+
+The capability is the product's point, so the missing piece had to exist. What
+could not be relaxed while adding it: the frozen `RunScope`, the workspace
+containment boundary, the deny rules around credentials/`.git`/migrations/
+`authorizer.py`, the fail-closed defaults, idempotency, and the rule that a run
+reports what really happened.
+
+### Accepted decisions
+
+- **One isolated, standard-library module.** `app/agent_runtime/code_writer.py`
+  is the whole capability: deterministic, no network, no model call, no shell,
+  no subprocess. It receives the model answer and the caller's own workspace and
+  returns a structured result. It is not a second execution plane.
+- **Two answer shapes only, and no guessing.** A fenced block carrying a path
+  header (`` ```python path=tools/foo.py `` or a preceding `**File: ...**` line)
+  and a unified diff (`--- a/path` / `+++ b/path`). An answer with neither is
+  `no_changes`; a fenced block with no path is prose, not a change.
+- **Path validation reuses the canonical boundary.** Every path is normalized by
+  `normalize_workspace_relative_path` (which already refuses `..`, absolute,
+  drive-qualified, UNC, ADS and reserved names) and then resolved through
+  `WorkspaceBoundary.resolve_relative` - the same containment check
+  `app/execution/sandbox.py` runs at the authority boundary and before a child
+  process is spawned. A canonical target that differs from its lexical form
+  (a link on the way) is refused.
+- **A hard deny list, not a silent skip.** `.env`/`.env.*`, `.git`, `.venv`,
+  `node_modules`, `dist`, `authorizer.py`, the PostgreSQL migrations, names
+  carrying `secret`/`credential`/`token`, and anything the project's own secret
+  recognizer (`app/execution/secret_files.py`) marks as credential material are
+  refused. Refusal rejects the **whole answer**; no file is written.
+- **Caps.** At most 20 files and 200 KB written per answer, enforced before the
+  first byte is written.
+- **Atomic per file, with backups.** Each file is written through
+  `<path>.forge-new` and `os.replace`. A modified file's bytes are first copied
+  to `.forge/backups/<run_id>/<relative path>`. Nothing is deleted by a change;
+  a diff that would delete a file is refused.
+- **Fail-closed verification.** Every touched `.py` is compiled with the standard
+  library's `py_compile` (in-process - the same check as `python -m py_compile`,
+  with no process and no artifact left in the workspace). If one fails, **every**
+  file of that run is rolled back from its backup (created files are removed), and
+  the result is `verification_failed`.
+- **A real diff.** The reported diff is computed with `difflib` from the before
+  and after bytes, per file, with `--- /dev/null` for a creation.
+- **Opt-in, code-only request field.** `TaskRunRequest.write_mode: bool = False`,
+  read from the `write_mode` payload key of `POST /api/tasks/run`. Write mode is
+  active only when the flag is true **and** the category is `code`; every existing
+  caller keeps the read-only behaviour, and the pinned response contract is
+  unchanged (the report travels in `output`). A write-mode dispatch is a different
+  logical operation, so the idempotency fingerprint appends a marker **only when
+  the flag is set**, leaving every existing fingerprint byte-identical.
+- **The live provider branch is reused, not reimplemented.** With a real provider
+  selected, the model answer is the provider's own output from the existing
+  `RunExecutor` dispatch (the write happens after it, inside the same frozen
+  scope). With the offline provider, the "answer" is the deterministic plan text,
+  so the pipeline (parse -> validate -> apply -> verify -> persist) runs end to
+  end and honestly reports `no_changes`.
+- **The model gets names, not contents.** In write mode the task text is sent with
+  a bounded, deterministic listing of the workspace's file names
+  (`build_workspace_context`), skipping secret-shaped paths. This keeps the prompt
+  inside the request budget and keeps the prompt from becoming a read primitive.
+- **The run record carries the outcome.** The result (status, files with
+  added/removed counts, the real diff, the verification status, the reason) is
+  merged into the run's existing `RunStateSnapshot.project_state` under
+  `code_write`, and a bounded `PROJECT_STATE_UPDATED` event marks the same fact.
+  `success` survives only when the status is `applied` and verification passed;
+  `no_changes`, `rejected` and `verification_failed` are all reported as failures.
+- **The durable lifecycle follows the final verdict.** The idempotency lifecycle
+  write moved after write mode on the provider path, so a keyed write-mode run
+  cannot be recorded `COMPLETED` while nothing was written.
+
+### Rejected alternatives
+
+- **Let the model name a file without a header and infer the body.** That is a
+  guess about which file to overwrite; refused.
+- **Fuzzy-apply a diff whose context does not match.** It would silently write a
+  file the model never saw. Refused; the change is rejected instead.
+- **Give the writer its own workspace or its own authority.** The workspace comes
+  from the frozen scope the run already holds, so writing cannot widen a run.
+- **Implement the write as a tool invocation.** The tool plane has its own
+  approval and permission policy, and routing a file write through it would make
+  a model answer an indirect tool request. The write is a separate, explicit,
+  post-dispatch step controlled by the request flag.
+- **Add fields to `TaskRunResponse`.** The response is byte-pinned by existing
+  guard tests; the report rides in `output` and in the run record instead.
+- **Report `applied` for a run whose verification failed.** Verification failure
+  rolls back and reports `verification_failed`; success is never claimed.
+
+### Consequences and open items
+
+1. **A live provider is still required for real project code.** The provider
+   branch is exercised with local fakes only; no live provider is enabled in this
+   environment, so end-to-end writing of real code needs one enabled (and the
+   model must answer with a supported shape).
+2. **An answer cannot patch a file it never saw.** Only names are sent, so an
+   update diff is applied strictly against the file on disk; a mismatch is
+   refused. Sending small file contents is a separate, deliberate change.
+3. **No deletions, ever.** A diff that deletes a file is refused.
+4. **Write mode has no separate approval gate.** It is opt-in per request and
+   bounded by the rails above; whether an interactive approval must precede a
+   write remains an owner decision, and the approval machinery of the tool plane
+   is deliberately not reused.
+
+## Guarded Code-Writing Path v0.1 -- русская версия
+
+### Контекст
+
+Репозиторий умел планировать, проверять, отчитываться и (по объявлению оператора)
+запускать команду, но **ни один путь не превращал ответ модели в изменение на
+диске**. Offline-цикл по построению только читает (`app/agent_runtime/offline_task.py`),
+и ни один исполнитель не применял вывод модели к файлам. Любой запрос «напиши код»
+выводил за пределы продукта: владельцу приходилось вручную переносить ответ в
+рабочее дерево.
+
+Именно эта возможность и есть смысл продукта, поэтому недостающий шаг должен был
+появиться. Что нельзя было ослабить при его добавлении: замороженный `RunScope`,
+границу рабочей области, запреты вокруг секретов/`.git`/миграций/`authorizer.py`,
+fail-closed значения по умолчанию, идемпотентность и правило, что запуск сообщает
+только то, что произошло на самом деле.
+
+### Принятые решения
+
+- **Один изолированный модуль на стандартной библиотеке.**
+  `app/agent_runtime/code_writer.py` — это вся возможность: детерминированно, без
+  сети, без вызова модели, без shell и без subprocess. Он получает ответ модели и
+  рабочую область вызывающего и возвращает структурированный результат. Это не
+  вторая плоскость исполнения.
+- **Только две формы ответа и никаких догадок.** Фенсед-блок с заголовком пути
+  (`` ```python path=tools/foo.py `` или строка `**File: ...**` перед блоком) и
+  unified diff (`--- a/path` / `+++ b/path`). Ответ без них — `no_changes`;
+  фенсед-блок без пути — это текст, а не изменение.
+- **Проверка путей переиспользует каноническую границу.** Каждый путь
+  нормализуется `normalize_workspace_relative_path` (уже отклоняет `..`,
+  абсолютные, с буквой диска, UNC, ADS и зарезервированные имена), а затем
+  разрешается через `WorkspaceBoundary.resolve_relative` — ту же проверку
+  вложенности, которую `app/execution/sandbox.py` выполняет на границе authority и
+  перед запуском дочернего процесса. Каноническая цель, отличающаяся от лексической
+  формы (ссылка по пути), отклоняется.
+- **Жёсткий deny-list, а не молчаливый пропуск.** `.env`/`.env.*`, `.git`,
+  `.venv`, `node_modules`, `dist`, `authorizer.py`, миграции PostgreSQL, имена с
+  `secret`/`credential`/`token` и всё, что распознаватель секретов проекта
+  (`app/execution/secret_files.py`) считает credential-материалом, отклоняется.
+  Отказ отклоняет **весь ответ**; ни один файл не пишется.
+- **Лимиты.** Не более 20 файлов и 200 КБ на ответ, проверяется до записи первого
+  байта.
+- **Атомарность на файл, с резервными копиями.** Каждый файл пишется через
+  `<path>.forge-new` и `os.replace`. Байты изменяемого файла сначала копируются в
+  `.forge/backups/<run_id>/<relative path>`. Изменение ничего не удаляет; diff,
+  который удалил бы файл, отклоняется.
+- **Fail-closed проверка.** Каждый затронутый `.py` компилируется стандартным
+  `py_compile` (в процессе — та же проверка, что `python -m py_compile`, без
+  процесса и без артефактов в рабочей области). При ошибке **все** файлы запуска
+  откатываются из резервных копий (созданные удаляются), результат —
+  `verification_failed`.
+- **Настоящий diff.** Отчётный diff вычисляется `difflib` по байтам до и после, по
+  каждому файлу, с `--- /dev/null` для создания.
+- **Опциональное поле запроса, только для кода.**
+  `TaskRunRequest.write_mode: bool = False`, читается из ключа `write_mode` тела
+  `POST /api/tasks/run`. Write mode активен только когда флаг истинен **и**
+  категория `code`; все существующие вызовы сохраняют read-only поведение, а
+  закреплённый контракт ответа не меняется (отчёт идёт в `output`). Диспетчеризация
+  write mode — другая логическая операция, поэтому fingerprint идемпотентности
+  добавляет маркер **только при установленном флаге**, оставляя все существующие
+  fingerprint байт-в-байт прежними.
+- **Ветка живого провайдера переиспользуется, а не переписывается.** При выбранном
+  реальном провайдере ответ модели — это его собственный вывод из существующей
+  диспетчеризации `RunExecutor` (запись происходит после неё, внутри того же
+  замороженного scope). С offline-провайдером «ответ» — это детерминированный текст
+  плана, поэтому конвейер (parse -> validate -> apply -> verify -> persist)
+  проходит целиком и честно сообщает `no_changes`.
+- **Модель получает имена, а не содержимое.** В write mode текст задачи
+  отправляется с ограниченным детерминированным списком имён файлов рабочей
+  области (`build_workspace_context`), пропускающим похожие на секреты пути. Это
+  удерживает промпт в бюджете запроса и не превращает его в примитив чтения.
+- **Запись запуска содержит результат.** Результат (статус, файлы с числом
+  добавленных/удалённых строк, настоящий diff, статус проверки, причина)
+  добавляется в существующий `RunStateSnapshot.project_state` запуска под ключом
+  `code_write`, и ограниченное событие `PROJECT_STATE_UPDATED` фиксирует тот же
+  факт. `success` сохраняется только при статусе `applied` и пройденной проверке;
+  `no_changes`, `rejected` и `verification_failed` сообщаются как неудачи.
+- **Durable-жизненный цикл следует финальному вердикту.** Запись lifecycle
+  идемпотентности перенесена после write mode на пути провайдера, поэтому
+  ключевой запуск write mode не может быть записан как `COMPLETED` при отсутствии
+  записи.
+
+### Отклонённые альтернативы
+
+- **Позволить модели назвать файл без заголовка и вывести тело.** Это догадка о
+  том, какой файл перезаписывать; отклонено.
+- **Применять diff с несовпадающим контекстом «примерно».** Это молча записало бы
+  файл, которого модель не видела. Отклонено; изменение отклоняется.
+- **Дать писателю собственную рабочую область или собственную authority.** Рабочая
+  область берётся из замороженного scope запуска, поэтому запись не может его
+  расширить.
+- **Реализовать запись как вызов инструмента.** У плоскости инструментов своя
+  политика разрешений и одобрений, и маршрутизация записи через неё сделала бы
+  ответ модели косвенным запросом инструмента. Запись — отдельный явный шаг после
+  диспетчеризации, управляемый флагом запроса.
+- **Добавить поля в `TaskRunResponse`.** Ответ закреплён существующими guard-тестами;
+  отчёт идёт в `output` и в запись запуска.
+- **Сообщать `applied` для запуска с провалившейся проверкой.** Провал проверки
+  откатывает изменения и сообщает `verification_failed`; успех не заявляется.
+
+### Следствия и открытые пункты
+
+1. **Для реального кода проекта всё ещё нужен живой провайдер.** Ветка провайдера
+   проверена только локальными фейками; в этой среде ни один живой провайдер не
+   включён, поэтому сквозная запись реального кода требует его включения (и модель
+   должна ответить поддерживаемой формой).
+2. **Ответ не может патчить файл, которого не видел.** Передаются только имена,
+   поэтому diff-обновление применяется строго к файлу на диске; несовпадение
+   отклоняется. Передача содержимого небольших файлов — отдельное осознанное
+   изменение.
+3. **Никаких удалений.** Diff, удаляющий файл, отклоняется.
+4. **У write mode нет отдельного гейта одобрения.** Он опционален для запроса и
+   ограничен перечисленными рамками; нужен ли интерактивный approval перед записью —
+   решение владельца, и механизм одобрений плоскости инструментов сознательно не
+   переиспользуется.

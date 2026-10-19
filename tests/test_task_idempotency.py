@@ -31,7 +31,7 @@ class IdempotencyTests(unittest.TestCase):
         self.root = self._base / "runs"
         self.root.mkdir(parents=True, exist_ok=True)
         os.environ["FORGE_RUN_STORE_ROOT"] = str(self.root)
-        self.service = ForgeApiService(run_store=RunStore(root=self.root))
+        self.service = ForgeApiService(authorized_project_id="idempotency-unit", run_store=RunStore(root=self.root))
         self.addCleanup(lambda: shutil.rmtree(self._base, ignore_errors=True))
 
     def _dispatch(self, key: str | None, description: str = "C2 task", **extra):
@@ -69,7 +69,7 @@ class IdempotencyTests(unittest.TestCase):
 
     def test_04_a_replay_survives_a_new_service_instance(self) -> None:
         first = self._dispatch("key-d")
-        fresh = ForgeApiService(run_store=RunStore(root=self.root))
+        fresh = ForgeApiService(authorized_project_id="idempotency-unit", run_store=RunStore(root=self.root))
         replay = fresh.run_task_detailed(
             TaskRunRequest(description="C2 task", category="code", provider_name="mock"),
             idempotency_key="key-d",
@@ -122,7 +122,7 @@ class IdempotencyTests(unittest.TestCase):
     def test_09_an_unusable_ledger_refuses_a_keyed_dispatch(self) -> None:
         # Fail closed: with a ledger that cannot be created, a keyed dispatch must not execute.
         blocked = pathlib.Path(os.environ.get("SystemRoot", "C:\\Windows")) / "ForgeAI-not-writable"
-        service = ForgeApiService(run_store=RunStore(root=self.root))
+        service = ForgeApiService(authorized_project_id="idempotency-unit", run_store=RunStore(root=self.root))
         service._run_store = RunStore(root=blocked)
         before = self._run_directories()
         from app.api.service import IdempotencyUnavailable
@@ -136,7 +136,7 @@ class IdempotencyTests(unittest.TestCase):
 
     def test_10_without_a_key_the_legacy_behaviour_still_executes(self) -> None:
         blocked = pathlib.Path(os.environ.get("SystemRoot", "C:\\Windows")) / "ForgeAI-not-writable"
-        service = ForgeApiService(run_store=RunStore(root=self.root))
+        service = ForgeApiService(authorized_project_id="idempotency-unit", run_store=RunStore(root=self.root))
         service._run_store = RunStore(root=blocked)
         outcome = service.run_task_detailed(
             TaskRunRequest(description="C2: legacy", category="code", provider_name="mock")

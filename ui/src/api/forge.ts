@@ -78,6 +78,63 @@ export type DispatchResult = {
   facts: DispatchFacts;
 };
 
+/**
+ * One row of `GET /api/models` `models`, with the catalogue's own key names.
+ *
+ * The registry answers `provider_id` / `model_id` per row (verified against the live payload), so
+ * the model list is filtered by the provider the form actually sends, not by a display name.
+ */
+export type CatalogueModel = { provider_id?: string; model_id?: string; display_name?: string };
+
+/**
+ * The model ids `/api/models` lists for one provider, sorted by id.
+ *
+ * A registry row is membership, not availability (`availability_note` says so), which is exactly
+ * what a chooser needs: these are the ids the Core knows how to name. Sorting keeps the list from
+ * shuffling between two 15 s backend polls, and duplicates are dropped so one id appears once.
+ */
+export const catalogueModelsFor = (
+  catalogue: Record<string, unknown> | null,
+  provider: string
+): string[] => {
+  if (!catalogue || provider === "") return [];
+  const rows = catalogue.models;
+  if (!Array.isArray(rows)) return [];
+  const ids: string[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const record = row as CatalogueModel;
+    const providerId = String(record.provider_id ?? "");
+    const modelId = String(record.model_id ?? "");
+    if (providerId !== provider || modelId === "" || ids.includes(modelId)) continue;
+    ids.push(modelId);
+  }
+  return ids.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+};
+
+/**
+ * The provider/model the installed configuration defaults to.
+ *
+ * `FORGE_DEFAULT_PROVIDER`/`FORGE_DEFAULT_MODEL` are resolved by `app/config/settings.py` inside
+ * the Core, and the Core publishes no route that carries the model (`/api/status.details` has
+ * `default_provider` only). The shell server answers `/ui-defaults.json` from that same loader, so
+ * the form preselects what the Core would use. The read is best-effort: when the route is absent
+ * the screen falls back to the first model of the provider instead of inventing a default.
+ */
+export type UiDefaults = { default_provider?: string; default_model?: string };
+
+export const loadUiDefaults = async (): Promise<Result<UiDefaults>> => {
+  const outcome = await readJson<UiDefaults>("/ui-defaults.json");
+  if (!outcome.ok) return outcome;
+  if (!outcome.value || typeof outcome.value !== "object") {
+    return {
+      ok: false,
+      failure: { kind: "error", status: 200, path: "/ui-defaults.json", detail: "the response is not an object" },
+    };
+  }
+  return outcome;
+};
+
 /** `RunRecordClassification.to_dict()` in `app/runtime/run_store.py`. */
 export type RunClassification = {
   outcome?: string;
@@ -86,6 +143,34 @@ export type RunClassification = {
   evidence?: string[];
   is_terminal?: boolean;
   is_success?: boolean;
+};
+
+/**
+ * One file the guarded writer touched.
+ *
+ * Mirrors one entry of `CodeWriteResult.files` in `app/agent_runtime/code_writer.py`:
+ * `path`, `action` (`create` / `update`), and the exact numbers of added and removed lines.
+ */
+export type CodeWriteFile = {
+  path?: string;
+  action?: string;
+  added?: number;
+  removed?: number;
+};
+
+/**
+ * The write record `app/api/service.py` persists as `project_state.code_write`.
+ *
+ * It is written only when a dispatch asked for `write_mode` and the task was code work,
+ * so its presence is what proves the run went through the guarded writer. `status` is one
+ * of `applied`, `no_changes`, `rejected`, `verification_failed`.
+ */
+export type CodeWriteResult = {
+  status?: string;
+  verification?: string;
+  reason?: string;
+  diff?: string;
+  files?: CodeWriteFile[];
 };
 
 /** `RunRecord.summary()` plus the read-time `classification` key from `get_run_record`. */
@@ -103,6 +188,20 @@ export type RunRecord = {
   updated_at?: string;
   interrupted?: boolean;
   classification?: RunClassification;
+};
+
+/**
+ * The `project_state.code_write` record of a run, or `null` when the run carried none.
+ *
+ * A missing key is not an empty write: it is the honest answer "this run recorded no
+ * write", and the screen must say that instead of drawing an empty file list.
+ */
+export const codeWriteOf = (record: RunRecord | null): CodeWriteResult | null => {
+  const projectState = record?.project_state;
+  if (!projectState || typeof projectState !== "object") return null;
+  const value = (projectState as Record<string, unknown>).code_write;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as CodeWriteResult;
 };
 
 export type FailureKind =
@@ -214,9 +313,24 @@ export const dispatchTask = async (input: {
   description: string;
   category: TaskCategoryValue;
   providerName?: string;
+  /**
+   * `TaskRunRequest.model_name`: the model the owner picked. Sent only when a non-empty id was
+   * chosen, so an untouched field leaves the Core's configured default in force instead of
+   * sending `""`, which would look like a choice nobody made.
+   */
+  modelName?: string;
   projectId?: string;
   /** Sent as the `Idempotency-Key` header, which `run_task` reads (`Header(alias=...)`). */
   idempotencyKey?: string;
+  /**
+   * `TaskRunRequest.write_mode`: the guarded writer (`app/agent_runtime/code_writer.py`)
+   * applies the answer inside the run's workspace. Sent only when it was actually asked
+   * for, and the Core only honours it for the `code` category, so its default stays a
+   * read-only dispatch byte-for-byte.
+   */
+  writeMode?: boolean;
+  /** Lets the interface cancel its own request; the backend keeps whatever it already did. */
+  signal?: AbortSignal;
 }): Promise<Result<DispatchResult>> => {
   const path = "/api/tasks/run";
   const body: Record<string, unknown> = {
@@ -224,7 +338,10 @@ export const dispatchTask = async (input: {
     category: input.category,
   };
   if (input.providerName) body.provider_name = input.providerName;
+  const modelName = (input.modelName ?? "").trim();
+  if (modelName !== "") body.model_name = modelName;
   if (input.projectId) body.project_id = input.projectId;
+  if (input.writeMode === true) body.write_mode = true;
 
   const headers: Record<string, string> = {
     "content-type": "application/json",
@@ -238,6 +355,7 @@ export const dispatchTask = async (input: {
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      signal: input.signal,
     });
   } catch (error) {
     return { ok: false, failure: disconnected(path, error) };

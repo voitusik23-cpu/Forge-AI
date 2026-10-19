@@ -1,134 +1,112 @@
-import { useEffect, useState } from "react";
-import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
+// Запуски — the read-only run history.
+//
+// There is exactly ONE place in the application that dispatches a task: the task card on
+// «Кузница» (POST /api/tasks/run). This screen used to carry a second copy of that form, which
+// meant two submit buttons for one operation and two independent in-flight guards. It is now the
+// read side only, and it reads the two routes that exist:
+//
+//   GET /api/product/runs   -> the recorded runs of the active project (the list below)
+//   GET /api/runs/{run_id}  -> one persisted run record plus its classification (the details)
+//
+// Nothing here dispatches, retries, or resumes a run: opening a row is a read.
+
+import { useState } from "react";
+import { Badge, Button, Card, CardHead, StatusDot } from "../components/Primitives";
 import { IconPlay, IconRefresh } from "../components/Icons";
 import { t, type Lang } from "../i18n";
-import type { BackendState, Project, RunRow } from "../api/client";
-
-const CATEGORIES: string[] = ["code", "analysis", "review", "coding", "reasoning", "large-context", "cheap/free", "fast/cheap", "other"];
+import { loadRunRecord, type Failure, type RunRecord } from "../api/forge";
+import type { BackendState, RunRow } from "../api/client";
 
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
 
-const fixed = (value: unknown, digits: number): string =>
-  typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
+const yesNo = (lang: Lang, value: unknown): string => {
+  if (typeof value !== "boolean") return t(lang, "runs.unknown");
+  return value ? (lang === "ru" ? "да" : "yes") : (lang === "ru" ? "нет" : "no");
+};
 
-type RunResult = Record<string, unknown>;
+/** One run record: what the backend answered for GET /api/runs/{run_id}, or why it did not. */
+type Detail =
+  | { status: "idle" }
+  | { status: "loading"; runId: string }
+  | { status: "ready"; runId: string; record: RunRecord }
+  | { status: "failed"; runId: string; failure: Failure };
+
+const Facts = ({ items }: { items: Array<[string, string]> }) => (
+  <div className="forge-facts">
+    {items.map(([label, value]) => (
+      <div className="forge-fact" key={label}>
+        <div className="label">{label}</div>
+        <div className="mono small" style={{ wordBreak: "break-word" }}>
+          {value}
+        </div>
+      </div>
+    ))}
+  </div>
+);
 
 export const Runs = ({
   lang,
   backend,
   onRefresh,
   onHelp,
+  onOpenForge,
 }: {
   lang: Lang;
   backend: BackendState;
   onRefresh: () => void;
   onHelp: () => void;
+  onOpenForge: () => void;
 }) => {
   const live = backend.status === "live";
-  const projects: Project[] = live && Array.isArray(backend.onboarding.projects) ? backend.onboarding.projects : [];
-  const agents = live ? backend.agents : [];
-  const productHistory: RunRow[] = live && Array.isArray(backend.runs.runs) ? backend.runs.runs : [];
+  const history: RunRow[] = live && Array.isArray(backend.runs.runs) ? backend.runs.runs : [];
+  const recorded = live && typeof backend.runs.total_recorded === "number" ? backend.runs.total_recorded : history.length;
+  const truncated = live && backend.runs.truncated === true;
+  const [detail, setDetail] = useState<Detail>({ status: "idle" });
 
-  const [projectId, setProjectId] = useState("");
-  const [category, setCategory] = useState(CATEGORIES[0] ?? "code");
-  const [provider, setProvider] = useState("");
-  const [description, setDescription] = useState("");
-  const [inFlight, setInFlight] = useState(false);
-  const [result, setResult] = useState<RunResult | null>(null);
-  const [error, setError] = useState("");
-  const [dispatched, setDispatched] = useState<RunResult[]>([]);
-  const [record, setRecord] = useState<{ id: string; body: string } | null>(null);
-  // One key per logical operation, kept across retries so a timeout cannot pay twice.
-  const [idempotencyKey, setIdempotencyKey] = useState(() =>
-    typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : `key-${Date.now()}-${Math.random().toString(16).slice(2)}`
-  );
-
-  useEffect(() => {
-    if (!projectId && projects.length > 0) setProjectId(String(projects[0].project_id ?? ""));
-  }, [projects, projectId]);
-
-  useEffect(() => {
-    if (!provider && agents.length > 0) setProvider(String(agents[0].provider ?? ""));
-  }, [agents, provider]);
-
-  // POST /api/tasks/run has no idempotency key, so a second click must be stopped here:
-  // the handler refuses re-entry and the button is disabled for the whole request.
-  const submit = async () => {
-    if (inFlight) return;
-    if (!description.trim()) {
-      setError(t(lang, "runs.error.description"));
-      return;
-    }
-    setInFlight(true);
-    setError("");
-    setResult(null);
-    const submitted = description.trim();
-    try {
-      const response = await fetch("/api/tasks/run", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          description: submitted,
-          category,
-          project_id: projectId || undefined,
-          provider_name: provider || undefined,
-          idempotency_key: idempotencyKey,
-        }),
-      });
-      const payload = (await response.json()) as RunResult;
-      if (!response.ok) {
-        setError(`${response.status}: ${text(payload.detail ?? payload.error, "")}`);
-      } else {
-        setResult(payload);
-        setDispatched((previous) => [payload, ...previous].slice(0, 20));
-        if (payload.idempotent_replay !== true) {
-          // The operation finished: the next submit is a new logical operation.
-          setIdempotencyKey(
-            typeof crypto !== "undefined" && "randomUUID" in crypto
-              ? crypto.randomUUID()
-              : `key-${Date.now()}`
-          );
-        }
-      }
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setInFlight(false);
-      onRefresh();
-    }
+  const open = async (runId: string) => {
+    setDetail({ status: "loading", runId });
+    const outcome = await loadRunRecord(runId);
+    if (outcome.ok) setDetail({ status: "ready", runId, record: outcome.value });
+    else setDetail({ status: "failed", runId, failure: outcome.failure });
   };
 
-  // The durable record: shown exactly as the backend answers, including a refusal.
-  const loadRecord = async (runId: string) => {
-    setRecord(null);
-    try {
-      const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
-      const body = await response.text();
-      setRecord({
-        id: runId,
-        body:
-          response.ok
-            ? body
-            : `${response.status} ${response.statusText}\n${body || t(lang, "runs.record.missing")}`,
-      });
-    } catch (caught) {
-      setRecord({ id: runId, body: caught instanceof Error ? caught.message : String(caught) });
-    }
-  };
+  const selected = detail.status === "ready" ? detail.record : null;
+  const selectedId = detail.status === "idle" ? "" : detail.runId;
+  const classification = selected?.classification ?? null;
 
   return (
     <div className="content">
       <div className="row between" style={{ marginBottom: 18 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: "var(--t-title)" }}>{t(lang, "nav.runs")}</h1>
-          <div className="small muted" style={{ marginTop: 4 }}>{t(lang, "runs.subtitle")}</div>
+          <div className="small muted" style={{ marginTop: 4 }}>
+            {t(lang, "runs.subtitle")}
+          </div>
         </div>
         <div className="row">
-          <Button size="small" tone="ghost" onClick={onHelp}>{t(lang, "help.how")}</Button>
-          <Button onClick={onRefresh}><IconRefresh size={15} /> {t(lang, "action.refresh")}</Button>
+          <Button size="small" tone="ghost" onClick={onHelp}>
+            {t(lang, "help.how")}
+          </Button>
+          <Button onClick={onRefresh}>
+            <IconRefresh size={15} /> {t(lang, "action.refresh")}
+          </Button>
+        </div>
+      </div>
+
+      {!live ? (
+        <div className="notice warn" style={{ marginBottom: 16 }}>
+          {t(lang, "state.offline")}
+        </div>
+      ) : null}
+
+      {/* The single dispatch point is named, linked, and never duplicated here. */}
+      <div className="notice" style={{ marginBottom: 16 }}>
+        <div className="row between" style={{ gap: 12, flexWrap: "wrap" }}>
+          <span>{t(lang, "runs.readonly.note")}</span>
+          <Button size="small" onClick={onOpenForge}>
+            <IconPlay size={14} /> {t(lang, "runs.open.forge")}
+          </Button>
         </div>
       </div>
 
@@ -136,186 +114,189 @@ export const Runs = ({
         <div className="stack">
           <Card className="rise">
             <CardHead
-              title={t(lang, "runs.form.title")}
-              hint="POST /api/tasks/run"
-              action={<Badge tone={live ? "info" : "warn"}>{live ? "LIVE" : "OFFLINE"}</Badge>}
+              title={t(lang, "runs.history.title")}
+              hint="/api/product/runs"
+              action={
+                <Badge tone={live ? "info" : "neutral"}>
+                  {live ? `${history.length} / ${recorded}` : "OFFLINE"}
+                </Badge>
+              }
             />
-            <div className="stack" style={{ gap: 14 }}>
-              <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-                <label className="field" style={{ flex: "1 1 200px" }}>
-                  <span className="label">{t(lang, "runs.form.project")}</span>
-                  <select className="input" value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-                    {projects.map((project) => (
-                      <option key={String(project.project_id)} value={String(project.project_id)}>
-                        {String(project.name ?? project.project_id)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field" style={{ flex: "0 1 160px" }}>
-                  <span className="label">{t(lang, "runs.form.category")}</span>
-                  <select className="input" value={category} onChange={(event) => setCategory(event.target.value)}>
-                    {CATEGORIES.map((item) => (
-                      <option key={item} value={item}>{item}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field" style={{ flex: "0 1 190px" }}>
-                  <span className="label">{t(lang, "runs.form.agent")}</span>
-                  <select className="input" value={provider} onChange={(event) => setProvider(event.target.value)}>
-                    {agents.map((agent) => (
-                      <option key={String(agent.provider)} value={String(agent.provider)}>
-                        {String(agent.name)} ({String(agent.provider)})
-                      </option>
-                    ))}
-                  </select>
-                </label>
+            <div className="small muted" style={{ marginBottom: 10 }}>
+              {t(lang, "runs.history.note")}
+            </div>
+            {history.length === 0 ? (
+              <div className="small muted">{t(lang, "runs.history.empty")}</div>
+            ) : (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>{t(lang, "runs.col.id")}</th>
+                    <th>{t(lang, "runs.col.state")}</th>
+                    <th>{t(lang, "runs.col.updated")}</th>
+                    <th>{t(lang, "runs.col.events")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((run, index) => {
+                    const runId = String(run.run_id ?? run.id ?? "");
+                    const success = run.classification?.is_success === true;
+                    return (
+                      <tr
+                        key={`${runId}-${index}`}
+                        className={runId !== "" && runId === selectedId ? "selected" : ""}
+                        onClick={() => (runId === "" ? undefined : void open(runId))}
+                        style={{ cursor: runId === "" ? "default" : "pointer" }}
+                      >
+                        <td className="mono small">{text(runId)}</td>
+                        <td>
+                          <span className="row" style={{ gap: 8 }}>
+                            <StatusDot tone={success ? "ok" : run.state === "FAILED" ? "danger" : "idle"} />
+                            <span className="small">{text(run.state ?? run.status)}</span>
+                            {run.classification?.outcome ? (
+                              <span className="small muted">{String(run.classification.outcome)}</span>
+                            ) : null}
+                          </span>
+                        </td>
+                        <td className="mono small">{text(run.updated_at ?? run.created_at)}</td>
+                        <td className="mono small">{text(run.event_count)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+            {truncated ? (
+              <div className="small muted" style={{ marginTop: 10 }}>
+                {t(lang, "runs.history.truncated")}
               </div>
-
-              <Field label={t(lang, "runs.form.description")} hint={t(lang, "runs.form.description.hint")}>
-                <textarea
-                  className="input"
-                  rows={3}
-                  value={description}
-                  onChange={(event) => setDescription(event.target.value)}
-                  placeholder={t(lang, "runs.form.description.placeholder")}
-                />
-              </Field>
-
-              <div className="row" style={{ gap: 10 }}>
-                <Button tone="primary" disabled={inFlight || !live} onClick={() => void submit()}>
-                  <IconPlay size={15} /> {inFlight ? t(lang, "runs.form.running") : t(lang, "runs.form.submit")}
-                </Button>
-                <span className="small muted">{t(lang, "runs.form.idempotency")}</span>
-              </div>
-
-              {error ? <div className="notice danger">{error}</div> : null}
+            ) : null}
+            <div className="small muted" style={{ marginTop: 10 }}>
+              {t(lang, "runs.detail.hint")}
             </div>
           </Card>
 
-          {result ? (
-            <Card className="rise d1">
-              <CardHead
-                title={t(lang, "runs.result.title")}
-                hint={String(result.run_id ?? "")}
-                action={
-                  <Badge tone={result.success === true ? "ok" : "warn"}>
-                    {String(result.state ?? "UNKNOWN").toUpperCase()}
+          <Card className="rise d1">
+            <CardHead
+              title={t(lang, "runs.detail.title")}
+              hint={selectedId === "" ? "/api/runs/{run_id}" : `/api/runs/${selectedId}`}
+              action={
+                selected ? (
+                  <Badge tone={classification?.is_success === true ? "ok" : "warn"}>
+                    {text(selected.state, t(lang, "runs.unknown"))}
                   </Badge>
-                }
-              />
-              <div className="grid cols-4" style={{ marginBottom: 12 }}>
-                {[
-                  [
-                    t(lang, "runs.result.tokens"),
-                    result.tokens === null || result.tokens === undefined
-                      ? t(lang, "runs.unknown")
-                      : String(result.tokens),
-                  ],
-                  [
-                    t(lang, "runs.result.cost"),
-                    typeof result.cost === "number" ? `$${fixed(result.cost, 4)}` : t(lang, "runs.unknown"),
-                  ],
-                  [t(lang, "runs.result.duration"), fixed(result.duration_seconds ?? 0, 2)],
-                  [t(lang, "runs.result.provider"), text(result.provider_used)],
-                ].map(([label, value]) => (
-                  <div key={String(label)}>
-                    <div className="label">{String(label)}</div>
-                    <div className="mono">{String(value)}</div>
+                ) : null
+              }
+            />
+            {detail.status === "idle" ? (
+              <div className="small muted">{t(lang, "runs.selected.none")}</div>
+            ) : detail.status === "loading" ? (
+              <div className="small muted">{t(lang, "forge.execution.waiting")}</div>
+            ) : detail.status === "failed" ? (
+              <div className="notice danger">
+                <div>
+                  {detail.failure.kind === "unauthorized"
+                    ? t(lang, "forge.state.unauthorized")
+                    : detail.failure.kind === "disconnected"
+                      ? t(lang, "forge.state.disconnected")
+                      : `${t(lang, "forge.state.error")}: ${detail.failure.path} → HTTP ${detail.failure.status}`}
+                </div>
+                {detail.failure.detail ? (
+                  <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+                    {detail.failure.detail}
                   </div>
-                ))}
-              </div>
-              <pre className="mono small" style={{ whiteSpace: "pre-wrap", margin: 0 }}>
-                {text(result.output, "")}
-              </pre>
-              {result.error ? (
-                <div className="notice danger" style={{ marginTop: 10 }}>{String(result.error)}</div>
-              ) : null}
-              <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                <Badge tone={String(result.usage_basis) === "ACTUAL" ? "ok" : String(result.usage_basis) === "MOCK" ? "warn" : "neutral"}>
-                  {t(lang, "runs.basis.usage")}: {String(result.usage_basis ?? "UNKNOWN")}
-                </Badge>
-                <Badge tone={String(result.cost_basis) === "ACTUAL" ? "ok" : String(result.cost_basis) === "MOCK" ? "warn" : "neutral"}>
-                  {t(lang, "runs.basis.cost")}: {String(result.cost_basis ?? "UNKNOWN")}
-                </Badge>
-                {result.idempotent_replay === true ? (
-                  <Badge tone="info">{t(lang, "runs.basis.replay")}</Badge>
                 ) : null}
               </div>
-              {result.history_recorded === false ? (
-                <div className="notice warn" style={{ marginTop: 10 }}>
-                  {t(lang, "runs.history.failed")}: {text(result.history_error)}
-                </div>
-              ) : null}
-              <div className="small muted" style={{ marginTop: 8 }}>
-                {t(lang, "runs.result.model")}: {text(result.model_used)} · task {text(result.task_id)} · project{" "}
-                {text(result.project_id)}
-              </div>
-            </Card>
-          ) : null}
+            ) : (
+              <Facts
+                items={[
+                  [t(lang, "forge.execution.state"), text(selected?.state)],
+                  [t(lang, "forge.execution.status"), text(selected?.status)],
+                  [t(lang, "forge.execution.events"), text(selected?.event_count)],
+                  [t(lang, "forge.execution.sequence"), text(selected?.last_sequence_number)],
+                  [t(lang, "forge.execution.attempt"), text(selected?.attempt_number)],
+                  [t(lang, "forge.execution.interrupted"), yesNo(lang, selected?.interrupted)],
+                  [t(lang, "forge.execution.updated"), text(selected?.updated_at)],
+                  [t(lang, "forge.execution.classification"), text(classification?.outcome)],
+                  [t(lang, "forge.execution.reason"), text(classification?.reason)],
+                  [t(lang, "forge.execution.detail"), text(classification?.detail)],
+                ]}
+              />
+            )}
+          </Card>
         </div>
 
         <div className="stack">
           <Card className="rise d1">
             <CardHead
-              title={t(lang, "runs.session.title")}
-              hint={t(lang, "runs.session.hint")}
-              action={<Badge tone="ok">{dispatched.length}</Badge>}
+              title={t(lang, "runs.result.title")}
+              hint="/api/runs/{run_id} · classification"
+              action={
+                classification ? (
+                  <Badge tone={classification.is_success === true ? "ok" : "warn"}>
+                    {text(classification.outcome, t(lang, "runs.unknown"))}
+                  </Badge>
+                ) : null
+              }
             />
-            {dispatched.length === 0 ? (
-              <div className="small muted">{t(lang, "runs.session.empty")}</div>
+            {classification === null ? (
+              <div className="small muted">{t(lang, "runs.selected.none")}</div>
             ) : (
-              <div className="stack small" style={{ gap: 6 }}>
-                {dispatched.map((item, index) => (
-                  <button
-                    key={`${String(item.run_id)}-${index}`}
-                    className="nav-item"
-                    onClick={() => void loadRecord(String(item.run_id ?? ""))}
-                  >
-                    <StatusDot tone={item.success === true ? "ok" : "warn"} />
-                    <span className="label mono">{String(item.run_id ?? "")}</span>
-                    <span className="count">
-                      {fixed(item.duration_seconds ?? 0, 2)}s · ${fixed(item.cost ?? 0, 4)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </Card>
-
-          <Card className="rise d2">
-            <CardHead
-              title={t(lang, "runs.history.title")}
-              hint="/api/product/runs"
-              action={<Badge tone="neutral">PIPELINE</Badge>}
-            />
-            <div className="small muted" style={{ marginBottom: 8 }}>{t(lang, "runs.history.note")}</div>
-            {productHistory.length === 0 ? (
-              <div className="small muted">{t(lang, "runs.history.empty")}</div>
-            ) : (
-              <div className="stack small" style={{ gap: 6 }}>
-                {productHistory.slice(0, 10).map((run, index) => (
-                  <div className="row between" key={String(run.run_id ?? index)}>
-                    <span className="mono small">{String(run.run_id ?? "—")}</span>
-                    <span className="small muted">{String(run.status ?? "—")}</span>
+              <div className="stack" style={{ gap: 12 }}>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <Badge tone={classification.is_terminal === true ? "ok" : "neutral"}>
+                    {t(lang, "runs.result.terminal")}: {yesNo(lang, classification.is_terminal)}
+                  </Badge>
+                  <Badge tone={classification.is_success === true ? "ok" : "warn"}>
+                    {t(lang, "runs.result.success")}: {yesNo(lang, classification.is_success)}
+                  </Badge>
+                </div>
+                <div>
+                  <div className="label">{t(lang, "runs.result.output")}</div>
+                  <pre className="forge-output mono small">{text(classification.detail, "")}</pre>
+                </div>
+                {classification.reason ? (
+                  <div className="small muted">
+                    {t(lang, "forge.execution.reason")}: {String(classification.reason)}
                   </div>
-                ))}
+                ) : null}
+                {classification.evidence && classification.evidence.length > 0 ? (
+                  <div>
+                    <div className="label">{t(lang, "forge.execution.evidence")}</div>
+                    <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                      {classification.evidence.map((item) => (
+                        <Badge key={item} tone="neutral">
+                          {item}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                <div className="small muted">{t(lang, "runs.result.source")}</div>
               </div>
             )}
           </Card>
 
-          {record ? (
-            <Card className="rise d3">
-              <CardHead title={t(lang, "runs.detail.title")} hint={record.id} />
-              <pre className="mono small" style={{ whiteSpace: "pre-wrap", margin: 0, maxHeight: 240, overflow: "auto" }}>
-                {record.body}
-              </pre>
-            </Card>
-          ) : (
-            <Card className="rise d3" tight>
-              <div className="small muted">{t(lang, "runs.record.gap")}</div>
-            </Card>
-          )}
+          <Card className="rise d2" tight>
+            <CardHead title={t(lang, "runs.routes.title")} hint="/api/product/runs · /api/runs/{run_id}" />
+            <div className="stack small" style={{ gap: 6 }}>
+              <div className="row between">
+                <span className="muted mono">POST /api/tasks/run</span>
+                <span className="small muted">{t(lang, "runs.routes.dispatch")}</span>
+              </div>
+              <div className="row between">
+                <span className="muted mono">GET /api/product/runs</span>
+                <span className="small muted">{t(lang, "runs.routes.history")}</span>
+              </div>
+              <div className="row between">
+                <span className="muted mono">GET /api/runs/{"{run_id}"}</span>
+                <span className="small muted">{t(lang, "runs.routes.detail")}</span>
+              </div>
+              <div className="muted" style={{ marginTop: 6 }}>
+                {t(lang, "runs.record.gap")}
+              </div>
+            </div>
+          </Card>
         </div>
       </div>
     </div>

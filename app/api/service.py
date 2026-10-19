@@ -45,7 +45,21 @@ from app.agent_runtime.idempotency_integration import (
 )
 from app.agent_runtime.tool_execution import ToolIntent
 from app.agent_runtime.models import HarnessRequest
+from app.agent_runtime.code_writer import (
+    STATUS_APPLIED,
+    WriteResult,
+    apply_changes,
+    build_workspace_context,
+    render_write_report,
+)
+from app.agent_runtime.offline_task import (
+    OfflineTaskDecisionProvider,
+    OfflineWorkspaceVerifier,
+    build_offline_task_plan,
+    render_offline_task_report,
+)
 from app.agent_runtime.policy import AgentHarnessPolicy
+from app.config.settings import OFFLINE_PROVIDER_NAME
 from app.execution.capabilities import ExecutionCapability
 from app.execution.declaration import (
     ExecutionDeclaration,
@@ -259,6 +273,39 @@ IDENTITY_LOOP_POLICY = AgentHarnessPolicy(
 )
 
 
+# Bounds for the offline task loop. The offline task path performs read-only
+# workspace observation and then reports its verdict, so its control flow is
+# "verify, then complete (or fail)" - two actions inside three iterations. No
+# hint of a wider bound is intended: the values narrow what the existing policy
+# already permits, and `max_execution_attempts` is irrelevant here because the
+# offline decision provider never proposes EXECUTE.
+OFFLINE_TASK_LOOP_POLICY = AgentHarnessPolicy(
+    max_iterations=3,
+    max_actions=2,
+    max_execution_attempts=1,
+    max_revision_attempts=1,
+)
+
+
+# The ``project_state`` key the guarded code writer's outcome occupies inside the
+# run's own durable snapshot. It rides beside the existing step-graph, recovery,
+# memory and baseline records, so the applied diff, the file list and the
+# verification status travel with the run instead of in a second store.
+CODE_WRITE_PROJECT_STATE_KEY = "code_write"
+
+
+# The ``project_state`` key naming which Radox account (by pool position) served the
+# run. ``TaskRunResponse`` is byte-pinned by the repository's contract tests, so the
+# index travels in the run's durable state -- beside ``code_write`` -- instead of as a
+# new response field. It is a position, never a key, a prefix or a hash.
+PROVIDER_KEY_INDEX_PROJECT_STATE_KEY = "radox_key_index"
+
+
+#: The only task category that may write. A write is code work by definition, so a
+#: ``write_mode`` flag on a documentation request is not enough on its own.
+CODE_WRITE_CATEGORY = "code"
+
+
 from pathlib import Path
 
 
@@ -331,6 +378,7 @@ class ForgeApiService:
         # whether it may be invoked. With no declared intents no tool action is
         # ever offered.
         tool_intents: Sequence["ToolIntent"] = (),
+        authorized_project_id: Optional[str] = None,
     ) -> None:
         self._workspace = workspace or Workspace(Path.cwd())
 
@@ -472,7 +520,7 @@ class ForgeApiService:
             fabric=self._fabric,
             health_monitor=self._health_monitor,
         )
-        self._active_project_id = "default"
+        self._active_project_id: Optional[str] = authorized_project_id
 
     def _effective_tool_ids(self) -> frozenset[str]:
         """Compute the tools this service may authorize for a Run.
@@ -1584,7 +1632,13 @@ class ForgeApiService:
                 continue
 
     def _persist_loop_state(
-        self, store: RunStore, run_id: str, task_id: str, result: object
+        self,
+        store: RunStore,
+        run_id: str,
+        task_id: str,
+        result: object,
+        *,
+        event_count: Optional[int] = None,
     ) -> None:
         """Persist the loop's terminal snapshot with the existing state writer.
 
@@ -1593,6 +1647,11 @@ class ForgeApiService:
         from ``record_run_state``. It uses the same ``RunStateSnapshot`` type and
         the same atomic writer, so the durable history keeps one shape and the
         ``task_id`` matches the events exactly.
+
+        ``event_count`` lets a caller that also wrote its own events around the
+        loop record the count of the **whole** durable trail instead of only the
+        loop's share; when it is omitted the loop's own event count is written,
+        which is what every existing caller already recorded.
         """
         try:
             events = tuple(getattr(result, "events", ()) or ())
@@ -1604,7 +1663,9 @@ class ForgeApiService:
                     state=state.value if hasattr(state, "value") else str(state or ""),
                     status=state.value if hasattr(state, "value") else str(state or ""),
                     attempt_number=0,
-                    event_count=len(events),
+                    event_count=(
+                        len(events) if event_count is None else max(0, int(event_count))
+                    ),
                     updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 )
             )
@@ -2293,6 +2354,22 @@ class ForgeApiService:
             "history_scope": "this process only; not a billing archive",
         }
 
+    def radox_keys_status(self) -> Dict[str, Any]:
+        """Read-only report of the Radox key pool and its per-position ledger.
+
+        The keys are re-read from the process environment and the repository ``.env``
+        on every call and only *counted*; nothing about a key -- its value, a hash, a
+        prefix or its length -- can reach this payload. ``active_index`` is the pool
+        position that will serve the next request -- a rotation cursor, not an
+        identity and not a claim that the position is healthy; ``keys[].disabled``
+        says whether that position is inside a 429 cooldown.
+        """
+
+        from app.agents.providers.radox_keys import key_pool_payload
+        from app.config.secrets import SecretStore
+
+        return key_pool_payload(SecretStore())
+
     def list_models_catalogue(self) -> Dict[str, Any]:
         """Read-only catalogue of the model registry: providers, models and accounts.
 
@@ -2486,6 +2563,19 @@ class ForgeApiService:
                 str(req.provider_name or ""),
             )
         )
+        if bool(getattr(req, "write_mode", False)):
+            # A write-mode dispatch is a different logical operation from a read-only
+            # one carrying the same text: it changes files, so it must not replay a
+            # stored read-only result under the same key. The marker is appended only
+            # in write mode, which keeps every existing fingerprint byte-identical.
+            material += "\u0000write_mode"
+        requested_model = getattr(req, "model_name", None)
+        if requested_model:
+            # The same text on a different model is a different logical operation: a
+            # caller that names a model and changes it between retries must not be
+            # handed the earlier model's stored answer. Appended only when a model was
+            # actually named, so a request without one fingerprints exactly as before.
+            material += "\u0000model:" + str(requested_model)
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _operation_identity(
@@ -2555,10 +2645,623 @@ class ForgeApiService:
             model_used=model,
         )
 
+    def bind_authorized_project(self, project_id: str) -> None:
+        """Bind this instance to the project the server authorized at composition time.
+
+        Core serves one authorized project per instance, exactly as ``app.state.forge_project_id`` does,
+        so the binding is set once at startup rather than carried per request; an empty value is refused
+        and project-sensitive work fails closed while the service is unbound.
+        """
+
+        if not project_id:
+            raise ValueError("an authorized project is required to bind this service")
+
+        # One project per instance: the composition binds the server's decision once. Rebinding to a
+        # different project would silently move an instance already authorized for another one.
+        existing = getattr(self, "_active_project_id", None)
+        if existing and existing != project_id:
+            raise PermissionError(
+                "this service is already bound to a different authorized project"
+            )
+        self._active_project_id = project_id
+
     def run_task(self, req: TaskRunRequest) -> TaskRunResponse:
         """Backwards-compatible entry point: the response alone."""
 
         return self.run_task_detailed(req).response
+
+    # ---------------------------------------------------------------- provider
+    def _selected_provider_name(self, req: TaskRunRequest) -> str:
+        """The provider this task will actually run on.
+
+        The selection is the same one the dispatcher makes: an explicitly named
+        provider wins, otherwise the composition's configured default is used.
+        Reading it here - rather than re-deriving a routing policy - is what keeps
+        "the offline provider was selected" and "the offline path ran" the same
+        fact. It is read from the runtime the dispatcher itself holds, so a
+        service whose runtime was supplied by a caller resolves it that caller's
+        way.
+        """
+
+        requested = (req.provider_name or "").strip()
+        if requested:
+            return requested
+        # The configured default decides. It is read from the runtime settings first, because those are
+        # the values the operator wrote (``FORGE_DEFAULT_PROVIDER`` in the repository ``.env``); the
+        # dispatcher's own copy is a fallback for a runtime whose settings were supplied without one.
+        # Reading the dispatcher first silently ignored an operator's choice: settings said "radox"
+        # while every unnamed request still ran on the previously configured provider.
+        settings = getattr(self._runtime, "settings", None)
+        configured = getattr(settings, "default_provider", None)
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        dispatcher = getattr(
+            getattr(self._runtime, "orchestrator", None), "_dispatcher", None
+        )
+        configured = getattr(dispatcher, "_default_provider", None)
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        return ""
+
+    # ----------------------------------------------------------------- offline
+    @staticmethod
+    def _offline_project_discovery() -> object:
+        """The bounded observation stage the offline task loop runs with.
+
+        Composition-owned, exactly like every other harness stage: the limits are
+        declared here, not per request, and a narrower limit can only make the
+        observation smaller. The default scanner bound (5000 files, 50 MB, depth
+        32) is measured at ~9 s on this repository, which is too slow for one
+        interactive task; the bound below observes the same workspace structure
+        within the request budget.
+        """
+
+        from app.agent_runtime.project_discovery import ProjectDiscovery
+        from app.understanding.models import ScanLimits
+
+        return ProjectDiscovery(
+            limits=ScanLimits(
+                max_file_size_bytes=128 * 1024,
+                max_total_bytes=4 * 1024 * 1024,
+                max_file_count=300,
+                max_depth=6,
+                parse_timeout_seconds=0.5,
+            )
+        )
+
+    def _offline_telemetry_sink(self) -> object:
+        """The durable physical-telemetry sink the offline task loop writes to.
+
+        The composition's own sink is used when it supplied one. Otherwise the
+        sink is rooted beside this service's run store -- the same durable
+        location the run's history already uses -- instead of the process default
+        per-user root. The default root is measurably not writable in this
+        environment, and a sink failure is (correctly) reported as a
+        ``HARNESS_FAILED`` event: on a client-reachable path that would print a
+        failure marker after a run that succeeded, so the measurement is kept
+        where the history it belongs to is kept.
+        """
+
+        from app.agent_runtime.physical_telemetry import FileTelemetrySink
+
+        root = getattr(self._run_store, "root", None)
+        if not root:
+            return FileTelemetrySink()
+        return FileTelemetrySink(root=Path(root) / "telemetry")
+
+    # -------------------------------------------------------------- write mode
+    def _write_mode_enabled(self, req: TaskRunRequest, category: object) -> bool:
+        """Whether this request opted into the guarded write path.
+
+        Two independent conditions must hold: the caller asked for it, and the task
+        is code work. The flag is never inferred from the description, the
+        provider, the project, or the model answer, so a caller that does not send
+        it keeps exactly the read-only behaviour it had before write mode existed.
+        """
+
+        if not bool(getattr(req, "write_mode", False)):
+            return False
+        name = getattr(category, "value", category)
+        return str(name or "").strip().lower() == CODE_WRITE_CATEGORY
+
+    def _write_task_description(self, description: str) -> str:
+        """The task text handed to the model: the task plus bounded context.
+
+        Only the *names* of the workspace's files are added, and only in write
+        mode. The listing is produced by the code writer's own bounded walk, so it
+        cannot become a way to read credential material, ``.git``, the virtualenv,
+        dependencies, or the run store.
+        """
+
+        context = build_workspace_context(self._workspace)
+        if not context:
+            return description
+        return f"{description}\n\n{context}"
+
+    @staticmethod
+    def _offline_write_answer(plan: object) -> str:
+        """The deterministic plan text used as the offline "model answer".
+
+        The offline provider cannot answer for work, so in write mode the answer
+        this path applies is the plan it already derived from the task text -
+        verbatim, with no fenced block and no invented file. The whole pipeline
+        (parse -> validate -> apply -> verify -> persist) is therefore exercised
+        end to end, and the honest outcome is ``no_changes``: nothing is written,
+        because nothing in that text names a file to write.
+        """
+
+        lines = ["Deterministic offline plan (no provider was called):"]
+        for index, step in enumerate(getattr(plan, "steps", ()) or (), start=1):
+            kind = getattr(step, "kind", "")
+            kind_name = getattr(kind, "value", kind)
+            target = getattr(step, "target", "") or "."
+            title = getattr(step, "title", "")
+            lines.append(f"{index}. [{kind_name}] {title} -> {target}")
+        return "\n".join(lines)
+
+    def _apply_model_changes(
+        self,
+        *,
+        answer: object,
+        workspace: object,
+        run_id: str,
+        task_id: str,
+        run_store: Optional[RunStore],
+    ) -> WriteResult:
+        """Run one model answer through the guarded writer and record its outcome.
+
+        The workspace is the frozen scope's own workspace, so the files land in the
+        perimeter this run already holds. An unexpected failure is a refusal, never
+        a success: only the writer's own statuses are reported, and the run's
+        durable record is written from them.
+        """
+
+        try:
+            result = apply_changes(answer, workspace=workspace, run_id=run_id)
+        except Exception as error:  # noqa: BLE001 - a writer failure must not write
+            result = WriteResult(
+                status=STATUS_REJECTED,
+                reason=f"writer_error:{type(error).__name__}",
+            )
+        self._record_write_outcome(run_store, run_id, task_id, result)
+        return result
+
+    def _record_write_outcome(
+        self,
+        store: Optional[RunStore],
+        run_id: str,
+        task_id: str,
+        result: WriteResult,
+    ) -> None:
+        """Persist the write outcome in the run's own durable record.
+
+        The status, the applied diff, the file list and the verification status go
+        into the existing ``RunStateSnapshot.project_state`` (merged beside the
+        other records, exactly as the memory, step-graph and recovery stores do),
+        and a bounded event marks the same fact in the run's trail. Persistence is
+        best effort: it must never decide or rewrite the run's outcome.
+        """
+
+        if store is None:
+            return
+        try:
+            snapshot = store.read_state(run_id)
+            store.append_event(
+                EventType.PROJECT_STATE_UPDATED,
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "code_write_status": result.status,
+                    "code_write_verification": result.verification,
+                    "code_write_files": [
+                        str(item.get("path", "")) for item in result.files
+                    ][:20],
+                    "code_write_file_count": len(result.files),
+                    "code_write_reason": str(result.reason)[:300],
+                },
+                run_id=run_id,
+                task_id=task_id,
+            )
+            if snapshot is None:
+                # No snapshot to merge into. The event above still records the
+                # outcome, and inventing an empty state record here would claim the
+                # run had no state at all.
+                return
+            self._write_project_state_entry(
+                store, run_id, CODE_WRITE_PROJECT_STATE_KEY, result.to_dict()
+            )
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            pass
+
+    def _write_project_state_entry(
+        self,
+        store: RunStore,
+        run_id: str,
+        key: str,
+        value: Any,
+    ) -> bool:
+        """Merge one key into the run's durable ``project_state``.
+
+        Returns False when the run has no snapshot to merge into: inventing one would
+        claim the run had state it never had. The merge rule lives here so every
+        outcome that records beside the existing step-graph, recovery, memory and
+        baseline records writes the snapshot the same way.
+        """
+
+        snapshot = store.read_state(run_id)
+        if snapshot is None:
+            return False
+        project_state: Dict[str, Any] = (
+            dict(snapshot.project_state) if snapshot.project_state else {}
+        )
+        project_state[key] = value
+        persisted = None
+        try:
+            persisted = store.load(run_id)
+        except Exception:  # noqa: BLE001 - the count falls back to the snapshot
+            persisted = None
+        store.write_state(
+            RunStateSnapshot(
+                run_id=run_id,
+                task_id=snapshot.task_id,
+                state=snapshot.state,
+                status=snapshot.status,
+                attempt_number=snapshot.attempt_number,
+                completed_attempt_indexes=snapshot.completed_attempt_indexes,
+                project_state=project_state,
+                event_count=(
+                    persisted.event_count
+                    if persisted is not None
+                    else snapshot.event_count
+                ),
+                updated_at=_utc_now_iso(),
+            )
+        )
+        return True
+
+    def _provider_key_index(
+        self, provider_name: str, run_id: str
+    ) -> Optional[int]:
+        """Which rotation position of ``provider_name`` served *this* run, if any.
+
+        The position is read from the provider instance the composition registered and
+        only when that provider recorded this run's own id with it. The pair is what
+        keeps a failed run from inheriting the index a previous run was served by --
+        a plain "last used" attribute alone would attribute across runs.
+        """
+
+        name = str(provider_name or "").strip().lower()
+        if not name:
+            return None
+        registry = getattr(self._runtime, "provider_registry", None)
+        getter = getattr(registry, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            provider = getter(name)
+        except Exception:  # noqa: BLE001 - an unknown provider has no index
+            return None
+        index = getattr(provider, "last_key_index", None)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            return None
+        if str(getattr(provider, "last_key_run_id", "")) != str(run_id):
+            return None
+        return index
+
+    def _record_provider_key_index(
+        self,
+        store: Optional[RunStore],
+        run_id: str,
+        task_id: str,
+        provider_name: str,
+        index: Optional[int],
+    ) -> None:
+        """Record which pool position served the run, without recording the key.
+
+        The fact goes into the run's durable ``project_state`` (beside ``code_write``)
+        and a bounded event marks it in the run's trail, so the UI can show which
+        account served a run while the byte-pinned response model stays unchanged.
+        Persistence is best effort: it must never decide or rewrite the outcome.
+        """
+
+        if store is None or index is None:
+            return
+        try:
+            store.append_event(
+                EventType.PROJECT_STATE_UPDATED,
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "provider": provider_name,
+                    PROVIDER_KEY_INDEX_PROJECT_STATE_KEY: int(index),
+                },
+                run_id=run_id,
+                task_id=task_id,
+            )
+            self._write_project_state_entry(
+                store,
+                run_id,
+                PROVIDER_KEY_INDEX_PROJECT_STATE_KEY,
+                int(index),
+            )
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            pass
+
+    def _run_offline_task(
+        self,
+        req: TaskRunRequest,
+        *,
+        task: Task,
+        run_id: str,
+        task_id: str,
+        project_id: str,
+        identity: object | None,
+        run_store: Optional[RunStore],
+        started_at: float,
+        write_mode: bool = False,
+    ) -> "RunDispatchResult":
+        """Execute one submitted task with the deterministic offline run loop.
+
+        The offline provider cannot answer for work - its provider call is a fixed
+        string - so the task is executed by the repository's canonical
+        ``AgentHarness`` loop instead, with the runtime's real stages:
+
+            discovery (bounded workspace observation)
+              -> planning (the deterministic ``Planner``, from the task text)
+              -> decision (``OfflineTaskDecisionProvider``: verify)
+              -> verification (``OfflineWorkspaceVerifier``: real read-only checks)
+              -> acceptance (``AcceptanceGate`` over those checks)
+              -> decision (complete or fail) -> terminal state
+
+        This path **cannot execute a command and cannot invoke a tool**: it carries
+        no execution request, no tool intent, and a frozen ``RunScope`` that
+        authorises neither, and its decision provider cannot propose either action.
+        It also makes no provider call at all, so the zero tokens/cost it reports
+        is a measured zero rather than an estimate.
+        """
+
+        plan = build_offline_task_plan(req.description)
+        task_specification = TaskSpecification(
+            task_id=task_id,
+            title=str(getattr(task.category, "value", task.category) or "task"),
+            description=plan.description or req.description,
+            requirements=(),
+            acceptance_criteria=plan.criteria,
+        )
+
+        # The frozen perimeter for this run: this service's own workspace, its
+        # execution profile, no tool, and no command. The criteria are the checks
+        # this path really performs; they are derived server-side and frozen here
+        # before the loop starts.
+        scope = RunScope(
+            run_id=run_id,
+            workspace=self._workspace,
+            execution_profile=self._execution_profile,
+            allowed_tool_ids=frozenset(),
+            allowed_execution_commands=frozenset(),
+            acceptance_criteria=plan.criteria,
+        )
+        scope.freeze()
+        require_active_scope(run_id, scope)
+
+        # What the run is about and what it will be judged by, recorded before it
+        # runs, exactly as the other trusted loop entry points do.
+        self._emit_acceptance_event(
+            run_store,
+            run_id,
+            task_id,
+            "RUN_STARTED",
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "entry_point": "run_task_offline",
+                "provider": OFFLINE_PROVIDER_NAME,
+                "step_count": plan.step_count,
+            },
+        )
+        self._emit_acceptance_event(
+            run_store,
+            run_id,
+            task_id,
+            "CRITERION_DEFINED",
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "criterion_ids": [item.criterion_id for item in plan.criteria],
+                "criteria_source": "offline_task_derivation",
+                "expectation_count": len(plan.checks),
+            },
+        )
+
+        request = HarnessRequest(
+            run_id=run_id,
+            workspace=self._workspace,
+            task_specification=task_specification,
+            # No command, no tool intent: the two action sources this run could
+            # otherwise reach are empty by construction, not by a runtime check.
+            execution_requests=(),
+            allowed_execution_commands=tuple(scope.allowed_execution_commands),
+            acceptance_criteria=plan.criteria,
+            verification_expectations={
+                check.criterion_id: check for check in plan.checks
+            },
+            run_scope=scope,
+            metadata={
+                "task_id": task_id,
+                "entry_point": "run_task_offline",
+                "provider": OFFLINE_PROVIDER_NAME,
+                "step_count": plan.step_count,
+            },
+        )
+
+        harness = self._harness_factory(
+            decision_provider=OfflineTaskDecisionProvider(),
+            verifier=OfflineWorkspaceVerifier(),
+            policy=OFFLINE_TASK_LOOP_POLICY,
+            # A *narrowed* observation of this service's workspace. The offline
+            # task path is interactive, so its discovery bound is tighter than the
+            # default one; a narrower bound can only observe less, never more, and
+            # the observation is still produced by the canonical scanner.
+            project_discovery=self._offline_project_discovery(),
+            telemetry_sink=(self._telemetry_sink or self._offline_telemetry_sink()),
+        )
+        loop_started = time.perf_counter()
+        result = harness.run(request)
+        duration = time.perf_counter() - loop_started
+
+        acceptance = getattr(result, "final_acceptance", None)
+        acceptance_status = (
+            acceptance.status.value if acceptance is not None else "not_evaluated"
+        )
+        if run_store is not None:
+            self._persist_harness_events(run_store, result)
+            self._emit_acceptance_event(
+                run_store,
+                run_id,
+                task_id,
+                "ACCEPTANCE_COMPLETED",
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "status": acceptance_status,
+                    "code": (
+                        acceptance.code if acceptance is not None else ""
+                    ) or "verification_not_evaluated",
+                    "criterion_ids": [item.criterion_id for item in plan.criteria],
+                    "criteria_source": "offline_task_derivation",
+                },
+            )
+            persisted = None
+            try:
+                persisted = run_store.load(run_id)
+            except Exception:  # noqa: BLE001 - the count falls back to the loop's own
+                persisted = None
+            self._persist_loop_state(
+                run_store,
+                run_id,
+                task_id,
+                result,
+                event_count=(
+                    persisted.event_count if persisted is not None else None
+                ),
+            )
+
+        final_status = getattr(
+            getattr(result, "final_state", None), "status", None
+        )
+        state_name = (
+            final_status.value
+            if hasattr(final_status, "value")
+            else str(final_status or "")
+        )
+        succeeded = state_name == "COMPLETED" and acceptance_status == "pass"
+        error: Optional[str] = None
+        if not succeeded:
+            metadata = getattr(
+                getattr(result, "final_state", None), "metadata", None
+            ) or {}
+            reason = str(metadata.get("reason") or "") if isinstance(metadata, Mapping) else ""
+            error = (
+                "offline task did not pass acceptance: "
+                + (reason or (acceptance.code if acceptance is not None else "") or state_name)
+            )
+
+        output = render_offline_task_report(
+            plan,
+            result,
+            run_id=run_id,
+            task_id=task_id,
+            project_id=project_id,
+            duration_seconds=duration,
+        )
+
+        # WRITE MODE on the offline path. The "model answer" is the deterministic
+        # plan text, so the pipeline really runs end to end; it carries no fenced
+        # block and no diff, so the honest outcome is `no_changes` and the run is
+        # NOT a success. Nothing is written, and nothing is claimed.
+        if write_mode:
+            write_result = self._apply_model_changes(
+                answer=self._offline_write_answer(plan),
+                workspace=scope.workspace,
+                run_id=run_id,
+                task_id=task_id,
+                run_store=run_store,
+            )
+            output = f"{output}\n\n{render_write_report(write_result)}"
+            write_succeeded = write_result.status == STATUS_APPLIED
+            # The loop's own verdict is never rewritten by a writer that found
+            # nothing to apply; the write failure is reported only when the run
+            # itself had passed, and the run's verdict always includes it.
+            if not write_succeeded and succeeded:
+                error = (
+                    "write mode: no change was applied "
+                    f"({write_result.status})"
+                    + (f": {write_result.reason}" if write_result.reason else "")
+                )
+            succeeded = succeeded and write_succeeded
+
+        # The dispatch outcome decides the durable idempotency lifecycle, exactly
+        # as it does on the provider path, so a replay is admitted to replay. It is
+        # recorded AFTER write mode has decided the final verdict, so the durable
+        # position cannot say COMPLETED for a run that wrote nothing.
+        if identity is not None:
+            self._record_task_lifecycle(identity, success=succeeded, attempt_number=0)
+
+        history_recorded = bool(
+            run_store is not None and self._run_store.exists(run_id)
+        )
+        return RunDispatchResult(
+            response=TaskRunResponse(
+                run_id=run_id,
+                task_id=task_id,
+                project_id=project_id,
+                state=state_name or "UNKNOWN",
+                success=succeeded,
+                output=output,
+                error=error,
+                # Nothing was consumed because no provider was called: a measured
+                # zero, labelled with the same MOCK basis the offline provider's
+                # own reports use.
+                tokens=0,
+                cost=0.0,
+                duration_seconds=round(duration, 3),
+                provider_used=OFFLINE_PROVIDER_NAME,
+                # No model produced anything on this path, so the model field
+                # names the deterministic offline engine rather than a provider.
+                model_used="deterministic-offline",
+            ),
+            idempotent_replay=False,
+            history_recorded=history_recorded,
+            history_error=(
+                "" if history_recorded else self._run_store_write_reason()
+            ),
+            usage_basis="MOCK",
+            cost_basis="MOCK",
+        )
+
+    def _record_task_lifecycle(
+        self, identity: object, *, success: bool, attempt_number: int
+    ) -> None:
+        """Record the terminal lifecycle of a keyed task dispatch.
+
+        Best effort by contract: the dispatch outcome is already decided, and an
+        unusable ledger must not rewrite it. It is called by both task paths so the
+        durable position cannot differ between the provider path and the offline
+        path.
+        """
+
+        try:
+            from app.agent_runtime.idempotency import RunLifecycleState
+
+            self._idempotency_ledger_instance().update(
+                identity,
+                lifecycle=(
+                    RunLifecycleState.COMPLETED if success else RunLifecycleState.FAILED
+                ),
+                attempt_number=int(attempt_number),
+            )
+        except Exception:  # noqa: BLE001 - the dispatch outcome is already decided
+            pass
 
     def run_task_detailed(
         self, req: TaskRunRequest, *, idempotency_key: Optional[str] = None
@@ -2567,6 +3270,11 @@ class ForgeApiService:
         run_id = f"run-api-{uuid.uuid4().hex[:8]}"
         task_id = req.task_id or f"task-{uuid.uuid4().hex[:6]}"
         project_id = req.project_id or self._active_project_id
+        if not project_id:
+            raise PermissionError(
+                "this execution has no authorized project: bind one at composition time "
+                "before creating any run"
+            )
 
         category = TaskCategory.CODE
         try:
@@ -2627,9 +3335,20 @@ class ForgeApiService:
         context = dict(req.context)
         context.update({"run_id": run_id, "project_id": project_id})
 
+        # WRITE MODE is opt-in and code-only. When it is on, the model is given the
+        # task text plus a bounded list of the workspace's file names (never their
+        # contents), so an answer can name a real path. When it is off, the task is
+        # exactly the description it always was.
+        write_mode = self._write_mode_enabled(req, category)
+        task_description = (
+            self._write_task_description(req.description)
+            if write_mode
+            else req.description
+        )
+
         task = Task(
             id=task_id,
-            description=req.description,
+            description=task_description,
             category=category,
             context=context,
             parameters={"run_id": run_id},
@@ -2650,13 +3369,44 @@ class ForgeApiService:
         # root, the fail-closed execution profile, the server-side tool allowlist,
         # and the command authority derived from the operator's declared
         # executions. Nothing here is taken from the HTTP request.
+        #
+        # THE OFFLINE TASK PATH comes first, and it builds its own scope: the
+        # criteria it is judged by are derived from the task, and a frozen scope
+        # cannot be replaced afterwards. It executes no command and invokes no
+        # tool, so it authorises neither, and it is still an ordinary frozen
+        # `RunScope` over this service's own workspace.
+        if self._selected_provider_name(req).strip().lower() == OFFLINE_PROVIDER_NAME:
+            return self._run_offline_task(
+                req,
+                task=task,
+                run_id=run_id,
+                task_id=task_id,
+                project_id=project_id,
+                identity=identity,
+                run_store=api_run_store,
+                started_at=t0,
+                write_mode=write_mode,
+            )
+
+        # A model named in the request selects the provider model for THIS run. The dispatcher
+        # already honours ``task.parameters["model"]`` as a per-run override; without this bridge a
+        # caller's model was silently ignored and every non-default model failed as
+        # "<provider> model is not configured" (measured with deepseek and radox).
+        if getattr(req, "model_name", None) and isinstance(getattr(task, "parameters", None), dict):
+            task.parameters["model"] = str(req.model_name)
+
         scope = self._build_run_scope(run_id, task)
         effective_tool_ids = scope.allowed_tool_ids
         execution_request_factory = self._build_execution_request_factory(run_id)
 
+        # The SELECTED provider is passed, not ``req.provider_name``: when a request names no provider
+        # the selected one is the configured default, and passing the raw request field (``None``)
+        # made the dispatcher fall back to its own copy of the default -- so a request with no
+        # provider ran on a provider the operator had not configured as default (measured: settings
+        # said "radox", every unnamed run executed on "openrouter").
         run = self._runtime.run_executor.execute(
             task=task,
-            provider_name=req.provider_name,
+            provider_name=(self._selected_provider_name(req) or None),
             workspace=self._workspace,
             run_id=run_id,
             run_scope=scope,
@@ -2702,20 +3452,6 @@ class ForgeApiService:
         )
         history_recorded = bool(api_run_store is not None and self._run_store.exists(run_id))
         history_error = "" if history_recorded else self._run_store_write_reason()
-        if identity is not None:
-            try:
-                from app.agent_runtime.idempotency import RunLifecycleState
-
-                self._idempotency_ledger_instance().update(
-                    identity,
-                    lifecycle=(
-                        RunLifecycleState.COMPLETED if success else RunLifecycleState.FAILED
-                    ),
-                    attempt_number=int(getattr(run_acc, "total_attempts", 0) or 0),
-                )
-            except Exception:  # noqa: BLE001 - the dispatch outcome is already decided
-                pass
-
         success = (run.state == RunState.COMPLETED)
 
         last_att = run_acc.attempt_records[-1] if run_acc.attempt_records else None
@@ -2783,6 +3519,60 @@ class ForgeApiService:
 
         if not output and run.result is not None:
             output = run.result.output
+
+        # WRITE MODE on the provider path: the "model answer" is the provider's own
+        # output, and the guarded writer applies it inside this run's frozen
+        # workspace. `success` survives only when a change was really applied and
+        # verified; every other status is reported as a failure with its reason.
+        # A dispatch that produced no usable answer is not retried or guessed at -
+        # its own honest error stands and nothing is written.
+        if write_mode:
+            answer = getattr(terminal, "output", "") if terminal is not None else ""
+            if success and isinstance(answer, str) and answer.strip():
+                write_result = self._apply_model_changes(
+                    answer=answer,
+                    workspace=scope.workspace,
+                    run_id=run_id,
+                    task_id=task_id,
+                    run_store=api_run_store,
+                )
+                output = f"{output or ''}\n\n{render_write_report(write_result)}".lstrip("\n")
+                success = write_result.status == STATUS_APPLIED
+                error = None if success else (
+                    "write mode: no change was applied "
+                    f"({write_result.status})"
+                    + (f": {write_result.reason}" if write_result.reason else "")
+                )
+            else:
+                success = False
+                if not error:
+                    error = "write mode: the provider produced no usable answer"
+
+        # WHICH ACCOUNT SERVED THE RUN. The response model is byte-pinned, so the
+        # rotation position is recorded in the run's durable state beside the write
+        # outcome. It is a position in the key pool -- never a key, a prefix or a
+        # hash -- and it is written only when the provider recorded this very run id
+        # with it, so a failed run cannot inherit another run's index.
+        self._record_provider_key_index(
+            api_run_store,
+            run_id,
+            task_id,
+            provider_used,
+            self._provider_key_index(provider_used, run_id),
+        )
+
+        # The lifecycle is recorded through the shared helper, AFTER the verdict is
+        # final. The inline version this replaced read `success` one line before it
+        # was assigned, so the NameError was swallowed by the surrounding catch-all
+        # and the durable position never advanced on the provider path. It now also
+        # follows write mode, so a keyed write-mode run cannot be recorded COMPLETED
+        # while nothing was written.
+        if identity is not None:
+            self._record_task_lifecycle(
+                identity,
+                success=success,
+                attempt_number=int(getattr(run_acc, "total_attempts", 0) or 0),
+            )
 
         response = TaskRunResponse(
             run_id=run_id,

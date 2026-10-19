@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Vault Demo</title>
+  <style>
+    /* Reset and base styles */
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    header {
+      text-align: center;
+      padding: 30px 10px;
+      font-size: 3.5rem;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: #00ffe5;
+      text-shadow: 0 0 10px rgba(0, 255, 229, 0.7);
+    }
+    main#grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+      padding: 20px;
+    }
+    .tile {
+      background: linear-gradient(145deg, #1c1c1c, #141414);
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 20px;
+      transition: transform 0.25s, box-shadow 0.25s;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .tile:hover {
+      transform: translateY(-6px);
+      box-shadow: 0 6px 20px rgba(255, 255, 255, 0.1);
+    }
+    .emoji {
+      font-size: 2.5rem;
+      margin-bottom: 10px;
+    }
+    .provider {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #4da6ff;
+      margin: 0.5rem 0;
+    }
+    .model {
+      font-size: 0.95rem;
+      color: #b0b0b0;
+      margin-bottom: 1rem;
+    }
+    .key-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: auto;
+    }
+    .masked-key {
+      flex: 1;
+      font-family: monospace;
+      background: #2b2b2b;
+      padding: 8px 12px;
+      border-radius: 6px;
+      color: #e0e0e0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.85rem;
+    }
+    .copy-btn {
+      background-color: #4da6ff;
+      border: none;
+      color: #000;
+      padding: 8px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: background-color 0.2s;
+    }
+    .copy-btn:hover {
+      background-color: #66c2ff;
+    }
+    .balance {
+      margin-top: 16px;
+      font-size: 1.1rem;
+      color: #5cff5c;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <header>AI</header>
+  <main id="grid"></main>
+
+  <script>
+    // Sample AI agents data (emoji, provider, model, masked key, balance)
+    const agents = [
+      { emoji: "🤖", provider: "OpenAI", model: "GPT-4 Turbo", key: "sk-XXXXXXXXXXxxxxXXXXX", balance: "$5.00" },
+      { emoji: "🐍", provider: "Anthropic", model: "Claude 3 Opus", key: "sk-ant-XXXXXXXXXXxxxxXXX", balance: "$12.50" },
+      { emoji: "🧠", provider: "Google", model: "Gemini Pro", key: "AIzaSyXXXXXXXXXXxx", balance: "$0.00" },
+      { emoji: "🔵", provider: "Groq", model: "Llama 3 70B", key: "gsk_XXXXXXXXXXxx", balance: "$3.75" },
+      { emoji: "🖥️", provider: "Together", model: "Meta LLama 3", key: "tgi-XXXXXXXXXXxx", balance: "$8.20" },
+      { emoji: "💡", provider: "DeepSeek", model: "DeepSeek-Chat", key: "ds_XXXXXXXXXXxx", balance: "$1.10" },
+      { emoji: "⚡", provider: "xAI", model: "Grok‑1", key: "xai-XXXXXXXXXXxx", balance: "$4.60" },
+      { emoji: "🎭", provider: "Mock", model: "MockModel", key: "mock_XXXXXXXXXXxx", balance: "$0.00" }
+    ];
+
+    function renderAgents() {
+      const grid = document.getElementById('grid');
+      agents.forEach(agent => {
+        const tile = document.createElement('article');
+        tile.className = 'tile';
+        tile.innerHTML = `
+          <div class="emoji">${agent.emoji}</div>
+          <div class="provider">${agent.provider}</div>
+          <div class="model">${agent.model}</div>
+          <div class="key-row">
+            <div class="masked-key" title="API Key">${agent.key}</div>
+            <button class="copy-btn" data-key="${agent.key}">Copy</button>
+          </div>
+          <div class="balance">Balance: ${agent.balance}</div>
+        `;
+        grid.appendChild(tile);
+
+        // Attach copy behavior to the button inside this tile
+        const btn = tile.querySelector('.copy-btn');
+        btn.addEventListener('click', function() {
+          const key = this.getAttribute('data-key');
+          navigator.clipboard.writeText(key).then(() => {
+            const original = this.textContent;
+            this.textContent = 'Copied!';
+            this.style.backgroundColor = '#4caf50';
+            setTimeout(() => {
+              this.textContent = original;
+              this.style.backgroundColor = '';
+            }, 1500);
+          }).catch(err => {
+            console.error('Copy failed:', err);
+          });
+        });
+      });
+    }
+
+    // Initial render after DOM is ready
+    document.addEventListener('DOMContentLoaded', renderAgents);
+  </script>
+</body>
+</html>

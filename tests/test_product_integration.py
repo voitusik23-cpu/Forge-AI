@@ -91,6 +91,12 @@ from fastapi.testclient import TestClient
 
 PROFILE_ID = "block8-profile"
 
+#: The project this composition serves. A service that creates a run needs an authorized project, and
+#: it is supplied the way the production composition supplies it -- bound once at composition time,
+#: never read from a request body. The value is stable per test module, so every service these tests
+#: build is bound to the same project.
+AUTHORIZED_PROJECT_ID = "product-integration"
+
 #: Writes a tiny package with its own passing test suite.
 _CREATION_PROGRAMME = (
     "import pathlib\n"
@@ -386,10 +392,14 @@ class Block8Case(unittest.TestCase):
             approval_resolver=approval_resolver,
             idempotency_guard=self.idempotency_guard,
             verification_resolver=verification_resolver,
+            authorized_project_id=AUTHORIZED_PROJECT_ID,
         )
 
     def client(self, service: ForgeApiService | None = None) -> TestClient:
-        app = create_api_app(service or self.service())
+        # The composition supplies the project, exactly as `create_api_app` does in production.
+        app = create_api_app(
+            service or self.service(), authorized_project_id=AUTHORIZED_PROJECT_ID
+        )
         client = TestClient(app)
         self._clients.append(client)
         return client
@@ -1105,6 +1115,72 @@ class AuthorizedRunTests(Block8Case):
         body = client.get("/api/product/runs").json()
         self.assertGreaterEqual(len(body["runs"]), 1)
         self.assertTrue(all("classification" in run for run in body["runs"]))
+        # Every item also carries ``project_state`` -- present as a key, ``null``
+        # when the run has none -- so a client never has to guess between "no
+        # state recorded" and "this endpoint does not report state".
+        self.assertTrue(all("project_state" in run for run in body["runs"]))
+
+    def test_14a_the_run_history_item_carries_the_same_project_state(self) -> None:
+        """The list endpoint must publish ``project_state``, not only the detail one.
+
+        THE DEFECT THIS PINS. ``GET /api/product/runs`` built each item from the
+        state/status pair, the classification, an event count and the timestamp,
+        and dropped ``project_state`` entirely. A client that counted
+        code-writing outcomes from the list therefore measured zero however many
+        runs had recorded one (measured: 40 runs, 0 carrying ``code_write``,
+        while ``GET /api/product/runs/{run_id}`` showed it for each of them).
+
+        The item now carries the SAME projection the single-run route returns,
+        and ``null`` -- not an empty object -- when the run recorded no state.
+        """
+
+        code_write = {
+            "status": "applied",
+            "verification": "passed",
+            "files": [{"path": "hello.txt", "action": "add", "added": 1, "removed": 0}],
+            "reason": "",
+        }
+        # Older by time, but later in the alphabet: this test is not about ordering.
+        self.assertIsNotNone(
+            self.run_store.write_state(
+                RunStateSnapshot(
+                    run_id="zzz-with-write",
+                    task_id="t",
+                    state="completed",
+                    status="success",
+                    project_state={"code_write": code_write},
+                    updated_at="2020-01-01T00:00:00+00:00",
+                )
+            )
+        )
+        self.assertIsNotNone(
+            self.run_store.write_state(
+                RunStateSnapshot(
+                    run_id="aaa-without-state",
+                    task_id="t",
+                    state="completed",
+                    status="success",
+                    updated_at="2024-01-01T00:00:00+00:00",
+                )
+            )
+        )
+
+        client = self.client()
+        history = client.get("/api/product/runs").json()
+        by_id = {item["run_id"]: item for item in history["runs"]}
+
+        self.assertIn("project_state", by_id["zzz-with-write"])
+        self.assertEqual(
+            by_id["zzz-with-write"]["project_state"]["code_write"], code_write
+        )
+        self.assertIn("project_state", by_id["aaa-without-state"])
+        self.assertIsNone(by_id["aaa-without-state"]["project_state"])
+
+        # The value is exactly what the single-run route already reported.
+        detail = client.get("/api/product/runs/zzz-with-write").json()
+        self.assertEqual(
+            detail["project_state"], by_id["zzz-with-write"]["project_state"]
+        )
 
     def test_14b_newest_first_is_by_time_not_by_run_id(self) -> None:
         """_INJECTION_TARGET_: "newest" must be time, not lexicographic order.
@@ -3459,7 +3535,20 @@ class CompatibilityTests(Block8Case):
         )
         self.assertEqual(
             set(TaskRunRequest("d").to_dict()),
-            {"description", "category", "task_id", "provider_name", "project_id", "context"},
+            {
+                "description",
+                "category",
+                "task_id",
+                "provider_name",
+                "project_id",
+                "context",
+                # Opt-in write mode: false by default, and always present in the
+                # request contract once it exists.
+                "write_mode",
+                # The model for this dispatch only; ``None`` by default, so a caller
+                # that never names one keeps the provider's configured model.
+                "model_name",
+            },
         )
         self.assertEqual(
             set(

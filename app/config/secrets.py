@@ -43,6 +43,24 @@ class SecretStore:
         value = self._file_values.get(name)
         return value if value and value.strip() else None
 
+    def secret_names(self) -> tuple[str, ...]:
+        """Every secret *name* this store can resolve, sorted, and no value.
+
+        A caller that needs to enumerate a numbered family (``RADOX_API_KEY_1``,
+        ``RADOX_API_KEY_2``, ...) cannot do it by probing alone: the count is the
+        owner's data, not a constant. This reports the names only -- the values
+        stay behind :meth:`get_secret`, so a caller cannot accidentally serialize
+        what is returned here.
+        """
+
+        names = {
+            name for name in self._environ if _SECRET_NAME.fullmatch(str(name))
+        }
+        if self._file_values is None:
+            self._file_values = self._read_env_file()
+        names.update(self._file_values)
+        return tuple(sorted(names))
+
     def _read_env_file(self) -> dict[str, str]:
         """Read simple KEY=VALUE entries; ignore comments and malformed lines."""
         try:

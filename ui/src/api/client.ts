@@ -156,14 +156,32 @@ export type Dashboard = {
   generated_at?: string;
 };
 
+/**
+ * One row of `GET /api/product/runs`.
+ *
+ * The `/api/product/runs` answer carries the run state and its classification, so the Запуски
+ * screen can show a run without a second request; the full record still comes from
+ * `GET /api/runs/{run_id}`.
+ */
 export type RunRow = {
   run_id?: string;
   id?: string;
   goal?: string;
   title?: string;
+  state?: string;
   status?: string;
   tokens?: number;
+  event_count?: number;
+  updated_at?: string;
   created_at?: string;
+  classification?: {
+    outcome?: string;
+    reason?: string;
+    detail?: string;
+    evidence?: string[];
+    is_terminal?: boolean;
+    is_success?: boolean;
+  };
 };
 
 export type Runs = {

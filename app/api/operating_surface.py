@@ -556,7 +556,34 @@ class OperatingSurface:
     def snapshotter(self) -> UnderstandingSnapshotter:
         return self._snapshotter
 
+
+    def _require_project(self) -> str:
+        """The authorized project, or a controlled refusal.
+
+        Memory scopes, snapshots and event reconciliation are project-scoped: writing them under an
+        empty identifier would put unrelated work into one shared namespace. This method exists so those
+        call sites fail closed before any side effect instead of persisting an ambiguous scope.
+        """
+
+        project_id = self._project_id()
+        if not project_id:
+                                    raise PermissionError(
+                                                                    "this surface has no authorized project: project-scoped state cannot be written"
+                                    )
+        return project_id
     def _project_id(self) -> str:
+        """The authorized project of this surface, or an empty string when there is none.
+
+        An empty project list means the surface has no project at all. It used to fabricate the
+        literal "default" here, which callers could then bind as execution authority; that made a
+        missing identity indistinguishable from a real one. The empty string is the repository's
+        missing-value convention, and every project-sensitive path must fail closed on it.
+        """
+
+        projects = self._service.list_projects()
+        if not projects:
+            return ""
+        return str(getattr(projects[0], "project_id", "") or "")
         projects = self._service.list_projects()
         if not projects:
             return "default"
@@ -747,6 +774,13 @@ class OperatingSurface:
                     "state": record.get("state", ""),
                     "status": record.get("status", ""),
                     "classification": record.get("classification"),
+                    # The SAME projection ``GET /api/runs/{run_id}`` returns, read from
+                    # the run's own snapshot. Without it the list carried no
+                    # ``project_state`` at all, so a client that counts code-writing
+                    # outcomes from this endpoint always measured zero even when every
+                    # run had recorded one. ``None`` (not ``{}``) when the run has no
+                    # state, which is what the single-run endpoint reports too.
+                    "project_state": record.get("project_state"),
                     "event_count": (
                         persisted.event_count if persisted is not None else 0
                     ),
@@ -794,7 +828,7 @@ class OperatingSurface:
             statement=statement,
             source=ContextSourceType.EXPLICIT_INPUT,
             source_id=memory_id,
-            scope=MemoryScope(project_id=self._project_id()),
+            scope=MemoryScope(project_id=self._require_project()),
             trust_level=ContextTrustLevel.INFERRED,
             details={"role": "goal", "entered_by": "operator"},
         )
@@ -826,7 +860,7 @@ class OperatingSurface:
         """
 
         snapshot = self._snapshotter.create_snapshot(
-            self._workspace, project_id=self._project_id()
+            self._workspace, project_id=self._require_project()
         )
         return {
             "project_id": snapshot.project_id,
@@ -1419,7 +1453,7 @@ class OperatingSurface:
 
         memory = self._memory_store.load()
         snapshot = self._snapshotter.create_snapshot(
-            self._workspace, project_id=self._project_id()
+            self._workspace, project_id=self._require_project()
         )
         return self._memory_projection(memory, self._freshness(snapshot))
 
@@ -1479,7 +1513,7 @@ class OperatingSurface:
             statement=statement.strip(),
             source=ContextSourceType.EXPLICIT_INPUT,
             source_id=memory_id,
-            scope=MemoryScope(project_id=self._project_id(), paths=()),
+            scope=MemoryScope(project_id=self._require_project(), paths=()),
             trust_level=ContextTrustLevel.INFERRED,
             details=details,
         )
@@ -1544,7 +1578,7 @@ class OperatingSurface:
 
         memory = self._memory_store.load()
         snapshot = self._snapshotter.create_snapshot(
-            self._workspace, project_id=self._project_id()
+            self._workspace, project_id=self._require_project()
         )
         index = self._freshness(snapshot)
         updated, result = memory.refresh(index)
@@ -1584,7 +1618,7 @@ class OperatingSurface:
         """
 
         snapshot = self._snapshotter.create_snapshot(
-            self._workspace, project_id=self._project_id()
+            self._workspace, project_id=self._require_project()
         )
         self._persist_baseline(snapshot)
         self._baseline = _Baseline(snapshot)
@@ -1643,7 +1677,7 @@ class OperatingSurface:
             base = self._load_baseline(self.BASELINE_ID)
             if base is None:
                 base = self._snapshotter.create_snapshot(
-                    self._workspace, project_id=self._project_id()
+                    self._workspace, project_id=self._require_project()
                 )
                 if not read_only:
                     self._persist_baseline(base)
@@ -1651,7 +1685,7 @@ class OperatingSurface:
             self._baseline = _Baseline(base)
 
         current = self._snapshotter.create_snapshot(
-            self._workspace, project_id=self._project_id()
+            self._workspace, project_id=self._require_project()
         )
         analysis = self.change_analysis(
             base=base, current=current, read_only=read_only
@@ -1751,11 +1785,11 @@ class OperatingSurface:
             base = self._resolve_baseline(baseline, persist=not read_only)
         if current is None:
             current = self._snapshotter.create_snapshot(
-                self._workspace, project_id=self._project_id()
+                self._workspace, project_id=self._require_project()
             )
         memory = self._memory_store.load()
-        if memory.project_id != self._project_id():
-            memory = replace(memory, project_id=self._project_id())
+        if memory.project_id != self._require_project():
+            memory = replace(memory, project_id=self._require_project())
         engine = ChangeImpactEngine(
             baseline=base,
             current=current,
@@ -1810,7 +1844,7 @@ class OperatingSurface:
             base = self._resolve_baseline(baseline, persist=not record_history)
         if current is None:
             current = self._snapshotter.create_snapshot(
-                self._workspace, project_id=self._project_id()
+                self._workspace, project_id=self._require_project()
             )
         from app.analysis.impact import ChangeImpactEngine
 
@@ -1960,7 +1994,7 @@ class OperatingSurface:
         base = self._load_baseline(self.BASELINE_ID)
         if base is None:
             base = self._snapshotter.create_snapshot(
-                self._workspace, project_id=self._project_id()
+                self._workspace, project_id=self._require_project()
             )
             if persist:
                 self._persist_baseline(base)
@@ -2088,7 +2122,7 @@ class OperatingSurface:
 
         baseline = self._load_baseline(self.BASELINE_ID)
         current = self._snapshotter.create_snapshot(
-            self._workspace, project_id=self._project_id()
+            self._workspace, project_id=self._require_project()
         )
         baseline_fingerprints: dict[str, str | None] = {}
         if baseline is not None:
@@ -2139,7 +2173,7 @@ class OperatingSurface:
         operation_states = self._operation_states(snapshot)
 
         builder = EvidenceGraphBuilder(
-            project_id=self._project_id(),
+            project_id=self._require_project(),
             goal_records=goal_records,
             declarations=getattr(self._service, "declarations", {}) or {},
             acceptance_specs=getattr(self._service, "acceptance_specs", {}) or {},

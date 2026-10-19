@@ -98,9 +98,28 @@ export const Projects = ({
         <div className="stack small">
           <div className="row between">
             <span className="muted">{t(lang, "projects.create.gap")}</span>
-            <Badge tone="warn">POST /api/projects</Badge>
+            <Badge tone="warn">{t(lang, "projects.create.noroute")}</Badge>
           </div>
+          {/* No create control is drawn at all: a disabled button would imply that a route exists
+              and is merely switched off. The card states the fact and names what does exist. */}
           <div className="muted">{t(lang, "projects.create.reason")}</div>
+          <div>
+            <div className="label">{t(lang, "projects.create.routes")}</div>
+            <div className="stack mono small" style={{ gap: 4, marginTop: 6 }}>
+              {[
+                "GET /api/status",
+                "GET /api/projects",
+                "GET /api/agents",
+                "GET /api/models",
+                "GET /api/runs/{run_id}",
+                "POST /api/tasks/run",
+              ].map((route) => (
+                <span key={route} className="muted">
+                  {route}
+                </span>
+              ))}
+            </div>
+          </div>
         </div>
       </Card>
     </div>

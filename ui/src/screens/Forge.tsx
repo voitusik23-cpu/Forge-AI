@@ -13,17 +13,21 @@
 // nor an accept/reject button is drawn: the card says what is missing and why. Every number on
 // this screen is copied from a response; none is computed to look like progress.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { t, type Lang } from "../i18n";
 import type { BackendState } from "../api/client";
 import {
   TASK_CATEGORIES,
+  catalogueModelsFor,
+  codeWriteOf,
   dispatchTask,
   isTerminalRecord,
   loadProjects,
   loadRunRecord,
+  loadUiDefaults,
+  type CodeWriteResult,
   type DispatchResult,
   type Failure,
   type ProjectInfo,
@@ -110,6 +114,104 @@ const Facts = ({ items }: { items: Array<[string, string]> }) => (
   </div>
 );
 
+/** The tones the writer's four statuses are drawn with, so a refusal never looks like success. */
+const WRITE_TONES: Record<string, "ok" | "warn" | "danger" | "neutral"> = {
+  applied: "ok",
+  no_changes: "neutral",
+  rejected: "danger",
+  verification_failed: "warn",
+};
+
+/**
+ * What the guarded writer actually did, read from `project_state.code_write` of the run.
+ *
+ * Every line here comes from the record: the status, the post-write verification, the exact
+ * per-file +/- counts and the unified diff. When the record carries no `code_write` at all the
+ * card says so instead of drawing an empty list that would read as "nothing to report".
+ */
+const CodeWriteCard = ({ lang, write }: { lang: Lang; write: CodeWriteResult | null }) => {
+  const status = write ? String(write.status ?? "") : "";
+  const tone = WRITE_TONES[status] ?? "neutral";
+  const files: Array<Record<string, unknown>> = Array.isArray(write?.files)
+    ? write.files.filter((file): file is Record<string, unknown> => !!file && typeof file === "object")
+    : [];
+  const diff = typeof write?.diff === "string" ? write.diff : "";
+  const reason = text(write?.reason, t(lang, "forge.write.reason.empty"));
+
+  return (
+    <Card className="rise d2">
+      <CardHead
+        title={t(lang, "forge.write.title")}
+        hint={t(lang, "forge.write.hint")}
+        action={
+          <Badge tone={write ? tone : "neutral"}>
+            {write ? text(status, t(lang, "runs.unknown")) : t(lang, "forge.write.none")}
+          </Badge>
+        }
+      />
+      {write === null ? (
+        <div className="notice warn">{t(lang, "forge.write.absent")}</div>
+      ) : (
+        <div className="stack" style={{ gap: 14 }}>
+          <Facts
+            items={[
+              [t(lang, "forge.write.status"), text(status, t(lang, "runs.unknown"))],
+              [t(lang, "forge.write.verification"), text(write.verification, t(lang, "runs.unknown"))],
+              [t(lang, "forge.write.files.count"), String(files.length)],
+            ]}
+          />
+
+          {status !== "applied" ? (
+            <div className={`notice ${status === "rejected" ? "danger" : "warn"}`}>
+              <div className="label">{t(lang, "forge.write.reason")}</div>
+              <div className="mono small" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+                {reason}
+              </div>
+            </div>
+          ) : null}
+
+          {files.length === 0 ? (
+            <div className="small muted">{t(lang, "forge.write.files.empty")}</div>
+          ) : (
+            <div>
+              <div className="label">{t(lang, "forge.write.files")}</div>
+              <div className="stack mono small" style={{ gap: 6, marginTop: 6 }}>
+                {files.map((file, index) => (
+                  <div
+                    className="row between"
+                    key={`${String(file.path ?? "")}-${index}`}
+                    style={{ gap: 10, flexWrap: "wrap" }}
+                  >
+                    <span style={{ wordBreak: "break-all" }}>{text(file.path)}</span>
+                    <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                      <Badge tone={file.action === "create" ? "ok" : "info"}>
+                        {text(file.action, t(lang, "runs.unknown"))}
+                      </Badge>
+                      <Badge tone="ok">+{text(file.added, "0")}</Badge>
+                      <Badge tone="danger">-{text(file.removed, "0")}</Badge>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {diff === "" ? (
+            <div className="small muted">{t(lang, "forge.write.diff.none")}</div>
+          ) : (
+            <details>
+              <summary className="small muted" style={{ cursor: "pointer" }}>
+                {t(lang, "forge.write.diff")}
+              </summary>
+              <pre className="forge-output mono small">{diff}</pre>
+            </details>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+};
+
 export const Forge = ({
   lang,
   backend,
@@ -154,6 +256,10 @@ export const Forge = ({
   }, [projects, selectedProject, activeProject]);
 
   // ------------------------------------------------------------------ providers
+  // The model catalogue the form chooses from: the same GET /api/models answer `loadBackend`
+  // already reads, so no second request and no second source of truth.
+  const catalogue = backend.status === "live" ? backend.catalogue : null;
+
   const providerChoice = useMemo(() => {
     if (backend.status !== "live") return { list: [] as string[], fallback: "" };
     const details = backend.core.details ?? {};
@@ -185,12 +291,63 @@ export const Forge = ({
     setProvider(next);
   }, [providerChoice, provider]);
 
+  // ------------------------------------------------------------------ models
+  // The models the catalogue lists for the selected provider, sorted by id. An entry is
+  // membership, not availability — the note under the selects says so.
+  const modelChoice = useMemo(() => catalogueModelsFor(catalogue, provider), [catalogue, provider]);
+
+  const [model, setModel] = useState("");
+  // Set as soon as the owner picks a model himself, so a later arriving default never overwrites
+  // a deliberate choice.
+  const [modelPicked, setModelPicked] = useState(false);
+  // The configured `FORGE_DEFAULT_MODEL`, read through the shell server. Empty when the route is
+  // absent, which only means the form falls back to the first model of the provider.
+  const [configuredModel, setConfiguredModel] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const outcome = await loadUiDefaults();
+      if (cancelled || !outcome.ok) return;
+      const value = String(outcome.value.default_model ?? "").trim();
+      if (value !== "") setConfiguredModel(value);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** What the select actually shows: the state, or the first id while the effect catches up. */
+  const selectedModel =
+    modelChoice.length === 0 ? model.trim() : modelChoice.includes(model) ? model : (modelChoice[0] ?? "");
+
+  useEffect(() => {
+    if (provider === "") return;
+    // No catalogue entry for this provider: the field is free text and keeps what was typed.
+    if (modelChoice.length === 0) return;
+    // The configured default wins while it belongs to this provider; otherwise the first id.
+    const preferred = modelChoice.includes(configuredModel) ? configuredModel : (modelChoice[0] ?? "");
+    if (modelPicked && modelChoice.includes(model)) return;
+    if (model !== preferred) setModel(preferred);
+  }, [provider, modelChoice, model, configuredModel, modelPicked]);
+
   // ------------------------------------------------------------------ task form
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<TaskCategoryValue>("code");
+  // Off by default: a read-only dispatch stays what every earlier click did. Turning it on is
+  // the only way this window can ask the Core to write, and the warning under the box says
+  // exactly what that means instead of reassuring anyone.
+  const [writeMode, setWriteMode] = useState(false);
+  // What the *current* run asked for, fixed at submit time: the checkbox may be toggled while
+  // the run is still in flight, and the card below must describe the run, not the form.
+  const [requestedWriteMode, setRequestedWriteMode] = useState(false);
   const [descriptionError, setDescriptionError] = useState("");
   const [dispatch, setDispatch] = useState<DispatchState>({ status: "idle" });
   const [idempotencyKey, setIdempotencyKey] = useState(newIdempotencyKey);
+  // Everything the submit button has to say that is not a task failure: that a second click was
+  // refused, that the request was cancelled, or that it is still in flight.
+  const [notice, setNotice] = useState("");
+  const inFlight = useRef<AbortController | null>(null);
 
   // ------------------------------------------------------------------ run record
   const [record, setRecord] = useState<RunRecord | null>(null);
@@ -201,6 +358,9 @@ export const Forge = ({
   const dispatched = dispatch.status === "sent" ? dispatch.result : null;
   const runId = String(dispatched?.response.run_id ?? "");
   const terminal = isTerminalRecord(record);
+  // `project_state.code_write` is written by the Core only for a write-mode code run, so its
+  // presence is the record's own proof that the writer ran — never inferred from the checkbox.
+  const codeWrite = codeWriteOf(record);
 
   // Poll GET /api/runs/{run_id} while the record is not terminal. A read failure stops the
   // loop and is shown with a retry: retrying a *read* executes nothing, unlike retrying a task.
@@ -235,37 +395,86 @@ export const Forge = ({
   const polling = runId !== "" && recordFailure === null && !terminal;
 
   const submit = async () => {
-    if (dispatch.status === "pending" || !live) return;
+    // The button is deliberately never disabled. A disabled button with no reason is what made
+    // "Запустить задачу" look dead; every click now either dispatches or says why it did not.
+    if (dispatch.status === "pending") {
+      setNotice(t(lang, "forge.task.busy"));
+      return;
+    }
     const trimmed = description.trim();
     if (trimmed === "") {
       setDescriptionError(t(lang, "runs.error.description"));
+      setNotice("");
       return;
     }
     setDescriptionError("");
+    setNotice("");
     setRecord(null);
     setRecordFailure(null);
     setDispatch({ status: "pending" });
-    const outcome = await dispatchTask({
-      description: trimmed,
-      category,
-      // Only a provider the Core itself reported is sent; an empty or stale selection leaves
-      // the routing to the backend instead of naming a provider that is not in the list.
-      providerName: providerChoice.list.includes(provider) ? provider : undefined,
-      projectId: selectedProject === "" ? undefined : selectedProject,
-      idempotencyKey,
-    });
-    if (outcome.ok) {
-      setDispatch({ status: "sent", result: outcome.value });
-      // A replayed answer must not silently become a new logical operation.
-      if (outcome.value.facts.idempotent_replay !== true) setIdempotencyKey(newIdempotencyKey());
-    } else {
-      setDispatch({ status: "failed", failure: outcome.failure });
+    setRequestedWriteMode(writeMode);
+    const controller = new AbortController();
+    inFlight.current = controller;
+    // Only a provider the Core itself reported is sent; an empty or stale selection leaves the
+    // routing to the backend instead of naming a provider that is not in the list.
+    const providerToSend = providerChoice.list.includes(provider) ? provider : undefined;
+    // The model rides with the provider it was chosen for: sending an id from another provider
+    // would be a route nobody chose, and an empty id leaves the Core's own default in force.
+    const modelToSend = providerToSend !== undefined && selectedModel !== "" ? selectedModel : undefined;
+    try {
+      const outcome = await dispatchTask({
+        description: trimmed,
+        category,
+        providerName: providerToSend,
+        modelName: modelToSend,
+        projectId: selectedProject === "" ? undefined : selectedProject,
+        writeMode,
+        idempotencyKey,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        // Aborted by the user: no result to show, and the in-flight state is cleared below.
+        setDispatch({ status: "idle" });
+        setNotice(t(lang, "forge.task.cancelled"));
+      } else if (outcome.ok) {
+        setDispatch({ status: "sent", result: outcome.value });
+        // A replayed answer must not silently become a new logical operation.
+        if (outcome.value.facts.idempotent_replay !== true) setIdempotencyKey(newIdempotencyKey());
+      } else {
+        setDispatch({ status: "failed", failure: outcome.failure });
+      }
+    } catch (error) {
+      // `dispatchTask` reports failures instead of throwing, so this is the unexpected path; it
+      // must still clear the in-flight state rather than leave the form permanently busy.
+      setDispatch(
+        controller.signal.aborted
+          ? { status: "idle" }
+          : {
+              status: "failed",
+              failure: {
+                kind: "disconnected",
+                status: 0,
+                path: "/api/tasks/run",
+                detail: error instanceof Error ? error.message : String(error),
+              },
+            }
+      );
+      if (controller.signal.aborted) setNotice(t(lang, "forge.task.cancelled"));
+    } finally {
+      if (inFlight.current === controller) inFlight.current = null;
+      onRefresh();
     }
-    onRefresh();
+  };
+
+  /** Cancel this window's own request and drop the in-flight state. */
+  const cancel = () => {
+    inFlight.current?.abort();
+    inFlight.current = null;
+    setDispatch({ status: "idle" });
+    setNotice(t(lang, "forge.task.cancelled"));
   };
 
   // ------------------------------------------------------------------ settings facts
-  const catalogue = backend.status === "live" ? backend.catalogue : null;
   const registryCounts =
     catalogue && typeof catalogue.counts === "object" && catalogue.counts !== null
       ? (catalogue.counts as Record<string, unknown>)
@@ -293,6 +502,16 @@ export const Forge = ({
   const basisReported =
     dispatched !== null && dispatched.facts.usage_basis !== "" && dispatched.facts.cost_basis !== "";
 
+  // The exact provider · model pair the submit button will send, or the honest "the backend
+  // chooses" when the Core reported nothing to choose from.
+  const routeLabel =
+    [
+      providerChoice.list.includes(provider) ? provider : "",
+      providerChoice.list.includes(provider) ? selectedModel : "",
+    ]
+      .filter((part) => part !== "")
+      .join(" · ") || t(lang, "forge.task.route.auto");
+
   return (
     <div className="content forge-workbench">
       <div className="row between" style={{ marginBottom: 18 }}>
@@ -306,6 +525,13 @@ export const Forge = ({
           </div>
         </div>
         <div className="row">
+          <Button
+            size="small"
+            tone="ghost"
+            onClick={() => window.open("/code-stats.html", "_blank", "noopener,noreferrer")}
+          >
+            {t(lang, "forge.stats.open")}
+          </Button>
           <Button size="small" tone="ghost" onClick={onHelp}>
             {t(lang, "help.how")}
           </Button>
@@ -420,6 +646,40 @@ export const Forge = ({
                     )}
                   </select>
                 </label>
+                <label className="field" style={{ flex: "0 1 240px" }}>
+                  <span className="label">{t(lang, "forge.task.model")}</span>
+                  {modelChoice.length > 0 ? (
+                    <select
+                      className="input"
+                      value={selectedModel}
+                      onChange={(event) => {
+                        setModelPicked(true);
+                        setModel(event.target.value);
+                      }}
+                      disabled={provider === ""}
+                    >
+                      {modelChoice.map((item) => (
+                        <option key={item} value={item}>
+                          {item}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    // The catalogue lists no model for this provider: free text keeps the field
+                    // usable instead of offering an empty select nobody can submit.
+                    <input
+                      className="input"
+                      type="text"
+                      value={model}
+                      onChange={(event) => {
+                        setModelPicked(true);
+                        setModel(event.target.value);
+                      }}
+                      placeholder={t(lang, "forge.task.model.placeholder")}
+                      disabled={provider === ""}
+                    />
+                  )}
+                </label>
                 <label className="field" style={{ flex: "0 1 190px" }}>
                   <span className="label">{t(lang, "runs.form.category")}</span>
                   <select
@@ -442,18 +702,47 @@ export const Forge = ({
                   : t(lang, "forge.task.provider.note")}
               </div>
 
-              <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-                <Button
-                  tone="primary"
-                  disabled={dispatch.status === "pending" || !live}
-                  onClick={() => void submit()}
-                >
+              {/* The catalogue note is drawn only when the Core actually reported providers: with
+                  no answer at all the honest statement is the provider note above, not a claim
+                  that the registry holds no model for this provider. */}
+              {providerChoice.list.length > 0 ? (
+                <div className="small muted">
+                  {modelChoice.length === 0
+                    ? t(lang, "forge.task.model.free")
+                    : t(lang, "forge.task.model.note")}
+                </div>
+              ) : null}
+
+              {/* What the next submit will actually name, so the owner sees the model that runs. */}
+              <div className="small row" style={{ gap: 6, flexWrap: "wrap" }}>
+                <span className="muted">{t(lang, "forge.task.route")}</span>
+                <span className="mono">{routeLabel}</span>
+              </div>
+
+              <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                <Button tone="primary" onClick={() => void submit()}>
                   <IconPlay size={15} />
                   {dispatch.status === "pending" ? t(lang, "runs.form.running") : t(lang, "runs.form.submit")}
                 </Button>
+                {dispatch.status === "pending" ? (
+                  <Button size="small" tone="danger" onClick={cancel}>
+                    {t(lang, "forge.task.cancel")}
+                  </Button>
+                ) : null}
+                <label className="forge-toggle">
+                  <input
+                    type="checkbox"
+                    checked={writeMode}
+                    onChange={(event) => setWriteMode(event.target.checked)}
+                  />
+                  <span>{t(lang, "forge.task.write.label")}</span>
+                </label>
                 <span className="small muted">{t(lang, "forge.task.guarded")}</span>
               </div>
+              <div className="small muted forge-write-warning">{t(lang, "forge.task.write.warning")}</div>
 
+              {dispatch.status === "pending" ? <div className="notice">{t(lang, "forge.task.pending")}</div> : null}
+              {notice !== "" ? <div className="notice warn">{notice}</div> : null}
               {dispatch.status === "failed" ? <FailureNotice lang={lang} failure={dispatch.failure} /> : null}
             </div>
           </Card>
@@ -524,6 +813,11 @@ export const Forge = ({
               </div>
             )}
           </Card>
+
+          {/* --------------------------------------------------------------- code write */}
+          {codeWrite !== null || (requestedWriteMode && terminal) ? (
+            <CodeWriteCard lang={lang} write={codeWrite} />
+          ) : null}
 
           {/* ----------------------------------------------------------------- result */}
           <Card className="rise d3">

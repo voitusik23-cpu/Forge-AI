@@ -151,6 +151,8 @@ class AcceptanceSliceTestCase(unittest.TestCase):
             declarations=declarations,
             acceptance_specs=specs,
             approval_policy=kwargs.pop("approval_policy", ApprovalPolicy()),
+            # The composition authorizes one project; a run cannot be created without it.
+            authorized_project_id="acceptance-production",
             **kwargs,
         )
 
@@ -308,7 +310,22 @@ class TrustedCriteriaTests(AcceptanceSliceTestCase):
         fields = {f.name for f in dataclasses.fields(TaskRunRequest)}
         self.assertEqual(
             fields,
-            {"description", "category", "task_id", "provider_name", "project_id", "context"},
+            {
+                "description",
+                "category",
+                "task_id",
+                "provider_name",
+                "project_id",
+                "context",
+                # Opt-in write mode (guarded code-writing path). It carries no
+                # acceptance authority: criteria and expectations still come only
+                # from the operator composition.
+                "write_mode",
+                # The model this one dispatch runs on, for the provider named above.
+                # It selects no provider and grants nothing: the acceptance
+                # authority is still the operator composition.
+                "model_name",
+            },
         )
         for banned in (
             "criterion_id", "criteria", "acceptance_criteria",

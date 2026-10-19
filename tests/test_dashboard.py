@@ -424,21 +424,39 @@ class DashboardObservesApiRunsTests(unittest.TestCase):
             ),
             fabric=fabric,
         )
-        return ForgeApiService(runtime=runtime, fabric=fabric)
+        # The composition authorizes one project; a run cannot be created without it.
+        return ForgeApiService(
+            runtime=runtime, fabric=fabric, authorized_project_id="dashboard"
+        )
 
     def test_01_a_run_reaches_the_dashboard_with_its_attempts(self) -> None:
-        from app.api.models import TaskRunRequest
+        # The dispatch is driven through the runtime's own executor: the API task path
+        # executes the offline provider through the deterministic harness loop, which
+        # makes no provider call and therefore records no provider attempt. The fact
+        # under test - a real dispatch reaches the dashboard through the service's own
+        # fabric - is unchanged.
+        from app.orchestrator.models import Task
 
         service = self._service()
-        response = service.run_task(TaskRunRequest(description="dashboard probe"))
-        self.assertTrue(response.success)
+        run = service.runtime.run_executor.execute(
+            task=Task(
+                id="dashboard-probe-task",
+                description="dashboard probe",
+                context={"run_id": "run-dashboard-probe"},
+                parameters={"run_id": "run-dashboard-probe"},
+            ),
+            provider_name=None,
+            workspace=service.workspace,
+            run_id="run-dashboard-probe",
+        )
+        self.assertTrue(run.result.success)
 
         dashboard = CostDashboardService(fabric=service.fabric)
         records = dashboard.get_run_records()
         self.assertEqual(len(records), 1)
         record = records[0]
         self.assertGreaterEqual(record.total_attempts, 1)
-        self.assertEqual(record.attempt_records[-1].provider_name, response.provider_used)
+        self.assertEqual(record.attempt_records[-1].provider_name, run.result.provider)
 
         report = dashboard.get_report()
         providers = {entry.provider for entry in report.providers}

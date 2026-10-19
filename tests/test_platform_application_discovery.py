@@ -1093,3 +1093,120 @@ class ErrorAndLayeringTests(ApplicationDiscoveryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# --------------------------------------------------------------------------- #
+# AS-3 — create a project (the slice this stage implements)
+# --------------------------------------------------------------------------- #
+class AS3CreateProjectTests(ApplicationDiscoveryTestCase):
+    """``DiscoveryService.create_project`` against the same live PostgreSQL harness.
+
+    The class inherits the existing fixture lifecycle: one migrated database per class,
+    one seeded spread per test, the system login for discovery and the application login
+    for the authorized write. Nothing is provisioned here and no second harness exists.
+    """
+
+    def test_070_creates_a_project_in_an_available_organization(self):
+        try:
+            created = run_async(
+                self.service().create_project(self.owner(), self._seed.primary_org, "Created here")
+            )
+            self.assertEqual(created.name, "Created here")
+            self.assertEqual(created.status, "active")
+            self.assertTrue(created.project_id)
+            # the identifier follows the project's own convention, not a caller-supplied value
+            self.assertIsInstance(created.project_id, str)
+            self.assertNotIn(created.project_id, {self._seed.primary_project, self._seed.archived_project})
+        finally:
+            pass
+
+    def test_071_the_created_project_appears_in_list_projects(self):
+        try:
+            created = run_async(
+                self.service().create_project(self.owner(), self._seed.primary_org, "Visible after create")
+            )
+            projects = run_async(self.service().list_projects(self.owner(), self._seed.primary_org))
+            listed = {project.project_id for project in projects}
+            self.assertIn(created.project_id, listed)
+            # the pre-existing spread is still there: create added a project, it did not replace any
+            self.assertIn(self._seed.primary_project, listed)
+            self.assertIn(self._seed.archived_project, listed)
+        finally:
+            pass
+
+    def test_072_a_foreign_or_unknown_organization_is_not_found(self):
+        """Creation reuses the AS-2 decision, so the non-disclosure rule holds here too.
+
+        A cross-tenant identifier and a non-existent one must produce the same refusal,
+        otherwise create would become a way to enumerate other tenants.
+        """
+
+        try:
+            with self.assertRaises(NotFound) as foreign:
+                run_async(
+                    self.service().create_project(self.owner(), self._seed.foreign_org, "Not allowed")
+                )
+            with self.assertRaises(NotFound) as unknown:
+                run_async(
+                    self.service().create_project(self.owner(), "no-such-organization", "Not allowed")
+                )
+            self.assertEqual(foreign.exception.code, ErrorCode.NOT_FOUND)
+            self.assertEqual(unknown.exception.code, ErrorCode.NOT_FOUND)
+            self.assertEqual(str(foreign.exception), str(unknown.exception))
+            self.assertNotIsInstance(foreign.exception, NotPermitted)
+        finally:
+            pass
+
+    def test_073_a_missing_or_invalid_principal_is_refused_without_a_write(self):
+        try:
+            before = {
+                project.project_id
+                for project in run_async(
+                    self.service().list_projects(self.owner(), self._seed.primary_org)
+                )
+            }
+            for bad in (None, self._seed.owner, "", 7, object()):
+                with self.assertRaises(Unauthenticated, msg=repr(bad)):
+                    run_async(
+                        self.service().create_project(bad, self._seed.primary_org, "Nope")
+                    )
+            after = {
+                project.project_id
+                for project in run_async(
+                    self.service().list_projects(self.owner(), self._seed.primary_org)
+                )
+            }
+            # nothing was written by a refused call: the project spread is exactly as before
+            self.assertEqual(before, after)
+        finally:
+            pass
+
+    def test_074_a_persistence_error_surfaces_as_the_application_error(self):
+        """A real persistence failure is translated by ``translate_persistence_error``.
+
+        The failure is produced on a **dedicated** connection created for this test and closed
+        on purpose, so the shared ``self._tenant_database`` the fixture lifecycle owns is never
+        touched. A closed connection makes the write fail inside the driver, not in a mock.
+
+        The boundary must answer with the project's own application error - one carrying a code
+        from the closed list - and must not leak the driver exception.
+        """
+
+        broken = None
+        try:
+            broken = run_async(RecordingDatabase(self._handle.dsn).connect())
+            run_async(broken.close())
+            failing_service = DiscoveryService(self._database, broken)
+            with self.assertRaises(Exception) as caught:
+                run_async(
+                    failing_service.create_project(self.owner(), self._seed.primary_org, "Will fail")
+                )
+            error = caught.exception
+            self.assertTrue(
+                hasattr(error, "code"),
+                f"the failure must be an application error carrying a code, got {type(error).__name__}",
+            )
+            self.assertNotIn("asyncpg", type(error).__module__)
+        finally:
+            # only the connection this test opened is closed here, and never the shared ones
+            if broken is not None:
+                run_async(broken.close())
