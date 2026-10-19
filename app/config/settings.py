@@ -40,7 +40,10 @@ class RuntimeSettings:
     default_provider: str = "mock"
     default_model: str = "mock"
     openrouter_model: str = "cohere/north-mini-code:free"
-    gemini_model: str = "gemini-3.8-flash"
+    #: The Gemini model the google provider is configured with. ``gemini-flash-latest`` is
+    #: the id measured to answer through this provider; ``gemini-2.0-flash`` (the earlier
+    #: CHEAP row) does not exist in the provider's catalogue at all.
+    gemini_model: str = "gemini-flash-latest"
     enabled_providers: Tuple[str, ...] = ("mock", "openrouter")
     request_timeout: int = 30
     retry_count: int = 2

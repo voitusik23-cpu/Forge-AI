@@ -127,9 +127,9 @@ export const Auth = ({
               {notice ? <div className={"notice " + notice.tone}>{notice.text}</div> : null}
 
               <div className="row" style={{ gap: 10, marginTop: 4 }}>
-                <span style={{ flex: 1, height: 1, background: "var(--hairline)" }} />
+                <span style={{ flex: 1, height: 1, background: "var(--border)" }} />
                 <span className="label">{t(lang, "auth.dev")}</span>
-                <span style={{ flex: 1, height: 1, background: "var(--hairline)" }} />
+                <span style={{ flex: 1, height: 1, background: "var(--border)" }} />
               </div>
 
               <Button wide onClick={grant}>

@@ -149,6 +149,7 @@ class RunExecutor:
         approval_policy: "ApprovalPolicy | None" = None,
         approval_resolver: "ApprovalResolver | None" = None,
         generate_decision: bool = True,
+        allow_fallback: Optional[bool] = None,
         _run: Run | None = None,
         _attempt_number: int = 0,
     ) -> Run:
@@ -209,6 +210,13 @@ class RunExecutor:
                 )
             self._record_context_assembled(run, execution_context, run_store=run_store)
             dispatch_task = self._task_with_execution_context(task, execution_context)
+            # ``allow_fallback`` is forwarded only when the caller set it. A caller that
+            # supplies an orchestrator double with the historical ``dispatch`` signature
+            # must keep working, and an unspecified value means "the orchestrator decides"
+            # anyway.
+            dispatch_options: dict[str, object] = {}
+            if allow_fallback is not None:
+                dispatch_options["allow_fallback"] = allow_fallback
             if generate_decision:
                 result = self._orchestrator.dispatch(
                     dispatch_task,
@@ -217,6 +225,7 @@ class RunExecutor:
                     observer=lambda event_type, data: self._record(
                         run, event_type, observer, run_store, **data
                     ),
+                    **dispatch_options,
                 )
             else:
                 # The decision already exists outside this run. It is *recorded*,
@@ -277,6 +286,7 @@ class RunExecutor:
                     observer=lambda event_type, data: self._record(
                         run, event_type, observer, run_store, **data
                     ),
+                    **dispatch_options,
                 )
                 followup_invocations = list(result.tool_invocations)
                 followup_context = ToolExecutionContext(

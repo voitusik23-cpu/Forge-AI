@@ -31,12 +31,14 @@ export const HELP_TOPICS: HelpTopic[] = [
     body: {
       ru: [
         "Провайдер — внешний поставщик моделей. Их состояние приходит из GET /api/dashboard: для каждого указаны статус аккаунта, расход Forge, оценка стоимости, сообщённая провайдером стоимость, учтённая стоимость, запросы, запуски, токены и счётчики успехов и ошибок.",
+        "Раздел навигации «Провайдеры» объединяет четыре экрана: Агенты, Модели, Расходы и Инструменты. Их маршруты, данные и endpoint'ы не изменились — изменилось только место в навигации, и каждый из них открывается из этого раздела и из самого левого меню.",
         "Сегодня подключено 7 провайдеров, готовых — 0 из 7: без ключей провайдеры не опрашиваются, поэтому provider_status = DEGRADED.",
         "Модели: GET /api/dashboard отдаёт models: [], а GET /api/capabilities в этой среде содержит только домены task и tool. Раздел Models поэтому честно показывает отсутствие данных, а не список из каталога.",
         "Ключи читаются из переменных окружения. Не вставляйте ключ в файл, который попадает в git: .env в игнорировании, а .env.example перечисляет имена.",
       ],
       en: [
         "A provider is an external supplier of models. Its state comes from GET /api/dashboard: account status, Forge spend, Forge estimate, provider-reported cost, accounted cost, requests, runs, tokens and success/failure counters.",
+        "The «Providers» navigation area gathers four screens: Agents, Models, Costs and Tools. Their routes, data and endpoints are unchanged — only their place in the navigation moved, and each of them opens from that area and from the rail itself.",
         "Seven providers are configured, none ready (0/7): without keys they are not probed, so provider_status = DEGRADED.",
         "Models: GET /api/dashboard answers models: [], and GET /api/capabilities in this environment carries only the task and tool domains. The Models section therefore states that no data exists instead of showing a catalogue.",
         "Keys are read from the environment. Never paste a key into a file that is committed: .env is ignored by git and .env.example lists the names.",
@@ -116,13 +118,13 @@ export const HELP_TOPICS: HelpTopic[] = [
       ru: [
         "PASSED — объявленная проверка выполнена и подтвердилась. FAILED — выполнена и не подтвердилась. ERROR и UNKNOWN — проверить не удалось. INDETERMINATE — попытку нельзя свести к успеху.",
         "Отчёт никогда не считается доказательством: доказательство — это проверка, которая действительно выполнялась.",
-        "Статусные слова (CONNECTED, DEGRADED, NOT_CHECKED, AVAILABLE) не переводятся — это литералы, как PASSED и UNKNOWN.",
+        "Статусные слова не переводятся — это литералы, как PASSED и UNKNOWN. Состояние провайдера: REGISTERED (только запись в реестре), READY (включён, ключ есть, проверка подтвердила доступ), NO_CREDENTIALS (нет ключа), DISABLED (не включён в FORGE_ENABLED_PROVIDERS), NOT_CHECKED (проверки не было), NO_CREDITS (402 / insufficient_quota), NETWORK_BLOCKED (провайдер не ответил), ERROR (последняя проверка не удалась). Слова AVAILABLE в этом словаре нет: регистрация не равна доступности.",
         "Ошибка API объясняется человеческим языком: если запрос не удался, интерфейс пишет, какой именно путь и какой код ответа, и показывает кнопку повторного запроса.",
       ],
       en: [
         "PASSED means a declared check was evaluated and held. FAILED means it was evaluated and did not hold. ERROR and UNKNOWN mean it could not be evaluated. INDETERMINATE means the attempt cannot be summarised as success.",
         "A report is never treated as evidence: evidence is a check that actually ran.",
-        "Status words (CONNECTED, DEGRADED, NOT_CHECKED, AVAILABLE) are not translated — they are literals, like PASSED and UNKNOWN.",
+        "Status words are not translated — they are literals, like PASSED and UNKNOWN. A provider's state is one of REGISTERED (a registry entry only), READY (enabled, key present, a probe reported access), NO_CREDENTIALS (no key), DISABLED (not in FORGE_ENABLED_PROVIDERS), NOT_CHECKED (nothing probed), NO_CREDITS (402 / insufficient_quota), NETWORK_BLOCKED (the provider did not answer), ERROR (the last probe failed). AVAILABLE is not part of this vocabulary: being registered is not being available.",
         "An API error is explained in plain language: when a request fails, the interface names the path and the response code and offers a retry.",
       ],
     },
@@ -186,6 +188,7 @@ export const HELP_TOPIC_BY_ID = (id: string): HelpTopic | undefined =>
 export const CONTEXT_TOPIC: Record<string, string> = {
   forge: "run",
   overview: "status",
+  providers: "providers",
   agents: "agents",
   settings: "appearance",
   projects: "project",

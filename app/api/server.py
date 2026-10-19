@@ -157,6 +157,7 @@ def create_api_app(
     ui_assets_directory: Optional[Path] = None,
     idempotency_guard: Optional[object] = None,
     authorized_project_id: Optional[str] = None,
+    discovery_service: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -169,6 +170,12 @@ def create_api_app(
 
     ``ui_assets_directory`` exists so a test can point the app at a fixture
     directory. It defaults to the repository's own ``app/static``.
+
+    ``discovery_service`` is the Discovery/Clarification layer that sits *in front
+    of* the pipeline (``app/discovery``). It defaults to a service over the
+    deployment's own store, and a test can supply one rooted at a temporary
+    directory. It adds no executor: the task route below only uses it to refuse an
+    unconfirmed run and to prepend a confirmed specification to the task text.
     """
 
     from fastapi import FastAPI, HTTPException, Request, Header
@@ -177,6 +184,7 @@ def create_api_app(
     from fastapi.responses import JSONResponse
 
     from app.api.operating_surface import build_operating_surface
+    from app.api.discovery_routes import register_discovery_routes
     from app.api.routes import (
         body_error_exception,
         error_body,
@@ -184,6 +192,12 @@ def create_api_app(
         register_operating_routes,
         set_request_id,
     )
+    from app.discovery.models import (
+        DiscoveryError,
+        DiscoveryNotConfirmed,
+        UnknownDiscoverySession,
+    )
+    from app.discovery.service import DiscoveryService, apply_specification
     from app.tools.approval import ApprovalPolicy
 
     api_service = service or ForgeApiService(
@@ -346,6 +360,16 @@ def create_api_app(
 
     register_operating_routes(app, _authorized_surface)
 
+    # One discovery service for this process, composed here exactly like the
+    # operating surface: the store root comes from the deployment, never from a
+    # request. It creates no executor and starts no run.
+    discovery = (
+        discovery_service
+        if discovery_service is not None
+        else DiscoveryService()
+    )
+    register_discovery_routes(app, discovery)
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         return api_service.get_health().to_dict()
@@ -353,6 +377,18 @@ def create_api_app(
     @app.get("/api/status")
     def status() -> dict[str, Any]:
         return api_service.get_system_status().to_dict()
+
+    @app.get("/api/version")
+    def version() -> dict[str, Any]:
+        """Which build answered: version, commit, build time, backend and UI build.
+
+        Read-only and additive. The commit is read from ``git rev-parse`` once, when the
+        backend starts, and an unresolved fact is reported as ``"unknown"`` (or
+        ``"missing"`` for an unbuilt interface) rather than guessed. The payload contains
+        no secret and no environment value -- see ``app.build_info``.
+        """
+
+        return api_service.get_version_info()
 
     @app.get("/api/projects")
     def list_projects() -> list[dict[str, Any]]:
@@ -433,8 +469,65 @@ def create_api_app(
         # adds no Request object and no field to the byte-pinned request model.
         if not payload.get("description"):
             raise HTTPException(status_code=400, detail="Missing required field 'description'")
+
+        # THE DISCOVERY HAND-OFF. A caller may name the session whose specification
+        # this run is executing. The field is read here, at the HTTP boundary, and is
+        # deliberately NOT a field of `TaskRunRequest`: that model's field set is the
+        # contract several tests pin, and a discovery session id is context for the
+        # task text, never a source of execution authority (no command, workspace,
+        # profile, environment, timeout or allowlist can be named through it).
+        #
+        # The guard is HARD: an unconfirmed, cancelled, unknown or still-unanswered
+        # session refuses the run with 409/404 before anything is dispatched. When the
+        # session IS confirmed, the specification is prepended to the caller's own
+        # description and the run continues on the existing path -- same Planner, same
+        # Dispatcher, same routing/fallback/cost policy, same provider selection.
+        description = payload["description"]
+        discovery_session_id = payload.get("discovery_session_id")
+        if discovery_session_id is not None:
+            if not isinstance(discovery_session_id, str) or not discovery_session_id.strip():
+                raise body_error_exception(
+                    "'discovery_session_id' must be a non-empty string when supplied"
+                )
+            try:
+                specification = discovery.require_confirmed(discovery_session_id)
+            except UnknownDiscoverySession as unknown:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        **error_body(
+                            error_code=unknown.code,
+                            code=unknown.code,
+                        ),
+                        "error": str(unknown),
+                    },
+                ) from unknown
+            except DiscoveryNotConfirmed as not_confirmed:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        **error_body(
+                            error_code=not_confirmed.code,
+                            code=not_confirmed.code,
+                        ),
+                        "error": str(not_confirmed),
+                    },
+                ) from not_confirmed
+            except DiscoveryError as refused:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        **error_body(
+                            error_code=refused.code,
+                            code=refused.code,
+                        ),
+                        "error": str(refused),
+                    },
+                ) from refused
+            description = apply_specification(specification, description)
+
         req = TaskRunRequest(
-            description=payload["description"],
+            description=description,
             category=payload.get("category", "code"),
             task_id=payload.get("task_id"),
             provider_name=payload.get("provider_name"),

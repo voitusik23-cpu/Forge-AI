@@ -61,6 +61,19 @@ MAX_FAILOVER_ATTEMPTS = 3
 #: How long a 429 disables an account when the provider sends no ``Retry-After``.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 
+#: Status codes that are a *hard* account failure, not a temporary rate limit: the
+#: account itself cannot serve the request -- 402 means its balance/quota is spent,
+#: 401/403 mean its credential is rejected. Rotating to the next account is right, but
+#: the failed one must also leave the rotation for a while. Without this the ledger
+#: recorded ``last_error_code: 402`` and no cooldown, so the same dead account was
+#: chosen again on the very next reservation (measured: ``idx 0..4 err 402`` forever).
+HARD_ACCOUNT_FAILURE_STATUS_CODES = frozenset({401, 402, 403})
+
+#: How long a hard account failure keeps the account out of the rotation. One hour is
+#: long enough that a run does not burn its attempts on dead accounts again, and short
+#: enough that a topped-up balance or a fixed key returns without a manual reset.
+HARD_ACCOUNT_FAILURE_BACKOFF_SECONDS = 3600.0
+
 #: Upper bound on a provider-supplied ``Retry-After``: a malicious or broken header
 #: must not remove an account from the pool for days.
 MAX_RATE_LIMIT_BACKOFF_SECONDS = 3600.0
@@ -389,7 +402,15 @@ class RadoxKeyLedger:
         error_code: Optional[int] = None,
         retry_after: Optional[float] = None,
     ) -> None:
-        """Count one failed attempt; a 429 also starts this account's cooldown."""
+        """Count one failed attempt; a 429 or a hard account failure starts a cooldown.
+
+        A 429 keeps the provider's own ``Retry-After`` semantics. A 402/401/403 is a
+        hard *account* failure -- insufficient funds/quota, or a rejected credential --
+        so it disables the position for :data:`HARD_ACCOUNT_FAILURE_BACKOFF_SECONDS`.
+        The position is not removed from the pool: :meth:`candidates` keeps a disabled
+        position as a last resort, so a pool where every account is cooling down still
+        attempts them rather than refusing to work.
+        """
 
         with _STATE_LOCK:
             state = self._read()
@@ -410,7 +431,26 @@ class RadoxKeyLedger:
                 entry["disabled_until"] = _iso(
                     _utc_now() + datetime.timedelta(seconds=seconds)
                 )
+            elif entry["last_error_code"] in HARD_ACCOUNT_FAILURE_STATUS_CODES:
+                entry["disabled_until"] = _iso(
+                    _utc_now()
+                    + datetime.timedelta(seconds=HARD_ACCOUNT_FAILURE_BACKOFF_SECONDS)
+                )
             self._write(state)
+
+    def every_key_cooling_down(self, key_count: int) -> bool:
+        """Whether *every* position is currently disabled, i.e. this was a last resort.
+
+        The rotation still uses a disabled account when nothing else is left (see
+        :meth:`candidates`); this answers the question the failure message has to state
+        honestly: was the whole pool cooling down, or just the account that failed?
+        """
+
+        count = _non_negative_int(key_count)
+        if count <= 0:
+            return False
+        keys = self.report(count)["keys"]
+        return bool(keys) and all(entry["disabled"] for entry in keys)
 
     # ------------------------------------------------------------------- report
     def report(self, key_count: int) -> Dict[str, Any]:

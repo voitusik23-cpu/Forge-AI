@@ -1,63 +1,159 @@
 /* FORGE AI design tokens. One source of truth for colour, type, space and motion.
 
-   The palette is the agreed one -- Space Navy base, Graphite surfaces, Electric Violet and
-   Cyan accents, Ice White text -- and every theme switch below only changes variables. No
-   component knows which theme is active, which is what keeps Light and Dark both finished.
+   Light and Dark define exactly the same semantic names; only the values differ, so no component
+   knows which theme is active. Light is the owner-approved palette: a warm off-white page, white
+   cards, nested green-grey areas and the soft lime brand accent. Dark is unchanged: the near-black
+   page, charcoal surfaces, the violet/cyan accent pair and the anvil gold inside Кузница.
 
-   Accents deliberately redefine the *primary* variables (--violet*) instead of introducing a
-   new name: every existing rule already builds on those, so an accent change repaints the
-   whole interface without touching a single component. */
+   Rules this sheet enforces:
+   - the brand accent in Light is the soft lime only -- no purple, blue or orange primary accent;
+   - status is always colour *and* text/icon (see .badge / .notice in components.css), which is why
+     a status has a fill hue (--ok/--warn/--danger), an ink for tinted pills (--ok-ink/...) and a
+     tone for notices (--ok-text/...);
+   - focus is a soft ring: box-shadow 0 0 0 3px var(--accent-soft) with border-color
+     var(--accent-border);
+   - only three radii exist (8/12/16) and shadows stay short and soft.
+
+   Every colour that used to be a literal inside components.css/base.css is a token here, so a
+   theme switch is a value change and nothing else. */
 
 :root {
-  /* surfaces */
-  --space: #060915;
-  --space-raised: #0a1020;
-  --graphite: #121a2b;
-  --graphite-raised: #182136;
-  --graphite-hi: #1f2a42;
-  --hairline: rgba(148, 172, 255, 0.14);
-  --hairline-strong: rgba(148, 172, 255, 0.26);
-  --aurora: 0.20;
-  --surface-rail: linear-gradient(180deg, rgba(12, 18, 34, 0.92), rgba(8, 12, 24, 0.86));
-  --surface-topbar: linear-gradient(180deg, rgba(10, 16, 32, 0.86), rgba(10, 16, 32, 0.35));
-  --surface-card: linear-gradient(180deg, rgba(24, 33, 54, 0.72), rgba(11, 17, 32, 0.72));
-  --surface-raised: rgba(18, 26, 43, 0.6);
-  --surface-hover: rgba(31, 42, 66, 0.8);
-  --surface-input: rgba(6, 9, 21, 0.55);
-  --surface-sunken: rgba(148, 172, 255, 0.08);
-  --surface-auth: linear-gradient(160deg, #080d1c, #05070f);
-  --ok-text: #b8f3dc;
-  --warn-text: #f7e2b0;
-  --danger-text: #ffd2da;
+  /* ------------------------------------------------------------ colour: semantic palette */
+  --bg: #060915;
+  --surface-1: #14171b;
+  --surface-2: #14171b;
+  --surface-3: #14171b;
+  --surface-code: var(--surface-1);
+  --border: rgba(148, 172, 255, 0.14);
+  --border-strong: rgba(148, 172, 255, 0.26);
+  --text: #eef2ff;
+  --text-soft: #b9c4e0;
+  --text-muted: #8492b4;
+  --text-faint: #5b6b88;
 
-  /* accents (primary pair, replaced by [data-accent]) */
-  --violet: #7c5cff;
-  --violet-hi: #9a80ff;
-  --violet-dim: rgba(124, 92, 255, 0.16);
-  --cyan: #22d3ee;
-  --cyan-hi: #67e8f9;
-  --cyan-dim: rgba(34, 211, 238, 0.14);
-  /* Informational text on a tinted badge/link. Separate from --cyan-hi, which is a *fill* colour
-     used by gradients: on a light surface #67e8f9 as text is unreadable, so Light redefines only
-     this one and every gradient keeps its hue. */
+  /* brand accent. Components read this or a composite built from it, never a literal. */
+  --accent: #7c5cff;
+  --accent-hover: #9a80ff;
+  --accent-soft: rgba(124, 92, 255, 0.16);
+  --accent-border: rgba(124, 92, 255, 0.35);
+  /* Ink on an accent fill. Light uses the dark page ink there, so contrast holds on the lime. */
+  --on-accent: #070b18;
+  /* Ink of the avatar initials, which sit on the pale accent gradient. */
+  --avatar-ink: #0b1020;
+
+  /* status: hue for dots/fills, ink for the text on a tint, tone for a notice on a solid tint */
+  --ok: #34d399;
+  --ok-ink: #34d399;
+  --ok-text: #b8f3dc;
+  --warn: #fbbf24;
+  --warn-ink: #fbbf24;
+  --warn-text: #f7e2b0;
+  --danger: #fb7185;
+  --danger-ink: #fb7185;
+  --danger-text: #ffd2da;
+  --info: #22d3ee;
   --info-text: #67e8f9;
 
-  /* type */
-  --ice: #eef2ff;
-  --ice-dim: #b9c4e0;
-  --muted: #8492b4;
-  --faint: #5b6b88;
+  /* Links: the value the browser already paints for an unvisited anchor, so Dark is untouched. */
+  --link: #0000ee;
 
-  /* semantic */
-  --ok: #34d399;
-  --warn: #fbbf24;
-  --danger: #fb7185;
+  /* depth: Dark keeps its flat charcoal cards, Light gets the two approved soft shadows */
+  --shadow-1: none;
+  --shadow-2: none;
+  --dot-glow: 0 0 12px currentColor;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  /* surface roles, expressed once as aliases so a surface is renamed in one place */
+  --surface-card: var(--surface-1);
+  --surface-raised: var(--surface-1);
+  --surface-rail: var(--surface-1);
+  --surface-topbar: var(--surface-1);
+  --surface-input: var(--surface-1);
+  --surface-hover: var(--surface-3);
+  --surface-sunken: var(--surface-2);
+  --surface-auth: #14171b;
+  --neutral-soft: rgba(148, 172, 255, 0.1);
+  --shadow-panel: var(--shadow-2);
+
+  /* composite roles: gradients, glows, sheen and inks that components used to spell out */
+  --nav-active-bg: linear-gradient(90deg, rgba(124, 92, 255, 0.22), rgba(34, 211, 238, 0.06));
+  --nav-marker: linear-gradient(180deg, var(--violet-hi), var(--cyan));
+  --nav-marker-glow: 0 0 14px rgba(124, 92, 255, 0.8);
+  --hover-wash: rgba(124, 92, 255, 0.1);
+  --hover-wash-faint: rgba(124, 92, 255, 0.07);
+  --row-selected-bg: linear-gradient(90deg, rgba(124, 92, 255, 0.18), rgba(34, 211, 238, 0.06));
+  --brand-glow: drop-shadow(0 6px 18px rgba(124, 92, 255, 0.45));
+  --card-sheen: linear-gradient(90deg, transparent, rgba(124, 92, 255, 0.55), transparent);
+  --accent-fill: linear-gradient(135deg, var(--cyan-hi), var(--violet-hi));
+  --glyph-bg: linear-gradient(135deg, rgba(124, 92, 255, 0.35), rgba(34, 211, 238, 0.22));
+  --meter-fill: linear-gradient(90deg, var(--violet), var(--cyan));
+  --meter-glow: 0 0 16px rgba(34, 211, 238, 0.45);
+  --slogan-gradient: linear-gradient(120deg, var(--cyan-hi), var(--violet-hi));
+  --page-aurora:
+    radial-gradient(60% 60% at 18% 0%, rgba(124, 92, 255, 0.2), transparent 70%),
+    radial-gradient(50% 50% at 82% 6%, rgba(34, 211, 238, 0.14), transparent 72%);
+  --auth-aurora:
+    radial-gradient(70% 60% at 20% 20%, rgba(124, 92, 255, 0.28), transparent 70%),
+    radial-gradient(60% 50% at 80% 80%, rgba(34, 211, 238, 0.2), transparent 72%),
+    var(--surface-auth);
+  --halo-border: rgba(124, 92, 255, 0.22);
+  --halo-shadow: inset 0 0 120px rgba(124, 92, 255, 0.16);
+  --halo2-border: rgba(34, 211, 238, 0.16);
+  --scrollbar-thumb: linear-gradient(180deg, rgba(124, 92, 255, 0.5), rgba(34, 211, 238, 0.35));
+  --selection-bg: rgba(124, 92, 255, 0.35);
+
+  /* primary action */
+  --primary-bg: linear-gradient(135deg, var(--violet), #5b8cff 60%, var(--cyan));
+  --primary-bg-hover: linear-gradient(135deg, var(--violet), #5b8cff 60%, var(--cyan));
+  --primary-ink: var(--on-accent);
+  --primary-shadow: 0 10px 28px rgba(124, 92, 255, 0.35);
+  --primary-shadow-hover: 0 14px 34px rgba(124, 92, 255, 0.45);
+
+  /* focus */
+  --focus-outline: #e0a33a;
+  --focus-outline-button: #22d3ee;
+  --focus-border-search: rgba(34, 211, 238, 0.5);
+  --focus-border-input: rgba(124, 92, 255, 0.6);
+
+  /* Кузница workspace: the anvil's gold in Dark, the brand lime in Light */
+  --workbench-accent: #e0a33a;
+  --workbench-primary-bg: linear-gradient(135deg, #e8b65f, var(--workbench-accent) 55%, #b97f22);
+  --workbench-primary-bg-hover: linear-gradient(135deg, #e8b65f, var(--workbench-accent) 55%, #b97f22);
+  --workbench-primary-ink: #1a1204;
+  --workbench-primary-shadow: 0 10px 26px rgba(224, 163, 58, 0.28);
+  --workbench-primary-shadow-hover: 0 14px 34px rgba(224, 163, 58, 0.42);
+  --forge-info: #4a86c8;
+  --forge-info-text: #a8c8ee;
+
+  /* the logo gradient: fixed stops, replaced by tokens so Light can use the lime */
+  --brand-mark-1: #9a80ff;
+  --brand-mark-2: #5b8cff;
+  --brand-mark-3: #67e8f9;
+
+  /* legacy names kept as aliases: components and inline styles still read them, and the accent
+     sets below keep working exactly as before */
+  --space: var(--bg);
+  --graphite: var(--surface-1);
+  --graphite-raised: var(--surface-2);
+  --graphite-hi: var(--surface-3);
+  --hairline: var(--border);
+  --hairline-strong: var(--border-strong);
+  --ice: var(--text);
+  --ice-dim: var(--text-soft);
+  --muted: var(--text-muted);
+  --faint: var(--text-faint);
+  --violet: var(--accent);
+  --violet-hi: var(--accent-hover);
+  --cyan: #22d3ee;
+  --cyan-hi: #67e8f9;
+  --r-sm: var(--radius-sm);
+  --r-md: var(--radius-md);
+  --r-lg: var(--radius-lg);
+  --r-xl: 22px;
 
   /* geometry */
-  --r-sm: 8px;
-  --r-md: 12px;
-  --r-lg: 16px;
-  --r-xl: 22px;
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -66,8 +162,6 @@
   --sp-6: 32px;
   --sp-7: 48px;
 
-  /* depth */
-  --shadow-panel: 0 18px 48px rgba(3, 6, 18, 0.55);
   --glow-violet: 0 0 0 1px rgba(124, 92, 255, 0.35), 0 10px 30px rgba(124, 92, 255, 0.22);
   --glow-cyan: 0 0 0 1px rgba(34, 211, 238, 0.32), 0 10px 30px rgba(34, 211, 238, 0.16);
 
@@ -85,81 +179,46 @@
   --speed: 160ms;
 }
 
-/* ------------------------------------------------------------------ light appearance */
-:root[data-theme="light"] {
-  --space: #eef2fb;
-  --space-raised: #ffffff;
-  --graphite: #ffffff;
-  --graphite-raised: #f6f8ff;
-  --graphite-hi: #e9eefb;
-  --hairline: rgba(21, 34, 64, 0.14);
-  --hairline-strong: rgba(21, 34, 64, 0.26);
-  --aurora: 0.10;
-  --surface-rail: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(243, 246, 255, 0.9));
-  --surface-topbar: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.6));
-  --surface-card: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(246, 249, 255, 0.94));
-  --surface-raised: rgba(255, 255, 255, 0.78);
-  --surface-hover: rgba(232, 238, 251, 0.95);
-  --surface-input: rgba(255, 255, 255, 0.85);
-  --surface-sunken: rgba(21, 34, 64, 0.05);
-  --surface-auth: linear-gradient(160deg, #f3f6ff, #e4eaff);
-  --ok-text: #0b6b4a;
-  --warn-text: #8a5a12;
-  --danger-text: #9b2c45;
-
-  --ice: #101a33;
-  --ice-dim: #2f3d5f;
-  --muted: #5b6884;
-  --faint: #8b96b4;
-
-  /* Semantic colours are used as *text* on their own 9-12% tint, which a light surface washes out:
-     the same hue is therefore darker here than in Dark, where it sits on graphite. Measured on the
-     tinted badge background these reach 4.5:1 or better instead of 3.0-3.6:1. */
-  --ok: #0a7350;
-  --warn: #8a5a12;
-  --danger: #a5283f;
-
-  --info-text: #0b6a86;
-
-  /* The Кузница blue, darkened for a light surface: #a8c8ee on white is about 1.7:1 at badge size.
-     A separate name because `.forge-workbench` sets --forge-blue locally. */
-  --forge-info-text: #27588c;
-
-  --shadow-panel: 0 16px 40px rgba(21, 34, 64, 0.12);
-  --glow-violet: 0 0 0 1px rgba(124, 92, 255, 0.30), 0 10px 24px rgba(124, 92, 255, 0.16);
-  --glow-cyan: 0 0 0 1px rgba(14, 165, 190, 0.30), 0 10px 24px rgba(34, 211, 238, 0.16);
-}
-
 /* ------------------------------------------------------------------------ accent sets */
+/* Dark only, by design: the Light accent is fixed to the approved lime, so the block at the end of
+   this file overrides these four choices. Each set mirrors the semantic accent family so
+   --accent and the legacy --violet/--cyan names never disagree. */
+
 :root[data-accent="cyan"] {
+  --accent: #22d3ee;
+  --accent-hover: #67e8f9;
+  --accent-soft: rgba(34, 211, 238, 0.18);
+  --accent-border: rgba(34, 211, 238, 0.35);
   --violet: #22d3ee;
   --violet-hi: #67e8f9;
-  --violet-dim: rgba(34, 211, 238, 0.18);
   --cyan: #7c5cff;
   --cyan-hi: #9a80ff;
-  --cyan-dim: rgba(124, 92, 255, 0.14);
   --glow-violet: 0 0 0 1px rgba(34, 211, 238, 0.35), 0 10px 30px rgba(34, 211, 238, 0.22);
   --glow-cyan: 0 0 0 1px rgba(124, 92, 255, 0.32), 0 10px 30px rgba(124, 92, 255, 0.16);
 }
 
 :root[data-accent="amber"] {
+  --accent: #f0a63c;
+  --accent-hover: #ffc86b;
+  --accent-soft: rgba(240, 166, 60, 0.18);
+  --accent-border: rgba(240, 166, 60, 0.35);
   --violet: #f0a63c;
   --violet-hi: #ffc86b;
-  --violet-dim: rgba(240, 166, 60, 0.18);
   --cyan: #5b8cff;
   --cyan-hi: #8fb0ff;
-  --cyan-dim: rgba(91, 140, 255, 0.14);
   --glow-violet: 0 0 0 1px rgba(240, 166, 60, 0.38), 0 10px 30px rgba(240, 166, 60, 0.22);
 }
 
 :root[data-accent="emerald"] {
+  --accent: #2fbf8f;
+  --accent-hover: #63dcb0;
+  --accent-soft: rgba(47, 191, 143, 0.18);
+  --accent-border: rgba(47, 191, 143, 0.35);
   --violet: #2fbf8f;
   --violet-hi: #63dcb0;
-  --violet-dim: rgba(47, 191, 143, 0.18);
   --cyan: #4f9dff;
   --cyan-hi: #86bcff;
-  --cyan-dim: rgba(79, 157, 255, 0.14);
-  --glow-violet: 0 0 0 1px rgba(47, 191, 143, 0.38), 0 10px 30px rgba(47, 191, 143, 0.20);
+  --glow-violet: 0 0 0 1px rgba(47, 191, 143, 0.38), 0 10px 30px rgba(47, 191, 143, 0.2);
 }
 
 /* --------------------------------------------------------------------------- density */
@@ -179,22 +238,118 @@
   scroll-behavior: auto !important;
 }
 
-/* ---------------------------------------------------------------------------------------------
- * Forge AI brand layer.
- *
- * The palette is the desktop identity: charcoal surfaces, the anvil's warm gold for the brand and
- * primary actions, restrained blue for technical detail. Only token values are overridden here, so
- * every existing screen inherits the identity without any markup or behaviour change, and both the
- * Russian and English interfaces are untouched.
- * ------------------------------------------------------------------------------------------- */
-:root {
-  --shadow-panel: #14171b;
-  --surface-auth: #14171b;
-  --surface-card: #14171b;
-  --surface-hover: #14171b;
-  --surface-input: #14171b;
-  --surface-rail: #14171b;
-  --surface-raised: #14171b;
-  --surface-sunken: #14171b;
-  --surface-topbar: #14171b;
+/* ------------------------------------------------------------------ light appearance */
+/* The owner-approved Light palette, verbatim. This block comes last on purpose: the accent sets
+   above are a Dark customisation, and in Light the brand accent is the soft lime and nothing else.
+   Only values change -- every name a component reads is already defined above. */
+
+:root[data-theme="light"] {
+  /* palette */
+  --bg: #f7f8f6;
+  --surface-1: #ffffff;
+  --surface-2: #f1f4ef;
+  --surface-3: #e9ede7;
+  --border: #e2e6df;
+  --border-strong: #d3d9ce;
+  --text: #1b2019;
+  --text-soft: #3d4539;
+  --text-muted: #5a6358;
+  --text-faint: #66705f;
+
+  --accent: #7fa83c;
+  --accent-hover: #6e9433;
+  --accent-soft: #eef5e2;
+  --accent-border: #c9dda6;
+  --on-accent: #1b2019;
+  --avatar-ink: #1b2019;
+
+  /* Status text sits on its own tint, which a light surface washes out: the ink and the notice
+     tone are therefore darker than the palette hue, measured at 4.6:1 or better on that tint. */
+  --ok: #3f7a33;
+  --ok-ink: #35682a;
+  --ok-text: #3f7a33;
+  --warn: #9a6b12;
+  --warn-ink: #7a530e;
+  --warn-text: #7a530e;
+  --danger: #a63a2e;
+  --danger-ink: #a63a2e;
+  --danger-text: #a63a2e;
+  --info: #2c5f63;
+  --info-text: #2c5f63;
+  /* A deep shade of the brand lime: a link has to read as text (4.5:1), which the lime itself
+     does not reach on white, and Light may not fall back to the browser's blue. */
+  --link: #3f6b2a;
+
+  /* depth: short and soft, never a heavy drop shadow */
+  --shadow-1: 0 1px 2px rgb(24 32 20 / 6%);
+  --shadow-2: 0 6px 20px rgb(24 32 20 / 8%);
+  --dot-glow: none;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  /* surfaces */
+  --surface-code: var(--surface-3);
+  --surface-auth: #f1f4ef;
+  --neutral-soft: var(--surface-2);
+
+  /* composite roles, re-cut in the lime family */
+  --nav-active-bg: var(--accent-soft);
+  --nav-marker: linear-gradient(180deg, var(--accent), var(--accent-hover));
+  --nav-marker-glow: none;
+  --hover-wash: var(--surface-3);
+  --hover-wash-faint: var(--surface-2);
+  --row-selected-bg: linear-gradient(90deg, var(--accent-soft), #f7faf1);
+  --brand-glow: drop-shadow(0 6px 18px rgb(127 168 60 / 18%));
+  --card-sheen: linear-gradient(90deg, transparent, var(--accent-border), transparent);
+  --accent-fill: linear-gradient(135deg, #a8c76b, #7fa83c);
+  --glyph-bg: linear-gradient(135deg, rgb(127 168 60 / 20%), rgb(127 168 60 / 8%));
+  --meter-fill: linear-gradient(90deg, var(--accent), #5c8636);
+  --meter-glow: none;
+  --slogan-gradient: linear-gradient(120deg, #3f6b2a, #6e9433);
+  --page-aurora:
+    radial-gradient(60% 60% at 18% 0%, rgb(127 168 60 / 10%), transparent 70%),
+    radial-gradient(50% 50% at 82% 6%, rgb(127 168 60 / 6%), transparent 72%);
+  --auth-aurora:
+    radial-gradient(70% 60% at 20% 20%, rgb(127 168 60 / 14%), transparent 70%),
+    radial-gradient(60% 50% at 80% 80%, rgb(127 168 60 / 8%), transparent 72%),
+    var(--surface-auth);
+  --halo-border: var(--accent-border);
+  --halo-shadow: inset 0 0 120px rgb(127 168 60 / 10%);
+  --halo2-border: rgb(127 168 60 / 10%);
+  --scrollbar-thumb: linear-gradient(180deg, #a8c76b, #7fa83c);
+  --selection-bg: #dcebc6;
+
+  --primary-bg: var(--accent);
+  --primary-bg-hover: var(--accent-hover);
+  --primary-ink: var(--on-accent);
+  --primary-shadow: var(--shadow-1);
+  --primary-shadow-hover: var(--shadow-2);
+
+  --focus-outline: var(--accent);
+  --focus-outline-button: var(--accent);
+  --focus-border-search: var(--accent-border);
+  --focus-border-input: var(--accent-border);
+
+  --workbench-accent: var(--accent);
+  --workbench-primary-bg: var(--accent);
+  --workbench-primary-bg-hover: var(--accent-hover);
+  --workbench-primary-ink: var(--on-accent);
+  --workbench-primary-shadow: var(--shadow-1);
+  --workbench-primary-shadow-hover: var(--shadow-2);
+  --forge-info: var(--info);
+  --forge-info-text: var(--info-text);
+
+  --brand-mark-1: #6e9433;
+  --brand-mark-2: #7fa83c;
+  --brand-mark-3: #a8c76b;
+
+  /* legacy names: Light keeps the gradient language, in lime rather than violet/cyan */
+  --violet: var(--accent);
+  --violet-hi: var(--accent-hover);
+  --cyan: #5c8636;
+  --cyan-hi: #a8c76b;
+  --r-xl: var(--radius-lg);
+  --glow-violet: 0 0 0 3px var(--accent-soft);
+  --glow-cyan: 0 0 0 3px var(--accent-soft);
 }

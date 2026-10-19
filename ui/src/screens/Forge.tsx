@@ -20,14 +20,23 @@ import { t, type Lang } from "../i18n";
 import type { BackendState } from "../api/client";
 import {
   TASK_CATEGORIES,
+  cancelDiscovery,
   catalogueModelsFor,
   codeWriteOf,
+  confirmDiscovery,
   dispatchTask,
   isTerminalRecord,
+  loadDiscoverySpecification,
   loadProjects,
   loadRunRecord,
   loadUiDefaults,
+  sendDiscoveryAnswers,
+  skipDiscoveryClarification,
+  startDiscovery,
   type CodeWriteResult,
+  type DiscoverySessionPayload,
+  type DiscoverySpecification,
+  type DiscoverySpecificationPayload,
   type DispatchResult,
   type Failure,
   type ProjectInfo,
@@ -66,6 +75,67 @@ type DispatchState =
   | { status: "sent"; result: DispatchResult }
   | { status: "failed"; failure: Failure };
 
+/** The four steps of the Кузница flow. Each one is a real request, not a drawing. */
+type DiscoveryPhase = "idea" | "clarify" | "spec" | "run";
+
+const DISCOVERY_STEPS: Array<{ id: DiscoveryPhase; labelKey: string }> = [
+  { id: "idea", labelKey: "forge.discovery.step.idea" },
+  { id: "clarify", labelKey: "forge.discovery.step.clarify" },
+  { id: "spec", labelKey: "forge.discovery.step.spec" },
+  { id: "run", labelKey: "forge.discovery.step.run" },
+];
+
+/** The specification fields, in the order the brief asks for them. */
+type SpecKey = "goal" | "project_type" | "users" | "core_features" | "platform" | "integrations" |
+  "data_storage" | "auth" | "notifications" | "constraints" | "acceptance_criteria" | "priorities";
+
+const SPEC_FIELDS: Array<{ key: SpecKey; labelKey: string }> = [
+  { key: "goal", labelKey: "forge.discovery.spec.goal" },
+  { key: "project_type", labelKey: "forge.discovery.spec.project_type" },
+  { key: "users", labelKey: "forge.discovery.spec.users" },
+  { key: "core_features", labelKey: "forge.discovery.spec.core_features" },
+  { key: "platform", labelKey: "forge.discovery.spec.platform" },
+  { key: "integrations", labelKey: "forge.discovery.spec.integrations" },
+  { key: "data_storage", labelKey: "forge.discovery.spec.data_storage" },
+  { key: "auth", labelKey: "forge.discovery.spec.auth" },
+  { key: "notifications", labelKey: "forge.discovery.spec.notifications" },
+  { key: "constraints", labelKey: "forge.discovery.spec.constraints" },
+  { key: "acceptance_criteria", labelKey: "forge.discovery.spec.acceptance_criteria" },
+  { key: "priorities", labelKey: "forge.discovery.spec.priorities" },
+];
+
+/** The one honest sentence per failure, with the status kept visible next to it. */
+const failureLabel = (lang: Lang, failure: Failure): string => {
+  if (failure.kind === "unauthorized") return t(lang, "forge.state.unauthorized");
+  if (failure.kind === "disconnected") return t(lang, "forge.state.disconnected");
+  const code = failure.code ?? "";
+  if (failure.status === 409 && code === "discovery_not_confirmed")
+    return t(lang, "forge.discovery.not_confirmed");
+  if (failure.status === 409 && code === "discovery_not_ready")
+    return t(lang, "forge.discovery.not_ready");
+  if (failure.status === 409 && code === "discovery_state_conflict")
+    return t(lang, "forge.discovery.state_conflict");
+  if (failure.status === 404 && code === "unknown_discovery_session")
+    return t(lang, "forge.discovery.unknown_session");
+  if (failure.status === 400 && code === "invalid_discovery_answer")
+    return t(lang, "forge.discovery.invalid_answer");
+  return `${t(lang, "forge.state.error")}: ${failure.path} → HTTP ${failure.status}`;
+};
+
+/** What the refusal means for the next click, when the code says something specific. */
+const failureHint = (lang: Lang, failure: Failure): string => {
+  const code = failure.code ?? "";
+  if (failure.status === 409 && code === "discovery_not_confirmed")
+    return t(lang, "forge.discovery.not_confirmed.detail");
+  if (failure.status === 409 && code === "discovery_not_ready")
+    return t(lang, "forge.discovery.not_ready.detail");
+  if (failure.status === 409 && code === "discovery_state_conflict")
+    return t(lang, "forge.discovery.state_conflict.detail");
+  if (failure.status === 404 && code === "unknown_discovery_session")
+    return t(lang, "forge.discovery.unknown_session.detail");
+  return "";
+};
+
 /** One honest message per failure kind: 401/403, no answer at all, or an answered error. */
 const FailureNotice = ({
   lang,
@@ -75,31 +145,70 @@ const FailureNotice = ({
   lang: Lang;
   failure: Failure;
   onRetry?: () => void;
-}) => (
-  <div className={`notice ${failure.kind === "error" ? "warn" : "danger"}`}>
-    <div>
-      {failure.kind === "unauthorized"
-        ? t(lang, "forge.state.unauthorized")
-        : failure.kind === "disconnected"
-          ? t(lang, "forge.state.disconnected")
-          : `${t(lang, "forge.state.error")}: ${failure.path} → HTTP ${failure.status}`}
-    </div>
-    {failure.kind === "error" || failure.kind === "disconnected" ? (
-      failure.detail ? (
-        <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
-          {failure.detail}
+}) => {
+  const hint = failureHint(lang, failure);
+  return (
+    <div className={`notice ${failure.kind === "error" ? "warn" : "danger"}`}>
+      <div>{failureLabel(lang, failure)}</div>
+      {failure.kind === "error" ? (
+        <div className="small mono" style={{ marginTop: 6, wordBreak: "break-word" }}>
+          HTTP {failure.status}
+          {failure.code ? ` · ${failure.code}` : ""} · {failure.path}
         </div>
-      ) : null
-    ) : null}
-    {onRetry ? (
-      <div className="row" style={{ marginTop: 10 }}>
-        <Button size="small" onClick={onRetry}>
-          {t(lang, "action.retry")}
-        </Button>
-      </div>
-    ) : null}
-  </div>
-);
+      ) : null}
+      {hint !== "" ? (
+        <div className="small" style={{ marginTop: 6 }}>
+          {hint}
+        </div>
+      ) : null}
+      {failure.kind === "error" || failure.kind === "disconnected" ? (
+        failure.detail ? (
+          <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+            {failure.detail}
+          </div>
+        ) : null
+      ) : null}
+      {onRetry ? (
+        <div className="row" style={{ marginTop: 10 }}>
+          <Button size="small" onClick={onRetry}>
+            {t(lang, "action.retry")}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+/** The step rail: which step is current, which ones were actually completed. */
+const StepRail = ({ lang, phase }: { lang: Lang; phase: DiscoveryPhase }) => {
+  const current = DISCOVERY_STEPS.findIndex((step) => step.id === phase);
+  return (
+    <ol className="forge-steps">
+      {DISCOVERY_STEPS.map((step, index) => {
+        const state = index < current ? "done" : index === current ? "current" : "next";
+        return (
+          <li className={`forge-step ${state}`} key={step.id}>
+            <span className="forge-step-index">{index + 1}</span>
+            <span>{t(lang, step.labelKey)}</span>
+            {index === current ? (
+              <span className="small muted">· {t(lang, "forge.discovery.step.current")}</span>
+            ) : null}
+          </li>
+        );
+      })}
+    </ol>
+  );
+};
+
+/** One specification value as text: a list joins with `;`, an empty field says so. */
+const specValue = (specification: DiscoverySpecification | undefined, key: SpecKey): string => {
+  if (!specification) return "";
+  const value = specification[key];
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter((item) => item !== "").join("; ");
+  }
+  return typeof value === "string" ? value.trim() : "";
+};
 
 const Facts = ({ items }: { items: Array<[string, string]> }) => (
   <div className="forge-facts">
@@ -349,6 +458,197 @@ export const Forge = ({
   const [notice, setNotice] = useState("");
   const inFlight = useRef<AbortController | null>(null);
 
+  // ------------------------------------------------------------------ discovery
+  // The session is the Core's own record: `session.state` decides which step is reachable, and
+  // only a CONFIRMED session can be run (the backend enforces it with 409). Nothing below sets a
+  // step from a guess; every transition follows an answer that actually arrived.
+  const [phase, setPhase] = useState<DiscoveryPhase>("idea");
+  const [discoveryBusy, setDiscoveryBusy] = useState("");
+  const [discoverySession, setDiscoverySession] = useState<DiscoverySessionPayload | null>(null);
+  const [discoverySpec, setDiscoverySpec] = useState<DiscoverySpecificationPayload | null>(null);
+  const [answerDraft, setAnswerDraft] = useState<Record<string, string>>({});
+  const [discoveryFailure, setDiscoveryFailure] = useState<Failure | null>(null);
+  const [discoveryNotice, setDiscoveryNotice] = useState("");
+
+  const session = discoverySession?.session ?? null;
+  const sessionId = String(session?.session_id ?? "");
+  const sessionState = String(session?.state ?? "");
+  const questions = discoverySession?.questions ?? [];
+  const confirmed = sessionState === "CONFIRMED";
+
+  /**
+   * A refused dispatch belongs to the step it was attempted from.
+   *
+   * Without this, the honest 409 of one step would sit under the next step's form and look like
+   * that step had already failed. Clearing it says only "this step has not dispatched yet".
+   */
+  const dropFailedDispatch = () => {
+    if (dispatch.status === "failed") setDispatch({ status: "idle" });
+  };
+
+  /** Take a session answer as it came back, keeping what the user already typed. */
+  const adoptSession = (payload: DiscoverySessionPayload) => {
+    setDiscoverySession(payload);
+    const stored = payload.session?.answers ?? [];
+    const draft: Record<string, string> = {};
+    for (const answer of stored) {
+      const id = String(answer.question_id ?? "");
+      if (id !== "" && typeof answer.text === "string" && answer.text !== "") draft[id] = answer.text;
+    }
+    setAnswerDraft(draft);
+    setDiscoveryFailure(null);
+  };
+
+  /** Step 3 always reads the specification from its own route, never from a cached guess. */
+  const openSpecification = async (id: string) => {
+    if (id === "") {
+      setDiscoveryFailure({
+        kind: "error",
+        status: 0,
+        path: "/api/discovery/sessions",
+        detail: "the Core returned a session without a session_id",
+      });
+      return;
+    }
+    setDiscoveryBusy("spec");
+    const outcome = await loadDiscoverySpecification(id);
+    setDiscoveryBusy("");
+    if (!outcome.ok) {
+      setDiscoveryFailure(outcome.failure);
+      return;
+    }
+    setDiscoverySpec(outcome.value);
+    setDiscoveryNotice("");
+    setPhase("spec");
+  };
+
+  /** Step 1 -> step 2 (or straight to step 3 when the Core found nothing essential missing). */
+  const continueFromIdea = async () => {
+    if (discoveryBusy !== "") {
+      setDiscoveryNotice(t(lang, "forge.discovery.busy"));
+      return;
+    }
+    const goal = description.trim();
+    if (goal === "") {
+      setDescriptionError(t(lang, "runs.error.description"));
+      setDiscoveryNotice("");
+      return;
+    }
+    setDescriptionError("");
+    dropFailedDispatch();
+    setDiscoveryFailure(null);
+    setDiscoveryNotice("");
+    setDiscoveryBusy("idea");
+    const outcome = await startDiscovery(goal);
+    setDiscoveryBusy("");
+    if (!outcome.ok) {
+      setDiscoveryFailure(outcome.failure);
+      return;
+    }
+    adoptSession(outcome.value);
+    const id = String(outcome.value.session?.session_id ?? "");
+    const state = String(outcome.value.session?.state ?? "");
+    if (state === "READY_FOR_PLANNING") {
+      setDiscoveryNotice(t(lang, "forge.discovery.ready"));
+      await openSpecification(id);
+      return;
+    }
+    setPhase("clarify");
+  };
+
+  /** Step 2: the answers the user actually wrote. An empty field is not sent. */
+  const sendAnswers = async () => {
+    if (discoveryBusy !== "" || sessionId === "") return;
+    const answers = questions
+      .map((question) => {
+        const id = String(question.id ?? "");
+        return { question_id: id, text: (answerDraft[id] ?? "").trim() };
+      })
+      .filter((answer) => answer.question_id !== "" && answer.text !== "");
+    if (answers.length === 0) {
+      setDiscoveryNotice(t(lang, "forge.discovery.answers.empty"));
+      return;
+    }
+    setDiscoveryNotice("");
+    setDiscoveryFailure(null);
+    dropFailedDispatch();
+    setDiscoveryBusy("answers");
+    const outcome = await sendDiscoveryAnswers(sessionId, answers);
+    setDiscoveryBusy("");
+    if (!outcome.ok) {
+      setDiscoveryFailure(outcome.failure);
+      return;
+    }
+    adoptSession(outcome.value);
+    const state = String(outcome.value.session?.state ?? "");
+    if (state === "READY_FOR_PLANNING" || state === "CONFIRMED") {
+      setDiscoveryNotice(t(lang, "forge.discovery.ready"));
+      await openSpecification(sessionId);
+      return;
+    }
+    setDiscoveryNotice(t(lang, "forge.discovery.answers.accepted"));
+  };
+
+  /** Step 2 secondary action: end the round without answering everything. */
+  const skipClarification = async () => {
+    if (discoveryBusy !== "" || sessionId === "") return;
+    dropFailedDispatch();
+    setDiscoveryBusy("skip");
+    setDiscoveryFailure(null);
+    setDiscoveryNotice("");
+    const outcome = await skipDiscoveryClarification(sessionId);
+    setDiscoveryBusy("");
+    if (!outcome.ok) {
+      setDiscoveryFailure(outcome.failure);
+      return;
+    }
+    adoptSession(outcome.value);
+    await openSpecification(sessionId);
+  };
+
+  /** «Отменить»: close the session; the idea stays in the field. */
+  const cancelSession = async () => {
+    if (discoveryBusy !== "" || sessionId === "") return;
+    dropFailedDispatch();
+    setDiscoveryBusy("cancel");
+    setDiscoveryFailure(null);
+    setDiscoveryNotice("");
+    const outcome = await cancelDiscovery(sessionId);
+    setDiscoveryBusy("");
+    if (!outcome.ok) {
+      setDiscoveryFailure(outcome.failure);
+      return;
+    }
+    adoptSession(outcome.value);
+    setDiscoverySpec(null);
+    setPhase("idea");
+    setDiscoveryNotice(t(lang, "forge.discovery.cancelled"));
+  };
+
+  /** Step 3 -> step 4: the freeze that lets a run through. */
+  const confirmSpecification = async () => {
+    if (discoveryBusy !== "" || sessionId === "") return;
+    dropFailedDispatch();
+    setDiscoveryBusy("confirm");
+    setDiscoveryFailure(null);
+    setDiscoveryNotice("");
+    const outcome = await confirmDiscovery(sessionId);
+    setDiscoveryBusy("");
+    if (!outcome.ok) {
+      setDiscoveryFailure(outcome.failure);
+      return;
+    }
+    adoptSession(outcome.value);
+    setDiscoveryNotice(t(lang, "forge.discovery.spec.confirmed"));
+    setPhase("run");
+  };
+
+  /** Back from step 3 to step 2. Only possible before the confirmation, by the Core's own rule. */
+  const editAnswers = () => {
+    setDiscoveryNotice("");
+    setPhase("clarify");
+  };
+
   // ------------------------------------------------------------------ run record
   const [record, setRecord] = useState<RunRecord | null>(null);
   const [recordFailure, setRecordFailure] = useState<Failure | null>(null);
@@ -394,6 +694,12 @@ export const Forge = ({
 
   const polling = runId !== "" && recordFailure === null && !terminal;
 
+  // The mock provider is the offline executor: it answers without touching a file. The write
+  // switch is therefore disabled for it and the run is labelled honestly. For every real
+  // provider the switch stays live, because the guarded writer works there.
+  const mockSelected = provider === "mock";
+  const effectiveWriteMode = writeMode && !mockSelected;
+
   const submit = async () => {
     // The button is deliberately never disabled. A disabled button with no reason is what made
     // "Запустить задачу" look dead; every click now either dispatches or says why it did not.
@@ -412,7 +718,7 @@ export const Forge = ({
     setRecord(null);
     setRecordFailure(null);
     setDispatch({ status: "pending" });
-    setRequestedWriteMode(writeMode);
+    setRequestedWriteMode(effectiveWriteMode);
     const controller = new AbortController();
     inFlight.current = controller;
     // Only a provider the Core itself reported is sent; an empty or stale selection leaves the
@@ -428,7 +734,11 @@ export const Forge = ({
         providerName: providerToSend,
         modelName: modelToSend,
         projectId: selectedProject === "" ? undefined : selectedProject,
-        writeMode,
+        writeMode: effectiveWriteMode,
+        // The session travels with the run so the Core can apply its own confirmation guard: an
+        // unconfirmed session is refused with 409 discovery_not_confirmed, and that refusal is
+        // shown as it arrived instead of being hidden by the interface.
+        discoverySessionId: sessionId,
         idempotencyKey,
         signal: controller.signal,
       });
@@ -511,6 +821,142 @@ export const Forge = ({
     ]
       .filter((part) => part !== "")
       .join(" · ") || t(lang, "forge.task.route.auto");
+
+  /**
+   * The run block: provider, model, category, write switch and the submit itself.
+   *
+   * Drawn on step 4 and, deliberately, one step earlier — the same button that would run a
+   * confirmed session is the one that shows the Core's 409 refusal while it is not confirmed.
+   */
+  const runControls = (
+    <div className="stack" style={{ gap: 14 }}>
+      <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+        <label className="field" style={{ flex: "0 1 190px" }}>
+          <span className="label">{t(lang, "forge.task.provider")}</span>
+          <select
+            className="input"
+            value={provider}
+            onChange={(event) => setProvider(event.target.value)}
+            disabled={providerChoice.list.length === 0}
+          >
+            {providerChoice.list.length === 0 ? (
+              <option value="">{t(lang, "forge.settings.none")}</option>
+            ) : (
+              providerChoice.list.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        <label className="field" style={{ flex: "0 1 240px" }}>
+          <span className="label">{t(lang, "forge.task.model")}</span>
+          {modelChoice.length > 0 ? (
+            <select
+              className="input"
+              value={selectedModel}
+              onChange={(event) => {
+                setModelPicked(true);
+                setModel(event.target.value);
+              }}
+              disabled={provider === ""}
+            >
+              {modelChoice.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          ) : (
+            // The catalogue lists no model for this provider: free text keeps the field
+            // usable instead of offering an empty select nobody can submit.
+            <input
+              className="input"
+              type="text"
+              value={model}
+              onChange={(event) => {
+                setModelPicked(true);
+                setModel(event.target.value);
+              }}
+              placeholder={t(lang, "forge.task.model.placeholder")}
+              disabled={provider === ""}
+            />
+          )}
+        </label>
+        <label className="field" style={{ flex: "0 1 190px" }}>
+          <span className="label">{t(lang, "runs.form.category")}</span>
+          <select
+            className="input"
+            value={category}
+            onChange={(event) => setCategory(event.target.value as TaskCategoryValue)}
+          >
+            {TASK_CATEGORIES.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="small muted">
+        {providerChoice.list.length === 0
+          ? t(lang, "forge.task.provider.empty")
+          : t(lang, "forge.task.provider.note")}
+      </div>
+
+      {/* The catalogue note is drawn only when the Core actually reported providers: with
+          no answer at all the honest statement is the provider note above, not a claim
+          that the registry holds no model for this provider. */}
+      {providerChoice.list.length > 0 ? (
+        <div className="small muted">
+          {modelChoice.length === 0
+            ? t(lang, "forge.task.model.free")
+            : t(lang, "forge.task.model.note")}
+        </div>
+      ) : null}
+
+      {/* What the next submit will actually name, so the owner sees the model that runs. */}
+      <div className="small row" style={{ gap: 6, flexWrap: "wrap" }}>
+        <span className="muted">{t(lang, "forge.task.route")}</span>
+        <span className="mono">{routeLabel}</span>
+      </div>
+
+      {/* The offline executor is labelled as what it is: an answer without a file change. */}
+      {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
+
+      <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <Button tone="primary" onClick={() => void submit()}>
+          <IconPlay size={15} />
+          {dispatch.status === "pending" ? t(lang, "runs.form.running") : t(lang, "runs.form.submit")}
+        </Button>
+        {dispatch.status === "pending" ? (
+          <Button size="small" tone="danger" onClick={cancel}>
+            {t(lang, "forge.task.cancel")}
+          </Button>
+        ) : null}
+        <label className={`forge-toggle${mockSelected ? " disabled" : ""}`}>
+          <input
+            type="checkbox"
+            checked={effectiveWriteMode}
+            disabled={mockSelected}
+            onChange={(event) => setWriteMode(event.target.checked)}
+          />
+          <span>{t(lang, "forge.task.write.label")}</span>
+          {mockSelected ? (
+            <span className="small muted">· {t(lang, "forge.discovery.mock.write")}</span>
+          ) : null}
+        </label>
+        {mockSelected ? null : <span className="small muted">{t(lang, "forge.task.guarded")}</span>}
+      </div>
+      <div className="small muted forge-write-warning">{t(lang, "forge.task.write.warning")}</div>
+
+      {dispatch.status === "pending" ? <div className="notice">{t(lang, "forge.task.pending")}</div> : null}
+      {notice !== "" ? <div className="notice warn">{notice}</div> : null}
+      {dispatch.status === "failed" ? <FailureNotice lang={lang} failure={dispatch.failure} /> : null}
+    </div>
+  );
 
   return (
     <div className="content forge-workbench">
@@ -609,141 +1055,229 @@ export const Forge = ({
             <CardHead
               title={t(lang, "forge.task.title")}
               hint={t(lang, "forge.task.hint")}
-              action={<Badge tone={live ? "info" : "warn"}>{live ? "LIVE" : "OFFLINE"}</Badge>}
+              action={
+                <Badge tone={live ? "info" : backend.status === "loading" ? "neutral" : "warn"}>
+                  {backend.status === "loading" ? "…" : live ? "LIVE" : "OFFLINE"}
+                </Badge>
+              }
             />
             <div className="stack" style={{ gap: 14 }}>
-              <Field
-                label={t(lang, "forge.task.description")}
-                hint={t(lang, "runs.form.description.hint")}
-                error={descriptionError}
-              >
-                <textarea
-                  className="input"
-                  rows={4}
-                  value={description}
-                  onChange={(event) => setDescription(event.target.value)}
-                  placeholder={t(lang, "runs.form.description.placeholder")}
-                />
-              </Field>
+              <StepRail lang={lang} phase={phase} />
 
-              <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-                <label className="field" style={{ flex: "0 1 190px" }}>
-                  <span className="label">{t(lang, "forge.task.provider")}</span>
-                  <select
-                    className="input"
-                    value={provider}
-                    onChange={(event) => setProvider(event.target.value)}
-                    disabled={providerChoice.list.length === 0}
+              {/* Step 1 — the idea. The only field that is the user's own words. */}
+              {phase === "idea" ? (
+                <div className="stack" style={{ gap: 12 }}>
+                  <Field
+                    label={t(lang, "forge.discovery.goal.label")}
+                    hint={t(lang, "forge.discovery.goal.hint")}
+                    error={descriptionError}
                   >
-                    {providerChoice.list.length === 0 ? (
-                      <option value="">{t(lang, "forge.settings.none")}</option>
-                    ) : (
-                      providerChoice.list.map((item) => (
-                        <option key={item} value={item}>
-                          {item}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </label>
-                <label className="field" style={{ flex: "0 1 240px" }}>
-                  <span className="label">{t(lang, "forge.task.model")}</span>
-                  {modelChoice.length > 0 ? (
-                    <select
+                    <textarea
                       className="input"
-                      value={selectedModel}
-                      onChange={(event) => {
-                        setModelPicked(true);
-                        setModel(event.target.value);
-                      }}
-                      disabled={provider === ""}
-                    >
-                      {modelChoice.map((item) => (
-                        <option key={item} value={item}>
-                          {item}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    // The catalogue lists no model for this provider: free text keeps the field
-                    // usable instead of offering an empty select nobody can submit.
-                    <input
-                      className="input"
-                      type="text"
-                      value={model}
-                      onChange={(event) => {
-                        setModelPicked(true);
-                        setModel(event.target.value);
-                      }}
-                      placeholder={t(lang, "forge.task.model.placeholder")}
-                      disabled={provider === ""}
+                      rows={4}
+                      value={description}
+                      onChange={(event) => setDescription(event.target.value)}
+                      placeholder={t(lang, "forge.discovery.goal.placeholder")}
                     />
-                  )}
-                </label>
-                <label className="field" style={{ flex: "0 1 190px" }}>
-                  <span className="label">{t(lang, "runs.form.category")}</span>
-                  <select
-                    className="input"
-                    value={category}
-                    onChange={(event) => setCategory(event.target.value as TaskCategoryValue)}
-                  >
-                    {TASK_CATEGORIES.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <div className="small muted">
-                {providerChoice.list.length === 0
-                  ? t(lang, "forge.task.provider.empty")
-                  : t(lang, "forge.task.provider.note")}
-              </div>
-
-              {/* The catalogue note is drawn only when the Core actually reported providers: with
-                  no answer at all the honest statement is the provider note above, not a claim
-                  that the registry holds no model for this provider. */}
-              {providerChoice.list.length > 0 ? (
-                <div className="small muted">
-                  {modelChoice.length === 0
-                    ? t(lang, "forge.task.model.free")
-                    : t(lang, "forge.task.model.note")}
+                  </Field>
+                  <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                    <Button
+                      tone="primary"
+                      disabled={discoveryBusy === "idea"}
+                      onClick={() => void continueFromIdea()}
+                    >
+                      <IconPlay size={15} />
+                      {discoveryBusy === "idea"
+                        ? t(lang, "runs.form.running")
+                        : t(lang, "forge.discovery.continue")}
+                    </Button>
+                    <span className="small muted">{t(lang, "forge.discovery.continue.note")}</span>
+                  </div>
                 </div>
               ) : null}
 
-              {/* What the next submit will actually name, so the owner sees the model that runs. */}
-              <div className="small row" style={{ gap: 6, flexWrap: "wrap" }}>
-                <span className="muted">{t(lang, "forge.task.route")}</span>
-                <span className="mono">{routeLabel}</span>
-              </div>
+              {/* The session the Core actually opened, named as it is stored. */}
+              {phase !== "idea" ? (
+                <div className="small row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <span className="muted">{t(lang, "forge.discovery.session")}</span>
+                  <span className="mono">{text(sessionId, "—")}</span>
+                  <span className="muted">{t(lang, "forge.discovery.state")}</span>
+                  <Badge tone={confirmed ? "ok" : sessionState === "CANCELLED" ? "danger" : "info"}>
+                    {text(sessionState, t(lang, "runs.unknown"))}
+                  </Badge>
+                </div>
+              ) : null}
 
-              <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-                <Button tone="primary" onClick={() => void submit()}>
-                  <IconPlay size={15} />
-                  {dispatch.status === "pending" ? t(lang, "runs.form.running") : t(lang, "runs.form.submit")}
-                </Button>
-                {dispatch.status === "pending" ? (
-                  <Button size="small" tone="danger" onClick={cancel}>
-                    {t(lang, "forge.task.cancel")}
-                  </Button>
-                ) : null}
-                <label className="forge-toggle">
-                  <input
-                    type="checkbox"
-                    checked={writeMode}
-                    onChange={(event) => setWriteMode(event.target.checked)}
-                  />
-                  <span>{t(lang, "forge.task.write.label")}</span>
-                </label>
-                <span className="small muted">{t(lang, "forge.task.guarded")}</span>
-              </div>
-              <div className="small muted forge-write-warning">{t(lang, "forge.task.write.warning")}</div>
+              {/* Step 2 — the questions the Core returned, as a numbered list. */}
+              {phase === "clarify" ? (
+                <div className="stack" style={{ gap: 12 }}>
+                  <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+                    <div className="label">
+                      {t(lang, "forge.discovery.questions.title").replace("{n}", String(questions.length))}
+                    </div>
+                    <Badge tone={sessionState === "READY_FOR_PLANNING" ? "info" : "neutral"}>
+                      {text(sessionState, t(lang, "runs.unknown"))}
+                    </Badge>
+                  </div>
+                  {questions.length === 0 ? (
+                    <div className="small muted">{t(lang, "forge.discovery.questions.empty")}</div>
+                  ) : (
+                    <ol className="forge-questions">
+                      {questions.map((question) => {
+                        const id = String(question.id ?? "");
+                        return (
+                          <li className="forge-question" key={id}>
+                            <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+                              <span style={{ fontWeight: 600 }}>{text(question.text)}</span>
+                              <Badge tone={question.required ? "warn" : "neutral"}>
+                                {question.required
+                                  ? t(lang, "forge.discovery.question.required")
+                                  : t(lang, "forge.discovery.question.optional")}
+                              </Badge>
+                            </div>
+                            <div className="small muted">
+                              {t(lang, "forge.discovery.question.why")} {text(question.why, "—")}
+                            </div>
+                            <input
+                              className="input"
+                              type="text"
+                              value={answerDraft[id] ?? ""}
+                              onChange={(event) =>
+                                setAnswerDraft((previous) => ({ ...previous, [id]: event.target.value }))
+                              }
+                              placeholder={t(lang, "forge.discovery.answer.placeholder")}
+                              aria-label={text(question.text)}
+                            />
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  )}
+                  <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                    <Button
+                      tone="primary"
+                      disabled={discoveryBusy === "answers"}
+                      onClick={() => void sendAnswers()}
+                    >
+                      {discoveryBusy === "answers"
+                        ? t(lang, "runs.form.running")
+                        : t(lang, "forge.discovery.send")}
+                    </Button>
+                    <Button
+                      disabled={discoveryBusy === "skip"}
+                      onClick={() => void skipClarification()}
+                    >
+                      {t(lang, "forge.discovery.skip")}
+                    </Button>
+                    <Button
+                      tone="ghost"
+                      disabled={discoveryBusy === "cancel"}
+                      onClick={() => void cancelSession()}
+                    >
+                      {t(lang, "forge.discovery.cancel")}
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
 
-              {dispatch.status === "pending" ? <div className="notice">{t(lang, "forge.task.pending")}</div> : null}
-              {notice !== "" ? <div className="notice warn">{notice}</div> : null}
-              {dispatch.status === "failed" ? <FailureNotice lang={lang} failure={dispatch.failure} /> : null}
+              {/* Step 3 — the specification, as a definition list from its own route. */}
+              {phase === "spec" ? (
+                <div className="stack" style={{ gap: 12 }}>
+                  <div>
+                    <div className="label">{t(lang, "forge.discovery.spec.title")}</div>
+                    <div className="small muted">{t(lang, "forge.discovery.spec.hint")}</div>
+                  </div>
+                  {discoverySpec === null ? (
+                    <div className="small muted">
+                      {discoveryBusy === "spec"
+                        ? t(lang, "forge.discovery.spec.loading")
+                        : t(lang, "forge.discovery.spec.empty")}
+                    </div>
+                  ) : (
+                    <dl className="forge-spec">
+                      {SPEC_FIELDS.map(({ key, labelKey }) => {
+                        const value = specValue(discoverySpec.specification, key);
+                        return (
+                          <div className="forge-spec-row" key={key}>
+                            <dt className="label">{t(lang, labelKey)}</dt>
+                            <dd className={value === "" ? "muted" : ""}>
+                              {value === "" ? t(lang, "forge.discovery.spec.empty") : value}
+                            </dd>
+                          </div>
+                        );
+                      })}
+                    </dl>
+                  )}
+                  <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                    <Button
+                      tone="primary"
+                      disabled={discoveryBusy === "confirm"}
+                      onClick={() => void confirmSpecification()}
+                    >
+                      {discoveryBusy === "confirm"
+                        ? t(lang, "runs.form.running")
+                        : t(lang, "forge.discovery.spec.confirm")}
+                    </Button>
+                    <Button onClick={editAnswers}>{t(lang, "forge.discovery.spec.edit")}</Button>
+                    <Button
+                      tone="ghost"
+                      disabled={discoveryBusy === "cancel"}
+                      onClick={() => void cancelSession()}
+                    >
+                      {t(lang, "forge.discovery.cancel")}
+                    </Button>
+                  </div>
+                  {typeof discoverySpec?.task_text === "string" && discoverySpec.task_text !== "" ? (
+                    <details>
+                      <summary className="small muted" style={{ cursor: "pointer" }}>
+                        task_text
+                      </summary>
+                      <pre className="forge-output mono small">{discoverySpec.task_text}</pre>
+                    </details>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {/* Step 4 — the run. The same controls are reachable one step earlier on purpose:
+                  pressing "Запустить задачу" before confirming is exactly how the Core's 409
+                  guard becomes visible instead of hidden behind a disabled button. */}
+              {phase === "run" ? (
+                <div className="stack" style={{ gap: 14 }}>
+                  <div className={`notice ${confirmed ? "" : "warn"}`}>
+                    {confirmed ? t(lang, "forge.discovery.run.ready") : t(lang, "forge.discovery.run.preconfirm")}
+                  </div>
+                  <Field
+                    label={t(lang, "forge.discovery.run.task")}
+                    hint={t(lang, "forge.discovery.run.task.hint")}
+                    error={descriptionError}
+                  >
+                    <textarea
+                      className="input"
+                      rows={3}
+                      value={description}
+                      onChange={(event) => setDescription(event.target.value)}
+                      placeholder={t(lang, "forge.discovery.goal.placeholder")}
+                    />
+                  </Field>
+                  {runControls}
+                </div>
+              ) : null}
+
+              {phase === "clarify" || phase === "spec" ? (
+                <div className="stack" style={{ gap: 12 }}>
+                  <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+                    <div className="label">{t(lang, "forge.discovery.run.title")}</div>
+                    <Badge tone="warn">HTTP 409</Badge>
+                  </div>
+                  <div className="notice warn">{t(lang, "forge.discovery.run.preconfirm")}</div>
+                  {runControls}
+                </div>
+              ) : null}
+
+              {discoveryFailure !== null ? (
+                <FailureNotice lang={lang} failure={discoveryFailure} />
+              ) : null}
+              {discoveryNotice !== "" ? <div className="notice">{discoveryNotice}</div> : null}
             </div>
           </Card>
 

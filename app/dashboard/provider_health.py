@@ -117,6 +117,19 @@ class ProviderHealthMonitor:
     def get_thresholds(self, provider: str) -> ProviderThresholdConfig:
         return self._thresholds.get(provider, ProviderThresholdConfig.default_for_provider(provider))
 
+    def cached_statuses(self) -> Dict[str, ProviderAccountStatus]:
+        """Statuses already observed in this process, **without probing anything**.
+
+        A read that only needs to *report* what is known about a provider (the
+        provider states in ``/api/models``) must not start a network probe of its
+        own: this returns a copy of what earlier probes recorded, so a provider that
+        was never examined is simply absent from the mapping. Nothing is added to the
+        cache by calling this, and :meth:`check_all` / :meth:`check_provider` keep
+        their existing cache-then-probe behaviour unchanged.
+        """
+
+        return dict(self._cache)
+
     def set_thresholds(self, provider: str, config: ProviderThresholdConfig) -> None:
         self._thresholds[provider] = config
 

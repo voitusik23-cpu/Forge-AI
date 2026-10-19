@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from app.agents.base import AgentExecutionError
-from app.agents.providers.base import ProviderNotConfiguredError
+from app.agents.providers.base import ProviderError, ProviderNotConfiguredError
 from app.agents.providers.capabilities import (
     CostTier,
     ProviderCapabilitiesRegistry,
@@ -29,6 +29,31 @@ class DispatchDecision:
     candidates: Tuple[str, ...]
     selected_provider: Optional[str]
     reason: str
+
+
+def failover_eligible(exc: BaseException) -> bool:
+    """Whether another provider may legitimately serve the request that failed.
+
+    The chain advances for an *infrastructure* failure -- credential, quota, rate limit,
+    transport -- and stops for a *request* failure: an invalid payload or a model id no
+    provider knows is the caller's mistake, and repeating it on the next provider only
+    spends that account on a request that cannot succeed.
+
+    The answer is read from the ``ProviderError`` an agent wrapped at its boundary
+    (``ProviderAgent`` raises ``AgentExecutionError`` ``from`` the provider's own error),
+    so the class, not the message text, decides. A failure with no ``ProviderError`` in
+    its cause chain -- a stub agent, an unexpected exception -- carries no such evidence
+    and keeps the historical "advance" behaviour.
+    """
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ProviderError):
+            return bool(getattr(current, "failover_eligible", True))
+        current = current.__cause__ or current.__context__
+    return True
 
 
 class DispatchPolicy:
@@ -278,8 +303,17 @@ class Dispatcher:
         provider_name: Optional[str] = None,
         *,
         observer: Optional[Callable[[EventType, Dict[str, object]], None]] = None,
+        allow_fallback: Optional[bool] = None,
     ) -> TaskResult:
-        """Route to the primary and optional fallbacks unless provider is explicit."""
+        """Route to the primary and optional fallbacks unless provider is explicit.
+
+        ``allow_fallback`` decides whether the configured fallback chain may still serve
+        when the named provider fails for an infrastructure reason. ``None`` keeps the
+        historical rule -- an explicit name is pinned and only the automatic route uses
+        the chain -- while ``True`` says the name is the *primary* (the API layer resolves
+        the deployment's configured default into a name, so pinning it meant a 402 on the
+        default ended the run with ``openrouter`` never tried). A ``False`` is a pin.
+        """
         self._executor.validate_task(task)
         task = replace(task, category=classify_task(task))
         decision = self._policy.decide(
@@ -312,7 +346,9 @@ class Dispatcher:
             category=task.category.value,
             reason=("explicit provider selection" if provider_name is not None else decision.reason),
         )
-        allow_fallback = provider_name is None
+        allow_fallback = (
+            provider_name is None if allow_fallback is None else bool(allow_fallback)
+        )
         cost_aware = (
             (
                 task.category == TaskCategory.OTHER
@@ -322,6 +358,17 @@ class Dispatcher:
         )
         if provider_name is not None:
             attempts = [selected]
+            if allow_fallback:
+                # A named primary with the chain still available. Every fallback passes
+                # the same automatic-route checks a policy candidate passes (registered,
+                # capabilities registered, enabled, not a disallowed paid provider, key
+                # present), so this cannot reach a provider the deployment did not enable.
+                attempts.extend(
+                    name
+                    for name in self._fallback_chain
+                    if name != selected
+                    and self._automatic_route_rejection(name, task) is None
+                )
         elif cost_aware:
             # The policy's candidates are authoritative and keep their order. The
             # configured default provider is appended by `_with_default_provider` below,
@@ -383,6 +430,7 @@ class Dispatcher:
 
         failures = []
         previous_name = None
+        request_error_stopped = False
         for attempt_number, name in enumerate(attempts, start=1):
             if previous_name is not None:
                 self._emit(
@@ -479,6 +527,9 @@ class Dispatcher:
                     task=task,
                 )
                 previous_name = name
+                if not failover_eligible(exc):
+                    request_error_stopped = True
+                    break
                 continue
             except Exception as exc:
                 reason = f"Execution raised {type(exc).__name__}"
@@ -522,6 +573,13 @@ class Dispatcher:
                 error = decision.reason
             else:
                 error = "No provider candidates are permitted by the cost policy"
+        elif request_error_stopped:
+            # A request error is the caller's, not the provider's: the remaining
+            # candidates would reject the very same request and pay for the discovery.
+            error = (
+                "Provider request rejected; the fallback chain was not advanced: "
+                + "; ".join(failures)
+            )
         else:
             error = "Provider fallback chain exhausted: " + "; ".join(failures)
 

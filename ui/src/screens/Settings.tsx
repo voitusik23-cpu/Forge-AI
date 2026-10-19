@@ -1,4 +1,5 @@
 import { Badge, Button, Card, CardHead } from "../components/Primitives";
+import { VersionLine } from "../components/VersionLine";
 import {
   ACCENTS,
   ACCENT_SWATCH,
@@ -10,6 +11,7 @@ import {
   type ThemeMode,
 } from "../appearance";
 import { t, type Lang } from "../i18n";
+import type { Status } from "../api/client";
 
 const THEME_LABEL: Record<Lang, Record<ThemeMode, string>> = {
   ru: { dark: "Тёмная", light: "Светлая", system: "Как в системе" },
@@ -32,12 +34,15 @@ export const Settings = ({
   onChange,
   onHelp,
   storageWorks,
+  status,
 }: {
   lang: Lang;
   appearance: Appearance;
   onChange: (next: Appearance) => void;
   onHelp: () => void;
   storageWorks: boolean;
+  /** The build facts from /api/status.details, or null when the backend does not answer. */
+  status: Status | null;
 }) => (
   <div className="content">
     <div className="row between" style={{ marginBottom: 18 }}>
@@ -47,6 +52,10 @@ export const Settings = ({
           {lang === "ru"
             ? "Внешний вид и хранение настроек"
             : "Appearance and where preferences are kept"}
+        </div>
+        {/* version · short commit: the compact line from Part 1.1 of the brief. */}
+        <div style={{ marginTop: 6 }}>
+          <VersionLine lang={lang} status={status} />
         </div>
       </div>
       <Button size="small" tone="ghost" onClick={onHelp}>
@@ -93,8 +102,8 @@ export const Settings = ({
                     background: ACCENT_SWATCH[accent],
                     boxShadow:
                       appearance.accent === accent
-                        ? "0 0 0 2px var(--ice), 0 0 18px rgba(124,92,255,.5)"
-                        : "inset 0 0 0 1px var(--hairline)",
+                        ? "0 0 0 2px var(--text), 0 0 18px color-mix(in srgb, var(--accent) 50%, transparent)"
+                        : "inset 0 0 0 1px var(--border)",
                   }}
                 />
               ))}

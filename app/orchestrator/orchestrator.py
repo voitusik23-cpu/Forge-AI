@@ -45,6 +45,7 @@ class Orchestrator:
         *,
         provider_name: Optional[str] = None,
         observer: Optional[Callable[[EventType, Dict[str, object]], None]] = None,
+        allow_fallback: Optional[bool] = None,
     ) -> TaskResult:
         """Dispatch automatically, or use a legacy agent/provider override."""
         if agent_name is not None and provider_name is not None:
@@ -57,5 +58,8 @@ class Orchestrator:
         if agent_name is not None:
             return self._executor.execute(task, agent_name)
         return self._dispatcher.dispatch(
-            task, provider_name=provider_name, observer=observer
+            task,
+            provider_name=provider_name,
+            observer=observer,
+            allow_fallback=allow_fallback,
         )

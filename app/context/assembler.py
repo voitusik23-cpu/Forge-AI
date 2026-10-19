@@ -27,6 +27,7 @@ from app.context.selector import (
     CriticalContextUnfitError,
     InsufficientContextBudgetError,
     SelectionReport,
+    TASK_SPECIFICATION_BUDGET_TOKENS,
 )
 from app.context.validation import (
     MAX_CONTEXT_ITEMS,
@@ -37,6 +38,15 @@ from app.context.validation import (
 )
 from app.orchestrator.models import Task
 from app.skills.models import SkillDefinition
+
+
+#: The default character budget for one assembled context, about three characters per
+#: token (see ``estimate_tokens``). The historical 20 000 characters rejected a detailed
+#: task brief before the selector ever saw it, so the bound is derived from the Tier 1
+#: token budget the operator's own instruction is allowed; every other tier still competes
+#: for the model's much smaller input budget. It remains a real bound: a description
+#: above it is refused with a clear limit message instead of being silently trimmed.
+DEFAULT_MAX_CONTEXT_CHARACTERS: int = TASK_SPECIFICATION_BUDGET_TOKENS * 3
 
 
 class ContextBudgetExceededError(ContextAssemblyError):
@@ -68,7 +78,7 @@ class ContextAssembler:
         self,
         *,
         max_items: int = 16,
-        max_characters: int = 20_000,
+        max_characters: int = DEFAULT_MAX_CONTEXT_CHARACTERS,
         selector: Optional[ContextSelector] = None,
         budget_policy: Optional[ContextBudgetPolicy] = None,
     ) -> None:
@@ -173,6 +183,10 @@ class ContextAssembler:
                     max_items=self.max_items,
                     max_item_characters=self.max_characters,
                     allow_truncation=False,
+                    # The operator's own task text keeps a budget of its own; see
+                    # TASK_SPECIFICATION_BUDGET_TOKENS. A caller that supplies an explicit
+                    # policy still gets exactly that policy.
+                    task_specification_budget_tokens=TASK_SPECIFICATION_BUDGET_TOKENS,
                 )
             )
         )

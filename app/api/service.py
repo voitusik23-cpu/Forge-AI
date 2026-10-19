@@ -317,6 +317,93 @@ def _utc_now_iso() -> str:
     return _datetime.datetime.now(_datetime.timezone.utc).isoformat()
 
 
+# --------------------------------------------------------------- provider states
+#
+# These three helpers build the *inputs* of the one derivation function
+# (``app.agents.providers.provider_state.derive_provider_state``); the vocabulary is
+# never decided here. They are module-level rather than service methods on purpose:
+# ``list_models_catalogue`` is also called against a stand-in object that only carries
+# ``_model_registry`` / ``_runtime``, and a stand-in must keep working.
+
+
+def _enabled_provider_names(runtime: object) -> Optional[tuple]:
+    """The composition's enabled providers, or ``None`` when it cannot be read.
+
+    ``None`` is a real answer, not a failure to hide: without a runtime there is no
+    enabled set to read, and the derivation reports that as ``REGISTERED`` (membership
+    only) instead of inventing one.
+    """
+
+    settings = getattr(runtime, "settings", None)
+    enabled = getattr(settings, "enabled_providers", None)
+    if enabled is None:
+        return None
+    try:
+        return tuple(str(name).strip() for name in enabled if str(name).strip())
+    except TypeError:
+        return None
+
+
+def _provider_credentials_present(env_names) -> Dict[str, bool]:
+    """Which of these key variables resolve to a non-empty value.
+
+    Presence only: one boolean per name, so nothing this returns can reconstruct a key,
+    its length or a prefix. An unreadable secret file answers "absent" rather than
+    raising -- a status payload must never fail because the store could not be read.
+    """
+
+    from app.config.secrets import SecretStore
+
+    try:
+        store = SecretStore()
+    except Exception:  # noqa: BLE001 - an unusable store means "absent", never a crash
+        store = None
+    present: Dict[str, bool] = {}
+    for raw in env_names:
+        name = str(raw or "").strip()
+        if not name:
+            present[name] = False
+            continue
+        if name in present:
+            continue
+        if store is None:
+            present[name] = False
+            continue
+        try:
+            present[name] = bool(store.get_secret(name))
+        except Exception:  # noqa: BLE001 - a malformed secret file is "absent"
+            present[name] = False
+    return present
+
+
+def _observed_provider_probes(health_monitor: object) -> Dict[str, Dict[str, Any]]:
+    """Provider probe results already recorded in this process, keyed by provider name.
+
+    Cache-only on purpose: this read reports what is already known and starts nothing, so
+    asking for the catalogue can never dial a provider. A provider that has not been
+    examined is absent here and is reported ``NOT_CHECKED`` by the derivation.
+    """
+
+    cached_statuses = getattr(health_monitor, "cached_statuses", None)
+    if not callable(cached_statuses):
+        return {}
+    try:
+        observed = cached_statuses() or {}
+    except Exception:  # noqa: BLE001 - an unreadable cache is "nothing observed"
+        return {}
+    probes: Dict[str, Dict[str, Any]] = {}
+    for name, status in observed.items():
+        clean_name = str(name or "").strip().lower()
+        if not clean_name:
+            continue
+        raw = getattr(status, "status", None)
+        value = getattr(raw, "value", raw)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        probes[clean_name] = {"status": value.strip().upper()}
+    return probes
+
+
 class RunIdempotencyConflict(RuntimeError):
     """The same idempotency key arrived with a materially different request."""
 
@@ -1051,7 +1138,26 @@ class ForgeApiService:
             details={
                 "enabled_providers": list(self._runtime.settings.enabled_providers),
                 "default_provider": self._runtime.settings.default_provider,
+                # The build identity travels beside the provider facts, so an operator
+                # can tell which build answered without a second request.
+                **self.get_version_info(),
             },
+        )
+
+    def get_version_info(self) -> Dict[str, Any]:
+        """Version, commit and build timestamps of this running backend (read-only).
+
+        The values come from ``app.build_info``: the commit was read once, when the
+        process started, and every part of the payload is a timestamp, a hexadecimal
+        object name, a version string, or one fixed status word. No secret and no
+        environment value is included, and an unresolved fact is ``"unknown"`` rather
+        than a guess.
+        """
+
+        from app.build_info import build_version_payload
+
+        return build_version_payload(
+            backend="connected" if self._runtime is not None else "disconnected"
         )
 
     def list_projects(self) -> List[ProjectInfo]:
@@ -2379,13 +2485,23 @@ class ForgeApiService:
         * **membership** -- the model is defined in the registry;
         * **configuration** -- an account references a secret (reported as a boolean, never as
           the reference or the value);
-        * **availability** -- only ever reported by the account probe in ``/api/dashboard``,
-          not by this method.
+        * **availability** -- reported per provider as ``providers[].state``, derived by
+          ``app.agents.providers.provider_state.derive_provider_state`` from membership, the
+          composition's ``enabled_providers``, whether the provider's key variable resolves to a
+          non-empty value, and the last probe **already observed** in this process. This read
+          starts no probe and opens no socket, so an unexamined provider is ``NOT_CHECKED``
+          rather than being silently probed here.
 
         The registry is resolved defensively: the service holder, then the runtime, then the
         built-in default registry. When none is available the catalogue is empty rather than
         invented.
         """
+
+        from app.agents.providers.provider_state import (
+            derive_provider_state,
+            lookup_probe,
+            provider_state_counts,
+        )
 
         registry = getattr(self, "_model_registry", None)
         if registry is None:
@@ -2402,8 +2518,25 @@ class ForgeApiService:
         providers: List[Dict[str, Any]] = []
         models: List[Dict[str, Any]] = []
         accounts: List[Dict[str, Any]] = []
+        decisions = []
         if registry is not None:
-            for provider in registry.list_providers():
+            registry_providers = registry.list_providers()
+            runtime = getattr(self, "_runtime", None)
+            enabled_names = _enabled_provider_names(runtime)
+            credentials = _provider_credentials_present(
+                provider.default_secret_env for provider in registry_providers
+            )
+            probes = _observed_provider_probes(getattr(self, "_health_monitor", None))
+            for provider in registry_providers:
+                secret_env_name = str(provider.default_secret_env or "").strip()
+                decision = derive_provider_state(
+                    enabled_providers=enabled_names,
+                    provider_id=provider.provider_id,
+                    credential_env_var=secret_env_name,
+                    credential_present=bool(credentials.get(secret_env_name)),
+                    probe=lookup_probe(probes, provider.provider_id),
+                )
+                decisions.append(decision)
                 providers.append(
                     {
                         "provider_id": provider.provider_id,
@@ -2413,6 +2546,11 @@ class ForgeApiService:
                         "model_count": len(registry.list_models(provider.provider_id)),
                         "secret_env_name": provider.default_secret_env,
                         "has_base_url": bool(provider.default_base_url),
+                        # Membership is not availability: this is the derived state, and the
+                        # reason code it rests on. Neither can carry a key value.
+                        "state": decision.state.value,
+                        "reason": decision.reason,
+                        "probed": bool(decision.probed),
                     }
                 )
             for model in registry.list_models():
@@ -2440,6 +2578,7 @@ class ForgeApiService:
                         "secret_configured": bool(account.secret_ref),
                     }
                 )
+        state_counts = provider_state_counts(decisions)
         return {
             "providers": providers,
             "models": models,
@@ -2448,11 +2587,25 @@ class ForgeApiService:
                 "providers": len(providers),
                 "models": len(models),
                 "accounts": len(accounts),
+                # "Registered" is every provider in this payload; "ready" is how many the
+                # derivation reports READY. They are counted separately because a registry
+                # entry on its own says nothing about availability.
+                "providers_ready": state_counts["ready_total"],
             },
+            "provider_states": state_counts,
+            "provider_state_note": (
+                "providers[].state is one of REGISTERED, READY, NO_CREDENTIALS, "
+                "NETWORK_BLOCKED, NO_CREDITS, NOT_CHECKED, DISABLED, ERROR. It is derived "
+                "from registry membership, the composition's enabled_providers, whether the "
+                "provider's key variable resolves to a non-empty value, and the last probe "
+                "already observed in this process; this read starts no probe. No key value, "
+                "length, prefix or hash is reported anywhere in this payload."
+            ),
             "source": "ModelRegistry" if registry is not None else "unavailable",
             "availability_note": (
-                "Registry membership is not availability: availability comes from the account "
-                "probe in /api/dashboard and is NOT_CHECKED until that probe runs."
+                "Registry membership is not availability: availability comes from "
+                "providers[].state, and READY is only reported from a probe that reported "
+                "access. A provider that has not been examined is NOT_CHECKED."
             ),
         }
 
@@ -3404,9 +3557,16 @@ class ForgeApiService:
         # made the dispatcher fall back to its own copy of the default -- so a request with no
         # provider ran on a provider the operator had not configured as default (measured: settings
         # said "radox", every unnamed run executed on "openrouter").
+        #
+        # ``allow_fallback`` keeps the configured chain reachable for exactly those unnamed runs.
+        # Passing the resolved default as an explicit name made it a *pin*, so a 402 on the default
+        # ended the run with "Provider fallback chain exhausted" and openrouter was never tried,
+        # even though FORGE_PROVIDER_FALLBACK_CHAIN listed it. A run that names a provider itself
+        # stays pinned: the caller asked for that provider.
         run = self._runtime.run_executor.execute(
             task=task,
             provider_name=(self._selected_provider_name(req) or None),
+            allow_fallback=not (req.provider_name or "").strip(),
             workspace=self._workspace,
             run_id=run_id,
             run_scope=scope,

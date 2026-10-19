@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,104 @@ FORBIDDEN_CONTEXT_SUBSTRINGS: tuple[str, ...] = (
     "source_code",
     "file_content",
 )
+
+#: Field names an operator's engineering text may legitimately mention. The word "token"
+#: inside one of these is a *count* or a *limit*, not secret material. Measured: a task
+#: description that named ``tokens_in``/``tokens_out`` was refused with
+#: ``security_forbidden_content:token``, so the run never reached a provider.
+TOKEN_FIELD_NAMES: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "token_usage",
+    "token_count",
+    "token_budget",
+    "token_limit",
+    "tokens_in",
+    "tokens_out",
+    "max_tokens",
+    "tokens",
+    "tokenizer",
+    "tokenization",
+)
+
+#: Patterns for actual secret *material*, each paired with the reason word it reports.
+#: The reasons stay the existing vocabulary (``token``/``api_key``/``password``/
+#: ``secret``/``credential``) so a real positive keeps its existing refusal message.
+#: A bare word such as "token" is not material on its own, but these are: a ``Bearer``
+#: credential, a JWT, a provider key prefix, and an assigned credential. A long
+#: random-looking value is checked separately by :func:`_looks_random`.
+_SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("token", re.compile(r"\bbearer\s+[A-Za-z0-9\-_.=+/]{40,}", re.IGNORECASE)),
+    ("token", re.compile(r"\beyJ[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}")),
+    ("api_key", re.compile(r"\bsk-[A-Za-z0-9\-_]{16,}")),
+    ("api_key", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}")),
+    (
+        "api_key",
+        re.compile(
+            r"(?i)\b(?:api[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token)\b"
+            r"\s*[:=]\s*\S{8,}"
+        ),
+    ),
+    ("password", re.compile(r"(?i)\bpassw(?:or)?d\b\s*[:=]\s*\S{1,}")),
+    ("credential", re.compile(r"(?i)\bcredentials?\b\s*[:=]\s*\S{8,}")),
+)
+
+#: A single long, unbroken, machine-looking run of characters: the shape of a generated
+#: key. It must be *credential-shaped* -- mixed upper and lower case plus digits -- because
+#: a lowercase hex digest is an identifier, not a secret: the product emits workspace
+#: fingerprints and snapshot ids of exactly that shape, and flagging those failed every
+#: run that assembled an understanding snapshot.
+_RANDOM_LOOKING_CANDIDATE = re.compile(r"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b")
+
+
+def _has_bare_token(text_lower: str) -> bool:
+    """Whether "token" appears outside a recognised field name such as ``max_tokens``."""
+
+    scrubbed = text_lower
+    for name in sorted(TOKEN_FIELD_NAMES, key=len, reverse=True):
+        scrubbed = scrubbed.replace(name, " ")
+    return "token" in scrubbed
+
+
+def _looks_random(value: str) -> bool:
+    """Whether ``value`` carries a credential-shaped random run, i.e. key-like material."""
+
+    for candidate in _RANDOM_LOOKING_CANDIDATE.findall(value):
+        digits = sum(character.isdigit() for character in candidate)
+        if digits < 4:
+            continue
+        has_lower = any(character.islower() for character in candidate)
+        has_upper = any(character.isupper() for character in candidate)
+        if has_lower and has_upper:
+            return True
+    return False
+
+
+def find_forbidden_value_content(value: str) -> str | None:
+    """The forbidden marker present in one context *value*, or ``None`` when it is clean.
+
+    Secret material is refused exactly as before, with the same reason words. The one
+    narrowing is that "token" no longer matches when every occurrence is part of a field
+    name (``tokens_in``, ``max_tokens``, ...), because describing such a field is normal
+    engineering text and not a credential.
+    """
+
+    if not isinstance(value, str) or not value:
+        return None
+    for reason, pattern in _SECRET_VALUE_PATTERNS:
+        if pattern.search(value):
+            return reason
+    if _looks_random(value):
+        return "secret"
+    text_lower = value.lower()
+    for bad in FORBIDDEN_CONTEXT_SUBSTRINGS:
+        if bad == "token":
+            if _has_bare_token(text_lower):
+                return "token"
+            continue
+        if bad in text_lower:
+            return bad
+    return None
 
 
 def sanitize_context_metadata(metadata: Mapping[str, object] | None) -> dict[str, object]:
@@ -122,10 +221,9 @@ def validate_decision_context(envelope: DecisionContextEnvelope) -> ContextValid
             errors.append(f"oversized_item_value:{item.item_id}")
 
         # Forbidden substrings in item value
-        val_lower = item.value.lower()
-        for bad in FORBIDDEN_CONTEXT_SUBSTRINGS:
-            if bad in val_lower:
-                errors.append(f"forbidden_content:{bad}:{item.item_id}")
+        bad_value = find_forbidden_value_content(item.value)
+        if bad_value is not None:
+            errors.append(f"forbidden_content:{bad_value}:{item.item_id}")
 
         # Forbidden keys in item metadata
         for m_key in item.metadata:

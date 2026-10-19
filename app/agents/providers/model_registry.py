@@ -373,53 +373,96 @@ def create_default_registry() -> ModelRegistry:
     )
 
     # 3. Google Gemini
+    #
+    # The ids below are the curated set this owner asked for, and they all exist in the
+    # provider's own catalogue: ``GET
+    # https://generativelanguage.googleapis.com/v1beta/models`` returned 63 models, 46 of
+    # them answering ``generateContent``, including every id registered here. The two ids
+    # that were registered before this change were not both real: ``gemini-2.0-flash`` is
+    # absent from that answer, and it alone was the CHEAP row, so automatic routing could
+    # pick a model that does not exist.
+    #
+    # Measured through the app's own API on 2026-10-20 (one dispatch per row):
+    # ``gemini-2.5-flash`` is listed but this key's call answers
+    # ``HTTP 404 NOT_FOUND: This model models/gemini-2.5-flash is no longer available to
+    # new users`` -- so it stays selectable by name and is NOT routable automatically;
+    # ``gemini-flash-latest`` answered ``PONG`` and the response reported
+    # ``model_version=gemini-3.8-flash``, i.e. the alias resolves to the current flash
+    # model and that is the id a working default must use.
+    #
+    # ``cost_tier`` therefore carries its codebase meaning here -- "may this be chosen
+    # automatically while ``allow_paid_providers`` is false?" -- and only the model that
+    # was observed to answer is CHEAP. Naming a PAID row explicitly still works; the tier
+    # only keeps it out of automatic routing.
+    _gemini_capabilities = frozenset({
+        ModelCapability.ANALYSIS,
+        ModelCapability.REVIEW,
+        ModelCapability.FAST,
+        ModelCapability.LONG_CONTEXT,
+        ModelCapability.STRUCTURED_OUTPUT,
+        ModelCapability.TOOL_CALLING,
+        ModelCapability.STREAMING,
+        ModelCapability.VISION,
+    })
     registry.register_provider(
         ProviderInfo(
             provider_id="google",
             display_name="Google Gemini",
             protocol=ProviderProtocol.GOOGLE_GENAI,
             default_secret_env="GEMINI_API_KEY",
-            supported_models=("gemini-3.8-flash", "gemini-2.0-flash"),
+            supported_models=(
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-flash-latest",
+                "gemini-3.5-flash",
+            ),
         )
     )
     registry.register_model(
         ProviderModelInfo(
             provider_id="google",
-            model_id="gemini-3.8-flash",
-            display_name="Gemini 3.8 Flash",
+            model_id="gemini-2.5-flash",
+            display_name="Gemini 2.5 Flash",
             context_window=1048576,
             max_output_tokens=8192,
-            capabilities=frozenset({
-                ModelCapability.ANALYSIS,
-                ModelCapability.REVIEW,
-                ModelCapability.FAST,
-                ModelCapability.LONG_CONTEXT,
-                ModelCapability.STRUCTURED_OUTPUT,
-                ModelCapability.TOOL_CALLING,
-                ModelCapability.STREAMING,
-                ModelCapability.VISION,
-            }),
+            capabilities=_gemini_capabilities,
+            # PAID = not selected automatically: this key cannot call it (404 above).
             cost_tier=CostTier.PAID,
         )
     )
     registry.register_model(
         ProviderModelInfo(
             provider_id="google",
-            model_id="gemini-2.0-flash",
-            display_name="Gemini 2.0 Flash",
+            model_id="gemini-flash-latest",
+            display_name="Gemini Flash (latest)",
             context_window=1048576,
             max_output_tokens=8192,
-            capabilities=frozenset({
-                ModelCapability.ANALYSIS,
-                ModelCapability.REVIEW,
-                ModelCapability.FAST,
-                ModelCapability.LONG_CONTEXT,
-                ModelCapability.STRUCTURED_OUTPUT,
-                ModelCapability.TOOL_CALLING,
-                ModelCapability.STREAMING,
-                ModelCapability.VISION,
-            }),
+            capabilities=_gemini_capabilities,
+            # CHEAP = the one row automatic routing may pick. Measured to answer.
             cost_tier=CostTier.CHEAP,
+        )
+    )
+    registry.register_model(
+        ProviderModelInfo(
+            provider_id="google",
+            model_id="gemini-3.5-flash",
+            display_name="Gemini 3.5 Flash",
+            context_window=1048576,
+            max_output_tokens=8192,
+            capabilities=_gemini_capabilities,
+            # Listed, but not verified with this key: never routed to automatically.
+            cost_tier=CostTier.PAID,
+        )
+    )
+    registry.register_model(
+        ProviderModelInfo(
+            provider_id="google",
+            model_id="gemini-2.5-pro",
+            display_name="Gemini 2.5 Pro",
+            context_window=1048576,
+            max_output_tokens=8192,
+            capabilities=_gemini_capabilities | frozenset({ModelCapability.REASONING}),
+            cost_tier=CostTier.PAID,
         )
     )
 

@@ -95,7 +95,15 @@ model ID determines whether its capability tier is free (`:free` or
 `FORGE_ALLOW_PAID_PROVIDERS=true`. After category candidates fail or are
 unavailable, the finite `FORGE_PROVIDER_FALLBACK_CHAIN` is tried sequentially.
 Explicit `provider_name` bypasses automatic choice and fallback; the caller's
-selection is never replaced. Dispatcher uses only common registries, metadata,
+selection is never replaced. A provider failure only advances the chain when it
+is the provider's own condition - credential, quota (a 402), rate limit, or
+transport - while a *request* error (an invalid payload or unknown model id)
+stops the chain, because every provider would reject the same request. The
+dispatcher marks this distinction on the provider error class
+(`ProviderError.failover_eligible`), never on message text. The API layer passes
+the deployment's *resolved configured default* as a primary with
+`allow_fallback=True` (an unnamed run keeps the chain reachable); a provider the
+caller named itself stays pinned. Dispatcher uses only common registries, metadata,
 and SecretStore presence checks, not provider SDKs.
 
 
@@ -128,7 +136,15 @@ DeepSeek; остальные категории используют `FORGE_DEFA
 `FORGE_ALLOW_PAID_PROVIDERS=true`. После отказа или недоступности кандидатов
 категории последовательно перебирается конечная
 `FORGE_PROVIDER_FALLBACK_CHAIN`. Явный `provider_name` обходит автоматический выбор
-и fallback; выбор вызывающего никогда не подменяется. Dispatcher использует только
+и fallback; выбор вызывающего никогда не подменяется. Сбой провайдера продвигает
+цепочку только если это его собственное состояние — credentials, квота (402),
+rate limit или транспорт, — а *ошибка запроса* (некорректный payload или неизвестный
+id модели) цепочку останавливает, потому что тот же запрос отвергнет любой
+провайдер. Признак хранится на классе ошибки провайдера
+(`ProviderError.failover_eligible`), а не в тексте сообщения. API передаёт
+*разрешённый настроенный default* как primary с `allow_fallback=True` (запрос без
+явного провайдера сохраняет цепочку доступной); провайдер, названный самим
+вызывающим, остаётся закреплённым. Dispatcher использует только
 общие реестры, метаданные и проверку наличия через SecretStore, но не SDK
 провайдеров.
 ## Task Classification + Specialized Routing v0.1
@@ -4196,3 +4212,296 @@ POST /api/tasks/run  { category: "code", write_mode: true }
 реального кода проекта поэтому всё ещё требует включённого провайдера, чей ответ
 использует одну из двух поддерживаемых форм. Больше ничего не отсутствует: при
 таком ответе запись, проверка, откат и запись результата реализованы и проверены.
+
+## Discovery / Clarification v0.1
+
+A clarification layer now sits **in front of** the existing pipeline. It decides
+whether Forge knows enough to plan, asks at most six short practical questions when
+it does not, derives a `ProjectSpecification`, and refuses to let anything plan or
+execute until the user confirms. It creates no executor: after confirmation the
+existing Planner / Dispatcher / Run path runs, unchanged.
+
+```text
+user idea
+  -> DiscoveryService.start(goal)
+  -> ClarificationQuestion[1..6]        (only the still-missing areas)
+  -> answers
+  -> ProjectSpecification               (derived + answered, never guessed)
+  -> confirm()                          (skip() + confirm() is the explicit short path)
+  -> require_confirmed()                (the hard guard)
+  -> POST /api/tasks/run  with discovery_session_id
+  -> EXISTING Planner / Dispatcher / Run
+```
+
+### Models and determinism
+
+`app/discovery/models.py` holds plain, immutable dataclasses with no I/O:
+`ClarificationQuestion(id, text, field, why, required)`,
+`ClarificationAnswer(question_id, text, skipped, redacted)`,
+`ProjectSpecification(...12 fields..., source_answers)` and
+`DiscoverySession(session_id, initial_goal, state, questions, answers,
+specification, created_at, updated_at, skipped, skip_reason)`, with the states
+`NEEDS_CLARIFICATION`, `READY_FOR_PLANNING`, `CONFIRMED`, `CANCELLED`.
+
+`app/discovery/analyzer.py` derives what the goal text states outright, with rules
+only -- no model, no provider call, no network:
+
+| area | deterministic rule (goal text, case-folded) |
+| --- | --- |
+| `project_type` | Telegram + bot; booking/hotel; shop/e-commerce; dashboard; api; cli; site/web/app |
+| `platform` | Telegram; site/web; mobile; desktop; cli; bot |
+| `users` | administrator; staff/manager; guest; client/customer; user; student |
+| `core_features` | booking; search; payment; catalogue; reports; tasks; sign-up; notifications; export |
+| `integrations` | payment; Telegram; email; SMS; CRM/1C; calendar |
+| `data_storage` | PostgreSQL / MySQL / SQLite / "database" / files |
+| `auth` | explicit "no auth" wins; otherwise auth/login/sign-up |
+| `notifications` | notification/reminder/broadcast; confirmation + email |
+| `constraints` | budget; deadline; local/offline; no external services |
+| `acceptance_criteria` | "acceptance criteria"; "tests pass" |
+| `priorities` | priority; speed; quality |
+
+The fixed area set and its order are `AREA_ORDER` (goal, project_type, users,
+core_features, platform, integrations, data_storage, auth, notifications,
+constraints, acceptance_criteria, priorities). `ESSENTIAL_AREAS` is the first five.
+`missing_areas()` reports every area neither the goal nor an answer covers; an
+unstated area stays **empty** and is asked about, never guessed.
+
+`app/discovery/questions.py` turns missing areas into at most `MAX_QUESTIONS = 6`
+short Russian questions (one per area, each with a one-line `why`). The list is
+deterministic, essential areas come first so the cap can never drop a required
+question, and an area that already has an answer -- or an explicit skip -- is never
+asked again. An optional LLM phrasing hook behind the existing `Provider` interface
+is deliberately **not** implemented or required: tests, the smoke command, and a
+deployment without a provider all produce identical questions.
+
+### State machine and the guard
+
+| from | transition | to |
+| --- | --- | --- |
+| `start` | any essential area missing | `NEEDS_CLARIFICATION` |
+| `start` | nothing essential missing | `READY_FOR_PLANNING` |
+| `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `answer()` fills the essentials | `READY_FOR_PLANNING` |
+| `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `skip(reason)` | `READY_FOR_PLANNING`, `skipped=True` |
+| `READY_FOR_PLANNING` | `confirm()` | `CONFIRMED` |
+| `NEEDS_CLARIFICATION` | `confirm()` | refused (`DiscoveryNotReady`) |
+| `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `cancel()` | `CANCELLED` |
+| `CONFIRMED` | `confirm()` | `CONFIRMED` (idempotent) |
+| `CONFIRMED` | `answer()`, `skip()`, `cancel()` | refused (`DiscoveryStateConflict`) |
+| `CANCELLED` | any transition | refused |
+
+`DiscoveryService.require_confirmed(session_id)` is the hard guard: it raises
+`DiscoveryNotConfirmed` unless the state is `CONFIRMED`, so no planning or
+execution attempt can act on an unconfirmed or cancelled session. `skip()` is not a
+bypass -- it reaches `READY_FOR_PLANNING`, and execution still needs `confirm()`.
+Every transition is persisted before it is returned, so a reader never observes a
+half-applied answer.
+
+### Persistence and secrets
+
+`app/discovery/store.py` writes one small JSON file per session under
+`FORGE_DISCOVERY_ROOT` (default `<repository>/.forge/discovery`, gitignored), with
+the Run Store's proven mechanics: a conservative id allow-list, a re-proved
+containment check, and a temporary file that is fsynced before `os.replace`. It is
+a **separate** store from the Run Store: a discovery session precedes a run and is
+not execution evidence. A corrupt file reads as absent rather than partially
+trusted.
+
+No secret is stored. Every answer is screened with the existing
+`app.context.validation.find_forbidden_value_content`; a secret-shaped answer is
+replaced by a `[REDACTED:<reason>]` marker, `redacted=True` is recorded on the
+answer, and the value never reaches the specification, the session file, or any
+response. A secret-shaped **goal** is likewise not stored: the session opens with
+an empty goal and asks for it. Answers are user text only.
+
+### API
+
+`app/api/discovery_routes.py`, registered from `app/api/server.py`, adds seven
+read-only-in-effect routes over the one service instance composed at app creation:
+
+| route | purpose |
+| --- | --- |
+| `POST /api/discovery/sessions` `{goal}` | create a session, return it with its questions |
+| `GET /api/discovery/sessions/{id}` | read the session |
+| `POST /api/discovery/sessions/{id}/answers` `{answers:[{question_id,text}]}` | record answers |
+| `POST /api/discovery/sessions/{id}/skip` `{reason?}` | end the clarification round |
+| `GET /api/discovery/sessions/{id}/specification` | the specification and its task text |
+| `POST /api/discovery/sessions/{id}/confirm` | confirm it |
+| `POST /api/discovery/sessions/{id}/cancel` | close it |
+
+Responses carry only safe fields (ids, states, question texts, screened answers,
+the specification and its task text). Failures reuse the surface's existing error
+contract: 404 for an unknown session, 400 for a malformed body, 409 for a state
+conflict, each with the machine code published verbatim
+(`unknown_discovery_session`, `discovery_not_confirmed`, `discovery_not_ready`,
+`discovery_state_conflict`, `invalid_discovery_answer`).
+
+### Hand-off into the existing pipeline
+
+`POST /api/tasks/run` accepts an optional `discovery_session_id`. The field is read
+at the HTTP boundary and is **not** a field of `TaskRunRequest`: that model's field
+set is pinned by several contract tests, and a session id is context for the task
+text, never execution authority (no command, workspace, profile, environment,
+timeout, or allowlist can be named through it).
+
+* An unknown session is refused with 404; a session that is not `CONFIRMED`
+  (including one still in `NEEDS_CLARIFICATION`) is refused with **409** and code
+  `discovery_not_confirmed`, before anything is dispatched.
+* A confirmed session's `ProjectSpecification.as_task_text()` is prepended to the
+  caller's own description, and the run continues on the existing path. Explicit
+  provider/model selection, automatic routing, task classification, the fallback
+  chain, cost-aware routing, the frozen `RunScope`, and every security boundary are
+  untouched.
+
+### Smoke and tests
+
+`python -m app.smoke_discovery` prints `INITIAL GOAL`, `QUESTIONS`, `ANSWERS`
+(auto-answered from a fixture), `PROJECT SPECIFICATION`, `PLAN` (the existing
+`Planner`, plus one dispatch through the existing pipeline on the offline `mock`
+provider) and `STATUS`, and exits 0. `python -m app.smoke_routing --mock` keeps the
+routing smoke working offline. `tests/test_discovery.py` and
+`tests/test_smoke_discovery.py` cover the rules, the state machine, the redaction,
+the guard, the 409/confirmed HTTP behaviour, the spec text reaching the task
+description, and the preserved provider/model selection, with fake providers only.
+
+**Not implemented.** There is no browser UI for this layer, no navigation change,
+and no committed history. The clarification layer is reachable over HTTP and from
+Python.
+
+## Discovery / Clarification v0.1 — русская версия
+
+Слой уточнения теперь стоит **перед** существующим конвейером. Он решает, знает ли
+Forge достаточно для планирования, задаёт не более шести коротких практических
+вопросов, если нет, выводит `ProjectSpecification` и не позволяет ничего
+планировать или выполнять до подтверждения пользователем. Собственного исполнителя
+он не создаёт: после подтверждения работает существующий путь
+Planner / Dispatcher / Run, без изменений.
+
+```text
+идея пользователя
+  -> DiscoveryService.start(goal)
+  -> ClarificationQuestion[1..6]        (только ещё неизвестные области)
+  -> ответы
+  -> ProjectSpecification               (выведенное + отвеченное, без догадок)
+  -> confirm()                          (skip() + confirm() — явный короткий путь)
+  -> require_confirmed()                (жёсткая защита)
+  -> POST /api/tasks/run  с discovery_session_id
+  -> СУЩЕСТВУЮЩИЙ Planner / Dispatcher / Run
+```
+
+### Модели и детерминизм
+
+`app/discovery/models.py` содержит простые неизменяемые dataclass-объекты без I/O:
+`ClarificationQuestion(id, text, field, why, required)`,
+`ClarificationAnswer(question_id, text, skipped, redacted)`,
+`ProjectSpecification(...12 полей..., source_answers)` и
+`DiscoverySession(session_id, initial_goal, state, questions, answers,
+specification, created_at, updated_at, skipped, skip_reason)` с состояниями
+`NEEDS_CLARIFICATION`, `READY_FOR_PLANNING`, `CONFIRMED`, `CANCELLED`.
+
+`app/discovery/analyzer.py` выводит то, что цель уже говорит прямо, только
+правилами — без модели, без вызова провайдера, без сети: тип проекта (Telegram-бот,
+бронирование/отель, магазин, дашборд, api, cli, сайт/web), платформа, роли
+пользователей, ключевые функции, интеграции (оплата, Telegram, email, SMS, CRM/1C,
+календарь), хранение (PostgreSQL/MySQL/SQLite/«база данных»/файлы), авторизация,
+уведомления, ограничения (бюджет, срок, локальный запуск), критерии приёмки и
+приоритеты. Фиксированный набор и порядок областей — `AREA_ORDER`; `ESSENTIAL_AREAS`
+— первые пять. `missing_areas()` сообщает области, которые не покрыты ни целью, ни
+ответом; неизвестная область остаётся **пустой** и о ней спрашивают, её никогда не
+угадывают.
+
+`app/discovery/questions.py` превращает неизвестные области в не более чем
+`MAX_QUESTIONS = 6` коротких русских вопросов (по одному на область, с одной строкой
+`why`). Список детерминирован, существенные области идут первыми, поэтому ограничение
+не может отбросить обязательный вопрос, а область, на которую уже есть ответ (или
+явный пропуск), больше не спрашивается. Необязательный LLM-хук формулировок за
+существующим интерфейсом `Provider` намеренно **не** реализован и нигде не требуется:
+тесты, smoke-команда и развёртывание без провайдера дают одинаковые вопросы.
+
+### Машина состояний и защита
+
+| из | переход | в |
+| --- | --- | --- |
+| `start` | не хватает существенной области | `NEEDS_CLARIFICATION` |
+| `start` | существенного не хватает | `READY_FOR_PLANNING` |
+| `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `answer()` заполняет существенное | `READY_FOR_PLANNING` |
+| `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `skip(reason)` | `READY_FOR_PLANNING`, `skipped=True` |
+| `READY_FOR_PLANNING` | `confirm()` | `CONFIRMED` |
+| `NEEDS_CLARIFICATION` | `confirm()` | отказ (`DiscoveryNotReady`) |
+| `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `cancel()` | `CANCELLED` |
+| `CONFIRMED` | `confirm()` | `CONFIRMED` (идемпотентно) |
+| `CONFIRMED` | `answer()`, `skip()`, `cancel()` | отказ (`DiscoveryStateConflict`) |
+| `CANCELLED` | любой переход | отказ |
+
+`DiscoveryService.require_confirmed(session_id)` — жёсткая защита: она выбрасывает
+`DiscoveryNotConfirmed`, если состояние не `CONFIRMED`, поэтому ни одна попытка
+планирования или выполнения не может действовать по неподтверждённой или отменённой
+сессии. `skip()` не является обходом: он приводит к `READY_FOR_PLANNING`, а для
+выполнения всё равно нужен `confirm()`. Каждый переход сохраняется до возврата,
+поэтому читатель никогда не видит наполовину применённый ответ.
+
+### Хранение и секреты
+
+`app/discovery/store.py` пишет один небольшой JSON-файл на сессию под
+`FORGE_DISCOVERY_ROOT` (по умолчанию `<repository>/.forge/discovery`, gitignored),
+используя проверенные механики Run Store: консервативный allow-list идентификаторов,
+повторно доказываемую проверку вложенности и временный файл с fsync перед
+`os.replace`. Это **отдельное** хранилище от Run Store: сессия уточнения
+предшествует запуску и не является доказательством выполнения. Повреждённый файл
+читается как отсутствующий, а не как частично достоверный.
+
+Секреты не хранятся. Каждый ответ проверяется существующим
+`app.context.validation.find_forbidden_value_content`; похожий на секрет ответ
+заменяется маркером `[REDACTED:<reason>]`, в ответе записывается `redacted=True`, и
+значение не попадает ни в спецификацию, ни в файл сессии, ни в какой-либо ответ.
+Похожая на секрет **цель** также не сохраняется: сессия открывается с пустой целью и
+спрашивает её. Ответы — только текст пользователя.
+
+### API
+
+`app/api/discovery_routes.py`, регистрируемый из `app/api/server.py`, добавляет семь
+маршрутов над одним экземпляром сервиса, собранным при создании приложения:
+`POST /api/discovery/sessions` `{goal}` (создать сессию и вернуть её с вопросами),
+`GET /api/discovery/sessions/{id}`, `POST /api/discovery/sessions/{id}/answers`
+`{answers:[{question_id,text}]}`, `POST /api/discovery/sessions/{id}/skip` `{reason?}`,
+`GET /api/discovery/sessions/{id}/specification`,
+`POST /api/discovery/sessions/{id}/confirm`,
+`POST /api/discovery/sessions/{id}/cancel`.
+
+Ответы содержат только безопасные поля (идентификаторы, состояния, тексты вопросов,
+отфильтрованные ответы, спецификацию и её текст задачи). Отказы используют
+существующий контракт ошибок поверхности: 404 для неизвестной сессии, 400 для
+некорректного тела, 409 для конфликта состояния, с машинным кодом
+(`unknown_discovery_session`, `discovery_not_confirmed`, `discovery_not_ready`,
+`discovery_state_conflict`, `invalid_discovery_answer`).
+
+### Передача в существующий конвейер
+
+`POST /api/tasks/run` принимает необязательный `discovery_session_id`. Поле читается
+на границе HTTP и **не** является полем `TaskRunRequest`: набор полей этой модели
+закреплён несколькими контрактными тестами, а id сессии — это контекст текста задачи,
+а не authority выполнения (через него нельзя назвать ни команду, ни рабочую область,
+ни профиль, ни переменные окружения, ни таймаут, ни allowlist).
+
+- Неизвестная сессия отклоняется с 404; сессия не в состоянии `CONFIRMED` (включая
+  `NEEDS_CLARIFICATION`) отклоняется с **409** и кодом `discovery_not_confirmed` до
+  любой диспетчеризации.
+- `ProjectSpecification.as_task_text()` подтверждённой сессии добавляется перед
+  описанием вызывающего, и запуск продолжается по существующему пути. Явный выбор
+  провайдера/модели, автоматическая маршрутизация, классификация задач, цепочка
+  fallback, cost-aware маршрутизация, замороженный `RunScope` и все границы
+  безопасности не изменяются.
+
+### Smoke и тесты
+
+`python -m app.smoke_discovery` печатает `INITIAL GOAL`, `QUESTIONS`, `ANSWERS`
+(автоответы из фикстуры), `PROJECT SPECIFICATION`, `PLAN` (существующий `Planner` плюс
+одна диспетчеризация через существующий конвейер на offline-провайдере `mock`) и
+`STATUS`, и завершается с кодом 0. `python -m app.smoke_routing --mock` сохраняет
+работу smoke маршрутизации offline. `tests/test_discovery.py` и
+`tests/test_smoke_discovery.py` покрывают правила, машину состояний, редактирование
+секретов, защиту, поведение HTTP 409/подтверждено, попадание текста спецификации в
+описание задачи и сохранённый выбор провайдера/модели, только с фейковыми
+провайдерами.
+
+**Не реализовано.** Для этого слоя нет браузерного UI, нет изменения навигации и нет
+закоммиченной истории. Слой уточнения доступен по HTTP и из Python.

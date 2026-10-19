@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.build_info import FORGE_VERSION
+
 
 @dataclass(frozen=True)
 class HealthResponse:
@@ -12,7 +14,7 @@ class HealthResponse:
 
     status: str
     core_status: str
-    version: str = "0.1.0"
+    version: str = FORGE_VERSION
     timestamp: str = ""
 
     def to_dict(self) -> Dict[str, Any]:

@@ -48,6 +48,16 @@ TRANSPORT_ERROR_CLASS_NAMES = ("APIConnectionError", "APITimeoutError")
 #: What a redacted key value is replaced with in an error message.
 REDACTED_PLACEHOLDER = "[redacted]"
 
+#: What a failed account's HTTP status means, in the words the operator needs to act.
+#: The status is stated explicitly because the translated SDK message ("Radox API request
+#: failed") does not say *why*, and a spent balance is an owner action, not a retry.
+ACCOUNT_STATUS_NOTES = {
+    401: "the account credential was rejected (HTTP 401)",
+    402: "the account has insufficient funds or quota (HTTP 402)",
+    403: "the account credential was rejected (HTTP 403)",
+    429: "the account is rate limited (HTTP 429)",
+}
+
 
 def _status_code_of(exc: BaseException) -> Optional[int]:
     """The HTTP status an SDK error carries, when it carries one."""
@@ -110,6 +120,22 @@ def _redacted(error: BaseException, secret: str) -> BaseException:
         return type(error)(redacted_text)
     except Exception:  # noqa: BLE001 - an SDK error type that refuses a plain message
         return ProviderError(redacted_text)
+
+
+def _account_failure_note(
+    status_code: Optional[int], every_key_cooling_down: bool, key_count: int
+) -> str:
+    """The operator-facing explanation appended to an exhausted-pool failure."""
+
+    notes = []
+    status_note = ACCOUNT_STATUS_NOTES.get(status_code) if status_code is not None else None
+    if status_note:
+        notes.append(status_note)
+    if every_key_cooling_down:
+        notes.append(
+            f"all {key_count} Radox API key account(s) are cooling down after repeated failures"
+        )
+    return "; ".join(notes)
 
 
 class RadoxProvider(OpenAICompatibleProvider):
@@ -183,20 +209,20 @@ class RadoxProvider(OpenAICompatibleProvider):
         candidates = ledger.candidates(start, len(keys))[:attempts]
 
         last_error: Optional[BaseException] = None
+        last_status_code: Optional[int] = None
         last_key = keys[0]
-        for position, index in enumerate(candidates):
+        for index in candidates:
             api_key = keys[index]
             last_key = api_key
             try:
                 response = self._perform_request(request, api_key, model_name, sdk)
             except Exception as exc:  # noqa: BLE001 - classified below, then re-raised
                 status_code = _status_code_of(exc)
+                last_status_code = status_code
                 ledger.record_failure(index, status_code, _retry_after_of(exc))
                 last_error = self._translated_error(exc, sdk)
-                if (
-                    not _is_failover_error(exc, sdk, status_code)
-                    or position == len(candidates) - 1
-                ):
+                if not _is_failover_error(exc, sdk, status_code):
+                    # Not an account problem: another account cannot serve this request.
                     raise _redacted(last_error, api_key) from None
                 continue
 
@@ -210,10 +236,29 @@ class RadoxProvider(OpenAICompatibleProvider):
             )
             return response
 
-        # The loop either returned or raised; this keeps the type checker and a future
-        # edit honest rather than returning None.
+        # The pool could not serve the request. The error says which HTTP status failed
+        # and, when the whole pool is in cooldown, that it is -- so a spent balance is
+        # reported honestly instead of looking like a transient blip. A single-account
+        # pool has no rotation to explain, so its message stays exactly as it was.
         if last_error is not None:
-            raise _redacted(last_error, last_key) from None
+            note = (
+                _account_failure_note(
+                    last_status_code,
+                    ledger.every_key_cooling_down(len(keys)),
+                    len(keys),
+                )
+                if len(keys) > 1
+                else ""
+            )
+            redacted = _redacted(last_error, last_key)
+            if not note:
+                raise redacted from None
+            message = f"{redacted} ({note})"
+            try:
+                noted: BaseException = type(redacted)(message)
+            except TypeError:  # an SDK error type that refuses the longer message
+                noted = ProviderError(message)
+            raise noted from None
         raise ProviderNotConfiguredError(
             f"Set {api_key_env_var} in the local environment to use {self.PROVIDER_NAME}"
         )

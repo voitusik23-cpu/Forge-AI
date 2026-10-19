@@ -29,11 +29,25 @@ class ProviderResponse:
 
 
 class ProviderError(RuntimeError):
-    """A safe, expected provider execution failure."""
+    """A safe, expected provider execution failure.
+
+    ``failover_eligible`` tells the orchestrator's fallback chain whether *another*
+    provider may legitimately serve the same request after this failure. The default is
+    ``True`` because that is the historical behaviour of the chain: an unknown provider
+    error is treated as the provider's problem, not the request's. A subclass that
+    positively identifies a *request* error -- the caller's payload or model id is wrong,
+    so every provider would reject it -- sets it to ``False`` and stops the chain.
+    """
+
+    failover_eligible = True
 
 
 class ProviderNotConfiguredError(ProviderError):
-    """Raised when a provider has no real integration configured."""
+    """Raised when a provider has no real integration configured.
+
+    Missing configuration is the provider's problem, so the chain may still advance to a
+    provider that is configured.
+    """
 
 
 class Provider(ABC):

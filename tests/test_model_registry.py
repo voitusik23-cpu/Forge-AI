@@ -241,6 +241,51 @@ class ModelCapabilityAndFilteringTests(unittest.TestCase):
         self.assertEqual(openrouter_free.model_id, "cohere/north-mini-code:free")
         self.assertEqual(openrouter_free.cost_tier, CostTier.FREE)
 
+    def test_google_advertises_only_the_curated_existing_set(self) -> None:
+        """The Google rows are the ids the provider's own catalogue lists.
+
+        Read from ``GET https://generativelanguage.googleapis.com/v1beta/models``: 63
+        models, 46 answering ``generateContent``, including every id asserted here.
+        ``gemini-2.0-flash`` is absent from that answer and must not come back.
+        """
+
+        google = self.registry.list_models("google")
+        self.assertEqual(
+            {model.model_id for model in google},
+            {
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-flash-latest",
+                "gemini-3.5-flash",
+            },
+        )
+        self.assertNotIn(
+            "gemini-2.0-flash",
+            {model.model_id for model in self.registry.list_models()},
+        )
+        self.assertEqual(
+            self.registry.get_provider("google").supported_models,
+            (
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-flash-latest",
+                "gemini-3.5-flash",
+            ),
+        )
+
+    def test_only_the_measured_google_model_is_routable_automatically(self) -> None:
+        """``gemini-2.5-flash`` is listed but this account cannot call it (HTTP 404).
+
+        ``find_models`` with ``max_cost_tier=CHEAP`` is the shape automatic routing uses
+        while ``allow_paid_providers`` is false, so it must not hand out a model that
+        cannot answer. ``gemini-flash-latest`` is the row measured to reply.
+        """
+
+        routable = self.registry.find_models(
+            provider_id="google", max_cost_tier=CostTier.CHEAP
+        )
+        self.assertEqual([model.model_id for model in routable], ["gemini-flash-latest"])
+
 
 class SecretBoundaryAndSafetyTests(unittest.TestCase):
     """Verify that credentials and secrets never enter registry representations."""

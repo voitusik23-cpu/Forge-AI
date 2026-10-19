@@ -5,8 +5,8 @@
 html, body, #root { height: 100%; margin: 0; }
 
 body {
-  background: var(--space);
-  color: var(--ice);
+  background: var(--bg);
+  color: var(--text);
   font-family: var(--font);
   font-size: var(--t-body);
   -webkit-font-smoothing: antialiased;
@@ -19,21 +19,20 @@ body::before {
   position: fixed;
   inset: -20% -10% auto -10%;
   height: 70%;
-  background:
-    radial-gradient(60% 60% at 18% 0%, rgba(124, 92, 255, 0.20), transparent 70%),
-    radial-gradient(50% 50% at 82% 6%, rgba(34, 211, 238, 0.14), transparent 72%);
+  background: var(--page-aurora);
   filter: blur(20px);
   pointer-events: none;
   z-index: 0;
 }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+a { color: var(--link); }
 input { font: inherit; }
-::selection { background: rgba(124, 92, 255, 0.35); }
+::selection { background: var(--selection-bg); }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb {
-  background: linear-gradient(180deg, rgba(124, 92, 255, 0.5), rgba(34, 211, 238, 0.35));
+  background: var(--scrollbar-thumb);
   border-radius: 999px;
   border: 3px solid transparent;
   background-clip: content-box;
@@ -89,8 +88,8 @@ input { font: inherit; }
   text-transform: uppercase;
   letter-spacing: 0.13em;
   font-size: var(--t-micro);
-  color: var(--muted);
+  color: var(--text-muted);
   font-weight: 600;
 }
-.muted { color: var(--muted); }
+.muted { color: var(--text-muted); }
 .small { font-size: var(--t-small); }

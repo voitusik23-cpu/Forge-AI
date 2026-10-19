@@ -16,19 +16,59 @@ from app.usage import Usage
 
 
 class CompatibleAuthenticationError(ProviderError):
-    """A compatible API rejected authentication."""
+    """A compatible API rejected authentication.
+
+    Credential failure: the account cannot serve the request, another provider may.
+    """
+
+    failover_eligible = True
 
 
 class CompatibleRateLimitError(ProviderError):
     """A compatible API rate limit was reached."""
 
+    failover_eligible = True
+
 
 class CompatibleTimeoutError(ProviderError):
     """A compatible API request timed out."""
 
+    failover_eligible = True
+
 
 class CompatibleRequestError(ProviderError):
-    """A compatible API request failed for an expected reason."""
+    """A compatible API request failed for an expected reason.
+
+    This is the *request* class: the payload, the model id, or the endpoint was wrong, so
+    repeating the same request on another provider cannot help and the fallback chain
+    stops. A failure that is really about the provider rather than the request uses a
+    subclass that turns ``failover_eligible`` back on.
+    """
+
+    failover_eligible = False
+
+
+class CompatibleConnectionError(CompatibleRequestError):
+    """The transport to a compatible API failed; another provider may still serve."""
+
+    failover_eligible = True
+
+
+class CompatibleUnavailableError(CompatibleRequestError):
+    """The API refused to serve this account: quota, credential, or a server-side fault.
+
+    Measured: a 402 ``insufficient_quota`` was mapped to the generic request error, so a
+    fallback chain treated a spent balance as a bad request and stopped instead of trying
+    the next provider.
+    """
+
+    failover_eligible = True
+
+
+#: HTTP statuses that are the *account's* or the *server's* condition rather than the
+#: request's: quota/credential rejections, rate limits, request timeout, and 5xx faults.
+#: A 400/404/422 -- an invalid request or an unknown model id -- is deliberately absent.
+FAILOVER_STATUS_CODES = frozenset({401, 402, 403, 408, 409, 429, 500, 502, 503, 504})
 
 
 class CompatibleResponseError(ProviderError):
@@ -187,15 +227,41 @@ class OpenAICompatibleProvider(Provider):
         return sdk.OpenAI(**options)
 
     def _translate_sdk_error(self, exc: Exception, sdk: Any) -> None:
-        """Map known SDK failures to safe errors without exposing SDK messages."""
+        """Map known SDK failures to safe errors without exposing SDK messages.
+
+        The *text* of each message is unchanged; only the class chosen for a bare
+        ``APIError`` depends on its HTTP status, so a 402/401/403/429/5xx is reported as
+        a provider-side failure the fallback chain may advance past, while a 400/404/422
+        stays a request failure that ends the chain.
+        """
+        status_code = _status_code_of(exc)
         cases = (
             ("AuthenticationError", CompatibleAuthenticationError, "authentication failed"),
             ("RateLimitError", CompatibleRateLimitError, "rate limit exceeded"),
             ("APITimeoutError", CompatibleTimeoutError, "request timed out"),
-            ("APIConnectionError", CompatibleRequestError, "connection failed"),
+            ("APIConnectionError", CompatibleConnectionError, "connection failed"),
             ("APIError", CompatibleRequestError, "API request failed"),
         )
         for sdk_name, provider_error, description in cases:
             error_type = getattr(sdk, sdk_name, None)
             if isinstance(error_type, type) and isinstance(exc, error_type):
+                if (
+                    sdk_name == "APIError"
+                    and status_code is not None
+                    and status_code in FAILOVER_STATUS_CODES
+                ):
+                    provider_error = CompatibleUnavailableError
                 raise provider_error(f"{self.provider_name.title()} {description}") from None
+
+
+def _status_code_of(exc: BaseException) -> Optional[int]:
+    """The HTTP status an SDK error carries, when it carries one."""
+
+    value = getattr(exc, "status_code", None)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None

@@ -114,21 +114,21 @@ export const Sparkline = ({
     .map((value, index) => `${index * step},${height - ((value - min) / span) * (height - 6) - 3}`)
     .join(" ");
   const strokes: Record<string, string> = {
-    violet: "#9a80ff",
-    cyan: "#67e8f9",
-    ok: "#34d399",
-    danger: "#fb7185",
+    violet: "var(--violet-hi)",
+    cyan: "var(--cyan-hi)",
+    ok: "var(--ok)",
+    danger: "var(--danger)",
   };
   const colour = strokes[tone];
   return (
     <svg className="spark" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
       <defs>
         <linearGradient id={`spark-${tone}`} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={colour} stopOpacity="0.42" />
-          <stop offset="100%" stopColor={colour} stopOpacity="0" />
+          <stop offset="0%" style={{ stopColor: colour }} stopOpacity="0.42" />
+          <stop offset="100%" style={{ stopColor: colour }} stopOpacity="0" />
         </linearGradient>
       </defs>
-      <polyline points={path} fill="none" stroke={colour} strokeWidth="1.8" strokeLinejoin="round" />
+      <polyline points={path} fill="none" style={{ stroke: colour }} strokeWidth="1.8" strokeLinejoin="round" />
       <polygon points={`0,${height} ${path} ${width},${height}`} fill={`url(#spark-${tone})`} />
     </svg>
   );

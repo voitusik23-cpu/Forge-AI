@@ -4,6 +4,7 @@ import { Forge } from "./screens/Forge";
 import { Overview } from "./screens/Overview";
 import { Agents } from "./screens/Agents";
 import { Projects } from "./screens/Projects";
+import { Providers } from "./screens/Providers";
 import { Runs } from "./screens/Runs";
 import { Tools } from "./screens/Tools";
 import { Costs } from "./screens/Costs";
@@ -138,6 +139,16 @@ export const App = () => {
           />
         ) : null}
         {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}
+        {/* Провайдеры is a hub, not a new subsystem: it links to the four screens below it,
+            whose routes and endpoints are unchanged. */}
+        {nav === "providers" ? (
+          <Providers
+            lang={lang}
+            backend={backend}
+            onOpen={(section) => selectSection(section)}
+            onHelp={() => openHelp(CONTEXT_TOPIC.providers)}
+          />
+        ) : null}
         {nav === "agents" ? <Agents lang={lang} backend={backend} onRefresh={() => void reload()} /> : null}
         {nav === "projects" ? (
           <Projects
@@ -174,9 +185,12 @@ export const App = () => {
             onChange={updateAppearance}
             onHelp={() => openHelp(CONTEXT_TOPIC.settings)}
             storageWorks={storageWorks}
+            status={live ? backend.core : null}
           />
         ) : null}
-        {nav === "help" ? <Help lang={lang} topic={helpTopic} /> : null}
+        {nav === "help" ? (
+          <Help lang={lang} topic={helpTopic} status={live ? backend.core : null} />
+        ) : null}
         {/* Every section in the navigation rail now has a screen. This single list is the only
             place that says so, so it is kept in step with NavRail.ITEMS: a section that is mapped
             here must never also render the "not migrated yet" fallback below, and an unknown id
@@ -185,6 +199,7 @@ export const App = () => {
           "forge",
           "overview",
           "projects",
+          "providers",
           "agents",
           "models",
           "runs",

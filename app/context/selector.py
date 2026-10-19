@@ -14,7 +14,7 @@ from app.context.models import (
     ContextSourceType,
     ContextTrustLevel,
 )
-from app.context.validation import FORBIDDEN_CONTEXT_SUBSTRINGS
+from app.context.validation import find_forbidden_value_content
 
 if TYPE_CHECKING:
     from app.agents.providers.models import ProviderModelInfo
@@ -43,6 +43,18 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 2) // 3)
 
 
+#: Tokens the operator's own Tier 1 text (the task description above all) may use, on
+#: top of whatever the model's context window gives the surrounding content.
+#:
+#: The task text is special: it is the *instruction the operator wrote*, not retrieved
+#: evidence, so it must not compete for the same budget as project memory or traces.
+#: Measured: a moderately detailed Russian brief was dropped as "cannot fit into
+#: available budget (26624 tokens, max_items=16)" because the whole pool was the model's
+#: 32k window minus output and headroom -- a bound sized for evidence, applied to the
+#: instruction. 128k tokens admits a long brief while still refusing an absurd one.
+TASK_SPECIFICATION_BUDGET_TOKENS: int = 128_000
+
+
 @dataclass(frozen=True)
 class ContextBudgetPolicy:
     """Model-aware budget policy defining context limits and headroom bounds."""
@@ -57,6 +69,11 @@ class ContextBudgetPolicy:
     allow_truncation: bool = True
     min_retained_characters: int = 120
     model_name: Optional[str] = None
+    #: Tokens the Tier 1 operator text may use regardless of the model's input budget.
+    #: ``None`` keeps the historical behaviour (everything competes for one budget); the
+    #: default run composition sets :data:`TASK_SPECIFICATION_BUDGET_TOKENS`, because a
+    #: narrow window sized for evidence must not reject the operator's own instruction.
+    task_specification_budget_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.total_context_window < 1:
@@ -269,6 +286,11 @@ class ContextSelector:
         policy = budget_policy or self.policy
         budget_tokens = policy.input_budget_tokens
         max_items = policy.max_items
+        # Tier 1 text keeps its own, larger bound so the operator's instruction is never
+        # what a window sized for evidence evicts. Other tiers stay on `budget_tokens`.
+        tier_1_budget_tokens = budget_tokens
+        if policy.task_specification_budget_tokens is not None:
+            tier_1_budget_tokens = max(budget_tokens, policy.task_specification_budget_tokens)
 
         candidate_list = list(candidates)
         total_candidates = len(candidate_list)
@@ -286,8 +308,7 @@ class ContextSelector:
                 dropped_reasons[item_id] = f"security_sensitivity_exclusion:{sens_val}"
                 continue
 
-            val_lower = item.value.lower()
-            bad_found = next((bad for bad in FORBIDDEN_CONTEXT_SUBSTRINGS if bad in val_lower), None)
+            bad_found = find_forbidden_value_content(item.value)
             if bad_found:
                 dropped_reasons[item_id] = f"security_forbidden_content:{bad_found}"
                 continue
@@ -318,8 +339,9 @@ class ContextSelector:
                 continue
 
             item_tokens = estimate_tokens(item.value)
+            item_budget = tier_1_budget_tokens if self.is_tier_1(item) else budget_tokens
 
-            if accumulated_tokens + item_tokens <= budget_tokens:
+            if accumulated_tokens + item_tokens <= item_budget:
                 selected_items.append(item)
                 accumulated_tokens += item_tokens
             elif (
@@ -381,9 +403,19 @@ class ContextSelector:
         if critical_context_unfit and raise_on_critical_unfit:
             first_crit_id = critical_dropped[0]
             reason = dropped_reasons.get(first_crit_id, "unknown")
+            # Report the budget that actually applied to this item, not the generic one:
+            # a Tier 1 item is measured against its own, larger bound.
+            first_crit = next(
+                (c for c in candidate_list if c.item_id == first_crit_id), None
+            )
+            reported_budget = (
+                tier_1_budget_tokens
+                if first_crit is not None and self.is_tier_1(first_crit)
+                else budget_tokens
+            )
             raise CriticalContextUnfitError(
                 f"Critical Tier 1 context item '{first_crit_id}' cannot fit into available budget "
-                f"({budget_tokens} tokens, max_items={max_items}). Reason: {reason}"
+                f"({reported_budget} tokens, max_items={max_items}). Reason: {reason}"
             )
 
         return tuple(selected_items), report

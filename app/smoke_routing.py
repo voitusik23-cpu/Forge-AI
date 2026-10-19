@@ -1,10 +1,39 @@
 """Real-request smoke check for Forge's automatic provider routing."""
 
 import re
+import sys
 from typing import Iterable
 
 from app.orchestrator.models import Task, TaskCategory
 from app.runtime.bootstrap import create_runtime
+
+
+def _use_mock(argv: "list[str]") -> bool:
+    """Whether this invocation asks for the offline provider explicitly.
+
+    ``python -m app.smoke_routing --mock`` keeps the same assertions -- one task,
+    automatic routing, a reported provider and model -- while making no network
+    call at all, which is what a CI run or an offline session needs.
+    """
+
+    return any(argument.strip() == "--mock" for argument in argv)
+
+
+def _runtime(mock: bool):
+    """The ambient runtime, or a TEST runtime narrowed to the offline provider."""
+
+    if not mock:
+        return create_runtime()
+    from app.config.settings import RuntimeSettings
+
+    return create_runtime(
+        settings=RuntimeSettings(
+            default_provider="mock",
+            enabled_providers=("mock",),
+            provider_fallback_chain=(),
+        ),
+        test_mode=True,
+    )
 
 
 def _known_secrets(runtime) -> list[str]:
@@ -40,8 +69,9 @@ def _safe_text(value: str, secrets: Iterable[str]) -> str:
 
 def main() -> int:
     """Dispatch an ordinary task without a provider override and report routing."""
+    mock = _use_mock(sys.argv[1:])
     try:
-        runtime = create_runtime()
+        runtime = _runtime(mock)
         task = Task(
             id="automatic-routing-smoke",
             description=(
@@ -62,6 +92,8 @@ def main() -> int:
         print("Automatic routing smoke failed (details suppressed).")
         return 1
 
+    if mock:
+        print("mode: offline (mock provider, no network)")
     print(f"provider: {provider_name}")
     print(f"model: {model_name}")
     print(f"status: {'success' if result.success else 'failure'}")

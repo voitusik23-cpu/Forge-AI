@@ -5858,3 +5858,142 @@ fail-closed значения по умолчанию, идемпотентнос
    ограничен перечисленными рамками; нужен ли интерактивный approval перед записью —
    решение владельца, и механизм одобрений плоскости инструментов сознательно не
    переиспользуется.
+
+## Provider failover and context guards
+
+- **A hard account failure disables the account, not just rotates past it.** Radox
+  402 (insufficient funds/quota) and 401/403 (rejected credential) set
+  `disabled_until` (one hour) in addition to advancing the rotation cursor, exactly
+  like a 429. Before this, the ledger recorded `last_error_code: 402` with no
+  cooldown, so the same dead account was reserved again on the next request. A
+  disabled position stays a last resort: when every account is cooling down the pool
+  is still attempted, and the failure message says so.
+- **The fallback chain advances on the provider's problem, not on the request's.**
+  `ProviderError.failover_eligible` (a class attribute, never message text) marks
+  credential/quota/rate-limit/transport failures as eligible for the next provider;
+  a request error (400/404/422) ends the chain, because every provider would reject
+  the same request. `NOT_CONFIGURED` remains eligible.
+- **A resolved configured default is a primary, not a pin.** The API passes the
+  deployment's configured default with `allow_fallback=True`; a provider named by the
+  caller stays pinned. Passed as an explicit name, the default used to pin the run,
+  so a 402 on it ended the run with the configured chain never consulted.
+- **The operator's own task text is budgeted separately.** `TASK_SPECIFICATION_BUDGET_TOKENS`
+  (128k) bounds Tier 1 text independently of the model window, and the assembled
+  context's character bound is derived from it. A narrow window sized for retrieved
+  evidence must not reject the instruction itself; an absurd description is still
+  refused with an explicit limit message.
+- **The security filter refuses secret material, not the word "token".** A value
+  naming `tokens_in`/`tokens_out`/`max_tokens` is engineering text; a `Bearer`
+  credential, JWT, `sk-`/`ghp_` key, assigned credential, or credential-shaped
+  random value is still refused with the existing reasons. A lowercase hex digest
+  is an identifier (workspace fingerprints, snapshot ids) and is not treated as
+  secret material.
+
+### Provider failover и защиты контекста — русская версия
+
+- **Жёсткий отказ аккаунта выключает аккаунт, а не только пропускает его.** Radox
+  402 (нет средств/квоты) и 401/403 (отклонённые credentials) выставляют
+  `disabled_until` (один час) вместе с продвижением курсора ротации, как и 429. До
+  этого ledger записывал `last_error_code: 402` без cooldown, и тот же мёртвый
+  аккаунт выбирался снова на следующем запросе. Выключенная позиция остаётся
+  последним шансом: когда остывают все аккаунты, пул всё равно пробуется, и
+  сообщение об ошибке это сообщает.
+- **Цепочка fallback продвигается из-за проблемы провайдера, а не запроса.**
+  `ProviderError.failover_eligible` (атрибут класса, не текст сообщения) помечает
+  отказы credentials/квоты/rate-limit/транспорта как допустимые для следующего
+  провайдера; ошибка запроса (400/404/422) цепочку завершает, потому что тот же
+  запрос отвергнет любой провайдер. `NOT_CONFIGURED` остаётся допустимым.
+- **Разрешённый настроенный default — это primary, а не pin.** API передаёт
+  настроенный default с `allow_fallback=True`; провайдер, названный вызывающим,
+  остаётся закреплённым. Переданный как явное имя, default закреплял запуск, поэтому
+  402 на нём завершал запуск без обращения к настроенной цепочке.
+- **Текст задачи оператора бюджетируется отдельно.** `TASK_SPECIFICATION_BUDGET_TOKENS`
+  (128k) ограничивает Tier 1 текст независимо от окна модели, и граница символов
+  собранного контекста выводится из неё. Узкое окно, рассчитанное на извлечённые
+  доказательства, не должно отвергать саму инструкцию; абсурдное описание
+  по-прежнему отклоняется с явным сообщением о лимите.
+- **Фильтр безопасности отклоняет секретный материал, а не слово «token».** Значение,
+  называющее `tokens_in`/`tokens_out`/`max_tokens`, — это инженерный текст;
+  `Bearer`-credential, JWT, ключ `sk-`/`ghp_`, присвоенный credential или похожее на
+  credential случайное значение по-прежнему отклоняются с существующими причинами.
+  Hex-дайджест в нижнем регистре — это идентификатор (fingerprint рабочего
+  пространства, id снимка), а не секретный материал.
+
+## Discovery / Clarification v0.1
+
+- **Clarification sits in front of the pipeline, and owns no execution.** The layer
+  (`app/discovery`) decides whether the idea says enough to plan, asks at most six
+  short questions, derives a `ProjectSpecification`, and refuses planning/execution
+  until the user confirms. After confirmation the existing Planner / Dispatcher /
+  Run path runs unchanged; there is no second executor and no second run system.
+- **The obvious fields are derived by rules, not by a model.** Project type,
+  platform, users, core features, integrations, storage, auth and notifications are
+  matched with fixed keyword rules (`app/discovery/analyzer.py`), so the same goal
+  always yields the same derivation, tests need no network, and a run is never
+  blocked on an LLM being available. An optional LLM phrasing hook is deliberately
+  not implemented.
+- **Unstated means unknown, never guessed.** The area set is fixed (twelve areas);
+  an area neither the goal nor an answer covers stays empty and is asked about.
+- **The question list is capped and ordered.** At most six questions, essential
+  areas first, so the cap can never drop a required question; an answered or
+  explicitly skipped area is never asked again.
+- **Confirmation is the only way in.** `require_confirmed()` raises
+  `DiscoveryNotConfirmed` unless the state is `CONFIRMED`. `skip()` moves the
+  session to `READY_FOR_PLANNING`, not to `CONFIRMED`, so a skip is never a bypass:
+  the user still confirms explicitly before anything plans or runs.
+- **Sessions live in their own small store.** One JSON file per session under
+  `.forge/discovery` (`FORGE_DISCOVERY_ROOT`), atomically replaced exactly like the
+  Run Store's snapshots, but separate from it: a session precedes a run and is not
+  execution evidence.
+- **A secret-shaped answer is never stored.** Answers are screened with the existing
+  `find_forbidden_value_content`; a flagged answer is replaced by a
+  `[REDACTED:<reason>]` marker with `redacted=True`, so the value cannot reach the
+  specification, the file, the API, or a run. Answers are user text only.
+- **The hand-off is one task description.** `POST /api/tasks/run` reads
+  `discovery_session_id` at the HTTP boundary (not on `TaskRunRequest`, whose field
+  set is pinned), refuses 404/409 before dispatch unless the session is confirmed,
+  and otherwise prepends `as_task_text()` to the caller's description. Explicit
+  provider/model selection, automatic routing, classification, the fallback chain,
+  cost-aware routing, the frozen `RunScope` and every security boundary are
+  untouched.
+
+### Discovery / Clarification v0.1 — русская версия
+
+- **Уточнение стоит перед конвейером и не владеет выполнением.** Слой
+  (`app/discovery`) решает, достаточно ли идея говорит для планирования, задаёт не
+  более шести коротких вопросов, выводит `ProjectSpecification` и не позволяет
+  планировать/выполнять до подтверждения. После подтверждения существующий путь
+  Planner / Dispatcher / Run работает без изменений; второго исполнителя и второй
+  системы запусков нет.
+- **Очевидные поля выводятся правилами, а не моделью.** Тип проекта, платформа,
+  пользователи, ключевые функции, интеграции, хранение, авторизация и уведомления
+  сопоставляются фиксированными ключевыми правилами (`app/discovery/analyzer.py`),
+  поэтому одна цель всегда даёт один и тот же вывод, тесты не требуют сети, а запуск
+  никогда не блокируется доступностью LLM. Необязательный LLM-хук формулировок
+  намеренно не реализован.
+- **Не сказано — значит неизвестно, а не угадано.** Набор областей фиксирован
+  (двенадцать); область, не покрытая ни целью, ни ответом, остаётся пустой и о ней
+  спрашивают.
+- **Список вопросов ограничен и упорядочен.** Не более шести вопросов, существенные
+  области идут первыми, поэтому ограничение не может отбросить обязательный вопрос;
+  область с ответом или с явным пропуском больше не спрашивается.
+- **Единственный вход — подтверждение.** `require_confirmed()` выбрасывает
+  `DiscoveryNotConfirmed`, если состояние не `CONFIRMED`. `skip()` переводит сессию в
+  `READY_FOR_PLANNING`, а не в `CONFIRMED`, поэтому пропуск не является обходом:
+  пользователь всё равно подтверждает явно, прежде чем что-то планируется или
+  выполняется.
+- **Сессии живут в собственном небольшом хранилище.** Один JSON-файл на сессию под
+  `.forge/discovery` (`FORGE_DISCOVERY_ROOT`), атомарно заменяемый так же, как снимки
+  Run Store, но отдельно от него: сессия предшествует запуску и не является
+  доказательством выполнения.
+- **Похожий на секрет ответ не сохраняется.** Ответы проверяются существующим
+  `find_forbidden_value_content`; помеченный ответ заменяется маркером
+  `[REDACTED:<reason>]` с `redacted=True`, поэтому значение не может попасть ни в
+  спецификацию, ни в файл, ни в API, ни в запуск. Ответы — только текст пользователя.
+- **Передача — одно описание задачи.** `POST /api/tasks/run` читает
+  `discovery_session_id` на границе HTTP (не в `TaskRunRequest`, чей набор полей
+  закреплён), отклоняет 404/409 до диспетчеризации, если сессия не подтверждена, и
+  иначе добавляет `as_task_text()` перед описанием вызывающего. Явный выбор
+  провайдера/модели, автоматическая маршрутизация, классификация, цепочка fallback,
+  cost-aware маршрутизация, замороженный `RunScope` и все границы безопасности не
+  изменяются.

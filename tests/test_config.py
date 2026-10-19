@@ -20,7 +20,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.default_provider, "mock")
         self.assertEqual(settings.default_model, "mock")
         self.assertEqual(settings.openrouter_model, "cohere/north-mini-code:free")
-        self.assertEqual(settings.gemini_model, "gemini-3.8-flash")
+        self.assertEqual(settings.gemini_model, "gemini-flash-latest")
         self.assertEqual(settings.enabled_providers, ("mock", "openrouter"))
         self.assertEqual(settings.request_timeout, 30)
         self.assertEqual(settings.retry_count, 2)

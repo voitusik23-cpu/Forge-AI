@@ -220,6 +220,14 @@ export type Failure = {
   path: string;
   /** The backend's own explanation when it gave one. */
   detail: string;
+  /**
+   * The machine code the surface published (`error_code`/`code`), when it published one.
+   *
+   * A refusal is not one thing: `discovery_not_confirmed` (409) and a broken route (500) both
+   * arrive as a failed request, and the screen must tell the user which one happened instead of
+   * merging them into a generic error.
+   */
+  code?: string;
 };
 
 export type Result<T> = { ok: true; value: T } | { ok: false; failure: Failure };
@@ -235,6 +243,47 @@ const detailOf = (body: unknown, fallback: string): string => {
   return fallback;
 };
 
+/**
+ * The machine code of a refused request, read from the surface's own error contract.
+ *
+ * The discovery routes answer `{"detail": {"code": ..., "error_code": ..., "error": ...}}`, and
+ * older routes answer a plain string. Both shapes are searched, and an absent code stays empty so
+ * the screen falls back to the honest "HTTP <status>" instead of inventing a word.
+ */
+const machineCodeOf = (body: unknown): string => {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "";
+  const record = body as Record<string, unknown>;
+  const sources: Array<Record<string, unknown>> = [record];
+  if (record.detail && typeof record.detail === "object" && !Array.isArray(record.detail)) {
+    sources.unshift(record.detail as Record<string, unknown>);
+  }
+  for (const source of sources) {
+    for (const key of ["code", "error_code"]) {
+      const value = source[key];
+      if (typeof value === "string" && value.trim() !== "") return value.trim();
+    }
+  }
+  return "";
+};
+
+/** The server's own sentence about a refusal, when the body carries a readable one. */
+const serverMessageOf = (body: unknown): string => {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "";
+  const record = body as Record<string, unknown>;
+  const detail = record.detail;
+  const sources: Array<Record<string, unknown>> = [record];
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    sources.unshift(detail as Record<string, unknown>);
+  }
+  for (const source of sources) {
+    for (const key of ["error", "message"]) {
+      const value = source[key];
+      if (typeof value === "string" && value.trim() !== "") return value.trim();
+    }
+  }
+  return "";
+};
+
 const failureOf = async (path: string, response: Response): Promise<Failure> => {
   let body: unknown = null;
   let raw = "";
@@ -246,11 +295,14 @@ const failureOf = async (path: string, response: Response): Promise<Failure> => 
   }
   const kind: FailureKind =
     response.status === 401 || response.status === 403 ? "unauthorized" : "error";
+  const code = machineCodeOf(body);
   return {
     kind,
     status: response.status,
     path,
-    detail: detailOf(body, `${response.status} ${response.statusText}`.trim()),
+    detail:
+      serverMessageOf(body) || detailOf(body, `${response.status} ${response.statusText}`.trim()),
+    ...(code === "" ? {} : { code }),
   };
 };
 
@@ -329,6 +381,15 @@ export const dispatchTask = async (input: {
    * read-only dispatch byte-for-byte.
    */
   writeMode?: boolean;
+  /**
+   * The confirmed discovery session this run executes.
+   *
+   * `POST /api/tasks/run` reads the id at the HTTP boundary and refuses with 409
+   * `discovery_not_confirmed` unless that session is CONFIRMED; when it is, the Core prepends
+   * the specification to the description itself. This field carries no execution authority: no
+   * command, workspace, profile, environment or timeout can be named through it.
+   */
+  discoverySessionId?: string;
   /** Lets the interface cancel its own request; the backend keeps whatever it already did. */
   signal?: AbortSignal;
 }): Promise<Result<DispatchResult>> => {
@@ -342,6 +403,8 @@ export const dispatchTask = async (input: {
   if (modelName !== "") body.model_name = modelName;
   if (input.projectId) body.project_id = input.projectId;
   if (input.writeMode === true) body.write_mode = true;
+  const discoverySessionId = (input.discoverySessionId ?? "").trim();
+  if (discoverySessionId !== "") body.discovery_session_id = discoverySessionId;
 
   const headers: Record<string, string> = {
     "content-type": "application/json",
@@ -437,3 +500,138 @@ export const isTerminalRecord = (record: RunRecord | null): boolean => {
   );
   return labels.some((label) => label !== "" && TERMINAL_LABELS.has(label));
 };
+
+/* ---------------------------------------------------------------------------------------------
+ * Discovery / clarification
+ *
+ * Mirrors `app/api/discovery_routes.py` and `app/discovery/models.py`. The session is the user's
+ * own idea and the questions derived from it; the specification is what the Core understood. The
+ * four state names travel unchanged, so this file never translates them.
+ *
+ * Nothing here decides anything: a run still needs `state === "CONFIRMED"`, and that verdict
+ * belongs to the backend (`POST /api/tasks/run` refuses with 409 `discovery_not_confirmed`). The
+ * screen shows the answer it received; it never assumes the guard passed.
+ * ------------------------------------------------------------------------------------------- */
+
+export type DiscoveryQuestion = {
+  id?: string;
+  text?: string;
+  field?: string;
+  why?: string;
+  required?: boolean;
+};
+
+export type DiscoveryAnswer = {
+  question_id?: string;
+  text?: string;
+  skipped?: boolean;
+  redacted?: boolean;
+};
+
+/** `ProjectSpecification.to_dict()`: an empty field means "still unknown", never a guess. */
+export type DiscoverySpecification = {
+  goal?: string;
+  project_type?: string;
+  users?: string;
+  core_features?: string[];
+  platform?: string;
+  integrations?: string[];
+  data_storage?: string;
+  auth?: string;
+  notifications?: string;
+  constraints?: string[];
+  acceptance_criteria?: string[];
+  priorities?: string[];
+  source_answers?: Record<string, string>;
+};
+
+export type DiscoverySession = {
+  session_id?: string;
+  initial_goal?: string;
+  /** `NEEDS_CLARIFICATION` | `READY_FOR_PLANNING` | `CONFIRMED` | `CANCELLED`. */
+  state?: string;
+  questions?: DiscoveryQuestion[];
+  answers?: DiscoveryAnswer[];
+  specification?: DiscoverySpecification | null;
+  created_at?: string;
+  updated_at?: string;
+  skipped?: boolean;
+  skip_reason?: string;
+};
+
+/** The session routes answer `{session, questions}`; `questions` is the next round to ask. */
+export type DiscoverySessionPayload = {
+  session?: DiscoverySession;
+  questions?: DiscoveryQuestion[];
+};
+
+/** `GET .../specification` answers the derived spec plus the text a task would carry. */
+export type DiscoverySpecificationPayload = {
+  specification?: DiscoverySpecification;
+  task_text?: string;
+};
+
+/**
+ * POST JSON and read JSON back, with the same failure vocabulary as the rest of this file.
+ *
+ * `body` is omitted entirely when `undefined`, so the routes that take no body are called without
+ * one instead of receiving an empty object they never declared.
+ */
+const postJson = async <T>(path: string, body?: unknown): Promise<Result<T>> => {
+  const headers: Record<string, string> = { accept: "application/json" };
+  const init: RequestInit = { method: "POST", headers };
+  if (body !== undefined) {
+    headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  let response: Response;
+  try {
+    response = await fetch(path, init);
+  } catch (error) {
+    return { ok: false, failure: disconnected(path, error) };
+  }
+  if (!response.ok) return { ok: false, failure: await failureOf(path, response) };
+  try {
+    return { ok: true, value: (await response.json()) as T };
+  } catch (error) {
+    return {
+      ok: false,
+      failure: { kind: "error", status: response.status, path, detail: detailOf(null, String(error)) },
+    };
+  }
+};
+
+const discoveryPath = (sessionId: string, suffix: string): string =>
+  `/api/discovery/sessions/${encodeURIComponent(sessionId)}${suffix}`;
+
+/** `POST /api/discovery/sessions` — the idea becomes questions (or is ready immediately). */
+export const startDiscovery = (goal: string): Promise<Result<DiscoverySessionPayload>> =>
+  postJson<DiscoverySessionPayload>("/api/discovery/sessions", { goal });
+
+/** `POST .../answers` — record the user's own words, then re-derive the spec and the next round. */
+export const sendDiscoveryAnswers = (
+  sessionId: string,
+  answers: Array<{ question_id: string; text: string }>
+): Promise<Result<DiscoverySessionPayload>> =>
+  postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/answers"), { answers });
+
+/** `POST .../skip` — end the clarification round; the session becomes READY_FOR_PLANNING. */
+export const skipDiscoveryClarification = (
+  sessionId: string,
+  reason = ""
+): Promise<Result<DiscoverySessionPayload>> =>
+  postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/skip"), { reason });
+
+/** `GET .../specification` — readable before confirmation, by design. */
+export const loadDiscoverySpecification = (
+  sessionId: string
+): Promise<Result<DiscoverySpecificationPayload>> =>
+  readJson<DiscoverySpecificationPayload>(discoveryPath(sessionId, "/specification"));
+
+/** `POST .../confirm` — freeze the specification for execution. */
+export const confirmDiscovery = (sessionId: string): Promise<Result<DiscoverySessionPayload>> =>
+  postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/confirm"));
+
+/** `POST .../cancel` — close the session without planning anything. */
+export const cancelDiscovery = (sessionId: string): Promise<Result<DiscoverySessionPayload>> =>
+  postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/cancel"));

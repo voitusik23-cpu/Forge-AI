@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Button, Card, CardHead } from "../components/Primitives";
+import { VersionLine } from "../components/VersionLine";
 import { HELP_TOPICS, HELP_TOPIC_BY_ID } from "../help-content";
 import { t, type Lang } from "../i18n";
+import type { Status } from "../api/client";
 
-export const Help = ({ lang, topic }: { lang: Lang; topic: string }) => {
+export const Help = ({ lang, topic, status }: { lang: Lang; topic: string; status: Status | null }) => {
   const [active, setActive] = useState(topic || HELP_TOPICS[0].id);
 
   useEffect(() => {
@@ -18,6 +20,11 @@ export const Help = ({ lang, topic }: { lang: Lang; topic: string }) => {
         <h1 style={{ margin: 0, fontSize: "var(--t-title)" }}>{t(lang, "help.title")}</h1>
         <div className="small muted" style={{ marginTop: 4 }}>
           {t(lang, "help.subtitle")}
+        </div>
+        {/* Which build this guide belongs to: version · short commit, with the backend and UI
+            build times beside them. The values are the ones /api/status.details carries. */}
+        <div style={{ marginTop: 6 }}>
+          <VersionLine lang={lang} status={status} detailed />
         </div>
       </div>
 

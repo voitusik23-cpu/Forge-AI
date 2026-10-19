@@ -59,7 +59,14 @@ class GoogleProvider(Provider):
 
     PROVIDER_NAME = "google"
     API_KEY_ENV_VAR = "GEMINI_API_KEY"
-    DEFAULT_MODEL_ID = "gemini-3.8-flash"
+    #: The model a bare provider uses. ``gemini-flash-latest`` was measured to answer
+    #: through this provider: a real ``PONG`` reply, reported by the provider as
+    #: ``model_version=gemini-3.8-flash``, i.e. the alias resolves to the current flash
+    #: model. The default is therefore a model that works rather than an id that merely
+    #: looks right. ``gemini-2.5-flash`` is listed in the catalogue but this account's
+    #: call answers ``HTTP 404 NOT_FOUND: no longer available to new users``, so it is
+    #: not the default and is kept out of automatic routing (see model_registry.py).
+    DEFAULT_MODEL_ID = "gemini-flash-latest"
 
     def __init__(
         self,

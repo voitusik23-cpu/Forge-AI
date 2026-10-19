@@ -42,7 +42,9 @@ class ModelCatalogueTests(unittest.TestCase):
 
     def test_03_a_provider_payload_carries_exactly_the_allowed_keys(self) -> None:
         # The variable *name* is not a secret and belongs here; the *value* is not. Asserting the
-        # exact key set catches a payload that grows a field able to carry one.
+        # exact key set catches a payload that grows a field able to carry one. ``state`` and
+        # ``reason`` are the derived availability vocabulary (fixed literals from
+        # app.agents.providers.provider_state) and ``probed`` says whether a probe was observed.
         allowed = {
             "provider_id",
             "display_name",
@@ -51,6 +53,9 @@ class ModelCatalogueTests(unittest.TestCase):
             "model_count",
             "secret_env_name",
             "has_base_url",
+            "state",
+            "reason",
+            "probed",
         }
         for provider in self.catalogue["providers"]:
             self.assertEqual(set(provider), allowed, provider.get("provider_id"))

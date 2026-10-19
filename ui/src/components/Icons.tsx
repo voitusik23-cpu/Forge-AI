@@ -115,9 +115,10 @@ export const ForgeMark = ({ size = 38 }: { size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 48 48" className="mark">
     <defs>
       <linearGradient id="forgeMark" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stopColor="#9a80ff" />
-        <stop offset="55%" stopColor="#5b8cff" />
-        <stop offset="100%" stopColor="#67e8f9" />
+        {/* The stops are tokens, not literals: Light paints the same mark in the lime family. */}
+        <stop offset="0%" style={{ stopColor: "var(--brand-mark-1)" }} />
+        <stop offset="55%" style={{ stopColor: "var(--brand-mark-2)" }} />
+        <stop offset="100%" style={{ stopColor: "var(--brand-mark-3)" }} />
       </linearGradient>
     </defs>
     <rect x="2" y="2" width="44" height="44" rx="13" fill="url(#forgeMark)" opacity="0.16" />

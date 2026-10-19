@@ -14,10 +14,22 @@ export type Status = {
    * `SystemStatusResponse.details`: `enabled_providers` (list) and `default_provider` (string).
    * Declared here because the Кузница workspace grounds its provider choice in these two real
    * values instead of offering a catalogue entry that the Core does not route to.
+   *
+   * The six build facts are the same payload `GET /api/version` returns
+   * (`app.build_info.build_version_payload`): the running version, the commit the backend was
+   * started from (full and short), when the backend resolved that identity, whether it holds a
+   * runtime, and the build time of the UI bundle. An unresolved fact is the literal `unknown`
+   * (or `missing` for an unbuilt bundle), and no secret is ever part of it.
    */
   details?: {
     enabled_providers?: unknown;
     default_provider?: unknown;
+    version?: string;
+    commit?: string;
+    commit_short?: string;
+    built_at?: string;
+    backend?: string;
+    ui_build?: string;
   };
 };
 

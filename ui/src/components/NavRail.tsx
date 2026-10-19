@@ -1,4 +1,4 @@
-import type { ReactElement } from "react";
+import { Fragment, type ReactElement } from "react";
 import { ForgeMark, IconSearch } from "./Icons";
 import {
   IconAgents,
@@ -16,18 +16,34 @@ import { t, type Lang } from "../i18n";
 import { StatusDot } from "./Primitives";
 import type { ThemeMode } from "../appearance";
 
+// Seven primary sections. Агенты, Модели, Расходы and Инструменты are one area now: their
+// screens, routes and endpoints are untouched, they simply live under «Провайдеры» instead of
+// taking four top-level slots.
 const ITEMS: Array<{ id: string; key: string; Icon: (p: { size?: number }) => ReactElement; badge?: string }> = [
   { id: "forge", key: "nav.forge", Icon: IconAnvil },
   { id: "overview", key: "nav.overview", Icon: IconOverview },
   { id: "projects", key: "nav.projects", Icon: IconProjects, badge: "1" },
-  { id: "agents", key: "nav.agents", Icon: IconAgents },
-  { id: "models", key: "nav.models", Icon: IconModels },
   { id: "runs", key: "nav.runs", Icon: IconRuns },
-  { id: "tools", key: "nav.tools", Icon: IconTools },
-  { id: "usage", key: "nav.usage", Icon: IconUsage },
+  { id: "providers", key: "nav.providers", Icon: IconModels },
   { id: "settings", key: "nav.settings", Icon: IconSettings },
   { id: "help", key: "nav.help", Icon: IconHelp },
 ];
+
+/** The four screens the Провайдеры area links to. Their ids are their existing routes. */
+const PROVIDER_ITEMS: Array<{ id: string; key: string; Icon: (p: { size?: number }) => ReactElement }> = [
+  { id: "agents", key: "nav.agents", Icon: IconAgents },
+  { id: "models", key: "nav.models", Icon: IconModels },
+  { id: "usage", key: "nav.usage", Icon: IconUsage },
+  { id: "tools", key: "nav.tools", Icon: IconTools },
+];
+
+const PROVIDER_ITEM_IDS = PROVIDER_ITEMS.map((item) => item.id);
+
+/** Whether one rail entry is the active one, including a child of the Провайдеры area. */
+const isActive = (id: string, active: string): boolean => {
+  if (id === active) return true;
+  return id === "providers" && PROVIDER_ITEM_IDS.indexOf(active) >= 0;
+};
 
 export const NavRail = ({
   lang,
@@ -55,15 +71,31 @@ export const NavRail = ({
 
     <nav className="nav">
       {ITEMS.map(({ id, key, Icon, badge }) => (
-        <button
-          key={id}
-          onClick={() => onSelect(id)}
-          className={`nav-item${id === active ? " active" : ""}`}
-        >
-          <Icon size={19} />
-          <span className="label">{t(lang, key)}</span>
-          {badge ? <span className="count">{badge}</span> : null}
-        </button>
+        <Fragment key={id}>
+          <button
+            onClick={() => onSelect(id)}
+            className={`nav-item${isActive(id, active) ? " active" : ""}`}
+          >
+            <Icon size={19} />
+            <span className="label">{t(lang, key)}</span>
+            {badge ? <span className="count">{badge}</span> : null}
+          </button>
+          {id === "providers" ? (
+            <div className="nav-sub">
+              {PROVIDER_ITEMS.map((child) => (
+                <button
+                  key={child.id}
+                  onClick={() => onSelect(child.id)}
+                  className={`nav-item sub${child.id === active ? " active" : ""}`}
+                  title={t(lang, child.key)}
+                >
+                  <child.Icon size={15} />
+                  <span className="label">{t(lang, child.key)}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </Fragment>
       ))}
     </nav>
 

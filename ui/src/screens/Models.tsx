@@ -36,6 +36,47 @@ const shortCapability = (value: unknown): string => String(value).replace("Model
 const shortTier = (value: unknown): string => String(value).replace("CostTier.", "");
 const shortProtocol = (value: unknown): string => String(value).replace("ProviderProtocol.", "");
 
+// The provider state vocabulary is fixed on the backend
+// (app/agents/providers/provider_state.py): REGISTERED, READY, NO_CREDENTIALS, NETWORK_BLOCKED,
+// NO_CREDITS, NOT_CHECKED, DISABLED, ERROR. The words are literals and are not translated, like
+// the other status words in this interface; the reason beside them is translated.
+const stateTone = (state: string): "ok" | "warn" | "danger" | "info" | "neutral" => {
+  switch (state) {
+    case "READY":
+      return "ok";
+    case "NO_CREDENTIALS":
+      return "warn";
+    case "NO_CREDITS":
+    case "NETWORK_BLOCKED":
+    case "ERROR":
+      return "danger";
+    case "NOT_CHECKED":
+      return "info";
+    default:
+      return "neutral"; // REGISTERED, DISABLED
+  }
+};
+
+const stateDotTone = (state: string): "ok" | "warn" | "danger" | "idle" => {
+  const tone = stateTone(state);
+  return tone === "neutral" || tone === "info" ? "idle" : tone;
+};
+
+// A reason code is a fixed literal from the backend; its translation is a UI string. An
+// unknown code is shown as itself rather than as a missing-key placeholder.
+const reasonText = (lang: Lang, reason: unknown): string => {
+  const code = String(reason ?? "");
+  if (code === "") return "";
+  const key = `models.reason.${code}`;
+  const translated = t(lang, key);
+  return translated === key ? code : translated;
+};
+
+const stateOf = (value: unknown): string => {
+  const state = String(value ?? "");
+  return state === "" ? "REGISTERED" : state;
+};
+
 export const Models = ({
   lang,
   backend,
@@ -55,11 +96,23 @@ export const Models = ({
   const registryProviders = catalogue?.providers ?? [];
   const accounts = catalogue?.accounts ?? [];
   const accountsConfigured = accounts.filter((item) => item.secret_configured === true).length;
-  const ready = live && typeof backend.core.providers_ready === "number" ? backend.core.providers_ready : 0;
-  const total = live && typeof backend.core.providers_total === "number" ? backend.core.providers_total : 0;
 
   const probeFor = (providerId: string): Record<string, unknown> | undefined =>
     providers.find((item) => String(item.provider ?? "") === providerId);
+
+  // Two counters, never one: how many providers the registry lists, and how many the backend
+  // reports READY. A registry entry on its own is not availability.
+  const registeredCount =
+    catalogue !== null && typeof catalogue?.counts?.providers === "number"
+      ? catalogue.counts.providers
+      : registryProviders.length;
+  const readyCount = (() => {
+    const fromCounts = catalogue?.counts?.providers_ready;
+    if (typeof fromCounts === "number") return fromCounts;
+    return registryProviders.filter((provider) => stateOf(provider.state) === "READY").length;
+  })();
+  const stateFor = (providerId: string): Record<string, unknown> | undefined =>
+    registryProviders.find((item) => String(item.provider_id ?? "") === providerId);
 
   // Balances are read on demand: the endpoint dials a provider for every read, so it is not part of
   // the 15-second BackendState poll. `?provider=<id>` opens the detail section directly, which is
@@ -149,10 +202,21 @@ export const Models = ({
         <Card tight>
           <div className="kpi">
             <span className="label">{t(lang, "models.kpi.ready")}</span>
-            <span className="value mono">{`${ready}/${total}`}</span>
-            <span className="small muted">/api/status · probe</span>
+            <span className="value mono">{`${readyCount}/${registeredCount}`}</span>
+            <span className="small muted">/api/models · state</span>
           </div>
         </Card>
+      </div>
+
+      <div className="stack" style={{ gap: 6, marginBottom: 14 }} title={t(lang, "models.states.hint")}>
+        <span className="row" style={{ gap: 8 }}>
+          <Badge tone="neutral">{`${t(lang, "models.states.counters")}: ${registeredCount}`}</Badge>
+          <span className="small muted">{t(lang, "models.states.counters.sep")}</span>
+          <Badge tone={readyCount > 0 ? "ok" : "warn"}>
+            {`${t(lang, "models.states.ready")}: ${readyCount}`}
+          </Badge>
+        </span>
+        <span className="small muted">{t(lang, "models.states.note")}</span>
       </div>
 
       <div className="notice warn" style={{ marginBottom: 16 }}>
@@ -262,9 +326,8 @@ export const Models = ({
                 <tbody>
                   {models.map((model, index) => {
                     const providerId = String(model.provider_id ?? "");
-                    const probe = probeFor(providerId);
-                    const state = String(probe?.account_status ? (probe.account_status as Record<string, unknown>).status ?? "NOT_CHECKED" : "NO_PROBE");
-                    const tone = state === "OK" ? "ok" : state === "NOT_CHECKED" || state === "NO_PROBE" ? "idle" : "warn";
+                    const providerState = stateFor(providerId);
+                    const state = stateOf(providerState?.state);
                     return (
                       <tr key={`${providerId}-${String(model.model_id)}-${index}`}>
                         <td className="mono small">{providerId}</td>
@@ -282,8 +345,12 @@ export const Models = ({
                         </td>
                         <td className="small">{shortTier(model.cost_tier)}</td>
                         <td>
-                          <span className="row" style={{ gap: 8 }}>
-                            <StatusDot tone={tone} />
+                          <span
+                            className="row"
+                            style={{ gap: 8 }}
+                            title={reasonText(lang, providerState?.reason)}
+                          >
+                            <StatusDot tone={stateDotTone(state)} />
                             <span className="small">{state}</span>
                           </span>
                         </td>
@@ -307,7 +374,7 @@ export const Models = ({
               {registryProviders.map((provider) => {
                 const providerId = String(provider.provider_id ?? "");
                 const probe = probeFor(providerId);
-                const account = probe?.account_status as Record<string, unknown> | undefined;
+                const state = stateOf(provider.state);
                 return (
                   <div className="provider" key={providerId} style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
                     <div className="row between">
@@ -321,9 +388,14 @@ export const Models = ({
                           </span>
                         </span>
                       </span>
-                      <Badge tone={account?.status === "OK" ? "ok" : "neutral"}>
-                        {text(account?.status, "NOT_CHECKED")}
-                      </Badge>
+                      {/* The state word comes from /api/models and is not "AVAILABLE" merely
+                          because the provider is registered: READY requires a probe that
+                          reported access, and the reason says what the state rests on. */}
+                      <Badge tone={stateTone(state)}>{state}</Badge>
+                    </div>
+                    <div className="row between small">
+                      <span className="muted">{t(lang, "models.states.reason")}</span>
+                      <span>{reasonText(lang, provider.reason)}</span>
                     </div>
                     <div className="row between small">
                       <span className="muted">{t(lang, "models.secret.env")}</span>
