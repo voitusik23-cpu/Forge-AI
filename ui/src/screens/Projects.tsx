@@ -31,6 +31,7 @@ import {
   acceptanceLabel,
   archiveProject,
   catalogueModelsFor,
+  changeProjectPreview,
   createProjectVersion,
   dispatchTask,
   loadProjectDetail,
@@ -45,8 +46,10 @@ import {
   type Failure,
   type LifecycleArtifact,
   type LifecycleDetail,
+  type LifecycleEntryPoint,
   type LifecycleHistory,
   type LifecycleNewVersion,
+  type LifecyclePreview,
   type LifecycleProject,
   type LifecycleSummary,
   type LifecycleVersion,
@@ -211,6 +214,14 @@ const ProjectCard = ({
   mockSelected,
   actionFailure,
   actionNotice,
+  entrypoint,
+  preview,
+  stage,
+  verificationCommand,
+  filesCreated,
+  previewBusy,
+  onPreviewStart,
+  onPreviewStop,
 }: {
   lang: Lang;
   backend: BackendState;
@@ -249,6 +260,17 @@ const ProjectCard = ({
   mockSelected: boolean;
   actionFailure: Failure | null;
   actionNotice: string;
+  /** The one entry point the backend detected from the manifest, or null. */
+  entrypoint: LifecycleEntryPoint | null;
+  /** The preview's runtime state, as the backend reports it. */
+  preview: LifecyclePreview;
+  /** The eight-word stage the backend derived from this project's facts. */
+  stage: string;
+  verificationCommand: string;
+  filesCreated: number;
+  previewBusy: boolean;
+  onPreviewStart: () => void;
+  onPreviewStop: () => void;
 }) => {
   const archived = project.archived === true;
   const currentVersion = typeof project.current_version === "number" ? project.current_version : 0;
@@ -297,15 +319,16 @@ const ProjectCard = ({
     return "info";
   };
   const saveFacts = presentation.save_facts ?? [];
-  const headline: Array<[string, string]> = (presentation.headline ?? []).map((row) => [
-    String(row?.[0] ?? ""),
-    String(row?.[1] ?? ""),
-  ]);
   const factRows: Array<[string, string]> = (presentation.facts ?? []).map((row) => [
     String(row?.[0] ?? ""),
     String(row?.[1] ?? ""),
   ]);
-  const actions = (presentation.actions ?? []).filter((item) => item.visible !== false);
+  // The launch buttons belong to the preview block, which knows whether the backend
+  // detected an entry point and whether a safe command exists for it. Offering them in
+  // the generic action row as well would promise a launch the card cannot perform.
+  const actions = (presentation.actions ?? []).filter(
+    (item) => item.visible !== false && item.id !== "launch_local" && item.id !== "open_app"
+  );
   const hiddenActions = (presentation.actions ?? []).filter((item) => item.visible === false);
   const technicalFields = presentation.technical?.fields ?? [];
   // Whether a run was ever recorded for the current version. It is a technical fact,
@@ -313,6 +336,32 @@ const ProjectCard = ({
   const runIdValue = String((technicalFields.find((field) => field.key === "run_id") ?? {}).value ?? "");
   const hasRun = runIdValue !== "" && runIdValue !== "—";
   const notices = presentation.notices ?? [];
+
+  // ------------------------------------------------------------ the derived facts
+  // `stage` is one of the eight words the backend derives from the facts
+  // (`app/projects/stage.py`); it is shown beside the owner's word, never instead of it.
+  const stageWord = String(stage ?? "");
+  const fileTotal =
+    typeof filesCreated === "number" && Number.isFinite(filesCreated)
+      ? filesCreated
+      : Number(presentation.files_count ?? 0);
+  const entryLabel =
+    entrypoint !== null && typeof entrypoint.path === "string" && entrypoint.path !== ""
+      ? `${entrypoint.path} (${text(entrypoint.kind, "—")})`
+      : t(lang, "projects.facts.none");
+  const previewAvailable = preview.available === true;
+  const previewRunning = preview.running === true;
+  const previewUrl = String(preview.url ?? "");
+  // The two words the backend can return for "not available", and nothing else: an entry
+  // point that needs a process, or no entry point at all.
+  const honestLaunchNote =
+    fileTotal === 0
+      ? t(lang, "projects.empty.title")
+      : entrypoint === null
+        ? t(lang, "projects.preview.no_entry")
+        : previewAvailable
+          ? ""
+          : t(lang, "projects.preview.not_wired");
 
   const [launchNote, setLaunchNote] = useState("");
   const changeRef = useRef<HTMLTextAreaElement | null>(null);
@@ -368,16 +417,32 @@ const ProjectCard = ({
         {actionNotice !== "" ? <div className="notice">{actionNotice}</div> : null}
 
         {/* ------------------------------------------------------------ the truth */}
+        {/* The owner's word first, then the stage the backend derived from the facts.
+            `files: 0` can never render ГОТОВО: that rule lives in the backend, and this
+            block only repeats what it returned. */}
         <div className="project-truth" data-state={state}>
           <div className="stack" style={{ gap: 6 }}>
             <div className="label">{t(lang, "projects.truth.title")}</div>
             <div className="project-truth-state">{text(state)}</div>
             <div className="small muted">
-              {t(lang, "projects.truth.stage")}: {text(stageLabel)}
+              {t(lang, "projects.truth.stage")}: {stageWord === "" ? text(stageLabel) : text(stageWord)}
             </div>
           </div>
           <div className="stack project-truth-lines" style={{ gap: 4 }}>
-            {headline
+            {(
+              [
+                [t(lang, "projects.truth.title"), stageWord === "" ? text(state) : `${text(state)} · ${stageWord}`],
+                [t(lang, "projects.facts.files"), String(fileTotal)],
+                [t(lang, "projects.facts.folder"), text(project.project_path, t(lang, "projects.facts.none"))],
+                [
+                  t(lang, "projects.facts.version"),
+                  currentVersion > 0 ? `v${currentVersion}` : t(lang, "projects.facts.none"),
+                ],
+                [t(lang, "projects.facts.entry"), entryLabel],
+                [t(lang, "projects.truth.verification"), text(presentation.verification_line)],
+                [t(lang, "projects.facts.next"), text(presentation.next_step, t(lang, "projects.facts.none"))],
+              ] as Array<[string, string]>
+            )
               .filter(([label]) => label !== t(lang, "projects.truth.title"))
               .map(([label, value]) => (
                 <div className="row between" key={label} style={{ gap: 12, alignItems: "flex-start" }}>
@@ -389,17 +454,6 @@ const ProjectCard = ({
                   </span>
                 </div>
               ))}
-            <div className="row between" style={{ gap: 12, alignItems: "flex-start", marginTop: 4 }}>
-              <span className="small muted" style={{ flex: "0 0 180px" }}>
-                {t(lang, "projects.truth.verification")}
-              </span>
-              <span
-                className={`small${presentation.verification_not_run === true ? " muted" : ""}`}
-                style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}
-              >
-                {text(presentation.verification_line)}
-              </span>
-            </div>
           </div>
         </div>
 
@@ -408,6 +462,116 @@ const ProjectCard = ({
             {line}
           </div>
         ))}
+
+        {/* --------------------------------------------------- no project yet */}
+        {/* The only creation actions that exist when there is nothing to act on. They are
+            the same ids the backend offers in `presentation.actions`. */}
+        {fileTotal === 0 ? (
+          <div className="notice warn">
+            <div className="label">{t(lang, "projects.empty.title")}</div>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+              <Button
+                size="small"
+                tone="primary"
+                onClick={() => runAction("continue_creation")}
+                disabled={archived}
+              >
+                {t(lang, "projects.empty.continue")}
+              </Button>
+              <Button size="small" onClick={() => runAction("answer_questions")} disabled={archived}>
+                {t(lang, "projects.empty.answer")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* ---------------------------------------------------------- the preview */}
+        {/* Project folder · files created · entry point · verification command · run
+            command. The launch buttons appear only when the backend detected an entry
+            point AND a safe way to serve it exists; otherwise the honest sentence. */}
+        <div>
+          <div className="label">{t(lang, "projects.preview.title")}</div>
+          <div style={{ marginTop: 8 }}>
+            <Facts
+              items={[
+                [t(lang, "projects.preview.folder"), text(project.project_path, t(lang, "projects.facts.none"))],
+                [t(lang, "projects.preview.files"), String(fileTotal)],
+                [t(lang, "projects.preview.entry"), entryLabel],
+                [
+                  t(lang, "projects.preview.verify_command"),
+                  verificationCommand !== ""
+                    ? verificationCommand
+                    : t(lang, "projects.preview.nothing_to_verify"),
+                ],
+                [
+                  t(lang, "projects.preview.run_command"),
+                  entrypoint !== null && String(entrypoint.run_command ?? "") !== ""
+                    ? String(entrypoint.run_command)
+                    : t(lang, "projects.facts.none"),
+                ],
+              ]}
+            />
+          </div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+            <Button
+              size="small"
+              tone="ghost"
+              disabled={fileTotal === 0}
+              onClick={() =>
+                document.getElementById("project-artifacts")?.scrollIntoView({ behavior: "smooth", block: "start" })
+              }
+            >
+              {t(lang, "projects.preview.view")}
+            </Button>
+            <Button size="small" tone="ghost" onClick={() => setLaunchNote(t(lang, "projects.preview.folder_note"))}>
+              {t(lang, "projects.preview.folder_action")}
+            </Button>
+            <Button
+              size="small"
+              tone="primary"
+              disabled={!previewAvailable || previewRunning || previewBusy}
+              onClick={onPreviewStart}
+            >
+              {previewBusy ? t(lang, "state.loading") : t(lang, "projects.preview.start")}
+            </Button>
+            <Button
+              size="small"
+              disabled={!previewRunning || previewUrl === ""}
+              onClick={() => {
+                if (previewUrl !== "") window.open(previewUrl, "_blank", "noopener,noreferrer");
+              }}
+            >
+              {t(lang, "projects.preview.open")}
+            </Button>
+            <Button
+              size="small"
+              tone="ghost"
+              disabled={!previewRunning || previewBusy}
+              onClick={onPreviewStop}
+            >
+              {t(lang, "projects.preview.stop")}
+            </Button>
+            <Button size="small" tone="ghost" disabled={fileTotal === 0 || !hasRun} onClick={onVerify}>
+              {t(lang, "projects.preview.reverify")}
+            </Button>
+          </div>
+          {previewRunning && previewUrl !== "" ? (
+            <div className="small row" style={{ gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+              <Badge tone="ok">{t(lang, "projects.preview.running")}</Badge>
+              <span className="muted">{t(lang, "projects.preview.url")}</span>
+              <span className="mono">{previewUrl}</span>
+            </div>
+          ) : honestLaunchNote !== "" ? (
+            <div className="notice" style={{ marginTop: 8 }}>
+              {honestLaunchNote}
+            </div>
+          ) : null}
+          {launchNote !== "" ? (
+            <div className="notice" style={{ marginTop: 8 }}>
+              {launchNote}
+            </div>
+          ) : null}
+        </div>
 
         {/* -------------------------------------------------------- the save facts */}
         <div>
@@ -923,6 +1087,50 @@ export const Projects = ({
 
   const artifacts = files?.version === filesVersion ? files.items : [];
 
+  // ------------------------------------------------------------------- preview
+  // The preview is *runtime* state (`GET /api/projects/{id}/preview`), read from the detail
+  // payload and refreshed after every start/stop. A project with no file, no entry point or a
+  // python/node entry point keeps `available: false` and the card prints the backend's own
+  // reason instead of offering a launch.
+  const [previewState, setPreviewState] = useState<LifecyclePreview | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+
+  useEffect(() => {
+    const fromDetail = detail?.status === "ready" ? detail.value.preview ?? null : null;
+    setPreviewState(fromDetail);
+  }, [detail]);
+
+  // The detail payload already carries this; `previewState` is the fresher answer a
+  // start/stop returned, so it wins when it exists.
+  const preview: LifecyclePreview =
+    previewState ?? (detail?.status === "ready" ? detail.value.preview ?? {} : {});
+  const entrypoint: LifecycleEntryPoint | null =
+    detail?.status === "ready" ? detail.value.entrypoint ?? null : null;
+  const stageWord = detail?.status === "ready" ? String(detail.value.stage ?? "") : "";
+  const verificationCommand =
+    detail?.status === "ready" ? String(detail.value.verification_command ?? "") : "";
+  const filesCreated =
+    detail?.status === "ready" && typeof detail.value.files_created === "number"
+      ? detail.value.files_created
+      : typeof preview.files_created === "number"
+        ? preview.files_created
+        : 0;
+
+  const changePreview = async (action: "start" | "stop") => {
+    if (selectedId === "") return;
+    setPreviewBusy(true);
+    setActionFailure(null);
+    setActionNotice("");
+    const outcome = await changeProjectPreview(selectedId, { action });
+    setPreviewBusy(false);
+    if (!outcome.ok) {
+      setActionFailure(outcome.failure);
+      return;
+    }
+    setPreviewState(outcome.value);
+    await loadDetail(selectedId);
+  };
+
   // ---------------------------------------------------------------- run record
   const [runRecord, setRunRecord] = useState<RunRecord | null>(null);
   const [runFailure, setRunFailure] = useState<Failure | null>(null);
@@ -1245,6 +1453,14 @@ export const Projects = ({
           mockSelected={mockSelected}
           actionFailure={actionFailure}
           actionNotice={actionNotice}
+          entrypoint={entrypoint}
+          preview={preview}
+          stage={stageWord}
+          verificationCommand={verificationCommand}
+          filesCreated={filesCreated}
+          previewBusy={previewBusy}
+          onPreviewStart={() => void changePreview("start")}
+          onPreviewStop={() => void changePreview("stop")}
         />
       ) : null}
 

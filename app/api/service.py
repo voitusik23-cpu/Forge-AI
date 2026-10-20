@@ -313,6 +313,24 @@ PROVIDER_KEY_INDEX_PROJECT_STATE_KEY = "radox_key_index"
 CODE_WRITE_CATEGORY = "code"
 
 
+# THE TWO WRITE MODES. A run that writes files must say *how* it was allowed to, and
+# there are exactly two answers. Anything else -- a flag without a named provider and
+# model, a non-code category, a missing flag -- writes nothing and reports the empty
+# mode, so "some bytes appeared" can always be traced to one of these two facts.
+#
+#: The offline ``mock`` provider's deterministic answer. It is used by tests and the
+#: smoke: no socket, no credential, no cost, and the answer is produced by Forge
+#: itself (``app.projects.mock_answer``), not by a model.
+WRITE_MODE_MOCK_DETERMINISTIC = "MOCK_DETERMINISTIC"
+#: A real provider call the caller explicitly authorized: ``write_mode`` is true AND
+#: the request names both the provider and the model. Naming only one is not enough.
+WRITE_MODE_REAL_PROVIDER_EXPLICIT = "REAL_PROVIDER_EXPLICIT"
+WRITE_MODES = frozenset({WRITE_MODE_MOCK_DETERMINISTIC, WRITE_MODE_REAL_PROVIDER_EXPLICIT})
+
+#: The ``project_state`` key of a materialisation into a project's own workspace.
+MATERIALIZATION_PROJECT_STATE_KEY = "project_materialization"
+
+
 from pathlib import Path
 
 
@@ -3164,30 +3182,52 @@ class ForgeApiService:
         return FileTelemetrySink(root=Path(root) / "telemetry")
 
     # -------------------------------------------------------------- write mode
-    def _write_mode_enabled(self, req: TaskRunRequest, category: object) -> bool:
-        """Whether this request opted into the guarded write path.
+    def _resolve_write_mode(self, req: TaskRunRequest, category: object) -> str:
+        """Which write mode this request is allowed to use, or ``""``.
 
-        Two independent conditions must hold: the caller asked for it, and the task
-        is code work. The flag is never inferred from the description, the
-        provider, the project, or the model answer, so a caller that does not send
-        it keeps exactly the read-only behaviour it had before write mode existed.
+        The rules are exhaustive and fail closed:
+
+        * the caller must have asked (``write_mode`` true) **and** the task must be
+          code work -- the flag alone authorizes nothing;
+        * the offline ``mock`` provider resolves to ``MOCK_DETERMINISTIC``: its answer
+          is produced by Forge, so nothing is spent and no model is involved;
+        * any other provider resolves to ``REAL_PROVIDER_EXPLICIT`` **only** when the
+          request names both the provider *and* the model. Naming one, or relying on
+          the configured default, writes nothing.
+
+        The mode is never inferred from the description, the project, the plan or the
+        answer, so a caller that does not send the flag keeps exactly the read-only
+        behaviour it had before write mode existed.
         """
 
         if not bool(getattr(req, "write_mode", False)):
-            return False
+            return ""
         name = getattr(category, "value", category)
-        return str(name or "").strip().lower() == CODE_WRITE_CATEGORY
+        if str(name or "").strip().lower() != CODE_WRITE_CATEGORY:
+            return ""
+        if self._selected_provider_name(req).strip().lower() == OFFLINE_PROVIDER_NAME:
+            return WRITE_MODE_MOCK_DETERMINISTIC
+        named_provider = str(getattr(req, "provider_name", "") or "").strip()
+        named_model = str(getattr(req, "model_name", "") or "").strip()
+        if named_provider and named_model:
+            return WRITE_MODE_REAL_PROVIDER_EXPLICIT
+        return ""
 
-    def _write_task_description(self, description: str) -> str:
+    def _write_task_description(
+        self, description: str, workspace: object = None
+    ) -> str:
         """The task text handed to the model: the task plus bounded context.
 
         Only the *names* of the workspace's files are added, and only in write
         mode. The listing is produced by the code writer's own bounded walk, so it
         cannot become a way to read credential material, ``.git``, the virtualenv,
-        dependencies, or the run store.
+        dependencies, or the run store. ``workspace`` is the tree the run will write
+        into -- a lifecycle project's own folder when there is one -- so the context
+        names the files the answer may extend instead of the repository's.
         """
 
-        context = build_workspace_context(self._workspace)
+        target = workspace if workspace is not None else self._workspace
+        context = build_workspace_context(target)
         if not context:
             return description
         return f"{description}\n\n{context}"
@@ -3221,14 +3261,51 @@ class ForgeApiService:
         run_id: str,
         task_id: str,
         run_store: Optional[RunStore],
+        project_workspace: object = None,
+        project_id: str = "",
+        project_path: str = "",
     ) -> WriteResult:
         """Run one model answer through the guarded writer and record its outcome.
 
-        The workspace is the frozen scope's own workspace, so the files land in the
-        perimeter this run already holds. An unexpected failure is a refusal, never
-        a success: only the writer's own statuses are reported, and the run's
-        durable record is written from them.
+        ``workspace`` is the frozen scope's own workspace. When the run belongs to a
+        lifecycle project, ``project_workspace`` is that project's own folder and it
+        is the tree the writer is pointed at, through
+        :func:`app.projects.materialize.materialize_into`: the same writer, the same
+        rails, and a manifest recorded beside the run. There is no second writer and
+        no second perimeter.
+
+        An unexpected failure is a refusal, never a success: only the writer's own
+        statuses are reported, and the run's durable record is written from them.
         """
+
+        if project_workspace is not None:
+            from app.projects.materialize import materialize_into
+
+            try:
+                materialization = materialize_into(
+                    project_workspace,
+                    answer,
+                    run_id,
+                    project_id=str(project_id or ""),
+                    project_path=str(project_path or ""),
+                )
+            except Exception as error:  # noqa: BLE001 - a failure is never a write
+                materialization = None
+                result = WriteResult(
+                    status=STATUS_REJECTED,
+                    reason=f"materialization_error:{type(error).__name__}",
+                )
+            else:
+                result = materialization.write_result or WriteResult(
+                    status=STATUS_REJECTED,
+                    reason=f"materialization_{materialization.status.lower()}",
+                )
+            if materialization is not None:
+                self._record_materialization(
+                    run_store, run_id, task_id, materialization
+                )
+            self._record_write_outcome(run_store, run_id, task_id, result)
+            return result
 
         try:
             result = apply_changes(answer, workspace=workspace, run_id=run_id)
@@ -3239,6 +3316,65 @@ class ForgeApiService:
             )
         self._record_write_outcome(run_store, run_id, task_id, result)
         return result
+
+    def _record_materialization(
+        self,
+        store: Optional[RunStore],
+        run_id: str,
+        task_id: str,
+        materialization: object,
+    ) -> None:
+        """Persist the artifact manifest of a project materialisation.
+
+        The event and the snapshot carry **paths, sizes, digests and kinds only**:
+        never a file body, never a diff, never an absolute path. That is what lets a
+        run be audited for "what did it write" without the record becoming a copy of
+        the code. Persistence is best effort and never decides the run's outcome.
+        """
+
+        if store is None:
+            return
+        try:
+            manifest = list(getattr(materialization, "manifest", lambda: [])())
+            bounded = [
+                {
+                    "path": str(item.get("path", "")),
+                    "size": int(item.get("size", 0) or 0),
+                    "sha256": str(item.get("sha256", "") or ""),
+                    "kind": str(item.get("kind", "") or ""),
+                }
+                for item in manifest[:20]
+            ]
+            store.append_event(
+                EventType.PROJECT_STATE_UPDATED,
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "materialization_status": str(
+                        getattr(materialization, "status", "") or ""
+                    ),
+                    "materialization_files": bounded,
+                    "materialization_file_count": int(
+                        getattr(materialization, "files_created", 0) or 0
+                    ),
+                    "materialization_verification": str(
+                        getattr(materialization, "verification", "") or ""
+                    ),
+                    "materialization_project_path": str(
+                        getattr(materialization, "project_path", "") or ""
+                    ),
+                },
+                run_id=run_id,
+                task_id=task_id,
+            )
+            self._write_project_state_entry(
+                store,
+                run_id,
+                MATERIALIZATION_PROJECT_STATE_KEY,
+                materialization.to_dict(),
+            )
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            pass
 
     def _record_write_outcome(
         self,
@@ -3533,8 +3669,10 @@ class ForgeApiService:
         identity: object | None,
         run_store: Optional[RunStore],
         started_at: float,
-        write_mode: bool = False,
+        write_mode: str = "",
         cost_facts: Optional[Mapping[str, Any]] = None,
+        project_workspace: object = None,
+        project_path: str = "",
     ) -> "RunDispatchResult":
         """Execute one submitted task with the deterministic offline run loop.
 
@@ -3711,17 +3849,33 @@ class ForgeApiService:
             duration_seconds=duration,
         )
 
-        # WRITE MODE on the offline path. The "model answer" is the deterministic
-        # plan text, so the pipeline really runs end to end; it carries no fenced
-        # block and no diff, so the honest outcome is `no_changes` and the run is
-        # NOT a success. Nothing is written, and nothing is claimed.
+        # WRITE MODE on the offline path. Without a lifecycle project the "model
+        # answer" is the deterministic plan text, so the pipeline really runs end to
+        # end; it carries no fenced block and no diff, so the honest outcome is
+        # `no_changes` and the run is NOT a success. Nothing is written, and nothing
+        # is claimed. With a lifecycle project the answer is the deterministic mock
+        # scaffold (`app.projects.mock_answer`), which *does* carry files: the writer,
+        # the boundary, py_compile, the manifest and the project record are all the
+        # real ones, and the labels in the output and in both files say so.
         if write_mode:
+            if (
+                write_mode == WRITE_MODE_MOCK_DETERMINISTIC
+                and project_workspace is not None
+            ):
+                from app.projects.mock_answer import deterministic_project_answer
+
+                answer = deterministic_project_answer(task.description)
+            else:
+                answer = self._offline_write_answer(plan)
             write_result = self._apply_model_changes(
-                answer=self._offline_write_answer(plan),
+                answer=answer,
                 workspace=scope.workspace,
                 run_id=run_id,
                 task_id=task_id,
                 run_store=run_store,
+                project_workspace=project_workspace,
+                project_id=str(project_id or ""),
+                project_path=project_path,
             )
             output = f"{output}\n\n{render_write_report(write_result)}"
             write_succeeded = write_result.status == STATUS_APPLIED
@@ -3811,6 +3965,9 @@ class ForgeApiService:
                 project_files_created=False,
                 artifact_manifest_saved=False,
                 files_created=files_created,
+                # The mode this run used, stated in the response. "" means it did not
+                # write at all; the two non-empty values are the only modes there are.
+                write_mode=str(write_mode or ""),
                 cost_tier=cost_facts.get("cost_tier"),
                 # No provider ran, so no cost was estimated: a measured 0.0, not an
                 # unknown. Unknown is reported as None elsewhere.
@@ -3851,9 +4008,25 @@ class ForgeApiService:
             pass
 
     def run_task_detailed(
-        self, req: TaskRunRequest, *, idempotency_key: Optional[str] = None
+        self,
+        req: TaskRunRequest,
+        *,
+        idempotency_key: Optional[str] = None,
+        project_workspace: Optional[object] = None,
+        lifecycle_project_id: str = "",
+        lifecycle_project_path: str = "",
     ) -> "RunDispatchResult":
-        """Execute a task and return the response with its dispatch facts."""
+        """Execute a task and return the response with its dispatch facts.
+
+        ``project_workspace`` is the lifecycle project's own controlled folder, when
+        the run belongs to one. It is resolved by the **composition** from the
+        project store -- never from the request, the task, the plan or the answer --
+        and it is the only tree a write-mode run may write into: the guarded writer
+        receives it as its whole boundary, so a file can never land in the repository
+        workspace while a project is being created. ``lifecycle_project_id`` and
+        ``lifecycle_project_path`` are the same fact for the manifest and for the
+        event, and neither grants anything.
+        """
         run_id = f"run-api-{uuid.uuid4().hex[:8]}"
         task_id = req.task_id or f"task-{uuid.uuid4().hex[:6]}"
         project_id = req.project_id or self._active_project_id
@@ -3929,13 +4102,14 @@ class ForgeApiService:
         context = dict(req.context)
         context.update({"run_id": run_id, "project_id": project_id})
 
-        # WRITE MODE is opt-in and code-only. When it is on, the model is given the
-        # task text plus a bounded list of the workspace's file names (never their
-        # contents), so an answer can name a real path. When it is off, the task is
-        # exactly the description it always was.
-        write_mode = self._write_mode_enabled(req, category)
+        # WRITE MODE is opt-in and code-only, and it resolves to exactly one of the
+        # two modes (see ``_resolve_write_mode``). When it is on, the model is given
+        # the task text plus a bounded list of the target workspace's file names
+        # (never their contents), so an answer can name a real path. When it is off,
+        # the task is exactly the description it always was.
+        write_mode = self._resolve_write_mode(req, category)
         task_description = (
-            self._write_task_description(req.description)
+            self._write_task_description(req.description, project_workspace)
             if write_mode
             else req.description
         )
@@ -3981,6 +4155,8 @@ class ForgeApiService:
                 started_at=t0,
                 write_mode=write_mode,
                 cost_facts=cost_facts,
+                project_workspace=project_workspace,
+                project_path=lifecycle_project_path,
             )
 
         # A model named in the request selects the provider model for THIS run. The dispatcher
@@ -4145,6 +4321,9 @@ class ForgeApiService:
                     run_id=run_id,
                     task_id=task_id,
                     run_store=api_run_store,
+                    project_workspace=project_workspace,
+                    project_id=lifecycle_project_id,
+                    project_path=lifecycle_project_path,
                 )
                 output = f"{output or ''}\n\n{render_write_report(write_result)}".lstrip("\n")
                 success = write_result.status == STATUS_APPLIED
@@ -4248,6 +4427,8 @@ class ForgeApiService:
             project_files_created=False,
             artifact_manifest_saved=False,
             files_created=files_created,
+            # "" when the run did not write; otherwise the one mode that allowed it.
+            write_mode=str(write_mode or ""),
             cost_tier=actual_tier or cost_facts.get("cost_tier"),
             estimated_cost=estimated_cost,
         )

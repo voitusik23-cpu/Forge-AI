@@ -823,6 +823,10 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 "project_files_created",
                 "artifact_manifest_saved",
                 "files_created",
+                # The write mode this run used ("" when it wrote nothing, otherwise
+                # MOCK_DETERMINISTIC or REAL_PROVIDER_EXPLICIT). Additive, and stated
+                # rather than inferred from the file count.
+                "write_mode",
                 "cost_tier",
                 "estimated_cost",
             },

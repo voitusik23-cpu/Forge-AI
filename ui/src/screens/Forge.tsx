@@ -1118,6 +1118,25 @@ export const Forge = ({
       </div>
       <div className="small muted forge-write-warning">{t(lang, "forge.task.write.warning")}</div>
 
+      {/* The write mode this request will carry, stated before the click. There are exactly
+          two, and the backend decides from the provider/model/write triple -- this line only
+          repeats that decision in the owner's words. */}
+      <div className="small row" style={{ gap: 6, flexWrap: "wrap" }}>
+        <span className="muted">{t(lang, "forge.launch.write.mode")}</span>
+        <span className="mono">
+          {effectiveWriteMode
+            ? mockSelected
+              ? "MOCK_DETERMINISTIC"
+              : "REAL_PROVIDER_EXPLICIT"
+            : t(lang, "forge.launch.write.none")}
+        </span>
+      </div>
+      <div className="small muted">
+        {effectiveWriteMode
+          ? t(lang, "forge.launch.write.hint")
+          : t(lang, "forge.launch.write.noselection")}
+      </div>
+
       {dispatch.status === "pending" ? <div className="notice">{t(lang, "forge.task.pending")}</div> : null}
       {notice !== "" ? <div className="notice warn">{notice}</div> : null}
       {dispatch.status === "failed" ? <FailureNotice lang={lang} failure={dispatch.failure} /> : null}
@@ -1555,6 +1574,13 @@ export const Forge = ({
                   <div className="notice danger">{String(dispatched.response.error)}</div>
                 ) : null}
 
+                {/* Files were really written: the entry point and the local preview are on the
+                    project card, so this line points there instead of promising a launch here. */}
+                {typeof dispatched.response.files_created === "number" &&
+                dispatched.response.files_created > 0 ? (
+                  <div className="notice">{t(lang, "forge.result.launch_note")}</div>
+                ) : null}
+
                 <Facts
                   items={[
                     [
@@ -1579,6 +1605,10 @@ export const Forge = ({
                       typeof dispatched.response.files_created === "number"
                         ? String(dispatched.response.files_created)
                         : t(lang, "runs.unknown"),
+                    ],
+                    [
+                      t(lang, "forge.result.write_mode"),
+                      text(dispatched.response.write_mode, t(lang, "forge.launch.write.none")),
                     ],
                     [
                       t(lang, "forge.result.manifest"),

@@ -327,6 +327,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             description=staged.task_text,
             category="code",
             provider_name="stand-in-writer",
+            # REAL_PROVIDER_EXPLICIT: the caller names both the provider and the model.
+            model_name="deterministic-stand-in",
             write_mode=True,
         )
     )

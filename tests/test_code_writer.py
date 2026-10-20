@@ -412,6 +412,10 @@ class ServiceWriteModeTests(unittest.TestCase):
             "description": "Create hello.txt and tools/demo_add.py",
             "category": "code",
             "provider_name": "fake-provider",
+            # REAL_PROVIDER_EXPLICIT requires the caller to name both the provider and
+            # the model: the default here names the pair the fake executor reports, so
+            # the write mode this suite exercises is the one a real caller would get.
+            "model_name": "fake/model",
             "project_id": "code-writer-project",
             "write_mode": True,
         }

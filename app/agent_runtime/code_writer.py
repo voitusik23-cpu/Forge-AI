@@ -968,7 +968,14 @@ def build_workspace_context(
     """
 
     try:
-        root = Path(getattr(workspace, "root", workspace))
+        # ``Path`` is checked first on purpose: a ``WindowsPath`` has its own
+        # ``.root`` attribute (the drive-relative ``"\\"``), so ``getattr(p, "root",
+        # p)`` would silently name the drive root instead of the workspace. Only a
+        # workspace *contract* object (``Workspace``) carries a useful ``.root``.
+        if isinstance(workspace, (str, os.PathLike)):
+            root = Path(workspace)
+        else:
+            root = Path(getattr(workspace, "root", workspace))
     except (TypeError, ValueError):
         return ""
     if not root.is_dir():

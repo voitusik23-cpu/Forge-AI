@@ -302,6 +302,8 @@ def scenario_two(root: Path, failures: List[str]) -> None:
             description=task_text,
             category="code",
             provider_name="fake-provider",
+            # REAL_PROVIDER_EXPLICIT: the caller names both the provider and the model.
+            model_name="deterministic-fake",
             write_mode=True,
         )
     )

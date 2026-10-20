@@ -330,6 +330,12 @@ class ProjectVersion:
     provider: str = ""
     model: str = ""
     change_request: Optional[ChangeRequest] = None
+    #: True only when the owner explicitly stated that this version needs no local
+    #: preview. It is recorded **on the version**, not inferred from the entry kind:
+    #: a Python project has no static preview either, but "no entry point could be
+    #: served" is not the same fact as "the owner does not want a preview", and only
+    #: the second one may satisfy the completion gate's preview requirement.
+    preview_not_required: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.files, list):
@@ -374,6 +380,7 @@ class ProjectVersion:
             "model": self.model,
             "file_count": self.file_count,
             "pending": self.is_pending,
+            "preview_not_required": bool(self.preview_not_required),
             "change_request": (
                 self.change_request.to_dict()
                 if self.change_request is not None
@@ -401,6 +408,7 @@ class ProjectVersion:
             acceptance=str(data.get("acceptance") or ACCEPTANCE_PENDING),
             provider=str(data.get("provider", "")),
             model=str(data.get("model", "")),
+            preview_not_required=bool(data.get("preview_not_required", False)),
             change_request=(
                 ChangeRequest.from_dict(raw_change)
                 if isinstance(raw_change, Mapping)

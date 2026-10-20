@@ -3567,6 +3567,10 @@ class CompatibilityTests(Block8Case):
                 "outcome", "clarification_questions", "needs_clarification",
                 "run_record_saved", "project_created", "project_files_created",
                 "artifact_manifest_saved", "files_created",
+                # The write mode this run used: "" when it wrote nothing, otherwise
+                # MOCK_DETERMINISTIC or REAL_PROVIDER_EXPLICIT. Additive like the
+                # fields above.
+                "write_mode",
                 "cost_tier", "estimated_cost",
             },
         )

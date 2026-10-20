@@ -6474,3 +6474,102 @@ first. `app/smoke_project_truth.py` prints the two outcomes end to end, offline.
 оба исхода от начала до конца, офлайн. `tests/test_project_lifecycle.py`,
 `tests/test_false_completion_guard.py`, `tests/test_api.py` и
 `tests/test_discovery.py` не менялись и проходят.
+
+## Project Materialisation and Local Preview v0.1
+
+**Decision.** A write-mode run that belongs to a persistent project writes into that
+project's own controlled folder (`.forge/projects/<id>/workspace`), never into the
+repository tree. The write itself is still the existing guarded writer
+(`app.agent_runtime.code_writer.apply_changes`): `app/projects/materialize.py` only
+points it at the project workspace and then describes the bytes that are really on
+disk (path, kind, size, SHA-256, create/update, verification relevance). No file
+content enters the manifest, an event or a payload, and no second writer, store or
+boundary is introduced. The materialisation returns one typed result:
+`PROJECT_NOT_CREATED` (unavailable, refused, or zero files), `FILES_CREATED` (files,
+nothing compiled), `VERIFIED` (files, every Python file compiled) or `FAILED`
+(verification failed, or an artifact could not be read back).
+
+**Two write modes, and nothing else.** `MOCK_DETERMINISTIC` is the offline `mock`
+provider's mode: the answer is a deterministic scaffold Forge itself produces
+(`app.projects.mock_answer`), so the whole writer/manifest/preview path runs with no
+model, no socket and no cost. `REAL_PROVIDER_EXPLICIT` applies only when the caller
+sets `write_mode` **and** names both the provider and the model. Any other combination
+resolves to the empty mode, writes nothing, and reports the empty mode in the
+response, so "files appeared" is always traceable to one of two facts.
+
+**Entry point and preview.** The entry point is detected from the artifact manifest
+only, with a fixed priority (`index.html`; `app.py`/`main.py`/`server.py` at the root;
+`package.json` with a `start`/`dev` script, of which only the script *name* is read;
+any other root `*.html`). The preview serves a `static_html` project read-only on
+`127.0.0.1` with an ephemeral port: one directory, GET/HEAD only, strict path decoding,
+containment re-proved per request, no listing, no symlinks, no execution. A `python`
+or `node` entry point is refused with "local run is not wired for this entry kind"
+instead of running the project's own script. The derived stage is one of eight words,
+and `COMPLETED` additionally requires a running preview **or** an explicit
+`preview_not_required` recorded on the version -- the existing gate still requires a
+`passed` verification, so `not_applicable` never completes a project.
+
+**Rejected alternatives.** A second writer or a second project store (two rail sets
+would drift); launching a project by parsing model prose (a sentence would become an
+execution decision); starting a project's `python`/`node` entry point as a "preview"
+(that is arbitrary code execution, not a preview); treating the offline scaffold as a
+model result (it is labelled as a mock in the output and in both written files);
+inferring a write mode from the file count (the mode is decided before the run).
+
+**Consequences.** `tests/test_materialization.py` (37 tests, offline) covers the
+controlled folder, the boundary and deny-list refusals, the manifest, the entry-point
+rules, the preview and its traversal refusals, the stage gate, both write modes, version
+preservation, archive/restore and the absence of secrets or bodies from events and
+payloads. `app/smoke_materialization.py` prints the whole path offline. `GET
+/api/projects/{id}` gains additive `stage`, `files_created`, `entrypoint`, `preview`
+and `verification_command` fields, and `POST /api/tasks/run` reports `write_mode`.
+
+## Материализация проекта и локальный предпросмотр v0.1 — русская версия
+
+**Решение.** Write-mode запуск, принадлежащий постоянному проекту, пишет в его
+собственную контролируемую папку (`.forge/projects/<id>/workspace`), а не в дерево
+репозитория. Запись по-прежнему выполняет существующий защищённый писатель
+(`app.agent_runtime.code_writer.apply_changes`): `app/projects/materialize.py` лишь
+указывает ему рабочую область проекта и затем описывает реально лежащие на диске
+байты (путь, вид, размер, SHA-256, создание/обновление, отношение к проверке).
+Содержимое файлов не попадает ни в манифест, ни в событие, ни в ответ, и второй
+писатель, второе хранилище или вторая граница не появляются. Результат типизирован:
+`PROJECT_NOT_CREATED` (недоступно, отказ или ноль файлов), `FILES_CREATED` (файлы
+есть, ничего не компилировалось), `VERIFIED` (файлы есть, каждый `.py` скомпилирован)
+или `FAILED` (проверка не пройдена или артефакт не читается обратно).
+
+**Ровно два режима записи.** `MOCK_DETERMINISTIC` — режим офлайн-провайдера `mock`:
+ответом служит детерминированный каркас, который производит сам Forge
+(`app.projects.mock_answer`), поэтому весь путь писателя, манифеста и предпросмотра
+проходит без модели, сокета и затрат. `REAL_PROVIDER_EXPLICIT` действует только когда
+вызывающий выставил `write_mode` **и** назвал и провайдера, и модель. Любая другая
+комбинация даёт пустой режим, ничего не пишет и сообщает пустой режим в ответе,
+поэтому «файлы появились» всегда объясняется одним из двух фактов.
+
+**Точка входа и предпросмотр.** Точка входа определяется только по манифесту
+артефактов, с фиксированным приоритетом (`index.html`; `app.py`/`main.py`/`server.py`
+в корне; `package.json` со скриптом `start`/`dev`, из которого читается только *имя*
+скрипта; любой другой корневой `*.html`). Предпросмотр отдаёт проект `static_html`
+только для чтения на `127.0.0.1` со случайным портом: одна папка, только GET/HEAD,
+строгое декодирование пути, containment перепроверяется на каждом запросе, нет
+листинга, нет символических ссылок, нет выполнения. Для точки входа `python` или
+`node` возвращается «local run is not wired for this entry kind» вместо запуска
+собственного скрипта проекта. Производный этап — одно из восьми слов, и `COMPLETED`
+дополнительно требует работающий предпросмотр **или** явный `preview_not_required`,
+записанный на версии; существующий гейт по-прежнему требует `passed` проверки,
+поэтому `not_applicable` никогда не завершает проект.
+
+**Отклонённые альтернативы.** Второй писатель или второе хранилище проектов (два
+набора ограничений разошлись бы); запуск проекта по прозе модели (предложение стало бы
+решением об исполнении); запуск `python`/`node` точки входа как «предпросмотра» (это
+произвольное исполнение кода, а не предпросмотр); выдача офлайн-каркаса за результат
+модели (он помечен как mock в выводе и в обоих записанных файлах); вывод режима записи
+из количества файлов (режим решается до запуска).
+
+**Следствия.** `tests/test_materialization.py` (37 тестов, офлайн) покрывает
+контролируемую папку, отказы границы и deny-list, манифест, правила точки входа,
+предпросмотр и отказы обхода путей, гейт этапа, оба режима записи, сохранность версий,
+архив/восстановление и отсутствие секретов и тел файлов в событиях и ответах.
+`app/smoke_materialization.py` печатает весь путь офлайн. `GET /api/projects/{id}`
+получает аддитивные поля `stage`, `files_created`, `entrypoint`, `preview` и
+`verification_command`, а `POST /api/tasks/run` сообщает `write_mode`.

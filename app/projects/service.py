@@ -669,6 +669,34 @@ class ProjectService:
         return restored
 
     # --------------------------------------------------------------- re-verify
+    def set_preview_not_required(
+        self, project_id: object, value: bool = True
+    ) -> LifecycleProject:
+        """Record, on the current version, that no local preview is required.
+
+        This is an explicit statement by the caller, not an inference: a project with
+        no servable entry point is *not* a project whose preview is unnecessary. The
+        flag is stored on the version so the history keeps the fact per attempt, and
+        only ``True`` here can satisfy the completion gate's preview requirement
+        (``app.projects.stage.project_stage``).
+        """
+
+        project = self._store.require(_project_id(project_id))
+        version = project.current() or project.latest_version
+        if version is None:
+            raise UnknownProjectVersion(
+                f"project '{project.project_id}' has no version to annotate"
+            )
+        versions = [
+            replace(item, preview_not_required=bool(value))
+            if item.version == version.version
+            else item
+            for item in project.versions
+        ]
+        updated = replace(project, versions=versions, updated_at=utc_now())
+        self._store.write(updated)
+        return updated
+
     def verify_again(self, project_id: object) -> LifecycleProject:
         """Re-judge the recorded artifacts, then advance the lifecycle.
 
@@ -753,11 +781,15 @@ class ProjectService:
             number = pending.version
             created_at = pending.created_at or now
             change_request = pending.change_request
+            # The owner's explicit "no preview required" belongs to the version
+            # slot, so filling the slot keeps it rather than silently resetting it.
+            preview_not_required = bool(pending.preview_not_required)
             others = [item for item in project.versions if item.version != number]
         else:
             number = max(project.version_numbers, default=0) + 1
             created_at = now
             change_request = None
+            preview_not_required = False
             others = list(project.versions)
 
         filled = ProjectVersion(
@@ -770,6 +802,7 @@ class ProjectService:
             provider=facts.provider,
             model=facts.model,
             change_request=change_request,
+            preview_not_required=preview_not_required,
         )
         versions = sorted(others + [filled], key=lambda item: item.version)
         return replace(

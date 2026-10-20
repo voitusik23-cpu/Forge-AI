@@ -78,6 +78,12 @@ export type TaskRunResponse = {
   artifact_manifest_saved?: boolean;
   /** How many files this run actually wrote (0 for a text-only answer). */
   files_created?: number;
+  /**
+   * The write mode the run used, stated by the backend: "" when it did not write,
+   * otherwise `MOCK_DETERMINISTIC` or `REAL_PROVIDER_EXPLICIT`. A mode is never
+   * inferred here from the file count.
+   */
+  write_mode?: string;
   /** `FREE` | `CHEAP` | `PAID`, or null when the registries do not know the pair. */
   cost_tier?: string | null;
   /** The registry's own rate/estimate, or null when no estimate exists. */
@@ -769,12 +775,13 @@ export type LifecycleVersion = {
   model?: string;
   file_count?: number;
   pending?: boolean;
+  /** The owner's explicit "no local preview required" for this version. */
+  preview_not_required?: boolean;
   change_request?: LifecycleChangeRequest | null;
   files?: LifecycleArtifact[];
 };
 
-/** `Project.summary()`: the one-line projection of the lifecycle list. */
-export type LifecycleSummary = {
+/** `Project.summary()`: the one-line projection of the lifecycle list. */export type LifecycleSummary = {
   project_id?: string;
   name?: string;
   status?: string;
@@ -814,6 +821,50 @@ export type LifecycleDetail = {
   versions?: LifecycleVersion[];
   files?: LifecycleArtifact[];
   presentation?: ProjectPresentation;
+  /** One of the eight stage words this module documents on the backend. */
+  stage?: string;
+  files_created?: number;
+  entrypoint?: LifecycleEntryPoint | null;
+  preview?: LifecyclePreview;
+  /** The manual equivalent of the writer's own `py_compile`, empty when nothing to compile. */
+  verification_command?: string;
+};
+
+/**
+ * The one entry point detected from the manifest (`app/projects/entrypoint.py`).
+ *
+ * `path` and `location` are workspace- and repository-relative: an absolute path is never
+ * published. `run_command` is a display string this repository never executes;
+ * `serve_kind === "static"` is the only kind the local preview can serve.
+ */
+export type LifecycleEntryPoint = {
+  kind?: string;
+  path?: string;
+  run_command?: string;
+  serve_kind?: string;
+  location?: string;
+};
+
+/**
+ * The preview block (`GET/POST /api/projects/{id}/preview`).
+ *
+ * `available` is true only for a static entry point; `reason` otherwise says exactly why
+ * (`local run is not wired for this entry kind`, or that no entry point was detected).
+ * The absolute workspace root, when a server is running, is inside `diagnostics` only.
+ */
+export type LifecyclePreview = {
+  available?: boolean;
+  running?: boolean;
+  reason?: string;
+  url?: string;
+  port?: number;
+  entry_path?: string;
+  entry_kind?: string;
+  serve_kind?: string;
+  run_command?: string;
+  project_folder?: string;
+  files_created?: number;
+  diagnostics?: Record<string, unknown>;
 };
 
 /**
@@ -966,6 +1017,31 @@ export const loadProjectHistory = (projectId: string): Promise<Result<LifecycleH
 export const verifyProject = (projectId: string): Promise<Result<LifecycleVerification>> =>
   postJson<LifecycleVerification>(projectPath(projectId, "/verify"));
 
+/** `GET /api/projects/{id}/entrypoint` — the one entry point the manifest supports. */
+export const loadProjectEntryPoint = (
+  projectId: string
+): Promise<Result<{ project_id?: string; entrypoint?: LifecycleEntryPoint | null; reason?: string }>> =>
+  readJson(projectPath(projectId, "/entrypoint"));
+
+/** `GET /api/projects/{id}/preview` — the preview's runtime status. */
+export const loadProjectPreview = (
+  projectId: string
+): Promise<Result<LifecyclePreview & { project_id?: string }>> =>
+  readJson(projectPath(projectId, "/preview"));
+
+/**
+ * `POST /api/projects/{id}/preview` — start or stop the read-only static preview.
+ *
+ * `preview_not_required` records the owner's explicit statement on the current version;
+ * it is not a substitute for a preview the project could have served, and it starts
+ * nothing.
+ */
+export const changeProjectPreview = (
+  projectId: string,
+  body: { action: "start" | "stop" | "status"; preview_not_required?: boolean }
+): Promise<Result<LifecyclePreview & { project_id?: string; action?: string; stage?: string }>> =>
+  postJson(projectPath(projectId, "/preview"), body);
+
 /**
  * How one verdict word reads, without inventing a meaning the backend did not publish.
  *
@@ -1014,8 +1090,8 @@ export const acceptanceLabel = (lang: "ru" | "en", value: unknown): string => {
 /**
  * The provider the installed runtime uses for its offline, deterministic answer.
  *
- * It comes from `app/config/settings.py::OFFLINE_PROVIDER_NAME`, which `POST /api/tasks/run`
- * refuses to write files for: the guarded writer is only reached by a real provider. The screen
- * therefore keeps the write toggle disabled for this one name instead of promising a file.
+ * It comes from `app/config/settings.py::OFFLINE_PROVIDER_NAME`. A run on it never calls
+ * a provider, and it writes files only in `MOCK_DETERMINISTIC` mode -- the deterministic
+ * scaffold Forge itself produces, used by tests and the smoke -- not model output.
  */
 export const OFFLINE_PROVIDER = "mock";

@@ -221,6 +221,7 @@ def create_api_app(
     from app.api.operating_surface import build_operating_surface
     from app.api.discovery_routes import register_discovery_routes
     from app.api.project_routes import register_project_routes
+    from app.projects.preview import PreviewRegistry
     from app.api.routes import (
         body_error_exception,
         error_body,
@@ -403,6 +404,14 @@ def create_api_app(
     projects = (
         project_service if project_service is not None else ProjectService()
     )
+    # One preview registry for this process. It holds *runtime* state (a local HTTP
+    # server that is listening right now), so it is created at composition -- not
+    # stored on a project record, where it would be a claim that outlives the socket.
+    # The registry's server threads are daemons, so nothing keeps listening after the
+    # process exits, and ``POST /api/projects/{id}/preview {"action": "stop"}`` is the
+    # deterministic way to end one while the process keeps running.
+    previews = PreviewRegistry()
+    app.state.forge_previews = previews
     # The card's technical block needs facts the project store does not hold: the
     # run's own durable record, the provider registry ids and the route list. They
     # are supplied as read-only callables from this composition, so the project
@@ -411,6 +420,7 @@ def create_api_app(
         app,
         projects,
         run_record_loader=api_service.get_run_record,
+        preview_registry=previews,
         environment_facts=lambda: {
             "provider_registry_ids": _provider_registry_ids(api_service),
             "api_routes": sorted(
@@ -485,8 +495,15 @@ def create_api_app(
                 source["acceptance"] = (
                     "passed" if getattr(outcome.response, "success", False) else "failed"
                 )
+            # The written files live in the project's own workspace, so that folder is
+            # the source the manifest is recorded from. A run that wrote nothing has no
+            # entry to copy and this argument is never read.
+            try:
+                source_root: Any = projects.store.workspace_path(project_id)
+            except Exception:  # noqa: BLE001 - fall back to the run's own workspace
+                source_root = api_service.workspace.root
             attached = projects.attach_run(
-                project_id, source, source_root=api_service.workspace.root
+                project_id, source, source_root=source_root
             )
             version = attached.current() or attached.latest_version
             files = tuple(getattr(version, "files", ()) or ())
@@ -673,6 +690,27 @@ def create_api_app(
                 ) from refused
             description = apply_specification(specification, description)
 
+        # THE PROJECT WRITE TARGET. When this run belongs to a lifecycle project, the
+        # tree a write-mode answer may touch is that project's own controlled folder
+        # (``.forge/projects/<id>/workspace``), resolved here from the project store.
+        # No request value can name it: the only input is the confirmed discovery
+        # session this route already validated. When no project is linked, the target
+        # is absent and the guarded writer keeps the run's own workspace -- which is
+        # the read-only-per-project behaviour this route always had.
+        project_workspace: Optional[Path] = None
+        lifecycle_project_id = ""
+        lifecycle_project_path = ""
+        if discovery_session_id is not None and bool(payload.get("write_mode", False)):
+            linked_project = projects.project_for_session(discovery_session_id)
+            if linked_project:
+                lifecycle_project_id = linked_project
+                project_workspace = projects.store.workspace_path(
+                    linked_project, create=True
+                )
+                lifecycle_project_path = projects.store.project_path_relative(
+                    linked_project
+                )
+
         req = TaskRunRequest(
             description=description,
             category=payload.get("category", "code"),
@@ -689,7 +727,13 @@ def create_api_app(
             write_mode=bool(payload.get("write_mode", False)),
         )
         try:
-            outcome = api_service.run_task_detailed(req, idempotency_key=idempotency_key)
+            outcome = api_service.run_task_detailed(
+                req,
+                idempotency_key=idempotency_key,
+                project_workspace=project_workspace,
+                lifecycle_project_id=lifecycle_project_id,
+                lifecycle_project_path=lifecycle_project_path,
+            )
         except PaidModelRequiresConfirmation as paid:
             # A refusal, not an error: the request was well-formed and the server
             # declined to spend money. 409 says exactly that, and nothing was

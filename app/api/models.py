@@ -128,6 +128,12 @@ class TaskRunResponse:
     artifact_manifest_saved: bool = False
     #: How many files this run actually wrote (0 for a text-only answer).
     files_created: int = 0
+    #: The write mode this run used, stated rather than implied. Exactly two modes
+    #: exist: ``MOCK_DETERMINISTIC`` (the offline/mock provider's deterministic
+    #: answer) and ``REAL_PROVIDER_EXPLICIT`` (only when the caller named both the
+    #: provider and the model *and* set ``write_mode``). The empty string means the
+    #: run did not write and wrote nothing -- a mode is never inferred after the fact.
+    write_mode: str = ""
     #: The coarse price category of the provider/model this run used:
     #: ``FREE``, ``CHEAP`` or ``PAID``; ``None`` when the registries do not know it.
     cost_tier: Optional[str] = None
@@ -157,6 +163,7 @@ class TaskRunResponse:
             "project_files_created": self.project_files_created,
             "artifact_manifest_saved": self.artifact_manifest_saved,
             "files_created": self.files_created,
+            "write_mode": self.write_mode,
             "cost_tier": self.cost_tier,
             "estimated_cost": self.estimated_cost,
         }
