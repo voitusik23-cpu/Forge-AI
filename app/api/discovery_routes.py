@@ -20,6 +20,14 @@ planning/execution guard lives on the existing task route, not here.
 Failures use the surface's existing error contract: the status keeps its meaning
 (404 unknown session, 400 malformed body, 409 wrong state) and the machine code
 is published verbatim.
+
+Confirmation is also where a **persistent project record** is created, when the
+composition supplied a project service. The confirm route is the only moment at
+which the specification is frozen, so it is the only correct moment to materialise
+the record: ``create_from_discovery`` stores the confirmed specification in
+``WAITING_FOR_CONFIRMATION`` and the confirmation itself advances it to
+``PLANNED``, before any run exists. The response gains an additive ``project``
+field; every field it already had is unchanged.
 """
 
 from __future__ import annotations
@@ -36,13 +44,19 @@ from app.discovery.service import DiscoveryService
 __all__ = ["register_discovery_routes"]
 
 
-def register_discovery_routes(app: Any, discovery: DiscoveryService) -> None:
+def register_discovery_routes(
+    app: Any, discovery: DiscoveryService, projects: Optional[Any] = None
+) -> None:
     """Attach the discovery routes to ``app`` and expose the service on its state.
 
     The service instance is created once, at composition, so every request of one
     process shares one store and one view of the sessions. It is placed on
     ``app.state`` because that is how the rest of this surface publishes a
     composition-time dependency (see ``forge_operating_surface``).
+
+    ``projects`` is the optional project lifecycle service. When it is supplied, a
+    confirmed session produces its durable project record; when it is not, the
+    confirmation behaves exactly as it did before this parameter existed.
     """
 
     from fastapi import Body, HTTPException
@@ -75,11 +89,16 @@ def register_discovery_routes(app: Any, discovery: DiscoveryService) -> None:
             raise _refusal(UnknownDiscoverySession(""))
         return session_id
 
-    def _session_payload(session: Any) -> dict[str, Any]:
-        return {
+    def _session_payload(session: Any, project: Optional[Any] = None) -> dict[str, Any]:
+        payload = {
             "session": session.to_dict(),
             "questions": [question.to_dict() for question in session.questions],
         }
+        if project is not None:
+            # Additive: the record's own summary, so a client learns the project id
+            # and status without a second request.
+            payload["project"] = project.summary()
+        return payload
 
     @app.post("/api/discovery/sessions")
     def create_session(payload: dict[str, Any]) -> Any:
@@ -155,7 +174,14 @@ def register_discovery_routes(app: Any, discovery: DiscoveryService) -> None:
             session = discovery.confirm(_session_id(session_id))
         except DiscoveryError as exc:
             raise _refusal(exc) from exc
-        return _session_payload(session)
+        project = None
+        if projects is not None:
+            # The specification is frozen exactly here, so the durable record is
+            # created exactly here: created in WAITING_FOR_CONFIRMATION and then
+            # confirmed to PLANNED, before any run can be attached to it.
+            project = projects.create_from_discovery(session)
+            project = projects.confirm(project.project_id)
+        return _session_payload(session, project)
 
     @app.post("/api/discovery/sessions/{session_id}/cancel")
     def cancel_session(session_id: str) -> Any:

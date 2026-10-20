@@ -158,6 +158,7 @@ def create_api_app(
     idempotency_guard: Optional[object] = None,
     authorized_project_id: Optional[str] = None,
     discovery_service: Optional[object] = None,
+    project_service: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -176,6 +177,13 @@ def create_api_app(
     deployment's own store, and a test can supply one rooted at a temporary
     directory. It adds no executor: the task route below only uses it to refuse an
     unconfirmed run and to prepend a confirmed specification to the task text.
+
+    ``project_service`` is the persistent project lifecycle
+    (``app.projects.service``). It defaults to a service over the deployment's own
+    store and a test can supply one rooted at a temporary directory. It creates no
+    executor either: a confirmed discovery session creates a project record, and the
+    task route copies the *existing* run's written files into that project's
+    workspace after the run finished.
     """
 
     from fastapi import FastAPI, HTTPException, Request, Header
@@ -185,6 +193,7 @@ def create_api_app(
 
     from app.api.operating_surface import build_operating_surface
     from app.api.discovery_routes import register_discovery_routes
+    from app.api.project_routes import register_project_routes
     from app.api.routes import (
         body_error_exception,
         error_body,
@@ -198,6 +207,7 @@ def create_api_app(
         UnknownDiscoverySession,
     )
     from app.discovery.service import DiscoveryService, apply_specification
+    from app.projects.service import ProjectService
     from app.tools.approval import ApprovalPolicy
 
     api_service = service or ForgeApiService(
@@ -360,15 +370,76 @@ def create_api_app(
 
     register_operating_routes(app, _authorized_surface)
 
+    # One project lifecycle service for this process, composed here exactly like the
+    # operating surface and the discovery service: the store root comes from the
+    # deployment, never from a request. It creates no executor and starts no run.
+    projects = (
+        project_service if project_service is not None else ProjectService()
+    )
+    register_project_routes(app, projects)
+
     # One discovery service for this process, composed here exactly like the
     # operating surface: the store root comes from the deployment, never from a
-    # request. It creates no executor and starts no run.
+    # request. It creates no executor and starts no run. It is handed the project
+    # service so that confirming a session materialises its project record.
     discovery = (
         discovery_service
         if discovery_service is not None
         else DiscoveryService()
     )
-    register_discovery_routes(app, discovery)
+    register_discovery_routes(app, discovery, projects)
+
+    def _attach_project(session_id: Optional[str], outcome: Any) -> str:
+        """Attach one finished run to the project its discovery session produced.
+
+        Returns the fact for the ``X-Forge-Project-Attach`` header: ``none`` when no
+        session was named or no project is linked, ``ok`` when the run was recorded,
+        ``already_attached`` when that very run id is already a version (an
+        idempotent replay must not produce a second version), and
+        ``error:<Type>`` when the attachment failed -- in which case the failure is
+        logged here and the run's own response is left exactly as it was.
+        """
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            return "none"
+        try:
+            project_id = projects.project_for_session(session_id)
+            if not project_id:
+                return "none"
+            run_id = str(getattr(outcome.response, "run_id", "") or "")
+            project = projects.open_project(project_id)
+            if any(item.run_id == run_id for item in project.versions):
+                return "already_attached"
+            # The durable record is the evidence: it carries the classification the
+            # run store derived from the persisted snapshot and the writer's own
+            # outcome. ``provider_used``/``model_used`` are fields of the response,
+            # not of the record, so they are merged in from the response rather than
+            # invented. A missing record is reported honestly from the response
+            # instead of being treated as a success.
+            record = api_service.get_run_record(run_id) if run_id else None
+            source: Any = dict(record) if record is not None else {}
+            source["run_id"] = run_id
+            source["state"] = source.get("state") or getattr(outcome.response, "state", "")
+            source["error"] = source.get("error") or getattr(outcome.response, "error", None)
+            source["provider_used"] = source.get("provider_used") or getattr(
+                outcome.response, "provider_used", ""
+            )
+            source["model_used"] = source.get("model_used") or getattr(
+                outcome.response, "model_used", ""
+            )
+            if not source.get("acceptance"):
+                source["acceptance"] = (
+                    "passed" if getattr(outcome.response, "success", False) else "failed"
+                )
+            projects.attach_run(
+                project_id, source, source_root=api_service.workspace.root
+            )
+            return "ok"
+        except Exception as exc:  # noqa: BLE001 - the run's own result stands
+            logger.exception(
+                "project attach failed for discovery session %s", session_id
+            )
+            return f"error:{type(exc).__name__}"
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -555,6 +626,17 @@ def create_api_app(
         response.headers["X-Forge-Cost-Basis"] = outcome.cost_basis
         if outcome.history_error:
             response.headers["X-Forge-History-Error"] = outcome.history_error
+        # THE PROJECT ATTACH. When the caller named a confirmed discovery session,
+        # the run that just finished belongs to that session's project: its written
+        # files are copied into the project workspace, a version is recorded, and
+        # the lifecycle advances. This runs AFTER the existing run path returned and
+        # reads the run's durable record, so nothing above it changes and a failure
+        # here can never reinterpret the run's own result -- which is why the fact is
+        # reported in a header instead of being folded into the response body.
+        response.headers["X-Forge-Project-Attach"] = _attach_project(
+            discovery_session_id,
+            outcome,
+        )
         return response
 
     @app.get("/api/runs/{run_id}")

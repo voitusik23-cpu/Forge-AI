@@ -332,7 +332,18 @@ class DiscoveryApiTests(_DiscoveryTestCase):
     def _api_client(self, service: ForgeApiService):
         from fastapi.testclient import TestClient
 
-        app = create_api_app(service, discovery_service=self.discovery)
+        from app.projects.service import ProjectService
+        from app.projects.store import ProjectStore
+
+        # Confirming a session now also materialises its persistent project record,
+        # so this test redirects that store exactly as it already redirects the
+        # discovery and run stores: a test must never write into the deployment's
+        # own project store.
+        app = create_api_app(
+            service,
+            discovery_service=self.discovery,
+            project_service=ProjectService(ProjectStore(root=self.base / "projects")),
+        )
         return TestClient(app)
 
     def _offline_service(self) -> ForgeApiService:
