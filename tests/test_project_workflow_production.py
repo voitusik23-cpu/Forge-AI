@@ -829,6 +829,10 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 "write_mode",
                 "cost_tier",
                 "estimated_cost",
+                # The intent the answer declared (structured intent v0.1): an empty
+                # mapping means "no intent declared". Additive, like the fields
+                # above; nothing that existed before it changed.
+                "model_intent",
             },
         )
 

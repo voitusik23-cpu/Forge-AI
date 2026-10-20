@@ -571,3 +571,85 @@ Last recorded full run on the tree that includes the artifact-provenance fix:
 `python -m app.desktop` opens the program: a 23-second vector introduction, a language switch (Русский / English), access by email with a confirmation code or a labelled developer entry, and a built-in manual. The widget on the desktop opens it on a double-click. See [the guide](docs/USER_AND_DEVELOPER_GUIDE.md) section 14.
 
 `python -m app.desktop` открывает программу: 23-секундная векторная заставка, переключатель языка (Русский / English), доступ по почте с кодом подтверждения или явный вход для разработчика и встроенное руководство. Виджет на рабочем столе открывает её двойным щелчком. Подробности — в разделе 14 [руководства](docs/USER_AND_DEVELOPER_GUIDE.md).
+
+### Structured intent and the local run (v0.1) / Структурированное намерение и локальный запуск (v0.1)
+
+**Structured intent.** A model answer can now declare what it is doing, and the runtime
+classifies that declaration instead of guessing from prose. `app/agent_runtime/intent.py`
+is pure, standard-library-only and never raises: it accepts a bare JSON object, a
+```` ```json ```` fence or an object embedded in prose, and recognises exactly five
+intents — `CLARIFICATION_REQUIRED`, `PLAN_READY`, `GENERATE_PROJECT`, `REVIEW`,
+`FINAL_ANSWER`. A malformed envelope, an unknown type or a missing required field is
+reported (`valid=False` with a named error) and the run continues. The parsed type reaches
+the single completion rule as one more optional fact, so `FINAL_ANSWER`,
+`CLARIFICATION_REQUIRED` and `PLAN_READY` can never produce a completed project, and only
+`GENERATE_PROJECT` with files that were really written, verified and accepted can. The run
+response publishes `model_intent` and never echoes the raw answer. See
+[ARCHITECTURE](docs/ARCHITECTURE.md) "Structured Intent v0.1" and
+[DECISIONS](docs/DECISIONS.md).
+
+**What "project created" means.** A project exists when
+`.forge/projects/<project_id>/<project_id>.json` (the record: specification, status,
+versions, verdicts) exists and `.forge/projects/<project_id>/workspace/` holds the files a
+run really wrote. "Created" is not "ready": the card says **ГОТОВО** only when the current
+version has files, its verification passed, its acceptance passed and the workspace exists.
+Files live in `.forge/projects/<project_id>/workspace`; the local process log is
+`.forge/projects/<project_id>/run.log`; every published path is repository-relative.
+
+**Running and stopping.** A Python entry point (`app.py`, `main.py`, `server.py`, or a
+package with `__main__.py`) and a Node entry point (`server.js`, `app.js`, or a declared
+`package.json` `start`/`dev` script) are resolved server-side from the artifact manifest.
+Nothing is installed: a script whose dependencies are missing is reported as blocked, not
+repaired. The preview URL exists only when the process really binds a loopback port.
+Stopping terminates the whole process tree and unregisters the preview. Write approval,
+launch approval (the exact command plus its digest) and a paid model (named explicitly) are
+the three actions that always require your confirmation; `RUN_BLOCKED`, missing
+dependencies, `TIMED_OUT`, `REFUSED` and `FAILED` are stated with a reason and a next step.
+
+```powershell
+# the new smoke: the parser, the four branches, and no false COMPLETED (no network)
+.\\.venv\\Scripts\\python.exe -m app.smoke_structured_generation
+# the beta path tests: sixteen steps and seven negative checks, offline
+.\\.venv\\Scripts\\python.exe -B -X utf8 .forge\run_confined.py discover -s tests -p "test_beta_path.py" -v
+```
+
+**Структурированное намерение.** Ответ модели теперь может заявить, что именно он делает,
+и runtime классифицирует это заявление, а не угадывает по прозе.
+`app/agent_runtime/intent.py` чистый, только на стандартной библиотеке и никогда не бросает
+исключений: он принимает голый JSON-объект, ```` ```json ````-фенс или объект, встроенный в
+текст, и распознаёт ровно пять намерений — `CLARIFICATION_REQUIRED`, `PLAN_READY`,
+`GENERATE_PROJECT`, `REVIEW`, `FINAL_ANSWER`. Сломанный конверт, неизвестный тип или
+отсутствующее обязательное поле сообщаются (`valid=False` с названной ошибкой), и запуск
+продолжается. Разобранный тип попадает в единственное правило завершения как один
+дополнительный необязательный факт, поэтому `FINAL_ANSWER`, `CLARIFICATION_REQUIRED` и
+`PLAN_READY` никогда не дают завершённого проекта, а завершить его может только
+`GENERATE_PROJECT` с файлами, которые действительно записаны, проверены и приняты. Ответ
+запуска публикует `model_intent` и никогда не возвращает исходный ответ. См.
+[ARCHITECTURE](docs/ARCHITECTURE.md), раздел «Structured Intent v0.1», и
+[DECISIONS](docs/DECISIONS.md).
+
+**Что значит «проект создан».** Проект существует, когда есть
+`.forge/projects/<project_id>/<project_id>.json` (запись: спецификация, статус, версии,
+вердикты) и `.forge/projects/<project_id>/workspace/` содержит файлы, которые запуск
+действительно записал. «Создан» — это не «готов»: карточка говорит **ГОТОВО** только когда у
+текущей версии есть файлы, её проверка пройдена, её приёмка пройдена и workspace существует.
+Файлы лежат в `.forge/projects/<project_id>/workspace`; лог локального процесса —
+`.forge/projects/<project_id>/run.log`; любой опубликованный путь относителен репозитория.
+
+**Запуск и остановка.** Точка входа Python (`app.py`, `main.py`, `server.py` или пакет с
+`__main__.py`) и точка входа Node (`server.js`, `app.js` или объявленный в `package.json`
+скрипт `start`/`dev`) определяются на сервере по манифесту артефактов. Ничего не
+устанавливается: скрипт с отсутствующими зависимостями сообщается как заблокированный, а не
+чинится. URL предпросмотра существует только когда процесс действительно занял
+loopback-порт. Остановка завершает всё дерево процессов и снимает регистрацию preview.
+Подтверждение записи, подтверждение запуска (точная команда и её отпечаток) и платная
+модель (названная явно) — три действия, которые всегда требуют вашего подтверждения;
+`RUN_BLOCKED`, отсутствующие зависимости, `TIMED_OUT`, `REFUSED` и `FAILED` сообщаются с
+причиной и следующим шагом.
+
+```powershell
+# новый smoke: парсер, четыре ветки и отсутствие ложного COMPLETED (без сети)
+.\\.venv\\Scripts\\python.exe -m app.smoke_structured_generation
+# тесты бета-пути: шестнадцать шагов и семь негативных проверок, офлайн
+.\\.venv\\Scripts\\python.exe -B -X utf8 .forge\run_confined.py discover -s tests -p "test_beta_path.py" -v
+```

@@ -5163,3 +5163,93 @@ Platform / Core / Fabric / Registry; изоляция проектов; запр
 `a28c38a`, пять регрессионных тестов, полный набор `2359 тестов / OK (skipped=36)`.
 Этот документ следует репозиторию. Если задание авторитетно по невидимой здесь
 причине, пересматривать нужно исправление, а не документацию.
+
+## Structured Intent v0.1 — verified current state
+
+This section states only what the code does and what a passing check proves. Commit:
+`feat: add structured intent and beta verification` (the commit that adds the module).
+
+**Implemented and verified:**
+
+* `app/agent_runtime/intent.py` exists and is pure, stdlib-only, non-raising.
+  `IntentType` has exactly five members (`CLARIFICATION_REQUIRED`, `PLAN_READY`,
+  `GENERATE_PROJECT`, `REVIEW`, `FINAL_ANSWER`);
+  `parse_model_intent(answer_text) -> ModelIntent` returns a `ModelIntent` for any input,
+  including `None`, `""`, a truncated envelope and an unknown type.
+* The parser accepts a bare JSON object, a `json` fence and an object embedded in prose,
+  and validates `questions` / `plan` / `files` per type. A malformed envelope, an
+  unknown type and a missing required field are each reported with a fixed error code;
+  none of them raises and none of them stops the run.
+* `derive_outcome` accepts the optional `intent_type` fact. `intent_allows_completion`
+  admits only `GENERATE_PROJECT` (or no declared intent), so `FINAL_ANSWER`,
+  `CLARIFICATION_REQUIRED`, `PLAN_READY` and `REVIEW` cannot produce
+  `PROJECT_COMPLETED` even with every completion fact present.
+* `TaskRunResponse.model_intent` publishes `intent_type`, `summary`, `valid`,
+  `validation_errors`, `next_action` and `raw_text_preserved=true` on the provider run
+  path; the raw answer is not echoed to the client.
+* The explicit provider/model override, the fallback chain, the approval boundary and
+  the paid-model policy are unchanged; the new field is published, never obeyed.
+
+**Verified by:**
+
+* `tests/test_structured_intent.py` — 31 tests, offline, no provider call;
+* `tests/test_beta_path.py` — 10 tests, offline, the sixteen-step path and the seven
+  negative checks (the local runner is exercised for real; no provider is called);
+* `app/smoke_structured_generation.py` — exit 0, prints the task, the detected intent,
+  the summary, the next action and the absence of a false `COMPLETED` for a
+  clarification, a plan, a generation with fake files and a malformed envelope.
+
+**Limits of this evidence (statable, not hidden):**
+
+* No real AI provider was called. The provider path is exercised with an in-process
+  fake registered under a real provider name, exactly as the existing suites do.
+* The deterministic offline path (`provider == mock`) parses no model answer, so its
+  `model_intent` row is empty. That is an honest "no intent declared", not a claim.
+* Provider availability and any paid-model behaviour in a real deployment are not
+  demonstrated here and are reported separately as manual evidence.
+
+## Structured Intent v0.1 — проверенное текущее состояние
+
+Этот раздел утверждает только то, что делает код и что доказывает проходящая проверка.
+Коммит: `feat: add structured intent and beta verification` (коммит, добавляющий модуль).
+
+**Реализовано и проверено:**
+
+* `app/agent_runtime/intent.py` существует и является чистым, только на stdlib, не
+  бросающим исключений. В `IntentType` ровно пять членов (`CLARIFICATION_REQUIRED`,
+  `PLAN_READY`, `GENERATE_PROJECT`, `REVIEW`, `FINAL_ANSWER`);
+  `parse_model_intent(answer_text) -> ModelIntent` возвращает `ModelIntent` для любого
+  ввода, включая `None`, `""`, обрезанный конверт и неизвестный тип.
+* Парсер принимает голый JSON-объект, `json`-фенс и объект, встроенный в текст, и
+  проверяет `questions` / `plan` / `files` по типу. Сломанный конверт, неизвестный тип и
+  отсутствующее обязательное поле сообщаются фиксированным кодом ошибки; ни одно из них
+  не бросает исключение и не останавливает запуск.
+* `derive_outcome` принимает необязательный факт `intent_type`.
+  `intent_allows_completion` допускает только `GENERATE_PROJECT` (или отсутствие
+  заявленного намерения), поэтому `FINAL_ANSWER`, `CLARIFICATION_REQUIRED`, `PLAN_READY`
+  и `REVIEW` не могут дать `PROJECT_COMPLETED` даже при всех фактах завершения.
+* `TaskRunResponse.model_intent` публикует `intent_type`, `summary`, `valid`,
+  `validation_errors`, `next_action` и `raw_text_preserved=true` на пути запуска через
+  провайдера; исходный ответ не возвращается клиенту.
+* Явный override провайдера/модели, цепочка fallback, граница подтверждения и политика
+  платных моделей не изменены; новое поле публикуется, но ему не подчиняются.
+
+**Проверено:**
+
+* `tests/test_structured_intent.py` — 31 тест, офлайн, без вызова провайдера;
+* `tests/test_beta_path.py` — 10 тестов, офлайн, шестнадцать шагов пути и семь
+  негативных проверок (локальный runner используется по-настоящему; провайдер не
+  вызывается);
+* `app/smoke_structured_generation.py` — код 0, печатает задачу, распознанное намерение,
+  summary, следующее действие и отсутствие ложного `COMPLETED` для уточнения, плана,
+  генерации с фейковыми файлами и сломанного конверта.
+
+**Границы этих доказательств (называются, а не скрываются):**
+
+* Ни один реальный AI-провайдер не вызывался. Путь провайдера проверен внутрипроцессным
+  фейком, зарегистрированным под настоящим именем провайдера, как это делают
+  существующие наборы.
+* Детерминированный офлайн-путь (`provider == mock`) не парсит ответ модели, поэтому его
+  строка `model_intent` пуста. Это честное «намерение не заявлено», а не утверждение.
+* Доступность провайдеров и любое поведение платных моделей в реальном развёртывании
+  здесь не демонстрируются и сообщаются отдельно как ручное доказательство.

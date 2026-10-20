@@ -5024,3 +5024,190 @@ stdout и stderr читаются через `read1` (построчно буф�
 `app/smoke_node_preview.py` проходят путь материализация → точка входа → одобрение → запуск →
 `GET` предпросмотра 200 → проверка → остановка; node-smoke печатает
 `SKIPPED: node is not installed` и завершается с кодом 0, когда node нет.
+
+## Structured Intent v0.1
+
+**What it adds, and what it refuses to do.** Until v0.1 the only provider-neutral statement about a
+run was its *outcome* (`app/agent_runtime/outcome.py`, already implemented): the facts on disk decide
+it. What was missing is the other half of the same question — what the answer itself *declared*. A
+model answer is prose, and prose can say "three questions before I start", "here is the plan", "here
+are the files" or "here is the review"; the runtime could only infer that from a narrow question
+heuristic. `app/agent_runtime/intent.py` now classifies the declaration explicitly.
+
+The module is **pure and stdlib-only**: no clock, no I/O, no provider, no project store. It never
+sets a project status, never writes a file and never claims completion. It classifies one answer and
+records why it could not classify it.
+
+**`IntentType` is exactly five values:** `CLARIFICATION_REQUIRED`, `PLAN_READY`, `GENERATE_PROJECT`,
+`REVIEW`, `FINAL_ANSWER`.
+
+**`ModelIntent` carries only** `intent_type`, `summary`, `questions`, `plan`, `files`, `validation`,
+`next_action`, plus `raw_text` (the preserved original answer). `files` maps a path to its declared
+body; a `{"path", "purpose"}` entry records the purpose where a body would be, and the parser never
+fabricates file content.
+
+**`parse_model_intent(answer_text) -> ModelIntent`** accepts three envelope shapes — a bare JSON
+object, a ```` ```json ```` fence, and an object embedded in prose — and validates the fields each
+type requires:
+
+| Type | Required beyond a non-empty `summary` | Accepted shape |
+| --- | --- | --- |
+| `CLARIFICATION_REQUIRED` | `questions` | non-empty list of non-empty strings |
+| `PLAN_READY` | `plan` | non-empty list of non-empty strings |
+| `GENERATE_PROJECT` | `files` | mapping `path -> content`, or a list of `{path, purpose}` |
+| `REVIEW` | nothing | — |
+| `FINAL_ANSWER` | nothing | — |
+
+**Malformed input never raises and never stops the run:**
+
+* malformed JSON (the answer names `"intent_type"` or carries a `json`-labelled fence with an object,
+  and nothing parses) → `FINAL_ANSWER`, `valid=False`, error `invalid_json: ...`;
+* an unknown `intent_type` → `FINAL_ANSWER`, `valid=False`, error `unknown_intent_type: <word>`;
+* a recognised type with a missing or wrong-shaped field → **the recognised type is kept**,
+  `valid=False`, and the named error (`summary_missing`, `questions_invalid`, `plan_invalid`,
+  `files_invalid`, `files_empty`).
+
+Every error string is a fixed code with a short explanation and never echoes the answer's content.
+The raw text is always preserved in `raw_text`.
+
+**No envelope at all → a deterministic heuristic, in this fixed order:** two or more question lines
+(the same narrow rule `outcome.extract_clarifying_questions` already implements, imported rather than
+duplicated) → `CLARIFICATION_REQUIRED`; a fenced block naming a file (`path=` in the fence info, or a
+`**File: path**` line before it — the two forms the guarded writer accepts) → `GENERATE_PROJECT`; a
+numbered plan of three or more steps with **no** code fence → `PLAN_READY`; otherwise
+`FINAL_ANSWER`. An empty answer is an invalid `FINAL_ANSWER`.
+
+**The truthfulness rule stays where it was.** `derive_outcome` gained exactly one optional keyword,
+`intent_type` (`""` = the caller declared no intent, which is the pre-existing behaviour and keeps
+every existing caller byte-for-byte unchanged). The intent can only ever **lower** the outcome:
+
+* a declared `CLARIFICATION_REQUIRED` returns `CLARIFICATION_REQUIRED` (rule 2);
+* a declared `PLAN_READY` returns `PLAN_READY` when no confirmed project exists (rule 3);
+* before the completion rule, `intent_allows_completion(intent_type)` must hold. Only
+  `GENERATE_PROJECT` — or no declared intent — may justify `PROJECT_COMPLETED`; `FINAL_ANSWER`,
+  `CLARIFICATION_REQUIRED`, `PLAN_READY`, `REVIEW` and any unrecognised word refuse it (rule 7a).
+
+So `FINAL_ANSWER`, `CLARIFICATION_REQUIRED` and `PLAN_READY` can never yield a completed project,
+and `GENERATE_PROJECT` still completes only when the files it named were **actually written** through
+the existing write path and then verified and accepted. `intent_allows_completion` lives in
+`outcome.py` (the classifier applies it) and is re-exported by `intent.py`, so the rule is stated
+once.
+
+**Integration is additive.** At the outcome gate of `ForgeApiService.run_task_detailed` the provider
+answer is parsed once; the type is passed to `derive_outcome`, the questions come from the envelope
+when it is a valid `CLARIFICATION_REQUIRED`, and `TaskRunResponse.model_intent` publishes
+`intent_type`, `summary`, `valid`, `validation_errors`, `next_action` and `raw_text_preserved=true`.
+The raw text is **not** echoed to the client: the response is a client-facing document and the answer
+can carry prompt material or a credential-shaped string. Entry points that parse no model answer
+(the deterministic offline path, a replay, a project attach) publish an empty mapping, which means
+"no intent declared" rather than an invented one.
+
+**Boundaries untouched.** The intent is published, never obeyed. The explicit provider/model
+override, the provider fallback chain, the approval boundary and the paid-model policy are unchanged:
+`tests/test_structured_intent.py::ResponseIntegrationTests` asserts that an explicitly named
+provider and model survive the new field, and `tests/test_beta_path.py` asserts the same refusals as
+before.
+
+**Evidence.** `tests/test_structured_intent.py` (31 tests, offline) covers a valid envelope for each
+of the five types in each of the three shapes, malformed JSON, an unknown type, a missing required
+field per type, every heuristic branch, the false-completion rule with every completion fact present,
+`GENERATE_PROJECT` without real writes, the explicit provider/model pair and the plain-text
+regression. `tests/test_beta_path.py` (10 tests, offline) walks the sixteen-step path and pins the
+seven negative checks. `app/smoke_structured_generation.py` prints, for a clarification, a plan, a
+generation with fake files and a malformed envelope: the original task, the detected intent, the
+summary, the next action and the absence of a false `COMPLETED`; it exits 0 and opens no socket.
+
+## Structured Intent v0.1 — русская версия
+
+**Что добавляется и чего модуль не делает.** До v0.1 единственным провайдеро-нейтральным
+утверждением о запуске был его *исход* (`app/agent_runtime/outcome.py`, уже реализованный): его
+решают факты на диске. Не хватало второй половины того же вопроса — что заявил сам ответ. Ответ
+модели — это текст, а текст может говорить «три вопроса до начала», «вот план», «вот файлы» или
+«вот ревью»; runtime умел выводить это только из узкой эвристики вопросов. Теперь
+`app/agent_runtime/intent.py` классифицирует заявление явно.
+
+Модуль **чистый и только на stdlib**: без часов, без I/O, без провайдера, без хранилища проектов.
+Он никогда не выставляет статус проекта, не пишет файл и не заявляет завершение. Он классифицирует
+один ответ и записывает, почему классифицировать не удалось.
+
+**`IntentType` — ровно пять значений:** `CLARIFICATION_REQUIRED`, `PLAN_READY`,
+`GENERATE_PROJECT`, `REVIEW`, `FINAL_ANSWER`.
+
+**`ModelIntent` содержит только** `intent_type`, `summary`, `questions`, `plan`, `files`,
+`validation`, `next_action` и `raw_text` (сохранённый исходный ответ). `files` сопоставляет путь
+заявленному телу; запись `{"path", "purpose"}` записывает назначение туда, где было бы тело, и
+парсер никогда не выдумывает содержимое файла.
+
+**`parse_model_intent(answer_text) -> ModelIntent`** принимает три формы конверта — голый JSON-объект,
+```` ```json ````-фенс и объект, встроенный в текст, — и проверяет поля, обязательные для каждого
+типа:
+
+| Тип | Обязательно кроме непустого `summary` | Допустимая форма |
+| --- | --- | --- |
+| `CLARIFICATION_REQUIRED` | `questions` | непустой список непустых строк |
+| `PLAN_READY` | `plan` | непустой список непустых строк |
+| `GENERATE_PROJECT` | `files` | отображение `path -> content` или список `{path, purpose}` |
+| `REVIEW` | ничего | — |
+| `FINAL_ANSWER` | ничего | — |
+
+**Некорректный ввод никогда не бросает исключение и не останавливает запуск:**
+
+* сломанный JSON (ответ называет `"intent_type"` или несёт фенс с меткой `json` и объектом, а
+  ничего не парсится) → `FINAL_ANSWER`, `valid=False`, ошибка `invalid_json: ...`;
+* неизвестный `intent_type` → `FINAL_ANSWER`, `valid=False`, ошибка `unknown_intent_type: <слово>`;
+* распознанный тип с отсутствующим или неверным по форме полем → **распознанный тип сохраняется**,
+  `valid=False` и названная ошибка (`summary_missing`, `questions_invalid`, `plan_invalid`,
+  `files_invalid`, `files_empty`).
+
+Каждая строка ошибки — это фиксированный код с коротким пояснением, и она никогда не повторяет
+содержимое ответа. Исходный текст всегда сохраняется в `raw_text`.
+
+**Конверта нет вовсе → детерминированная эвристика в фиксированном порядке:** две или более строки
+вопросов (то же узкое правило, которое уже реализует `outcome.extract_clarifying_questions`, —
+импортируется, а не дублируется) → `CLARIFICATION_REQUIRED`; фенс, называющий файл (`path=` в
+заголовке фенса или строка `**File: path**` перед ним — две формы, которые принимает защищённый
+writer) → `GENERATE_PROJECT`; нумерованный план из трёх и более шагов **без** фенса кода →
+`PLAN_READY`; иначе `FINAL_ANSWER`. Пустой ответ — это невалидный `FINAL_ANSWER`.
+
+**Правило правдивости остаётся там, где было.** `derive_outcome` получил ровно один необязательный
+keyword-аргумент `intent_type` (`""` = вызывающий не заявил намерения; это прежнее поведение, и
+каждый существующий вызов остаётся байт-в-байт неизменным). Намерение может только **понизить**
+исход:
+
+* заявленный `CLARIFICATION_REQUIRED` возвращает `CLARIFICATION_REQUIRED` (правило 2);
+* заявленный `PLAN_READY` возвращает `PLAN_READY`, когда подтверждённого проекта нет (правило 3);
+* перед правилом завершения обязано выполняться `intent_allows_completion(intent_type)`. Только
+  `GENERATE_PROJECT` — или отсутствие заявленного намерения — может обосновать `PROJECT_COMPLETED`;
+  `FINAL_ANSWER`, `CLARIFICATION_REQUIRED`, `PLAN_READY`, `REVIEW` и любое нераспознанное слово
+  отказывают (правило 7a).
+
+Поэтому `FINAL_ANSWER`, `CLARIFICATION_REQUIRED` и `PLAN_READY` никогда не дают завершённого
+проекта, а `GENERATE_PROJECT` по-прежнему завершает только когда названные им файлы **действительно
+записаны** существующим путём записи и затем проверены и приняты. `intent_allows_completion` живёт
+в `outcome.py` (классификатор его применяет) и реэкспортируется из `intent.py`, поэтому правило
+сформулировано один раз.
+
+**Интеграция аддитивна.** На гейте исхода в `ForgeApiService.run_task_detailed` ответ провайдера
+парсится один раз; тип передаётся в `derive_outcome`, вопросы берутся из конверта, когда это
+валидный `CLARIFICATION_REQUIRED`, а `TaskRunResponse.model_intent` публикует `intent_type`,
+`summary`, `valid`, `validation_errors`, `next_action` и `raw_text_preserved=true`. Исходный текст
+**не** возвращается клиенту: ответ — клиентский документ, а в тексте могут быть материал промпта
+или строка, похожая на credential. Точки входа, которые не парсят ответ модели (детерминированный
+офлайн-путь, replay, attach проекта), публикуют пустое отображение, что означает «намерение не
+заявлено», а не выдуманное.
+
+**Границы не тронуты.** Намерение публикуется, но ему не подчиняются. Явный override
+провайдера/модели, цепочка fallback, граница подтверждения и политика платных моделей не
+изменены: `tests/test_structured_intent.py::ResponseIntegrationTests` проверяет, что явно названные
+провайдер и модель выживают с новым полем, а `tests/test_beta_path.py` проверяет те же отказы, что
+и раньше.
+
+**Доказательства.** `tests/test_structured_intent.py` (31 тест, офлайн) покрывает валидный конверт
+для каждого из пяти типов в каждой из трёх форм, сломанный JSON, неизвестный тип, отсутствующее
+обязательное поле по каждому типу, каждую ветку эвристики, правило ложного завершения при всех
+фактах завершения, `GENERATE_PROJECT` без реальной записи, явную пару провайдер/модель и регрессию
+плоского текста. `tests/test_beta_path.py` (10 тестов, офлайн) проходит шестнадцать шагов пути и
+закрепляет семь негативных проверок. `app/smoke_structured_generation.py` печатает для
+уточнения, плана, генерации с фейковыми файлами и сломанного конверта: исходную задачу,
+распознанное намерение, summary, следующее действие и отсутствие ложного `COMPLETED`; завершается
+кодом 0 и не открывает сокет.

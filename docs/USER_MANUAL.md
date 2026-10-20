@@ -266,6 +266,72 @@ A record that says `COMPLETED` is a run that finished; it is not automatically a
 project status is the verdict, and it comes from verification and acceptance — never from the fact
 that a run ended.
 
+## 15. Run the project on this machine
+
+**What "project created" means in practice.** A project exists when its record is on disk — the
+confirmed specification, the status, the versions and the verdicts — and its workspace folder holds
+the files a run really wrote:
+
+```
+.forge/projects/<project_id>/<project_id>.json   the record
+.forge/projects/<project_id>/workspace/          the files the current version wrote
+.forge/projects/<project_id>/run.log             the redacted, bounded log of the local process
+```
+
+"Created" is not "ready". The card says **ГОТОВО** only when the current version has at least one
+file, its verification passed, its acceptance passed and the workspace still exists. A folder with
+no file is **НЕ СОЗДАН**, not a project. Every path Forge publishes is relative to the repository;
+an absolute host path (`C:\...`) never appears in a payload or on screen.
+
+**Run a Python project.** The entry point is detected from the recorded artifact manifest only —
+`app.py`, `main.py` or `server.py` in the project root, or a root package with `__main__.py`. Forge
+runs it with this machine's own Python interpreter. Nothing is installed and no dependency is
+resolved.
+
+**Run a Node project.** `server.js` or `app.js` in the root runs as `node <file>`; a `package.json`
+runs only a declared `start` or `dev` script, through the local `npm` CLI. Forge never runs
+`npm install`: when the declared script needs packages that are not present, the run is reported as
+missing dependencies instead of installing them.
+
+**Open the preview.** When the process binds a loopback port, Forge publishes the URL, and
+**«Открыть preview»** opens it. The port is observed, never declared, so a process that binds no port
+has no URL. A static project (`index.html`) has a preview and no process.
+
+**Stop the process.** **«Остановить»** ends the whole process tree and unregisters the preview.
+Stopping is always accepted, and it is the safe move when anything looks wrong.
+
+**When the run does not start.** The run payload says what happened, and each answer has one next
+step:
+
+| What the payload says | What it means | What to do |
+| --- | --- | --- |
+| `RUN_BLOCKED` · `runtime_missing` | the interpreter or Node is not installed here | install it, then run again |
+| `RUN_BLOCKED` · dependencies | the declared script needs packages that are not installed | install them explicitly, then run again |
+| `REFUSED` · `approval_required` | no explicit approval, or no digest | confirm the command whose digest is shown |
+| `REFUSED` · `approval_stale` | the command changed after the approval | read the new command and confirm again |
+| `REFUSED` · `command_not_allowed` | the command is outside the allow-list | nothing to do from the interface: the allow-list is the boundary |
+| `REFUSED` · `unsafe_entry_path` / `entry_missing` | the entry path escapes the workspace, or the file is gone | check the project's files |
+| `TIMED_OUT` | the process outlived the timeout and its tree was killed | run again, or stop and read the log |
+| `FAILED` with `exit_code` | the process exited non-zero | read the log; the card shows the same state |
+
+## 16. What needs your confirmation
+
+Three actions are never automatic, and each one fails closed:
+
+1. **Writing the project's files.** A run writes only in write mode, and only through the guarded
+   writer: every path is validated, every `.py` file must compile, and the report names what was
+   created or updated. An answer that carries no file leaves the project exactly where it was.
+2. **Launching the process.** The command is resolved on the server, and the interface shows the
+   exact command and its digest. Nothing starts without `{"confirm": true}` plus that digest, and
+   one approval buys exactly one start.
+3. **Paying for a model.** A model priced `PAID` runs only when you name **both** the provider and
+   the model *and* the deployment enables paid providers. Otherwise the request is refused before
+   anything is dispatched: nothing was sent and nothing was spent, and the refusal names the pair
+   and its published rate.
+
+`NEEDS_CHANGES`, `FAILED`, `REFUSED`, `RUN_BLOCKED` and `TIMED_OUT` are all honest answers, and none
+of them is `COMPLETED`.
+
 ---
 
 # Forge AI — руководство владельца (beta)
@@ -530,3 +596,69 @@ any other event»* — это настоящий ответ backend, показ�
 Запись, которая говорит `COMPLETED`, — это запуск, который завершился; он не обязательно успешен.
 Вердикт — это статус проекта, и он складывается из проверки и приёмки, а не из факта, что запуск
 закончился.
+
+## 15. Запустить проект на этой машине
+
+**Что значит «проект создан» на практике.** Проект существует, когда его запись лежит на диске —
+подтверждённая спецификация, статус, версии и вердикты — и его папка workspace содержит файлы,
+которые запуск действительно записал:
+
+```
+.forge/projects/<project_id>/<project_id>.json   запись проекта
+.forge/projects/<project_id>/workspace/          файлы текущей версии
+.forge/projects/<project_id>/run.log             очищенный и ограниченный лог локального процесса
+```
+
+«Создан» — это не «готов». Карточка говорит **ГОТОВО** только когда у текущей версии есть хотя бы
+один файл, её проверка пройдена, её приёмка пройдена и workspace всё ещё существует. Папка без
+файлов — это **НЕ СОЗДАН**, а не проект. Любой путь, который публикует Forge, относителен
+репозитория; абсолютный путь хоста (`C:\...`) не появляется ни в payload, ни на экране.
+
+**Запустить Python-проект.** Точка входа определяется только по записанному манифесту артефактов —
+`app.py`, `main.py` или `server.py` в корне проекта, либо корневой пакет с `__main__.py`. Forge
+запускает её собственным Python-интерпретатором этой машины. Ничего не устанавливается и никакая
+зависимость не подбирается.
+
+**Запустить Node-проект.** `server.js` или `app.js` в корне запускается как `node <file>`;
+`package.json` запускает только объявленный скрипт `start` или `dev`, через локальный `npm` CLI.
+Forge никогда не выполняет `npm install`: если объявленному скрипту нужны отсутствующие пакеты,
+запуск сообщает об отсутствующих зависимостях вместо их установки.
+
+**Открыть preview.** Когда процесс занимает loopback-порт, Forge публикует URL, и **«Открыть
+preview»** открывает его. Порт наблюдается, а не объявляется, поэтому процесс, который не занял
+порт, URL не имеет. У статического проекта (`index.html`) есть preview и нет процесса.
+
+**Остановить процесс.** **«Остановить»** завершает всё дерево процессов и снимает регистрацию
+preview. Остановка принимается всегда, и это безопасное действие, когда что-то выглядит не так.
+
+**Когда запуск не стартовал.** Payload запуска говорит, что произошло, и у каждого ответа есть
+следующий шаг:
+
+| Что в payload | Что это значит | Что делать |
+| --- | --- | --- |
+| `RUN_BLOCKED` · `runtime_missing` | интерпретатор или Node здесь не установлен | установить, затем запустить снова |
+| `RUN_BLOCKED` · зависимости | объявленному скрипту нужны неустановленные пакеты | установить их явно, затем запустить снова |
+| `REFUSED` · `approval_required` | нет явного подтверждения или нет отпечатка | подтвердить команду, отпечаток которой показан |
+| `REFUSED` · `approval_stale` | команда изменилась после подтверждения | прочитать новую команду и подтвердить снова |
+| `REFUSED` · `command_not_allowed` | команда вне allow-list | из интерфейса делать нечего: allow-list — это граница |
+| `REFUSED` · `unsafe_entry_path` / `entry_missing` | путь точки входа выходит из workspace или файл исчез | проверить файлы проекта |
+| `TIMED_OUT` | процесс прожил дольше таймаута, и его дерево было убито | запустить снова или остановить и прочитать лог |
+| `FAILED` с `exit_code` | процесс завершился с ненулевым кодом | прочитать лог; карточка показывает то же состояние |
+
+## 16. Что требует вашего подтверждения
+
+Три действия никогда не происходят автоматически, и каждое отказывает в закрытую сторону:
+
+1. **Запись файлов проекта.** Запуск пишет только в write mode и только через защищённый writer:
+   каждый путь проверяется, каждый `.py` файл обязан компилироваться, а отчёт называет то, что
+   создано или обновлено. Ответ без файлов оставляет проект ровно там, где он был.
+2. **Запуск процесса.** Команда определяется на сервере, а интерфейс показывает точную команду и её
+   отпечаток. Ничего не стартует без `{"confirm": true}` и этого отпечатка, и одно подтверждение
+   даёт ровно один запуск.
+3. **Оплата модели.** Модель с ценой `PAID` запускается только когда вы назвали **и** провайдера,
+   **и** модель, *и* развёртывание разрешает платных провайдеров. Иначе запрос отклоняется до
+   отправки: ничего не отправлено и ничего не потрачено, а отказ называет пару и её опубликованную
+   цену.
+
+`NEEDS_CHANGES`, `FAILED`, `REFUSED`, `RUN_BLOCKED` и `TIMED_OUT` — все это честные ответы, и
+ни один из них не `COMPLETED`.

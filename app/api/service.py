@@ -45,6 +45,7 @@ from app.agent_runtime.idempotency_integration import (
 )
 from app.agent_runtime.tool_execution import ToolIntent
 from app.agent_runtime.models import HarnessRequest
+from app.agent_runtime.intent import IntentType, parse_model_intent
 from app.agent_runtime.outcome import (
     RunOutcome,
     derive_outcome,
@@ -4370,7 +4371,22 @@ class ForgeApiService:
         # provider's success flag would imply. The state it publishes follows that
         # outcome, which is what stops a list of clarifying questions from surfacing
         # as "COMPLETED".
-        questions = extract_clarifying_questions(provider_answer)
+        #
+        # The answer's *declared intent* is parsed first and passed to the same
+        # classifier as one more fact. Parsing never raises: a malformed envelope, an
+        # unknown `intent_type` or a missing required field produces a `FINAL_ANSWER`
+        # (or the recognised type with `valid=False` and the named errors), and the run
+        # continues. The intent is published on the response and never obeyed -- only
+        # the facts on disk can complete a project, and only `GENERATE_PROJECT` may
+        # accompany that completion.
+        model_intent = parse_model_intent(provider_answer)
+        questions = (
+            tuple(model_intent.questions)
+            if model_intent.intent_type is IntentType.CLARIFICATION_REQUIRED
+            and model_intent.valid
+            and model_intent.questions
+            else extract_clarifying_questions(provider_answer)
+        )
         outcome = derive_outcome(
             run_state=run.state.value,
             run_success=success,
@@ -4382,6 +4398,7 @@ class ForgeApiService:
             verification="",
             acceptance="",
             specification_confirmed=False,
+            intent_type=model_intent.intent_type.value,
         )
         # The actual pair that ran decides the published tier, and the run's own
         # accounting decides the estimate -- never the pre-run selection, which a
@@ -4431,6 +4448,7 @@ class ForgeApiService:
             write_mode=str(write_mode or ""),
             cost_tier=actual_tier or cost_facts.get("cost_tier"),
             estimated_cost=estimated_cost,
+            model_intent=model_intent.response_payload(),
         )
         return RunDispatchResult(
             response=response,

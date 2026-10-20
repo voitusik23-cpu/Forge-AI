@@ -22,14 +22,18 @@ The precedence is fixed and is implemented in this order
 --------------------------------------------------------
 
 1. a provider/execution error, or a settled run that is not a success -> ``FAILED``;
-2. an answer that is a list of clarifying questions (or a discovery session
-   still ``NEEDS_CLARIFICATION``) -> ``CLARIFICATION_REQUIRED``;
-3. no project record, or an unconfirmed specification -> ``PLAN_READY`` when a
-   plan exists and waits for confirmation, otherwise ``SPECIFICATION_READY``;
+2. an answer that is a list of clarifying questions -- or one that *declares*
+   ``CLARIFICATION_REQUIRED`` -- or a discovery session still ``NEEDS_CLARIFICATION``
+   -> ``CLARIFICATION_REQUIRED``;
+3. no project record, or an unconfirmed specification -> ``PLAN_READY`` when the answer
+   declares a plan (or a plan exists and waits for confirmation), otherwise
+   ``SPECIFICATION_READY``;
 4. a run still in flight -> ``EXECUTION_RUNNING``;
 5. verification not run -> ``VERIFICATION_REQUIRED``;
 6. verification or acceptance failed -> ``NEEDS_CHANGES``;
-7. otherwise ``PROJECT_COMPLETED`` -- but only when **every** fact holds:
+7. a declared intent that is not ``GENERATE_PROJECT`` -> ``NEEDS_CHANGES``: only a
+   generation may be a generated project, whatever the facts say;
+8. otherwise ``PROJECT_COMPLETED`` -- but only when **every** fact holds:
    the project exists, its workspace exists, it recorded at least one artifact
    (or the run explicitly produced no files), verification passed, acceptance
    passed, and the artifact manifest is non-empty. Anything short of that is
@@ -37,6 +41,13 @@ The precedence is fixed and is implemented in this order
 
 The last rule is the guard the owner needed: a text answer can never reach it,
 because no project exists to carry the evidence.
+
+The ``intent_type`` input is the one provider-neutral fact
+:func:`app.agent_runtime.intent.parse_model_intent` adds
+(``app/agent_runtime/intent.py``). It is **optional**: the empty string means the
+caller declared no intent, which keeps every existing caller's outcome byte-for-byte
+unchanged. A declared intent may only ever *lower* the outcome -- it can never create a
+completed project that the facts do not already support.
 """
 
 from __future__ import annotations
@@ -57,6 +68,7 @@ __all__ = [
     "derive_outcome",
     "extract_clarifying_questions",
     "honest_state",
+    "intent_allows_completion",
     "looks_like_clarification",
     "state_for_outcome",
 ]
@@ -126,6 +138,26 @@ USER_FACING_STATES = {
 
 #: A leading list marker ("- ", "* ", "1. ", "1) ", "a) ") on an answer line.
 _LIST_MARKER = re.compile(r"^\s*(?:[-*\u2022\u2013\u2014]|\d+[.)]|[a-zA-Z\u0430-\u044f]\))\s+")
+
+#: The declared intents that may ever justify a completed project. The empty string (or
+#: ``None``) is "the caller declared no intent", the pre-existing behaviour, and is
+#: therefore allowed. ``app.agent_runtime.intent`` re-exports this one function rather
+#: than restating the rule, so the classifier and the parser cannot disagree.
+_INTENT_ALLOWS_COMPLETION = frozenset({"", "GENERATE_PROJECT"})
+
+
+def intent_allows_completion(intent_type: object) -> bool:
+    """Whether a declared intent may ever justify a completed project.
+
+    Only ``GENERATE_PROJECT`` may. A final answer, a question list, a plan or a review
+    is not a generated project, and neither is a word this module does not recognise:
+    an unknown intent is refused rather than trusted. ``""``/``None`` means the caller
+    declared no intent, which is the pre-existing behaviour and stays allowed, so an
+    entry point that never heard of this module keeps its outcome unchanged.
+    """
+
+    word = str(getattr(intent_type, "value", intent_type) or "").strip().upper()
+    return word in _INTENT_ALLOWS_COMPLETION
 
 
 def _word(value: object) -> str:
@@ -197,6 +229,7 @@ def derive_outcome(
     plan_awaiting_confirmation: bool = False,
     discovery_state: object = "",
     no_file_result: bool = False,
+    intent_type: object = "",
 ) -> RunOutcome:
     """Classify one run. Pure: no I/O, no clock, no ambient state.
 
@@ -208,11 +241,18 @@ def derive_outcome(
     run that explicitly produced no files has no artifact to record, and claiming
     one would be a fabrication. It never substitutes for ``verification`` or
     ``acceptance``.
+
+    ``intent_type`` is the answer's declared intent
+    (:class:`app.agent_runtime.intent.IntentType`), or ``""`` when the caller
+    declared none. It is the only new fact, and it can only lower the outcome: a
+    declared ``CLARIFICATION_REQUIRED``/``PLAN_READY`` names its own outcome, and any
+    intent that is not ``GENERATE_PROJECT`` blocks completion.
     """
 
     state = _word(run_state)
     in_flight = state in IN_FLIGHT_RUN_STATES
     settled_success = state in TERMINAL_SUCCESS_RUN_STATES
+    intent = _word(intent_type)
 
     # 1. A provider/execution error, or a settled run that is not a success.
     if str(error or "").strip():
@@ -224,14 +264,19 @@ def derive_outcome(
     if state and not in_flight and not settled_success and run_success is not True:
         return RunOutcome.FAILED
 
-    # 2. An answer that is a list of clarifying questions.
+    # 2. An answer that is a list of clarifying questions, or one that declares it is
+    #    asking for clarification.
     if _word(discovery_state) == "NEEDS_CLARIFICATION":
+        return RunOutcome.CLARIFICATION_REQUIRED
+    if intent == RunOutcome.CLARIFICATION_REQUIRED.value:
         return RunOutcome.CLARIFICATION_REQUIRED
     if looks_like_clarification(answer_text):
         return RunOutcome.CLARIFICATION_REQUIRED
 
     # 3. No project record, or an unconfirmed specification: text is all there is.
     if not project_exists or not specification_confirmed:
+        if intent == RunOutcome.PLAN_READY.value:
+            return RunOutcome.PLAN_READY
         if plan_exists and plan_awaiting_confirmation:
             return RunOutcome.PLAN_READY
         return RunOutcome.SPECIFICATION_READY
@@ -256,6 +301,10 @@ def derive_outcome(
     manifest = tuple(artifact_manifest or ())
     recorded_files = int(artifact_count or 0) > 0 or bool(no_file_result)
     manifest_recorded = len(manifest) > 0 or bool(no_file_result)
+    # 7a. The answer's own declaration: only a generation may be a generated project.
+    # The empty intent keeps every caller that never hears of intent unchanged.
+    if not intent_allows_completion(intent_type):
+        return RunOutcome.NEEDS_CHANGES
     if (
         bool(project_exists)
         and bool(project_workspace_exists)

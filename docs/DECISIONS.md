@@ -6746,3 +6746,110 @@ Toolhelp / `taskkill /T` по проверенному pid — никогда п
 материализация → точка входа → одобрение → запуск → `GET` предпросмотра 200 →
 проверка → остановка (а node-версия печатает `SKIPPED: node is not installed` и
 завершается с кодом 0, когда node нет).
+
+## Decision: provider-neutral structured intent (v0.1)
+
+**Status:** accepted and implemented.
+
+**Problem.** The run outcome was already decided by facts on disk, and correctly so. The
+missing half was the *declaration*: an answer that asks three questions, proposes a plan,
+offers files or delivers a review was indistinguishable from a finished answer, because
+the only signal read was a narrow question-line heuristic. A structured protocol between
+the model and Forge would make the declaration explicit — but a model-controlled status
+would be a new way to fake completion, which is exactly the defect the outcome gate
+exists to prevent.
+
+**Decision.** Add a provider-neutral intent *parser*, not a protocol the model controls:
+
+1. `app/agent_runtime/intent.py` is pure, stdlib-only and non-raising. It accepts three
+   envelope shapes and validates the fields each type requires. Malformed JSON, an
+   unknown type and a missing field produce a reported `FINAL_ANSWER` (or the recognised
+   type with `valid=False` and named errors); the run continues.
+2. Without an envelope, a deterministic heuristic classifies the answer: two or more
+   question lines, a fenced file declaration, a numbered plan with no code fence, else
+   plain text.
+3. The parsed type reaches the **existing** classifier as one more optional fact
+   (`derive_outcome(intent_type=...)`). It can only lower the outcome, and
+   `intent_allows_completion` admits only `GENERATE_PROJECT` (or no declared intent), so
+   `FINAL_ANSWER`, `CLARIFICATION_REQUIRED`, `PLAN_READY` and `REVIEW` can never yield a
+   completed project.
+4. The response publishes the row (`model_intent`: `intent_type`, `summary`, `valid`,
+   `validation_errors`, `next_action`, `raw_text_preserved`) and does not echo the raw
+   answer.
+
+**Rejected alternatives.**
+
+* A new completion path decided by the intent: two places would decide "done", and the
+  model would gain control of the status.
+* Raising the outcome when the model declares `GENERATE_PROJECT`: a declaration is not a
+  write; only the write path plus verification and acceptance can complete a project.
+* A heuristic-only solution (no envelope): the question and plan guesses cannot express
+  a generation, and the owner asked for a structured option that providers can adopt
+  later.
+* Replacing the existing question extraction with the parser's: the classifier's narrow
+  rule is already tested and used elsewhere, so `intent.py` imports it instead of
+  restating it.
+* Echoing the raw answer in the response row: the run response is a client-facing
+  document, and the answer can contain prompt material or a credential-shaped string.
+
+**Consequences.** The explicit provider/model override, the fallback chain, the approval
+boundary and the paid-model policy are untouched: the intent is published, never obeyed.
+`tests/test_structured_intent.py` (31 tests) and `tests/test_beta_path.py` (10 tests) are
+offline; `app/smoke_structured_generation.py` demonstrates the four branches and exits 0
+without opening a socket. Entry points that parse no model answer (the deterministic
+offline path, a replay, a project attach) publish an empty mapping — an honest "no intent
+declared" rather than an invented one.
+
+## Решение: провайдеро-нейтральное структурированное намерение (v0.1)
+
+**Статус:** принято и реализовано.
+
+**Проблема.** Исход запуска уже решался фактами на диске, и это правильно. Не хватало
+второй половины — *заявления*: ответ, который задаёт три вопроса, предлагает план,
+предлагает файлы или даёт ревью, был неотличим от законченного ответа, потому что
+единственным сигналом была узкая эвристика строк с вопросами. Структурированный
+протокол между моделью и Forge сделал бы заявление явным, — но статус, управляемый
+моделью, стал бы новым способом подделать завершение, а именно этот дефект гейт исхода
+и предотвращает.
+
+**Решение.** Добавить провайдеро-нейтральный *парсер* намерения, а не протокол, которым
+управляет модель:
+
+1. `app/agent_runtime/intent.py` чистый, только на stdlib и не бросающий исключений. Он
+   принимает три формы конверта и проверяет поля, обязательные для каждого типа.
+   Сломанный JSON, неизвестный тип и отсутствующее поле дают сообщённый `FINAL_ANSWER`
+   (или распознанный тип с `valid=False` и названными ошибками); запуск продолжается.
+2. Без конверта детерминированная эвристика классифицирует ответ: две или более строки
+   вопросов, объявление файла в фенсе, нумерованный план без фенса кода, иначе плоский
+   текст.
+3. Разобранный тип попадает в **существующий** классификатор как один дополнительный
+   необязательный факт (`derive_outcome(intent_type=...)`). Он может только понизить
+   исход, а `intent_allows_completion` допускает только `GENERATE_PROJECT` (или
+   отсутствие заявленного намерения), поэтому `FINAL_ANSWER`, `CLARIFICATION_REQUIRED`,
+   `PLAN_READY` и `REVIEW` никогда не дают завершённого проекта.
+4. Ответ публикует строку (`model_intent`: `intent_type`, `summary`, `valid`,
+   `validation_errors`, `next_action`, `raw_text_preserved`) и не возвращает исходный
+   ответ.
+
+**Отклонённые альтернативы.**
+
+* Новый путь завершения, решаемый намерением: тогда «готово» решалось бы в двух местах,
+  и модель получила бы контроль над статусом.
+* Повышение исхода, когда модель заявляет `GENERATE_PROJECT`: заявление — это не запись;
+  завершить проект могут только путь записи плюс проверка и приёмка.
+* Решение только на эвристике (без конверта): догадки о вопросах и плане не выражают
+  генерацию, а владелец просил структурированный вариант, который провайдеры смогут
+  принять позже.
+* Замена существующего извлечения вопросов парсером: узкое правило классификатора уже
+  протестировано и используется в другом месте, поэтому `intent.py` импортирует его, а не
+  переписывает.
+* Возврат исходного ответа в строке ответа: ответ запуска — клиентский документ, а в
+  тексте могут быть материал промпта или строка, похожая на credential.
+
+**Следствия.** Явный override провайдера/модели, цепочка fallback, граница подтверждения
+и политика платных моделей не тронуты: намерение публикуется, но ему не подчиняются.
+`tests/test_structured_intent.py` (31 тест) и `tests/test_beta_path.py` (10 тестов)
+офлайн; `app/smoke_structured_generation.py` демонстрирует четыре ветки и завершается
+кодом 0, не открывая сокет. Точки входа, которые не парсят ответ модели
+(детерминированный офлайн-путь, replay, attach проекта), публикуют пустое отображение —
+честное «намерение не заявлено» вместо выдуманного.

@@ -140,6 +140,16 @@ class TaskRunResponse:
     #: The run's own estimated cost in USD, or ``None`` when no estimate exists.
     #: It is never invented from a zero: unknown is reported as unknown.
     estimated_cost: Optional[float] = None
+    #: The intent the answer declared, parsed by
+    #: :func:`app.agent_runtime.intent.parse_model_intent`
+    #: (``app/agent_runtime/intent.py``): ``intent_type``, ``summary``, ``valid``,
+    #: ``validation_errors``, ``next_action`` and ``raw_text_preserved``. It is an
+    #: empty mapping when the entry point does not parse an answer (a replay, a
+    #: project attach). The intent is *published*, never obeyed: it cannot set a
+    #: project status, and only ``GENERATE_PROJECT`` with files that were really
+    #: written can accompany a completed project. The raw answer is not echoed here;
+    #: the flag says it was preserved in the run's own record.
+    model_intent: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -166,6 +176,7 @@ class TaskRunResponse:
             "write_mode": self.write_mode,
             "cost_tier": self.cost_tier,
             "estimated_cost": self.estimated_cost,
+            "model_intent": dict(self.model_intent),
         }
 
 

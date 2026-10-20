@@ -3572,6 +3572,10 @@ class CompatibilityTests(Block8Case):
                 # fields above.
                 "write_mode",
                 "cost_tier", "estimated_cost",
+                # The intent the answer declared (structured intent v0.1). Additive:
+                # an empty mapping means "no intent declared", and no field that
+                # existed before it changed.
+                "model_intent",
             },
         )
         status = SystemStatusResponse("c", "a", "READY", 1, 1).to_dict()
