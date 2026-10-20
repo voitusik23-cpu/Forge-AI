@@ -825,7 +825,10 @@ export type LifecycleDetail = {
   stage?: string;
   files_created?: number;
   entrypoint?: LifecycleEntryPoint | null;
+  entrypoint_reason?: string;
   preview?: LifecyclePreview;
+  /** The local process, derived at request time from live state only. */
+  run?: LifecycleRun;
   /** The manual equivalent of the writer's own `py_compile`, empty when nothing to compile. */
   verification_command?: string;
 };
@@ -843,18 +846,29 @@ export type LifecycleEntryPoint = {
   run_command?: string;
   serve_kind?: string;
   location?: string;
+  /** `Python`, `Node.js`, `HTML` -- what the project is written in. */
+  language?: string;
+  /** True when the entry point has a command this deployment may start. */
+  runnable?: boolean;
+  /** SHA-256 over kind, path and argv: the value an approval must name. */
+  digest?: string;
+  /** Why a recognised entry point cannot be launched (a missing interpreter). */
+  reason?: string;
 };
 
 /**
  * The preview block (`GET/POST /api/projects/{id}/preview`).
  *
- * `available` is true only for a static entry point; `reason` otherwise says exactly why
- * (`local run is not wired for this entry kind`, or that no entry point was detected).
- * The absolute workspace root, when a server is running, is inside `diagnostics` only.
+ * For a static page `available` is true because this process serves it. For a runnable
+ * project it is true only while the project's **own process** is up and bound a local
+ * port; otherwise `reason` says exactly why there is no URL, and no URL is invented.
+ * The absolute workspace root, when something is running, is inside `diagnostics` only.
  */
 export type LifecyclePreview = {
   available?: boolean;
   running?: boolean;
+  /** `static` for the read-only file server, `process` for the project's own server. */
+  source?: string;
   reason?: string;
   url?: string;
   port?: number;
@@ -862,8 +876,60 @@ export type LifecyclePreview = {
   entry_kind?: string;
   serve_kind?: string;
   run_command?: string;
+  /** The value an approval must name: a changed command invalidates it. */
+  entrypoint_digest?: string;
+  runnable?: boolean;
   project_folder?: string;
   files_created?: number;
+  diagnostics?: Record<string, unknown>;
+};
+
+/**
+ * The local process (`GET/POST /api/projects/{id}/run`).
+ *
+ * `state` is the supervisor's own word -- one of `NOT_RUN`, `STARTING`, `RUNNING`,
+ * `STOPPING`, `STOPPED`, `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `REFUSED`, `RUN_BLOCKED`.
+ * The command is a display string; the absolute interpreter path stays in `diagnostics`.
+ * `network_policy` is `inherited`: this child is not network-isolated, and the payload
+ * never pretends it is.
+ */
+export type LifecycleRun = {
+  project_id?: string;
+  state?: string;
+  running?: boolean;
+  serving?: boolean;
+  reason?: string;
+  next_step?: string;
+  blocked_code?: string;
+  last_event?: string;
+  entry_kind?: string;
+  entry_path?: string;
+  /** `Python`, `Node.js`, `HTML`, or `""` when nothing was detected. */
+  language?: string;
+  command?: string;
+  executable?: string;
+  arguments?: string[];
+  entrypoint_digest?: string;
+  workspace?: string;
+  pid?: number | null;
+  exit_code?: number | null;
+  port?: number;
+  url?: string;
+  started_at?: string;
+  finished_at?: string;
+  updated_at?: string;
+  network_policy?: string;
+  offline?: boolean;
+  approval_required?: boolean;
+  log?: {
+    path?: string;
+    relative_path?: string;
+    readable?: boolean;
+    truncated?: boolean;
+    count?: number;
+    lines?: string[];
+    max_bytes?: number;
+  };
   diagnostics?: Record<string, unknown>;
 };
 
@@ -1039,8 +1105,48 @@ export const loadProjectPreview = (
 export const changeProjectPreview = (
   projectId: string,
   body: { action: "start" | "stop" | "status"; preview_not_required?: boolean }
-): Promise<Result<LifecyclePreview & { project_id?: string; action?: string; stage?: string }>> =>
+): Promise<Result<LifecyclePreview & { project_id?: string; action?: string; stage?: string; stopped?: boolean }>> =>
   postJson(projectPath(projectId, "/preview"), body);
+
+/** `GET /api/projects/{id}/run` — the project's local process, from live state only. */
+export const loadProjectRun = (
+  projectId: string
+): Promise<Result<LifecycleRun & { project_id?: string; stage?: string }>> =>
+  readJson(projectPath(projectId, "/run"));
+
+/**
+ * `POST /api/projects/{id}/run` — start the declared command.
+ *
+ * The body can only say *yes, start that exact command*: `confirm` must be true and
+ * `entrypointDigest` must be the digest that was shown. The command itself is never sent.
+ */
+export const startProjectRun = (
+  projectId: string,
+  entrypointDigest: string
+): Promise<Result<LifecycleRun & { project_id?: string; stage?: string }>> =>
+  postJson(projectPath(projectId, "/run"), { confirm: true, entrypoint_digest: entrypointDigest });
+
+/** `POST /api/projects/{id}/run/stop` — terminate the process tree. */
+export const stopProjectRun = (
+  projectId: string
+): Promise<Result<LifecycleRun & { project_id?: string; stage?: string }>> =>
+  postJson(projectPath(projectId, "/run/stop"), {});
+
+/** `POST /api/projects/{id}/run/restart` — stop, then start again under a fresh approval. */
+export const restartProjectRun = (
+  projectId: string,
+  entrypointDigest: string
+): Promise<Result<LifecycleRun & { project_id?: string; stage?: string }>> =>
+  postJson(projectPath(projectId, "/run/restart"), {
+    confirm: true,
+    entrypoint_digest: entrypointDigest,
+  });
+
+/** `GET /api/projects/{id}/run/log` — the redacted, bounded log. */
+export const loadProjectRunLog = (
+  projectId: string
+): Promise<Result<{ project_id?: string; state?: string; path?: string; lines?: string[]; truncated?: boolean; count?: number }>> =>
+  readJson(projectPath(projectId, "/run/log"));
 
 /**
  * How one verdict word reads, without inventing a meaning the backend did not publish.

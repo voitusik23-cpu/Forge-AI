@@ -1,4 +1,4 @@
-"""The stage of a project, stated as one of eight fixed words.
+"""The stage of a project, stated as one of twelve fixed words.
 
 Why this module exists
 ----------------------
@@ -9,10 +9,10 @@ answers the question this stage answers: **how far did the work actually get?**
 A record can be ``COMPLETED`` while its workspace holds no file, and a record can
 be ``NEEDS_CHANGES`` while its files are written, compiled and previewable. The
 stage is derived from the *facts* -- the manifest, the writer's verification
-verdict, the acceptance verdict and the preview -- so it cannot claim a step that
-did not happen.
+verdict, the acceptance verdict, the preview and (for the process words) the local
+supervisor's own state -- so it cannot claim a step that did not happen.
 
-The eight words, in the order the product walks through them:
+The eight work words, in the order the product walks through them:
 
 ``PROJECT_NOT_CREATED``
     There is no artifact. Nothing was written, or the write was refused.
@@ -39,6 +39,18 @@ The eight words, in the order the product walks through them:
     or the acceptance did not pass.
 ``FAILED``
     The run failed, or the writer's verification failed.
+``READY_TO_RUN``
+    Files exist, verification passed, the entry point is a runnable one, and this
+    project has not been started locally yet. The word says "there is something to
+    start"; it says nothing about the process.
+``RUNNING``
+    A local process of this project is starting, running or stopping **now**.
+``STOPPED``
+    The last local run was stopped by the owner and the project is not otherwise
+    complete. It is a process fact, never a completion claim.
+``BLOCKED``
+    The last attempt to run was refused, or a recognised entry point cannot be
+    launched (a missing interpreter, dependencies that are not installed).
 
 Two rules are structural:
 
@@ -48,21 +60,36 @@ Two rules are structural:
   missing fact is passed as its conservative value, and the function has no clock,
   no I/O, no store and no provider.
 
-``ARCHIVED`` is not one of the eight. An archived record is not *at* a stage: it is
-frozen, and the presentation layer says so with its own word. This function
+Two further rules apply to the process words:
+
+* **A started process never means ``COMPLETED``.** ``COMPLETED`` still needs the
+  writer's verification, the acceptance verdict, the lifecycle record and a preview
+  (available, or explicitly not required). ``RUNNING`` is reported *instead of* a
+  completion word while a process is up, so a server that is merely alive can never
+  be read as a finished project.
+* **A process word is never inferred.** ``run_state`` is the supervisor's own word
+  (:mod:`app.projects.runner`); a caller that does not have one passes ``""`` and
+  the ladder behaves exactly as before.
+
+``ARCHIVED`` is not one of these words. An archived record is not *at* a stage: it
+is frozen, and the presentation layer says so with its own word. This function
 returns an empty string for it rather than forcing it into the ladder.
 """
 
 from __future__ import annotations
 
 __all__ = [
+    "BLOCKED",
     "COMPLETED",
     "FAILED",
     "FILES_CREATED",
     "NEEDS_CHANGES",
     "PREVIEW_AVAILABLE",
     "PROJECT_NOT_CREATED",
+    "READY_TO_RUN",
+    "RUNNING",
     "STAGE_WORDS",
+    "STOPPED",
     "VERIFIED",
     "VERIFICATION_RUNNING",
     "project_stage",
@@ -77,9 +104,13 @@ PREVIEW_AVAILABLE = "PREVIEW_AVAILABLE"
 COMPLETED = "COMPLETED"
 NEEDS_CHANGES = "NEEDS_CHANGES"
 FAILED = "FAILED"
+READY_TO_RUN = "READY_TO_RUN"
+RUNNING = "RUNNING"
+STOPPED = "STOPPED"
+BLOCKED = "BLOCKED"
 
 #: Every word this module may return, plus the empty string for an archived record.
-#: A test iterates it, so a ninth word cannot appear by accident.
+#: A test iterates it, so a thirteenth word cannot appear by accident.
 STAGE_WORDS = (
     PROJECT_NOT_CREATED,
     FILES_CREATED,
@@ -89,7 +120,16 @@ STAGE_WORDS = (
     COMPLETED,
     NEEDS_CHANGES,
     FAILED,
+    READY_TO_RUN,
+    RUNNING,
+    STOPPED,
+    BLOCKED,
 )
+
+#: Process states that mean "a local process of this project is up right now".
+_LIVE_RUN_STATES = frozenset({"STARTING", "RUNNING", "STOPPING"})
+#: Process states that mean "the last attempt could not run".
+_BLOCKED_RUN_STATES = frozenset({"REFUSED", "RUN_BLOCKED"})
 
 
 def _word(value: object) -> str:
@@ -113,13 +153,18 @@ def project_stage(
     archived: bool = False,
     preview_available: bool = False,
     preview_not_required: bool = False,
+    run_state: object = "",
+    runnable: bool = False,
 ) -> str:
     """The stage of one project, from the facts only.
 
     ``lifecycle_status`` is ``ProjectStatus``'s word; ``verification`` and
     ``acceptance`` are the current version's recorded verdicts; ``files_count`` is
     the current version's manifest length. ``preview_available`` is runtime state
-    (a server is listening *now*), never a stored claim.
+    (a server is listening *now*), never a stored claim. ``run_state`` is the local
+    supervisor's word, and ``runnable`` says whether the entry point has a command
+    that could be started; both default to "unknown", which keeps the ladder
+    identical for a caller that does not have them.
     """
 
     if archived:
@@ -131,12 +176,18 @@ def project_stage(
     status = _word(lifecycle_status)
     verification_word = _plain(verification)
     acceptance_word = _plain(acceptance)
+    process_state = _word(run_state)
 
     if count <= 0:
         # A failed run that created nothing is still "nothing was created": the
         # absence of the artifact is the fact the owner needs, and the failure is
         # reported by the lifecycle status beside this word.
         return PROJECT_NOT_CREATED
+
+    # A live process is a fact about *now*, so it outranks a stored verdict: while a
+    # server is up the card must not claim the work is finished either.
+    if process_state in _LIVE_RUN_STATES:
+        return RUNNING
 
     if status == "FAILED":
         return FAILED
@@ -161,4 +212,14 @@ def project_stage(
         return VERIFIED
     if preview_available:
         return PREVIEW_AVAILABLE
+    if process_state in _BLOCKED_RUN_STATES:
+        # The work is not complete, and the last attempt to run it was refused or
+        # blocked. That is the actionable fact, so it is the word.
+        return BLOCKED
+    if process_state == "STOPPED":
+        return STOPPED
+    if runnable:
+        # Something can be started and nothing has been started yet (or the last
+        # start finished): the honest word is "ready", not "verified and done".
+        return READY_TO_RUN
     return VERIFIED

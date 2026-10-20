@@ -71,7 +71,126 @@ class ExecutionCoordinator:
         run_scope: Optional[object] = None,
         observer: Optional[Callable[[EventType, dict[str, object]], None]] = None,
     ) -> ExecutionResult:
-        """Run through the strict authorization chain before dispatching to adapter."""
+        """Run through the strict authorization chain, then dispatch to the adapter."""
+
+        authorized, denial = self._authorize(
+            request,
+            workspace_root=workspace_root,
+            run_id=run_id,
+            allowed_commands=allowed_commands,
+            approval_policy=approval_policy,
+            approval_resolver=approval_resolver,
+            run_scope=run_scope,
+            observer=observer,
+        )
+        if denial is not None or authorized is None:
+            return denial if denial is not None else ExecutionResult(
+                request_id=getattr(request, "request_id", "unknown"),
+                status=ExecutionStatus.DENIED,
+                stderr="Execution denied: no authorized execution was produced",
+            )
+
+        profile_id = (
+            request.profile.profile_id if request is not None and request.profile else None
+        )
+        request_id = authorized.request_id
+
+        self._emit(
+            observer,
+            EventType.EXECUTION_STARTED,
+            {
+                "run_id": authorized.run_id,
+                "request_id": request_id,
+                "profile_id": profile_id,
+            },
+        )
+
+        adapter = self._adapter
+        if adapter is None:
+            adapter = LocalExecutionAdapter(
+                workspace_root=authorized.workspace_root,
+                policy=self._policy,
+                redactor=self._redactor,
+            )
+
+        raw_result = adapter.execute(authorized)
+        outcome_status = self._map_outcome_status(raw_result.status)
+        result = replace(
+            raw_result,
+            outcome_status=outcome_status,
+            metadata={**raw_result.metadata, "outcome_status": outcome_status.value},
+        )
+
+        self._emit(
+            observer,
+            EventType.EXECUTION_COMPLETED,
+            {
+                "run_id": authorized.run_id,
+                "request_id": result.request_id,
+                "profile_id": profile_id,
+                "status": result.status.value,
+                "outcome_status": outcome_status.value,
+                "exit_code": result.exit_code,
+                "duration": result.duration_seconds,
+                "truncated": result.truncated,
+                "artifact_count": len(result.artifacts),
+            },
+        )
+
+        return result
+
+    execute_request = execute
+
+    def authorize(
+        self,
+        request: ExecutionRequest,
+        *,
+        workspace_root: Optional[Path] = None,
+        run_id: str = "",
+        allowed_commands: Optional[frozenset[str]] = None,
+        approval_policy: Optional[ApprovalPolicy] = None,
+        approval_resolver: Optional[ApprovalResolver] = None,
+        run_scope: Optional[object] = None,
+        observer: Optional[Callable[[EventType, dict[str, object]], None]] = None,
+    ) -> tuple[Optional[AuthorizedExecution], Optional[ExecutionResult]]:
+        """Authorize an execution **without dispatching it**.
+
+        Returns ``(AuthorizedExecution, None)`` when the whole chain -- run scope,
+        permission, intent, approval, policy and workspace -- accepted the request,
+        and ``(None, denial)`` when it refused.
+
+        The token is the same authority marker ``execute`` creates, so a caller that
+        must supervise a long-running process itself (a project's own server, which
+        has to stay up while a preview serves it) can do so **without bypassing the
+        execution plane**: it can only spawn with a token this coordinator minted,
+        and it must not mint one itself. This is a narrowing of ``execute``, not a
+        second path: both run exactly :meth:`_authorize`.
+        """
+
+        return self._authorize(
+            request,
+            workspace_root=workspace_root,
+            run_id=run_id,
+            allowed_commands=allowed_commands,
+            approval_policy=approval_policy,
+            approval_resolver=approval_resolver,
+            run_scope=run_scope,
+            observer=observer,
+        )
+
+    def _authorize(
+        self,
+        request: ExecutionRequest,
+        *,
+        workspace_root: Optional[Path] = None,
+        run_id: str = "",
+        allowed_commands: Optional[frozenset[str]] = None,
+        approval_policy: Optional[ApprovalPolicy] = None,
+        approval_resolver: Optional[ApprovalResolver] = None,
+        run_scope: Optional[object] = None,
+        observer: Optional[Callable[[EventType, dict[str, object]], None]] = None,
+    ) -> tuple[Optional[AuthorizedExecution], Optional[ExecutionResult]]:
+        """The strict authorization chain: permission, intent, approval, policy, root."""
         # Imported lazily: run_scope imports the execution identity module and the
         # execution package imports this coordinator, so a module-level import is
         # circular.
@@ -86,7 +205,7 @@ class ExecutionCoordinator:
             candidate = run_id or str(getattr(request, "metadata", {}).get("run_id") or "")
             frozen = RunScope.frozen_scope(candidate) if candidate else None
             if frozen is not None or allowed_commands is not None:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=candidate,
                     profile_id=profile_id,
@@ -102,7 +221,7 @@ class ExecutionCoordinator:
             resolved = run_id or str(getattr(request, "metadata", {}).get("run_id") or "")
             scope_run_id = str(getattr(run_scope, "run_id", "") or "")
             if not resolved.strip():
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=resolved,
                     profile_id=profile_id,
@@ -115,7 +234,7 @@ class ExecutionCoordinator:
                     observer=observer,
                 )
             if resolved != scope_run_id:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=resolved,
                     profile_id=profile_id,
@@ -168,7 +287,7 @@ class ExecutionCoordinator:
                 else:
                     reason = "run_scope_violation"
                     message = f"Execution denied by run scope: {exc}"
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=resolved,
                     profile_id=profile_id,
@@ -192,7 +311,7 @@ class ExecutionCoordinator:
         )
 
         if request is None or not isinstance(request, ExecutionRequest):
-            return self._deny(
+            return None, self._deny(
                 request=request or ExecutionRequest(command=()),
                 run_id=run_id,
                 profile_id=profile_id,
@@ -203,7 +322,7 @@ class ExecutionCoordinator:
             )
 
         if profile is None:
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -215,7 +334,7 @@ class ExecutionCoordinator:
 
         # 2. Permission check
         if allowed_commands is None or not request.command:
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -225,7 +344,7 @@ class ExecutionCoordinator:
                 observer=observer,
             )
         if not command_is_allowed(request.command, allowed_commands):
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -239,7 +358,7 @@ class ExecutionCoordinator:
         try:
             intent = IntentBuilder.from_request(request, profile).build()
         except PathSecurityError as exc:
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -249,7 +368,7 @@ class ExecutionCoordinator:
                 observer=observer,
             )
         except Exception as exc:
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -278,7 +397,7 @@ class ExecutionCoordinator:
         # deliberately NOT resolved the other way: "no policy" must never come to
         # mean "approval unnecessary".
         if approval_policy is None:
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -296,7 +415,7 @@ class ExecutionCoordinator:
             try:
                 identity = command_identity(request.command)
             except ValueError:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -314,7 +433,7 @@ class ExecutionCoordinator:
 
         if needs_approval:
             if approval_resolver is None:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -333,7 +452,7 @@ class ExecutionCoordinator:
             )
             resolution = approval_resolver.resolve(approval_req)
             if resolution is None:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -343,7 +462,7 @@ class ExecutionCoordinator:
                     observer=observer,
                 )
             if not isinstance(resolution, ApprovalResolution):
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -365,7 +484,7 @@ class ExecutionCoordinator:
                     if resolution.decision == ApprovalState.REJECTED
                     else "Execution waiting for approval"
                 )
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -378,7 +497,7 @@ class ExecutionCoordinator:
             # Invariant I1: Intent A cannot authorize Intent B
             # Independently verify fingerprint (fail closed if missing or mismatched)
             if not resolution.approved_fingerprint or resolution.approved_fingerprint != intent.fingerprint:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -402,7 +521,7 @@ class ExecutionCoordinator:
             },
         )
         if not policy_decision.allowed:
-            return self._deny(
+            return None, self._deny(
                 request=request,
                 run_id=run_id,
                 profile_id=profile_id,
@@ -421,7 +540,7 @@ class ExecutionCoordinator:
 
         if ws_root is None:
             if is_local_spawner:
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -434,7 +553,7 @@ class ExecutionCoordinator:
                 ws_root = Path(tempfile.gettempdir())
         else:
             if not isinstance(ws_root, Path) or not ws_root.is_absolute() or not ws_root.exists() or not ws_root.is_dir():
-                return self._deny(
+                return None, self._deny(
                     request=request,
                     run_id=run_id,
                     profile_id=profile_id,
@@ -458,52 +577,9 @@ class ExecutionCoordinator:
             coordinator_token=_COORDINATOR_SENTINEL,
         )
 
-        # 8. LocalExecutionAdapter / ExecutionBackend dispatch
-        self._emit(
-            observer,
-            EventType.EXECUTION_STARTED,
-            {
-                "run_id": run_id,
-                "request_id": request.request_id,
-                "profile_id": profile_id,
-            },
-        )
-
-        adapter = self._adapter
-        if adapter is None:
-            adapter = LocalExecutionAdapter(
-                workspace_root=ws_root,
-                policy=self._policy,
-                redactor=self._redactor,
-            )
-
-        raw_result = adapter.execute(authorized)
-        outcome_status = self._map_outcome_status(raw_result.status)
-        result = replace(
-            raw_result,
-            outcome_status=outcome_status,
-            metadata={**raw_result.metadata, "outcome_status": outcome_status.value},
-        )
-
-        self._emit(
-            observer,
-            EventType.EXECUTION_COMPLETED,
-            {
-                "run_id": run_id,
-                "request_id": result.request_id,
-                "profile_id": profile_id,
-                "status": result.status.value,
-                "outcome_status": outcome_status.value,
-                "exit_code": result.exit_code,
-                "duration": result.duration_seconds,
-                "truncated": result.truncated,
-                "artifact_count": len(result.artifacts),
-            },
-        )
-
-        return result
-
-    execute_request = execute
+        # 8. AuthorizedExecution created; dispatch is the caller's (``execute``) or the
+        # caller's own supervises spawn (``authorize``, for a long-running process).
+        return authorized, None
 
     def _deny(
         self,

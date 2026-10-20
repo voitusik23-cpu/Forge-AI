@@ -38,8 +38,12 @@ import {
   loadProjectFiles,
   loadProjectHistory,
   loadProjectLifecycle,
+  loadProjectRun,
   loadRunRecord,
+  restartProjectRun,
   restoreProject,
+  startProjectRun,
+  stopProjectRun,
   verificationLabel,
   verifyProject,
   type DispatchResult,
@@ -51,6 +55,7 @@ import {
   type LifecycleNewVersion,
   type LifecyclePreview,
   type LifecycleProject,
+  type LifecycleRun,
   type LifecycleSummary,
   type LifecycleVersion,
   type ProjectPresentation,
@@ -177,6 +182,227 @@ const ArtifactTable = ({ lang, artifacts }: { lang: Lang; artifacts: LifecycleAr
   </table>
 );
 
+/**
+ * The local-process block: what may run, in which folder, on which port, and what
+ * the supervisor last said.
+ *
+ * A launch is never one click away: the button opens an explicit confirmation that
+ * prints the **exact command** and its digest, and only the confirmation calls the
+ * backend. The digest is what the backend compares, so a command that changed cannot
+ * be run under the previous approval.
+ */
+const RunPanel = ({
+  lang,
+  run,
+  entrypoint,
+  preview,
+  busy,
+  onStart,
+  onStop,
+  onRestart,
+  onVerify,
+  onShowFiles,
+  canVerify,
+}: {
+  lang: Lang;
+  run: LifecycleRun;
+  entrypoint: LifecycleEntryPoint | null;
+  preview: LifecyclePreview;
+  busy: string;
+  onStart: (digest: string) => void;
+  onStop: () => void;
+  onRestart: (digest: string) => void;
+  onVerify: () => void;
+  onShowFiles: () => void;
+  canVerify: boolean;
+}) => {
+  const [confirming, setConfirming] = useState<"" | "start" | "restart">("");
+  const [showLog, setShowLog] = useState(false);
+  const state = String(run.state ?? "NOT_RUN");
+  const live = state === "STARTING" || state === "RUNNING" || state === "STOPPING";
+  const command = String(run.command ?? entrypoint?.run_command ?? "");
+  const digest = String(run.entrypoint_digest ?? entrypoint?.digest ?? "");
+  const runnable = entrypoint !== null && entrypoint.runnable === true;
+  const blocked = state === "RUN_BLOCKED" || state === "REFUSED";
+  const lines = Array.isArray(run.log?.lines) ? run.log?.lines ?? [] : [];
+  const logPath = String(run.log?.relative_path ?? run.log?.path ?? "");
+  const previewUrl = String(preview.url ?? "");
+  const port = typeof run.port === "number" && run.port > 0 ? String(run.port) : "—";
+  const exitCode =
+    typeof run.exit_code === "number" ? String(run.exit_code) : t(lang, "projects.facts.none");
+  const language = String(run.language ?? entrypoint?.language ?? "");
+  const entryLabel =
+    entrypoint !== null && String(entrypoint.path ?? "") !== ""
+      ? `${String(entrypoint.path)} (${String(entrypoint.kind ?? "")})`
+      : t(lang, "projects.facts.none");
+  const eventLine =
+    String(run.last_event ?? "") !== ""
+      ? String(run.last_event)
+      : String(run.reason ?? "") !== ""
+        ? String(run.reason)
+        : t(lang, "projects.facts.none");
+
+  const canStart = runnable && digest !== "" && !live && state !== "STARTING";
+  const canRestart = digest !== "" && !live && state !== "NOT_RUN";
+
+  return (
+    <div>
+      <div className="label">{t(lang, "projects.run.title")}</div>
+      <div style={{ marginTop: 8 }}>
+        <Facts
+          items={[
+            [t(lang, "projects.run.language"), language !== "" ? language : t(lang, "projects.facts.none")],
+            [t(lang, "projects.run.entry"), entryLabel],
+            [t(lang, "projects.run.command"), command !== "" ? command : t(lang, "projects.run.nocommand")],
+            [t(lang, "projects.run.workspace"), text(run.workspace, t(lang, "projects.facts.none"))],
+            [t(lang, "projects.run.port"), port],
+            [t(lang, "projects.run.url"), previewUrl !== "" ? previewUrl : t(lang, "projects.facts.none")],
+            [t(lang, "projects.run.state"), state],
+            [t(lang, "projects.run.event"), eventLine],
+            [t(lang, "projects.run.network"), t(lang, "projects.run.network.inherited")],
+            [t(lang, "projects.run.pid"), typeof run.pid === "number" ? String(run.pid) : "—"],
+            [t(lang, "projects.run.exit"), exitCode],
+            [t(lang, "projects.run.started"), text(run.started_at, t(lang, "projects.facts.none"))],
+          ]}
+        />
+      </div>
+      <div className="small muted" style={{ marginTop: 6 }}>
+        {t(lang, "projects.run.hint")}
+      </div>
+
+      {/* A blocked run states the reason and the next step, in the backend's words. */}
+      {blocked ? (
+        <div className="notice warn" style={{ marginTop: 8 }}>
+          <div>
+            <span className="label">{t(lang, "projects.run.blocked.reason")}: </span>
+            {text(run.reason, t(lang, "projects.run.nocommand"))}
+          </div>
+          {String(run.next_step ?? "") !== "" ? (
+            <div style={{ marginTop: 4 }}>
+              <span className="label">{t(lang, "projects.run.blocked.next")}: </span>
+              {String(run.next_step)}
+            </div>
+          ) : null}
+          {String(run.blocked_code ?? "") !== "" ? (
+            <div className="small mono" style={{ marginTop: 4 }}>
+              {String(run.blocked_code)}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+        {canStart ? (
+          <Button
+            size="small"
+            tone="primary"
+            disabled={busy !== "" || confirming !== ""}
+            onClick={() => setConfirming("start")}
+          >
+            {busy === "start" ? t(lang, "state.loading") : t(lang, "projects.run.start")}
+          </Button>
+        ) : null}
+        {live ? (
+          <Button size="small" tone="ghost" disabled={busy !== ""} onClick={onStop}>
+            {busy === "stop" ? t(lang, "state.loading") : t(lang, "projects.run.stop")}
+          </Button>
+        ) : null}
+        {canRestart ? (
+          <Button
+            size="small"
+            tone="ghost"
+            disabled={busy !== "" || confirming !== ""}
+            onClick={() => setConfirming("restart")}
+          >
+            {busy === "restart" ? t(lang, "state.loading") : t(lang, "projects.run.restart")}
+          </Button>
+        ) : null}
+        {preview.available === true && String(preview.url ?? "") !== "" ? (
+          <Button
+            size="small"
+            tone="ghost"
+            onClick={() => window.open(String(preview.url), "_blank", "noopener,noreferrer")}
+          >
+            {t(lang, "projects.run.open")}
+          </Button>
+        ) : null}
+        <Button size="small" tone="ghost" onClick={onShowFiles}>
+          {t(lang, "projects.run.files")}
+        </Button>
+        <Button size="small" tone="ghost" onClick={() => setShowLog((value) => !value)}>
+          {showLog ? t(lang, "projects.run.hidelog") : t(lang, "projects.run.showlog")}
+        </Button>
+        {canVerify ? (
+          <Button size="small" tone="ghost" onClick={onVerify}>
+            {t(lang, "projects.run.verify")}
+          </Button>
+        ) : null}
+      </div>
+
+      {/* The explicit approval: the exact command, printed, and the digest the
+          backend will compare. Nothing starts until the second button is pressed. */}
+      {confirming !== "" ? (
+        <div className="notice warn" style={{ marginTop: 10 }}>
+          <div className="label">{t(lang, "projects.run.confirm.title")}</div>
+          <div className="small" style={{ marginTop: 6 }}>
+            {t(lang, "projects.run.confirm.body")}
+          </div>
+          <pre className="forge-output mono small" style={{ marginTop: 6 }}>
+            {command}
+          </pre>
+          <div className="small mono" style={{ marginTop: 4, wordBreak: "break-word" }}>
+            {t(lang, "projects.run.confirm.digest")}: {digest}
+          </div>
+          <div className="small muted" style={{ marginTop: 4 }}>
+            {t(lang, "projects.run.confirm.note")}
+          </div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+            <Button
+              size="small"
+              tone="primary"
+              disabled={busy !== ""}
+              onClick={() => {
+                const action = confirming;
+                setConfirming("");
+                if (action === "restart") onRestart(digest);
+                else onStart(digest);
+              }}
+            >
+              {t(lang, "projects.run.confirm.accept")}
+            </Button>
+            <Button size="small" tone="ghost" onClick={() => setConfirming("")}>
+              {t(lang, "projects.run.confirm.cancel")}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {showLog ? (
+        <div style={{ marginTop: 10 }}>
+          <div className="row between" style={{ gap: 10, alignItems: "center" }}>
+            <div className="label">{t(lang, "projects.run.logs")}</div>
+            {logPath !== "" ? <span className="small mono muted">{logPath}</span> : null}
+          </div>
+          {lines.length === 0 ? (
+            <div className="small muted" style={{ marginTop: 6 }}>
+              {t(lang, "projects.run.log.empty")}
+            </div>
+          ) : (
+            <pre className="forge-output mono small" style={{ marginTop: 6, maxHeight: 260, overflow: "auto" }}>
+              {lines.join("\n")}
+            </pre>
+          )}
+          {run.log?.truncated === true ? (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              {t(lang, "projects.run.log.truncated")}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 const ProjectCard = ({
   lang,
   backend,
@@ -222,6 +448,11 @@ const ProjectCard = ({
   previewBusy,
   onPreviewStart,
   onPreviewStop,
+  run,
+  runBusy,
+  onRunStart,
+  onRunStop,
+  onRunRestart,
 }: {
   lang: Lang;
   backend: BackendState;
@@ -271,6 +502,12 @@ const ProjectCard = ({
   previewBusy: boolean;
   onPreviewStart: () => void;
   onPreviewStop: () => void;
+  /** The project's local process, from live state only. */
+  run: LifecycleRun;
+  runBusy: string;
+  onRunStart: (digest: string) => void;
+  onRunStop: () => void;
+  onRunRestart: (digest: string) => void;
 }) => {
   const archived = project.archived === true;
   const currentVersion = typeof project.current_version === "number" ? project.current_version : 0;
@@ -572,6 +809,27 @@ const ProjectCard = ({
             </div>
           ) : null}
         </div>
+
+        {/* ------------------------------------------------------- the local run */}
+        {/* The command, the folder, the port, the process state and the logs. Every
+            button appears only when the backend's own facts make it applicable; the
+            launch itself goes through an explicit confirmation that prints the exact
+            command, and the digest it shows is the value the backend compares. */}
+        <RunPanel
+          lang={lang}
+          run={run}
+          entrypoint={entrypoint}
+          preview={preview}
+          busy={runBusy}
+          canVerify={fileTotal > 0 && hasRun}
+          onStart={onRunStart}
+          onStop={onRunStop}
+          onRestart={onRunRestart}
+          onVerify={onVerify}
+          onShowFiles={() =>
+            document.getElementById("project-artifacts")?.scrollIntoView({ behavior: "smooth", block: "start" })
+          }
+        />
 
         {/* -------------------------------------------------------- the save facts */}
         <div>
@@ -1131,6 +1389,85 @@ export const Projects = ({
     await loadDetail(selectedId);
   };
 
+  // ---------------------------------------------------------------- local run
+  // The run block is *runtime* state (`GET /api/projects/{id}/run`), read from the
+  // detail payload and refreshed while the process is alive. A started process is
+  // never rendered as a finished project: the card prints the supervisor's own word
+  // and lets the backend decide what the stage is.
+  const [run, setRun] = useState<LifecycleRun | null>(null);
+  const [runBusy, setRunBusy] = useState("");
+
+  useEffect(() => {
+    setRun(detail?.status === "ready" ? detail.value.run ?? null : null);
+  }, [detail]);
+
+  const currentRun: LifecycleRun =
+    run ?? (detail?.status === "ready" ? detail.value.run ?? {} : {});
+
+  const refreshRun = useCallback(async () => {
+    if (selectedId === "") return;
+    const outcome = await loadProjectRun(selectedId);
+    if (outcome.ok) setRun(outcome.value);
+  }, [selectedId]);
+
+  const runStateWord = String(currentRun.state ?? "NOT_RUN");
+  useEffect(() => {
+    if (selectedId === "") return;
+    if (!["STARTING", "RUNNING", "STOPPING"].includes(runStateWord)) return;
+    const timer = window.setInterval(() => {
+      void refreshRun();
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [selectedId, runStateWord, refreshRun]);
+
+  const finishRunAction = async (value: LifecycleRun) => {
+    setRun(value);
+    await loadDetail(selectedId);
+    await loadList();
+  };
+
+  const runStart = async (digest: string) => {
+    if (selectedId === "") return;
+    setRunBusy("start");
+    setActionFailure(null);
+    setActionNotice("");
+    const outcome = await startProjectRun(selectedId, digest);
+    setRunBusy("");
+    if (!outcome.ok) {
+      setActionFailure(outcome.failure);
+      return;
+    }
+    await finishRunAction(outcome.value);
+  };
+
+  const runRestart = async (digest: string) => {
+    if (selectedId === "") return;
+    setRunBusy("restart");
+    setActionFailure(null);
+    setActionNotice("");
+    const outcome = await restartProjectRun(selectedId, digest);
+    setRunBusy("");
+    if (!outcome.ok) {
+      setActionFailure(outcome.failure);
+      return;
+    }
+    await finishRunAction(outcome.value);
+  };
+
+  const runStop = async () => {
+    if (selectedId === "") return;
+    setRunBusy("stop");
+    setActionFailure(null);
+    setActionNotice("");
+    const outcome = await stopProjectRun(selectedId);
+    setRunBusy("");
+    if (!outcome.ok) {
+      setActionFailure(outcome.failure);
+      return;
+    }
+    await finishRunAction(outcome.value);
+  };
+
   // ---------------------------------------------------------------- run record
   const [runRecord, setRunRecord] = useState<RunRecord | null>(null);
   const [runFailure, setRunFailure] = useState<Failure | null>(null);
@@ -1461,6 +1798,11 @@ export const Projects = ({
           previewBusy={previewBusy}
           onPreviewStart={() => void changePreview("start")}
           onPreviewStop={() => void changePreview("stop")}
+          run={currentRun}
+          runBusy={runBusy}
+          onRunStart={(digest) => void runStart(digest)}
+          onRunStop={() => void runStop()}
+          onRunRestart={(digest) => void runRestart(digest)}
         />
       ) : null}
 

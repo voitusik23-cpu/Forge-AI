@@ -2456,6 +2456,30 @@ design: an answer that patches a file it never saw is refused
 not contents, are sent; deletions are refused; and write mode has no separate
 approval gate (an open owner decision).
 
+### 3.8 Project materialization, local run and preview
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Materialization into the project's own workspace | **CURRENT / VERIFIED** | `app/projects/materialize.py` (calls `app/agent_runtime/code_writer.apply_changes`; the writer's boundary and deny list decide) — `tests/test_materialization.py` |
+| Entry point from the artifact manifest only | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_materialization.py`, `tests/test_local_execution.py` |
+| Runnable kinds (python script/module, node script, declared npm script) | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_local_execution.py`; `app/smoke_python_preview.py`, `app/smoke_node_preview.py` |
+| Approval without dispatch (`ExecutionCoordinator.authorize`) | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_execution_authorization_hardening*.py`, `tests/test_local_execution.py` |
+| Supervised local process (states, tree stop, timeout, bounded redacted log) | **CURRENT / VERIFIED** | `app/projects/runner.py` — `tests/test_local_execution.py` |
+| Shared process-tree kill (job object / Toolhelp / `taskkill /T`) | **CURRENT / VERIFIED** | `app/execution/adapter.py` (`terminate_process_tree`) — `tests/test_execution_timeout_and_tree_kill.py`, `tests/test_local_execution.py` |
+| Process preview for a running server | **CURRENT / VERIFIED** | `app/projects/preview.py` (`register_process`, observed listening port) — `tests/test_local_execution.py`, `tests/test_materialization.py` |
+| Local run / preview routes | **CURRENT / VERIFIED** | `app/api/project_routes.py` — `tests/test_local_execution.py` |
+| Stage words `READY_TO_RUN` / `RUNNING` / `STOPPED` / `BLOCKED` | **CURRENT / VERIFIED** | `app/projects/stage.py` — `tests/test_local_execution.py`, `tests/test_materialization.py` |
+| Project card run block and confirm step | **CURRENT / VERIFIED** (typechecked and built; exercised over HTTP, not by an automated UI test) | `ui/src/screens/Projects.tsx`, `ui/src/api/forge.ts` — `tsc --noEmit`, `vite build` |
+| Network isolation of a project process | **REJECTED for this block** — the child inherits the machine's network; the payload says `network_inherited` | `DECISIONS.md` Local run and preview v0.2 |
+| Dependency installation (`pip install` / `npm install`) as part of a run | **REJECTED** — a missing dependency is reported as `RUN_BLOCKED` with the next step | `DECISIONS.md`, `app/projects/runner.py` |
+
+**Honest boundaries.** The supervisor states them rather than hiding them: the child is **not**
+network-isolated (`network_policy: "inherited"`), there is **no** OS-level filesystem sandbox (the
+`WorkspaceBoundary` constrains the paths the plane resolves, not the child's syscalls), the log is a
+bounded 64 KiB-per-stream capture (later output is dropped with a marker), the preview URL exists only
+while the process is alive, and a process that outlives a hard process kill of the API server is not
+tracked after restart (the state is in memory and starts as `NOT_RUN`).
+
 
 ## 5. Planning, deferred and rejected
 
@@ -4043,6 +4067,31 @@ Stage 1 строится упорядоченными шагами. Шаги с 
 - **В слое персистентности нет денег.** `usage_records` хранит только физические
   измерения: токены, тайминги, счётчики и флаги. Ни колонки стоимости, цены, списания,
   баланса или валюты не существует нигде.
+
+### 3.8 Материализация проектов, локальный запуск и предпросмотр
+
+| Область | Статус | Доказательство |
+| --- | --- | --- |
+| Материализация в собственную рабочую область проекта | **CURRENT / VERIFIED** | `app/projects/materialize.py` (вызывает `app/agent_runtime/code_writer.apply_changes`; решают граница и deny-list писателя) — `tests/test_materialization.py` |
+| Точка входа только из манифеста артефактов | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_materialization.py`, `tests/test_local_execution.py` |
+| Запускаемые виды (python script/module, node script, объявленный npm-скрипт) | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_local_execution.py`; `app/smoke_python_preview.py`, `app/smoke_node_preview.py` |
+| Одобрение без диспетчеризации (`ExecutionCoordinator.authorize`) | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_execution_authorization_hardening*.py`, `tests/test_local_execution.py` |
+| Управляемый локальный процесс (состояния, остановка дерева, таймаут, ограниченный очищенный лог) | **CURRENT / VERIFIED** | `app/projects/runner.py` — `tests/test_local_execution.py` |
+| Общее уничтожение дерева процессов (job object / Toolhelp / `taskkill /T`) | **CURRENT / VERIFIED** | `app/execution/adapter.py` (`terminate_process_tree`) — `tests/test_execution_timeout_and_tree_kill.py`, `tests/test_local_execution.py` |
+| Процессный предпросмотр работающего сервера | **CURRENT / VERIFIED** | `app/projects/preview.py` (`register_process`, наблюдаемый слушающий порт) — `tests/test_local_execution.py`, `tests/test_materialization.py` |
+| Маршруты локального запуска и предпросмотра | **CURRENT / VERIFIED** | `app/api/project_routes.py` — `tests/test_local_execution.py` |
+| Слова этапа `READY_TO_RUN` / `RUNNING` / `STOPPED` / `BLOCKED` | **CURRENT / VERIFIED** | `app/projects/stage.py` — `tests/test_local_execution.py`, `tests/test_materialization.py` |
+| Блок запуска и шаг подтверждения в карточке проекта | **CURRENT / VERIFIED** (проверено типами и сборкой; проверено по HTTP, но не автотестом интерфейса) | `ui/src/screens/Projects.tsx`, `ui/src/api/forge.ts` — `tsc --noEmit`, `vite build` |
+| Сетевая изоляция процесса проекта | **REJECTED для этого блока** — дочерний процесс наследует сеть машины; ответ говорит `network_inherited` | `DECISIONS.md` Local run and preview v0.2 |
+| Установка зависимостей (`pip install` / `npm install`) как часть запуска | **REJECTED** — отсутствующая зависимость сообщается как `RUN_BLOCKED` со следующим шагом | `DECISIONS.md`, `app/projects/runner.py` |
+
+**Честные границы.** Супервизор их называет, а не скрывает: дочерний процесс **не** изолирован от
+сети (`network_policy: "inherited"`), **нет** OS-level песочницы файловой системы
+(`WorkspaceBoundary` ограничивает пути, которые разрешает сама плоскость, а не системные вызовы
+ребёнка), лог — это ограниченный захват 64 КиБ на поток (дальнейший вывод отбрасывается с
+маркером), URL предпросмотра существует только пока процесс жив, а процесс, переживший жёсткое
+убийство процесса API, после перезапуска не отслеживается (состояние в памяти и начинается с
+`NOT_RUN`).
 
 ## 4. Проверенные ограничения
 

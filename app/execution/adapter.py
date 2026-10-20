@@ -12,7 +12,7 @@ from ctypes import wintypes
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Tuple, runtime_checkable
 
 from app.execution.intent import AuthorizedExecution, ExecutionIntent
 from app.execution.paths import is_bare_executable
@@ -302,6 +302,105 @@ def _close_process_tree_job(job: int) -> None:
     try:
         _kernel32().CloseHandle(ctypes.c_void_p(job))
     except Exception:  # noqa: BLE001 - a leaked handle is not worth failing a run
+        pass
+
+
+def create_process_tree_job() -> int | None:
+    """Create the Windows job object that will own one child's process tree."""
+
+    return _create_process_tree_job()
+
+
+def assign_process_tree_job(job: int, proc: "subprocess.Popen[bytes]") -> bool:
+    """Put ``proc`` in ``job`` so every process it creates belongs to it as well."""
+
+    return _assign_process_to_job(job, proc)
+
+
+def close_process_tree_job(job: int) -> None:
+    """Close a job object handle created by :func:`create_process_tree_job`."""
+
+    _close_process_tree_job(job)
+
+
+def process_tree_pids(root_pid: int) -> Tuple[int, ...]:
+    """``root_pid`` and its descendants from a Toolhelp snapshot (Windows only).
+
+    An empty result means "the tree could not be enumerated", never "the tree is
+    just the root"; a caller that needs the root should add it itself.
+    """
+
+    if not isinstance(root_pid, int) or root_pid <= 0:
+        return ()
+    try:
+        return _windows_process_tree(root_pid)
+    except Exception:  # noqa: BLE001 - enumeration is best effort
+        return ()
+
+
+def terminate_process_tree(
+    proc: "subprocess.Popen[bytes]", *, job: int | None = None
+) -> None:
+    """Terminate ``proc`` and every process it created, then wait briefly.
+
+    This is the adapter's own tree kill, lifted to module level so a second
+    supervised spawner can use **one** implementation of it instead of a copy: a job
+    object when it could be created and assigned, else a Toolhelp snapshot on
+    Windows (descendants first) with ``taskkill /T`` as the last fallback, and a
+    process group on POSIX. Killing by name never happens: only the verified pid,
+    its descendants, and the job they were assigned to.
+    """
+
+    if os.name == "nt":
+        if job is not None:
+            _terminate_process_tree_job(job)
+        else:
+            # Fallback path: enumerate the tree from a Toolhelp snapshot. A
+            # snapshot failure returns an empty tree -- never "just the root" --
+            # so the legacy command below is actually reachable.
+            try:
+                process_tree = _windows_process_tree(proc.pid)
+            except Exception:  # noqa: BLE001 - the snapshot is best effort
+                process_tree = ()
+            for pid in process_tree:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            if not process_tree:
+                # A snapshot can fail transiently (for example during process
+                # table pressure), so retain the legacy command as a fallback.
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    else:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            time.sleep(0.2)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    try:
+        proc.wait(timeout=2)
+    except Exception:
         pass
 
 
@@ -995,57 +1094,10 @@ class LocalExecutionAdapter:
         ``taskkill``.
         """
 
-        if os.name == "nt":
-            if job is not None:
-                _terminate_process_tree_job(job)
-            else:
-                # Fallback path: enumerate the tree from a Toolhelp snapshot. A
-                # snapshot failure returns an empty tree -- never "just the root" --
-                # so the legacy command below is actually reachable.
-                try:
-                    process_tree = _windows_process_tree(proc.pid)
-                except Exception:  # noqa: BLE001 - the snapshot is best effort
-                    process_tree = ()
-                for pid in process_tree:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        pass
-                if not process_tree:
-                    # A snapshot can fail transiently (for example during process
-                    # table pressure), so retain the legacy command as a fallback.
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                            capture_output=True,
-                            timeout=5,
-                            check=False,
-                        )
-                    except Exception:
-                        pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        else:
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                time.sleep(0.2)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
+        # One implementation, shared with the supervised local run of a project
+        # (:mod:`app.projects.runner`): a second copy of a tree kill is a second
+        # chance to get "the child is gone" wrong.
+        terminate_process_tree(proc, job=job)
 
 
 class LocalProcessExecutionBackend(LocalExecutionAdapter):

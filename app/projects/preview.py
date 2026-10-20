@@ -48,19 +48,36 @@ from app.execution.secret_files import is_secret_directory, secret_reason
 from app.projects.entrypoint import SERVE_KIND_STATIC, EntryPoint
 
 __all__ = [
+    "PREVIEW_HOST",
+    "PREVIEW_NEEDS_PROCESS",
+    "PREVIEW_OWNED_BY_PROCESS",
     "LOCAL_RUN_NOT_WIRED",
     "NO_ENTRY_POINT",
-    "PREVIEW_HOST",
     "PreviewRegistry",
     "PreviewSession",
 ]
 
-#: The exact sentence the interface prints when an entry point exists but running it
-#: is not wired. A refusal, stated as a fact, never as a failure of the project.
-LOCAL_RUN_NOT_WIRED = "local run is not wired for this entry kind"
+#: The exact sentence the interface prints when an entry point exists but the
+#: project's own process is not running: there is nothing to point a URL at, and
+#: inventing one would be a claim the browser would immediately disprove.
+PREVIEW_NEEDS_PROCESS = (
+    "the project process is not running, so there is no preview URL"
+)
+
+#: The previous name of the sentence above. The word changed when local run became
+#: wired (:mod:`app.projects.runner`): for a process entry the honest answer is no
+#: longer "not wired", it is "nothing is running yet". The constant is kept so an
+#: importer reads the same name, and it holds the current sentence.
+LOCAL_RUN_NOT_WIRED = PREVIEW_NEEDS_PROCESS
 
 #: The reason a preview cannot start when the manifest has no entry point.
 NO_ENTRY_POINT = "no entry point was detected in the artifact manifest"
+
+#: The preview route's answer when asked to *stop* a preview that belongs to the
+#: project's own process: the preview cannot be closed without stopping the process.
+PREVIEW_OWNED_BY_PROCESS = (
+    "this preview is served by the project's own process: stop the process instead"
+)
 
 #: Loopback only. There is no host parameter anywhere in this module.
 PREVIEW_HOST = "127.0.0.1"
@@ -284,12 +301,74 @@ class PreviewRegistry:
         self._servers: Dict[str, Any] = {}
         self._threads: Dict[str, threading.Thread] = {}
         self._sessions: Dict[str, PreviewSession] = {}
+        #: Previews that are not served by this module at all: the project's own
+        #: process bound a localhost port, and this is the URL a browser can use.
+        self._processes: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ state
     def is_running(self, project_id: object) -> bool:
         key = str(project_id or "")
         with self._lock:
-            return key in self._servers
+            return key in self._servers or key in self._processes
+
+    def process_session(self, project_id: object) -> Optional[Dict[str, Any]]:
+        """The registered process preview of one project, or ``None``.
+
+        Registered by :mod:`app.projects.runner` when the child actually bound a
+        port. Nothing else may register one, and nothing here starts a process.
+        """
+
+        key = str(project_id or "")
+        with self._lock:
+            session = self._processes.get(key)
+            return dict(session) if session is not None else None
+
+    def register_process(
+        self,
+        project_id: object,
+        *,
+        port: object,
+        entry_path: str = "",
+        entry_kind: str = "",
+    ) -> Dict[str, Any]:
+        """Publish the loopback URL of a project process that is listening.
+
+        The port is the one the child **was observed listening on**, never a guess:
+        the caller scanned the child's own sockets. A port outside the valid range
+        is refused rather than turned into a URL.
+        """
+
+        key = str(project_id or "")
+        try:
+            number = int(port)
+        except (TypeError, ValueError):
+            number = 0
+        if not key or not 1 <= number <= 65535:
+            return {"available": False, "running": False, "url": "", "port": 0}
+        session = {
+            "available": True,
+            "running": True,
+            "source": "process",
+            "url": f"http://{PREVIEW_HOST}:{number}/",
+            "port": number,
+            "entry_path": str(entry_path or ""),
+            "entry_kind": str(entry_kind or ""),
+            "diagnostics": {
+                "loopback": True,
+                "served_by": "project_process",
+                "os_level_sandbox": False,
+            },
+        }
+        with self._lock:
+            self._processes[key] = dict(session)
+        return dict(session)
+
+    def unregister_process(self, project_id: object) -> None:
+        """Forget a process preview (the process ended, or was stopped)."""
+
+        key = str(project_id or "")
+        with self._lock:
+            self._processes.pop(key, None)
 
     def status(self, project_id: object) -> Dict[str, Any]:
         """The runtime state of one project's preview (never an absolute path)."""
@@ -297,6 +376,9 @@ class PreviewRegistry:
         key = str(project_id or "")
         with self._lock:
             session = self._sessions.get(key)
+            process = self._processes.get(key)
+        if process is not None:
+            return dict(process)
         if session is None:
             return {"running": False, "url": "", "port": 0, "entry_path": ""}
         payload = session.to_dict()
@@ -327,10 +409,13 @@ class PreviewRegistry:
                 "entry_path": "",
             }
         if entry.serve_kind != SERVE_KIND_STATIC:
+            process = self.process_session(key)
+            if process is not None:
+                return process
             return {
                 "available": False,
                 "running": False,
-                "reason": LOCAL_RUN_NOT_WIRED,
+                "reason": PREVIEW_NEEDS_PROCESS,
                 "url": "",
                 "entry_path": entry.path,
                 "entry_kind": entry.kind,
@@ -404,9 +489,19 @@ class PreviewRegistry:
             return session.to_dict()
 
     def stop(self, project_id: object) -> Dict[str, Any]:
-        """Stop one preview; a no-op that reports ``running: false`` when absent."""
+        """Stop one preview; a no-op that reports ``running: false`` when absent.
+
+        A preview served by the project's **own process** is not this module's to
+        stop: ending it would close a URL while the process kept running, and the
+        process is the thing the owner started. The answer says so, and
+        ``POST /api/projects/{id}/run/stop`` is the way to end it.
+        """
 
         key = str(project_id or "")
+        with self._lock:
+            process = self._processes.get(key)
+        if process is not None:
+            return {**process, "stopped": False, "reason": PREVIEW_OWNED_BY_PROCESS}
         with self._lock:
             server = self._servers.pop(key, None)
             thread = self._threads.pop(key, None)
@@ -437,5 +532,6 @@ class PreviewRegistry:
 
         with self._lock:
             keys = list(self._servers)
+            self._processes.clear()
         for key in keys:
             self.stop(key)

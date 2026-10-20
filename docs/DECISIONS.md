@@ -6573,3 +6573,176 @@ and `verification_command` fields, and `POST /api/tasks/run` reports `write_mode
 `app/smoke_materialization.py` печатает весь путь офлайн. `GET /api/projects/{id}`
 получает аддитивные поля `stage`, `files_created`, `entrypoint`, `preview` и
 `verification_command`, а `POST /api/tasks/run` сообщает `write_mode`.
+
+## Local run and preview for projects v0.2
+
+**Decision.** A project's own entry point may now be **run locally**, inside its own
+workspace, and a server it starts may be previewed — and it is run by the existing
+execution plane, not beside it. This entry supersedes the sentence in *"Project
+materialization and local preview v0.1"* that said a `python`/`node` entry point is
+reported but not started: the reason it was not started was that no supervisor
+existed, and the honest answer at the time was "not wired". Two facts changed that.
+First, `ExecutionCoordinator` gained `authorize()` — the *same* chain
+(`RunScope` → permission → intent → approval → policy → `workspace_root`) returning
+the `AuthorizedExecution` token **without dispatching**, because a server must stay up
+after the call that started it and `LocalExecutionAdapter.execute` is synchronous by
+design. Second, the adapter's tree kill was lifted to a module-level
+`terminate_process_tree`, so the supervisor terminates a process tree with exactly the
+code the adapter already uses instead of a second implementation.
+
+**The kinds, all from the manifest.** `app/projects/entrypoint.py` resolves exactly one
+of `static_html`, `python_script` (root `app.py`/`main.py`/`server.py`),
+`python_module` (a root package with `__main__.py`), `node_script` (root
+`server.js`/`app.js`) or `node_npm` (`package.json` with a declared `start`/`dev`
+script). Every command is built server-side: the interpreter is the repository's own
+virtual environment (or this process's interpreter with `pythonw.exe` mapped to
+`python.exe`), `node` is resolved once, and `npm` is started as
+`node <npm-cli.js> run <script>` because CreateProcess cannot execute the `.cmd`
+wrapper without a shell — and no shell is used anywhere. `npm install` is never part
+of a command. A recognised shape whose runtime is missing carries a `reason` and an
+**empty** command, which the runner reports as `RUN_BLOCKED`; it never invents one.
+
+**The runner.** `app/projects/runner.py` supervises the child. `start(project,
+approval_token)` refuses unless an explicit approval was recorded for *this* project
+and *this* exact argv: the API must be given `{"confirm": true}` plus the
+`entrypoint_digest` that was shown, the approval is single-use, it expires, and a
+command that changed (even to another allow-listed script) makes it stale. The child
+is started with `subprocess.Popen(shell=False)`, `cwd` = the authorized workspace
+root, and an environment of exactly `PATH`, `SYSTEMROOT`, `TEMP` and
+`PYTHONIOENCODING=utf-8` — a Forge credential, a provider key or a `.env` value is
+*absent*, not blanked. Output is captured into two 64 KiB ring buffers, every line is
+scanned by `DefaultSecretRedactor` **and** `find_forbidden_value_content`, and the
+redacted result is persisted to `.forge/projects/<id>/run.log`. The states are
+`NOT_RUN`, `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`, `SUCCEEDED`, `FAILED`,
+`TIMED_OUT`, `REFUSED` and `RUN_BLOCKED`. Timeout semantics are split on purpose: a
+script that is meant to finish is killed at the timeout (`TIMED_OUT`); a process that
+bound a localhost port is a server, so the timeout only answers "did it start" and
+never kills it. `stop` terminates the **tree** through the job object / Toolhelp
+snapshot / `taskkill /T` path on the verified pid — never by image name.
+
+**The preview.** `app/projects/preview.py` keeps its static server unchanged and gains
+a *registration* for a process preview: the runner publishes the URL only after it
+observed the child listening on a localhost port (netstat on Windows, `/proc` on
+Linux). A process that never bound a port has no URL, and the payload says
+"the project process is not running, so there is no preview URL" instead of inventing
+one. `POST /preview {"action": "stop"}` refuses to close a process preview: that would
+leave a dead URL while the process kept running.
+
+**The gate, the API and the card.** `app/projects/stage.py` gains `READY_TO_RUN`,
+`RUNNING`, `STOPPED` and `BLOCKED`. A live process is `RUNNING` and outranks a stored
+verdict; a refused or blocked attempt is `BLOCKED` only while the work is not
+otherwise complete; `COMPLETED` still requires files, `passed` verification, `passed`
+acceptance, the lifecycle record and a preview **or** `preview_not_required` — a
+started process never supplies those facts and is never read as completion. The API
+adds `GET/POST /api/projects/{id}/run`, `POST /api/projects/{id}/run/stop`,
+`POST /api/projects/{id}/run/restart` and `GET /api/projects/{id}/run/log`, plus an
+additive `run` block on the detail payload; absolute paths (the interpreter, the
+`cwd`) appear only inside `diagnostics`. The card prints the language, entry point,
+command, workspace, port, preview URL, process state, last event and logs, and offers
+each button only when its own facts allow it; the launch is an explicit confirm step
+that prints the exact command and the digest the backend compares.
+
+**Rejected alternatives.** A second executor or a generic shell (two security surfaces
+would drift); starting the process from `LocalExecutionAdapter.execute` with a
+background wait (the adapter's own contract is "run and report", and a server has no
+report); inferring the port from a project file or from prose (only an observed
+listening socket is evidence); installing dependencies automatically (a run that
+mutates its own environment is not a preview); claiming network isolation (the child
+inherits the machine's network, and the payload says `inherited`).
+
+**Consequences.** `tests/test_local_execution.py` (29 tests, offline) covers the five
+kinds, the allowlist and path refusals, the approval boundary (missing, wrong,
+cross-project, stale), success, module and node execution, the timeout kill, the
+process-tree stop, the 64 KiB cap, the environment, restart, redaction, the process
+preview and its absence, the four new stage words and the HTTP contract.
+`app/smoke_python_preview.py` and `app/smoke_node_preview.py` walk
+materialize → entrypoint → approval → start → preview `GET` 200 → verification → stop
+(and the node one prints `SKIPPED: node is not installed` and exits 0 when there is no
+node).
+
+## Локальный запуск и предпросмотр проектов v0.2 — русская версия
+
+**Решение.** Точку входа проекта теперь можно **запустить локально** в его собственной
+рабочей области, а поднятый ею сервер — показать в предпросмотре, и запускает её
+существующая плоскость исполнения, а не что-то рядом с ней. Эта запись отменяет фразу
+из «Материализация проекта и локальный предпросмотр v0.1» о том, что точка входа
+`python`/`node` только показывается, но не запускается: причиной было отсутствие
+супервизора, и честным ответом тогда было «не подключено». Изменили это два факта.
+Во-первых, у `ExecutionCoordinator` появился `authorize()` — **та же** цепочка
+(`RunScope` → разрешение → намерение → одобрение → политика → `workspace_root`),
+возвращающая токен `AuthorizedExecution` **без диспетчеризации**: сервер должен
+оставаться живым после вызова, который его запустил, а `LocalExecutionAdapter.execute`
+синхронен по своему контракту. Во-вторых, уничтожение дерева процессов из адаптера
+вынесено в модульную `terminate_process_tree`, поэтому супервизор убивает дерево ровно
+тем кодом, которым уже пользуется адаптер, а не второй реализацией.
+
+**Виды, и только из манифеста.** `app/projects/entrypoint.py` разрешает ровно один из
+`static_html`, `python_script` (корневые `app.py`/`main.py`/`server.py`),
+`python_module` (корневой пакет с `__main__.py`), `node_script` (корневые
+`server.js`/`app.js`) или `node_npm` (`package.json` с объявленным скриптом
+`start`/`dev`). Каждая команда собирается на сервере: интерпретатор — собственное
+виртуальное окружение репозитория (или интерпретатор этого процесса с заменой
+`pythonw.exe` на `python.exe`), `node` разрешается один раз, а `npm` запускается как
+`node <npm-cli.js> run <script>`, потому что CreateProcess не может выполнить
+`.cmd`-обёртку без командного интерпретатора — а shell не используется нигде.
+`npm install` никогда не входит в команду. Распознанная форма, у которой нет рантайма,
+несёт `reason` и **пустую** команду, и раннер сообщает это как `RUN_BLOCKED`, а не
+придумывает команду.
+
+**Раннер.** `app/projects/runner.py` наблюдает за дочерним процессом. `start(project,
+approval_token)` отказывает, пока не записано явное одобрение для **этого** проекта и
+**этого** точного argv: API обязан получить `{"confirm": true}` и
+`entrypoint_digest`, который был показан; одобрение одноразовое, истекает, а
+изменившаяся команда (даже на другой разрешённый скрипт) делает его устаревшим.
+Дочерний процесс стартует через `subprocess.Popen(shell=False)`, `cwd` = авторизованный
+корень рабочей области, а окружение — ровно `PATH`, `SYSTEMROOT`, `TEMP` и
+`PYTHONIOENCODING=utf-8`: учётные данные Forge, ключ провайдера или значение `.env`
+**отсутствуют**, а не обнуляются. Вывод захватывается в два кольцевых буфера по 64 КиБ,
+каждая строка проверяется `DefaultSecretRedactor` **и** `find_forbidden_value_content`,
+а очищенный результат сохраняется в `.forge/projects/<id>/run.log`. Состояния:
+`NOT_RUN`, `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`, `SUCCEEDED`, `FAILED`,
+`TIMED_OUT`, `REFUSED`, `RUN_BLOCKED`. Семантика таймаута разделена намеренно: скрипт,
+который должен завершиться, убивается по таймауту (`TIMED_OUT`); процесс, занявший
+локальный порт, — это сервер, поэтому таймаут отвечает только «успел ли он стартовать»
+и никогда его не убивает. `stop` уничтожает **дерево** через job object / снимок
+Toolhelp / `taskkill /T` по проверенному pid — никогда по имени образа.
+
+**Предпросмотр.** `app/projects/preview.py` сохраняет статический сервер без изменений
+и получает *регистрацию* процессного предпросмотра: раннер публикует URL только после
+того, как увидел дочерний процесс слушающим локальный порт (netstat в Windows,
+`/proc` в Linux). У процесса, который не занял порт, URL нет, и ответ говорит
+«процесс проекта не запущен, поэтому URL предпросмотра нет» вместо выдуманного адреса.
+`POST /preview {"action": "stop"}` отказывается закрывать процессный предпросмотр: это
+оставило бы мёртвый URL при живом процессе.
+
+**Гейт, API и карточка.** `app/projects/stage.py` получает `READY_TO_RUN`, `RUNNING`,
+`STOPPED` и `BLOCKED`. Живой процесс — `RUNNING` и важнее записанного вердикта;
+отказанная или заблокированная попытка — `BLOCKED`, только пока работа не завершена
+иначе; `COMPLETED` по-прежнему требует файлов, `passed` проверки, `passed` приёмки,
+записи жизненного цикла и предпросмотра **или** `preview_not_required` — запущенный
+процесс этих фактов не даёт и никогда не читается как завершение. API добавляет
+`GET/POST /api/projects/{id}/run`, `POST /api/projects/{id}/run/stop`,
+`POST /api/projects/{id}/run/restart` и `GET /api/projects/{id}/run/log`, а также
+аддитивный блок `run` в ответе детали; абсолютные пути (интерпретатор, `cwd`) видны
+только внутри `diagnostics`. Карточка печатает язык, точку входа, команду, рабочую
+область, порт, URL предпросмотра, состояние процесса, последнее событие и логи, и
+показывает каждую кнопку только когда это позволяют её собственные факты; запуск —
+явный шаг подтверждения, печатающий точную команду и отпечаток, который сверяет backend.
+
+**Отклонённые альтернативы.** Второй исполнитель или generic shell (две поверхности
+безопасности разошлись бы); запуск процесса из `LocalExecutionAdapter.execute` с
+фоновым ожиданием (контракт адаптера — «запустить и сообщить», а у сервера нет
+отчёта); вывод порта из файла проекта или из прозы (доказательство — только
+наблюдаемый слушающий сокет); автоматическая установка зависимостей (запуск, который
+меняет собственное окружение, — не предпросмотр); заявление о сетевой изоляции
+(дочерний процесс наследует сеть машины, и ответ говорит `inherited`).
+
+**Следствия.** `tests/test_local_execution.py` (29 тестов, офлайн) покрывает пять
+видов, отказы allowlist и путей, границу одобрения (нет, неверный, другой проект,
+устаревший), успешный запуск, модуль и node, убийство по таймауту, остановку дерева,
+ограничение 64 КиБ, окружение, перезапуск, редактирование секретов, процессный
+предпросмотр и его отсутствие, четыре новых слова этапа и HTTP-контракт.
+`app/smoke_python_preview.py` и `app/smoke_node_preview.py` проходят путь
+материализация → точка входа → одобрение → запуск → `GET` предпросмотра 200 →
+проверка → остановка (а node-версия печатает `SKIPPED: node is not installed` и
+завершается с кодом 0, когда node нет).

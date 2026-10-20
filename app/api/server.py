@@ -186,6 +186,7 @@ def create_api_app(
     authorized_project_id: Optional[str] = None,
     discovery_service: Optional[object] = None,
     project_service: Optional[object] = None,
+    project_runner: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -222,6 +223,7 @@ def create_api_app(
     from app.api.discovery_routes import register_discovery_routes
     from app.api.project_routes import register_project_routes
     from app.projects.preview import PreviewRegistry
+    from app.projects.runner import LocalRunner
     from app.api.routes import (
         body_error_exception,
         error_body,
@@ -412,6 +414,17 @@ def create_api_app(
     # deterministic way to end one while the process keeps running.
     previews = PreviewRegistry()
     app.state.forge_previews = previews
+    # One local runner for this process, composed beside the registry and sharing its
+    # store. It holds only *runtime* state (a live child, its job object, its bounded
+    # log), which is exactly why it is created here and never written to a record. It
+    # starts nothing at composition: every start needs the owner's explicit approval
+    # through ``POST /api/projects/{id}/run``.
+    runner = (
+        project_runner
+        if project_runner is not None
+        else LocalRunner(store=getattr(projects, "store", None), previews=previews)
+    )
+    app.state.forge_runner = runner
     # The card's technical block needs facts the project store does not hold: the
     # run's own durable record, the provider registry ids and the route list. They
     # are supplied as read-only callables from this composition, so the project
@@ -421,6 +434,7 @@ def create_api_app(
         projects,
         run_record_loader=api_service.get_run_record,
         preview_registry=previews,
+        runner=runner,
         environment_facts=lambda: {
             "provider_registry_ids": _provider_registry_ids(api_service),
             "api_routes": sorted(
