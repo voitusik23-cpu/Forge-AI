@@ -131,7 +131,18 @@ class OfflineTaskExecutionTests(unittest.TestCase):
         outcome = self._dispatch("перечислить содержимое корня репозитория")
         response = outcome.response
         self.assertTrue(response.success, response.error)
-        self.assertEqual(response.state, "COMPLETED")
+        # The loop really reached COMPLETED (the report below says so), but the
+        # *response* no longer claims a completed project: nothing was created, no
+        # file was written and no project record exists, so the outcome gate reports
+        # the answer that is ready instead. This assertion used to require
+        # "COMPLETED" -- the very claim the false-completion regression is about.
+        self.assertEqual(response.outcome, "SPECIFICATION_READY")
+        self.assertEqual(response.state, "SPECIFICATION_READY")
+        self.assertEqual(response.files_created, 0)
+        self.assertTrue(response.run_record_saved)
+        self.assertFalse(response.project_created)
+        self.assertFalse(response.project_files_created)
+        self.assertIn("Final state: COMPLETED", response.output)
         self.assertNotIn("MockProvider response:", response.output)
         self.assertIn("OFFLINE TASK EXECUTION", response.output)
         self.assertIn("перечислить содержимое корня репозитория", response.output)

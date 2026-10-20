@@ -64,22 +64,58 @@ def _is_latin_token(needle: str) -> bool:
     )
 
 
+#: Words that turn a mention into a refusal rather than a requirement. A needle
+#: matched right after one of them -- "не использовать онлайн-платежи", "без
+#: оплаты" -- is something the project must NOT have, so it must never become a
+#: specification value. The list is deliberately tiny and literal: this module
+#: derives only what the text states, and a guard against reading a refusal as a
+#: requirement is the same rule read in the other direction.
+#:
+#: The word must start a word of its own: "мне нужен сайт" and "интернет-магазин"
+#: contain the letters of "не"/"нет" but state no refusal, so a mention after them
+#: is derived exactly as before.
+_NEGATION = re.compile(r"(?:^|[^a-zа-яё0-9])(?:нет|не|без|no|not|never|without)\s")
+
+#: How far back a negation still governs the mention. Long enough for "не
+#: использовать онлайн-" before "платежи", short enough not to reach across a
+#: sentence. A comma ends the window: "это не бот, а сайт с оплатой" states a
+#: payment integration, and the comma is what keeps it.
+_NEGATION_WINDOW = 24
+
+
+def _negated_before(text: str, start: int) -> bool:
+    """Whether the mention at ``start`` is refused by a negation just before it."""
+
+    window = text[max(0, start - _NEGATION_WINDOW):start]
+    # Only the clause the mention belongs to decides; a comma starts a new one.
+    clause = window.rsplit(",", 1)[-1]
+    return _NEGATION.search(clause) is not None
+
+
 def _has(text: str, *needles: str) -> bool:
-    """Whether the case-folded ``text`` mentions any of ``needles``.
+    """Whether the case-folded ``text`` *states* any of ``needles``.
 
     A short Latin token is matched on word boundaries (so ``api`` does not match
     "rapid"), while a Russian stem is matched as a substring (``бронир`` covers
     "бронирование" and "бронировать"). Both are deterministic and locale-free.
+
+    A mention that a negation governs is not a statement: the next occurrence is
+    tried instead, so "не использовать онлайн-платежи" states no payment
+    integration while "с оплатой" still does.
     """
 
     for needle in needles:
         if _is_latin_token(needle):
-            if re.search(
-                rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", text
-            ):
-                return True
-        elif needle in text:
-            return True
+            pattern = rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])"
+            for match in re.finditer(pattern, text):
+                if not _negated_before(text, match.start()):
+                    return True
+        else:
+            start = text.find(needle)
+            while start >= 0:
+                if not _negated_before(text, start):
+                    return True
+                start = text.find(needle, start + 1)
     return False
 
 

@@ -36,7 +36,7 @@ import tempfile
 import time
 from typing import Any, Dict, List, Mapping, Optional
 
-from app.projects.models import Project, ProjectError, utc_now
+from app.projects.models import LifecycleProject, ProjectError, utc_now
 
 __all__ = [
     "INDEX_FILENAME",
@@ -251,7 +251,7 @@ class ProjectStore:
             return False
 
     # ------------------------------------------------------------------- I/O
-    def write(self, project: Project) -> Path:
+    def write(self, project: LifecycleProject) -> Path:
         """Atomically persist one project record and refresh its index entry."""
 
         target = self.path_for(project.project_id)
@@ -265,7 +265,7 @@ class ProjectStore:
         self._refresh_index(project)
         return written
 
-    def read(self, project_id: object) -> Optional[Project]:
+    def read(self, project_id: object) -> Optional[LifecycleProject]:
         """The stored project, or ``None`` when absent or unreadable.
 
         A corrupt record is reported as absent rather than partially trusted: a
@@ -287,11 +287,11 @@ class ProjectStore:
         if not isinstance(data, dict):
             return None
         try:
-            return Project.from_dict(data)
+            return LifecycleProject.from_dict(data)
         except (KeyError, TypeError, ValueError):
             return None
 
-    def require(self, project_id: object) -> Project:
+    def require(self, project_id: object) -> LifecycleProject:
         """The stored project, or :class:`UnknownProject`."""
 
         project = self.read(project_id)
@@ -299,7 +299,7 @@ class ProjectStore:
             raise UnknownProject(str(project_id))
         return project
 
-    def list_projects(self, *, include_archived: bool = True) -> List[Project]:
+    def list_projects(self, *, include_archived: bool = True) -> List[LifecycleProject]:
         """Every stored project, newest change first.
 
         The directory is the truth, not the index: a record present on disk is
@@ -308,7 +308,7 @@ class ProjectStore:
         deterministic tie-break.
         """
 
-        found: List[Project] = []
+        found: List[LifecycleProject] = []
         root = self.root
         if not root.is_dir():
             return found
@@ -379,7 +379,7 @@ class ProjectStore:
         )
         return _atomic_write_text(self.index_path, payload)
 
-    def _refresh_index(self, project: Project) -> None:
+    def _refresh_index(self, project: LifecycleProject) -> None:
         """Keep the summary cache in step with the record that was just written."""
 
         index = self.read_index()

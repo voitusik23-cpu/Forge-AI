@@ -136,6 +136,7 @@ export const App = () => {
             onRefresh={() => void reload()}
             onLanguage={setLang}
             onHelp={() => openHelp(CONTEXT_TOPIC.forge)}
+            onOpenProviders={() => selectSection("providers")}
           />
         ) : null}
         {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}

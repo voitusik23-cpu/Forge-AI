@@ -1,20 +1,24 @@
 // Кузница — the FORGE AI desktop workspace.
 //
-// One screen, six real answers from the Core, and nothing else:
+// The workspace is **questions first**. One screen, and the order on it is the order of the work:
 //
-//   projects  <- GET  /api/projects            (loaded here, because loadBackend does not)
-//   providers <- GET  /api/status + /api/agents (enabled_providers, default_provider, agents)
-//   dispatch  -> POST /api/tasks/run
-//   execution <- GET  /api/runs/{run_id}, polled every 1.75 s until the record is terminal
-//   agents    <- GET  /api/agents
-//   settings  <- GET  /api/status
+//   1. «Задача» (top of the page) — the idea, then the clarification card that replaces the idea
+//      form the moment the first submit returned questions, then the specification, then the launch
+//      step (provider · model · cost_tier · estimated_cost, the write switch and the run button);
+//   2. «Выполнение» — GET /api/runs/{run_id}, polled every 1.75 s until the record is terminal;
+//   3. «Запись в проект» — only when the run recorded a code_write;
+//   4. «Результат» — the POST /api/tasks/run answer, its outcome and the three independent save
+//      facts (run record / project / project files) the response carries;
+//   5. «Артефакты и изменения» — only once a run exists (there is no artifact route in
+//      app/api/server.py, and the card says so instead of drawing an invented list);
+//   6. «Проекты» and «Настройки» in the right-hand column. The agent list lives in «Провайдеры»,
+//      which is the full diagnostics hub, so the workspace is not half-filled with it.
 //
-// There is no artifact or approval route in app/api/server.py, so neither a fake artifact list
-// nor an accept/reject button is drawn: the card says what is missing and why. Every number on
-// this screen is copied from a response; none is computed to look like progress.
+// Every number on this screen is copied from a response; none is computed to look like progress.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
+import { ClarificationCard, emptyAnswerDraft, type AnswerDraft } from "../components/ClarificationCard";
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { RunProgress } from "../components/RunProgress";
 import { t, type Lang } from "../i18n";
@@ -22,6 +26,7 @@ import type { BackendState } from "../api/client";
 import {
   TASK_CATEGORIES,
   cancelDiscovery,
+  catalogueEntryFor,
   catalogueModelsFor,
   codeWriteOf,
   confirmDiscovery,
@@ -110,6 +115,10 @@ const failureLabel = (lang: Lang, failure: Failure): string => {
   if (failure.kind === "unauthorized") return t(lang, "forge.state.unauthorized");
   if (failure.kind === "disconnected") return t(lang, "forge.state.disconnected");
   const code = failure.code ?? "";
+  // A paid model the caller did not explicitly confirm: the Core's own sentence says what would
+  // have been spent, so it is shown verbatim instead of being summarised away.
+  if (failure.status === 409 && code === "paid_model_requires_confirmation")
+    return failure.detail;
   if (failure.status === 409 && code === "discovery_not_confirmed")
     return t(lang, "forge.discovery.not_confirmed");
   if (failure.status === 409 && code === "discovery_not_ready")
@@ -126,6 +135,8 @@ const failureLabel = (lang: Lang, failure: Failure): string => {
 /** What the refusal means for the next click, when the code says something specific. */
 const failureHint = (lang: Lang, failure: Failure): string => {
   const code = failure.code ?? "";
+  if (failure.status === 409 && code === "paid_model_requires_confirmation")
+    return t(lang, "forge.launch.paid.refusal");
   if (failure.status === 409 && code === "discovery_not_confirmed")
     return t(lang, "forge.discovery.not_confirmed.detail");
   if (failure.status === 409 && code === "discovery_not_ready")
@@ -163,7 +174,10 @@ const FailureNotice = ({
         </div>
       ) : null}
       {failure.kind === "error" || failure.kind === "disconnected" ? (
-        failure.detail ? (
+        // The detail is printed only when it says something the label does not: for a refusal whose
+        // message *is* the backend's own sentence (the paid gate), repeating it would read as two
+        // different failures.
+        failure.detail && failure.detail !== failureLabel(lang, failure) ? (
           <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
             {failure.detail}
           </div>
@@ -328,12 +342,15 @@ export const Forge = ({
   onRefresh,
   onLanguage,
   onHelp,
+  onOpenProviders,
 }: {
   lang: Lang;
   backend: BackendState;
   onRefresh: () => void;
   onLanguage: (lang: Lang) => void;
   onHelp: () => void;
+  /** Opens «Провайдеры»: the agent list is the hub's job, not the workspace's. */
+  onOpenProviders: () => void;
 }) => {
   const live = backend.status === "live";
   const status = live ? backend.core : null;
@@ -467,7 +484,9 @@ export const Forge = ({
   const [discoveryBusy, setDiscoveryBusy] = useState("");
   const [discoverySession, setDiscoverySession] = useState<DiscoverySessionPayload | null>(null);
   const [discoverySpec, setDiscoverySpec] = useState<DiscoverySpecificationPayload | null>(null);
-  const [answerDraft, setAnswerDraft] = useState<Record<string, string>>({});
+  // One draft per question. `text` is exactly what would be sent; the typed control writes it,
+  // «Не знаю» and «Пропустить» are explicit flags beside it, never a guessed value.
+  const [drafts, setDrafts] = useState<Record<string, AnswerDraft>>({});
   const [discoveryFailure, setDiscoveryFailure] = useState<Failure | null>(null);
   const [discoveryNotice, setDiscoveryNotice] = useState("");
 
@@ -476,6 +495,26 @@ export const Forge = ({
   const sessionState = String(session?.state ?? "");
   const questions = discoverySession?.questions ?? [];
   const confirmed = sessionState === "CONFIRMED";
+
+  /**
+   * The idea as the Core stored it, shown read-only above the questions.
+   *
+   * It is `initial_goal`, never the local textarea: a goal the backend screened away is not
+   * repeated here, which is why the empty case says so instead of falling back to user text.
+   */
+  const storedGoal = String(session?.initial_goal ?? "").trim();
+  const ideaText = storedGoal !== "" ? storedGoal : t(lang, "forge.discovery.idea.redacted");
+
+  // The questions card is the first thing on the page, so every step change brings it into view:
+  // that is the fix for "the questions appeared at the bottom of a long page".
+  const taskCardRef = useRef<HTMLDivElement | null>(null);
+  const previousPhase = useRef<DiscoveryPhase | null>(null);
+  useEffect(() => {
+    const previous = previousPhase.current;
+    previousPhase.current = phase;
+    if (previous === null || previous === phase) return;
+    taskCardRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, [phase]);
 
   /**
    * A refused dispatch belongs to the step it was attempted from.
@@ -487,16 +526,24 @@ export const Forge = ({
     if (dispatch.status === "failed") setDispatch({ status: "idle" });
   };
 
-  /** Take a session answer as it came back, keeping what the user already typed. */
+  /** Take a session answer as it came back, so the widgets show what the Core stored. */
   const adoptSession = (payload: DiscoverySessionPayload) => {
     setDiscoverySession(payload);
     const stored = payload.session?.answers ?? [];
-    const draft: Record<string, string> = {};
+    const next: Record<string, AnswerDraft> = {};
     for (const answer of stored) {
       const id = String(answer.question_id ?? "");
-      if (id !== "" && typeof answer.text === "string" && answer.text !== "") draft[id] = answer.text;
+      if (id === "") continue;
+      const storedText = typeof answer.text === "string" ? answer.text : "";
+      // An answer the Core stored as skipped with no text was an explicit «не знаю»; it stays
+      // visible as that, instead of looking like a question nobody touched.
+      next[id] = {
+        text: storedText,
+        unknown: answer.skipped === true && storedText === "",
+        skip: false,
+      };
     }
-    setAnswerDraft(draft);
+    setDrafts(next);
     setDiscoveryFailure(null);
   };
 
@@ -557,15 +604,29 @@ export const Forge = ({
     setPhase("clarify");
   };
 
-  /** Step 2: the answers the user actually wrote. An empty field is not sent. */
+  /**
+   * Step 2: the answers the owner actually gave through the widgets.
+   *
+   * Three shapes leave here, and each one means something different to the Core:
+   * `{text}` is a real answer, `{text: "", skipped: true}` is «Не знаю» (recorded as an explicit
+   * unknown, never asked again), and a question with «Пропустить» is not sent at all, so it stays
+   * open for the next round. An untouched question is not sent either.
+   */
   const sendAnswers = async () => {
     if (discoveryBusy !== "" || sessionId === "") return;
-    const answers = questions
-      .map((question) => {
-        const id = String(question.id ?? "");
-        return { question_id: id, text: (answerDraft[id] ?? "").trim() };
-      })
-      .filter((answer) => answer.question_id !== "" && answer.text !== "");
+    const answers: Array<{ question_id: string; text: string; skipped?: boolean }> = [];
+    for (const question of questions) {
+      const id = String(question.id ?? "");
+      if (id === "") continue;
+      const draft = drafts[id] ?? emptyAnswerDraft();
+      if (draft.skip) continue;
+      if (draft.unknown) {
+        answers.push({ question_id: id, text: "", skipped: true });
+        continue;
+      }
+      const text = draft.text.trim();
+      if (text !== "") answers.push({ question_id: id, text });
+    }
     if (answers.length === 0) {
       setDiscoveryNotice(t(lang, "forge.discovery.answers.empty"));
       return;
@@ -650,6 +711,23 @@ export const Forge = ({
     setPhase("clarify");
   };
 
+  /**
+   * The result's «Ответить на вопросы» button.
+   *
+   * A run whose outcome is `CLARIFICATION_REQUIRED` stopped because its answer asked questions, so
+   * the honest next step is the clarification card, not a second run. An open session is reopened
+   * as it is; a confirmed or cancelled one cannot accept answers any more (the Core refuses with
+   * 409 `discovery_state_conflict`), so a fresh session is opened from the same idea.
+   */
+  const answerClarification = async () => {
+    if (sessionId !== "" && !confirmed && sessionState !== "CANCELLED") {
+      setDiscoveryNotice("");
+      setPhase("clarify");
+      return;
+    }
+    await continueFromIdea();
+  };
+
   // ------------------------------------------------------------------ run record
   const [record, setRecord] = useState<RunRecord | null>(null);
   const [recordFailure, setRecordFailure] = useState<Failure | null>(null);
@@ -662,6 +740,20 @@ export const Forge = ({
   // `project_state.code_write` is written by the Core only for a write-mode code run, so its
   // presence is the record's own proof that the writer ran — never inferred from the checkbox.
   const codeWrite = codeWriteOf(record);
+
+  /**
+   * The provider-neutral outcome the run record itself carries (`project_state.outcome`).
+   *
+   * The record's own `state` is the run's terminal word (`COMPLETED` as soon as the run finished),
+   * which is not the same fact as "the project is complete". Both are shown, side by side, so the
+   * execution card can never be read as a completion claim the result card contradicts.
+   */
+  const recordOutcome = (() => {
+    const projectState = record?.project_state;
+    if (!projectState || typeof projectState !== "object") return "";
+    const value = (projectState as Record<string, unknown>).outcome;
+    return typeof value === "string" ? value.trim() : "";
+  })();
 
   // Poll GET /api/runs/{run_id} while the record is not terminal. A read failure stops the
   // loop and is shown with a retry: retrying a *read* executes nothing, unlike retrying a task.
@@ -695,17 +787,58 @@ export const Forge = ({
 
   const polling = runId !== "" && recordFailure === null && !terminal;
 
-  // The mock provider is the offline executor: it answers without touching a file. The write
-  // switch is therefore disabled for it and the run is labelled honestly. For every real
-  // provider the switch stays live, because the guarded writer works there.
+  // The offline executor is the one provider the Core's own composition names as "no files":
+  // it answers with a deterministic report and writes nothing. The write switch is therefore
+  // disabled there, and equally disabled when the run *cannot* write at all — a category other than
+  // `code` (`_write_mode_enabled` ignores write_mode for it) or no routable provider.
   const mockSelected = provider === "mock";
-  const effectiveWriteMode = writeMode && !mockSelected;
+  const writeUnavailable = mockSelected
+    ? t(lang, "forge.task.write.offline")
+    : category !== "code"
+      ? t(lang, "forge.task.write.noncode")
+      : !providerChoice.list.includes(provider)
+        ? t(lang, "forge.task.write.noprovider")
+        : "";
+  const writeSupported = writeUnavailable === "";
+  const effectiveWriteMode = writeMode && writeSupported;
+
+  // The launch step's cost facts, straight from the /api/models row of the selected pair. An
+  // unlisted pair has no tier and no price: both stay unknown instead of being assumed free.
+  const catalogueEntry = useMemo(
+    () => catalogueEntryFor(catalogue, provider, selectedModel),
+    [catalogue, provider, selectedModel]
+  );
+  const costTier = String(catalogueEntry?.cost_tier ?? "");
+  const paidModel = costTier === "PAID";
+  // A paid run needs a deliberate click on this box, per provider/model selection.
+  const [paidConfirmed, setPaidConfirmed] = useState(false);
+  useEffect(() => {
+    setPaidConfirmed(false);
+  }, [provider, selectedModel]);
+  const runBlocked = paidModel && !paidConfirmed;
+
+  const costLine = [
+    provider === "" ? t(lang, "forge.task.route.auto") : provider,
+    selectedModel === "" ? "—" : selectedModel,
+    costTier === "" ? t(lang, "forge.launch.cost.unknown") : costTier,
+    typeof catalogueEntry?.estimated_cost === "number"
+      ? t(lang, "forge.launch.cost.unit").replace(
+          "{price}",
+          `$${catalogueEntry.estimated_cost.toFixed(4)}`
+        )
+      : t(lang, "forge.launch.cost.notlisted"),
+  ].join(" · ");
 
   const submit = async () => {
-    // The button is deliberately never disabled. A disabled button with no reason is what made
-    // "Запустить задачу" look dead; every click now either dispatches or says why it did not.
+    // The button stays live for every honest reason a run cannot start (a disabled button with no
+    // explanation is what made "Запустить задачу" look dead). The single exception is the paid
+    // confirmation below: there the button is disabled *and* the reason is printed beside it.
     if (dispatch.status === "pending") {
       setNotice(t(lang, "forge.task.busy"));
+      return;
+    }
+    if (runBlocked) {
+      setNotice(t(lang, "forge.launch.paid.blocked"));
       return;
     }
     const trimmed = description.trim();
@@ -796,18 +929,6 @@ export const Forge = ({
       ? status.details.enabled_providers.map((item) => String(item))
       : [];
 
-  // Whether the run was persisted, from the strongest evidence actually available: the
-  // X-Forge-History-Recorded header when it reached the interface, otherwise the result of
-  // reading the record back with GET /api/runs/{run_id} — a 200 is proof it was stored, a 404
-  // is proof it was not, and anything else leaves the answer unknown.
-  const historyPersisted: boolean | null =
-    dispatched?.facts.history_recorded ??
-    (record !== null
-      ? true
-      : recordFailure !== null && recordFailure.kind === "error" && recordFailure.status === 404
-        ? false
-        : null);
-
   // The dispatch basis arrives in the X-Forge-* response headers. When they are absent the
   // interface says so instead of guessing what kind of number it is showing.
   const basisReported =
@@ -824,10 +945,11 @@ export const Forge = ({
       .join(" · ") || t(lang, "forge.task.route.auto");
 
   /**
-   * The run block: provider, model, category, write switch and the submit itself.
+   * The launch step: provider, model, category, the cost facts of that pair, the write switch and
+   * the submit itself.
    *
-   * Drawn on step 4 and, deliberately, one step earlier — the same button that would run a
-   * confirmed session is the one that shows the Core's 409 refusal while it is not confirmed.
+   * It is drawn on step 4 only. The questions and the specification come first, so the owner is
+   * never asked to pick a model before the Core has said what the project is.
    */
   const runControls = (
     <div className="stack" style={{ gap: 14 }}>
@@ -924,32 +1046,75 @@ export const Forge = ({
         <span className="mono">{routeLabel}</span>
       </div>
 
+      {/* provider · model · cost_tier · estimated_cost, all four read from the /api/models row. */}
+      <div className="forge-cost">
+        <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+          <span className="label">{t(lang, "forge.launch.cost")}</span>
+          <Badge
+            tone={costTier === "FREE" ? "ok" : costTier === "CHEAP" ? "info" : costTier === "PAID" ? "warn" : "neutral"}
+          >
+            {costTier === "" ? t(lang, "forge.launch.cost.unknown") : costTier}
+          </Badge>
+        </div>
+        <div className="mono small" style={{ marginTop: 6, wordBreak: "break-word" }}>
+          {costLine}
+        </div>
+        <div className="small muted" style={{ marginTop: 6 }}>
+          {t(lang, "forge.launch.cost.note")}
+        </div>
+      </div>
+
       {/* The offline executor is labelled as what it is: an answer without a file change. */}
       {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
 
+      {/* A paid pair runs only after a deliberate confirmation; free and cheap need none. */}
+      {paidModel ? (
+        <div className="notice warn">
+          <label className="forge-toggle">
+            <input
+              type="checkbox"
+              checked={paidConfirmed}
+              onChange={(event) => setPaidConfirmed(event.target.checked)}
+            />
+            <span>{t(lang, "forge.launch.paid.label")}</span>
+          </label>
+          <div className="small" style={{ marginTop: 6 }}>
+            {t(lang, "forge.launch.paid.note")}
+          </div>
+        </div>
+      ) : costTier !== "" ? (
+        <div className="small muted">{t(lang, "forge.launch.free.note")}</div>
+      ) : null}
+
       <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-        <Button tone="primary" onClick={() => void submit()}>
+        <Button tone="primary" disabled={runBlocked} onClick={() => void submit()}>
           <IconPlay size={15} />
           {dispatch.status === "pending" ? t(lang, "runs.form.running") : t(lang, "runs.form.submit")}
         </Button>
+        {runBlocked ? (
+          <span className="small muted">{t(lang, "forge.launch.paid.blocked")}</span>
+        ) : null}
         {dispatch.status === "pending" ? (
           <Button size="small" tone="danger" onClick={cancel}>
             {t(lang, "forge.task.cancel")}
           </Button>
         ) : null}
-        <label className={`forge-toggle${mockSelected ? " disabled" : ""}`}>
+        <label className={`forge-toggle${writeSupported ? "" : " disabled"}`}>
           <input
             type="checkbox"
             checked={effectiveWriteMode}
-            disabled={mockSelected}
+            disabled={!writeSupported}
             onChange={(event) => setWriteMode(event.target.checked)}
           />
           <span>{t(lang, "forge.task.write.label")}</span>
-          {mockSelected ? (
-            <span className="small muted">· {t(lang, "forge.discovery.mock.write")}</span>
-          ) : null}
+          {writeSupported ? null : (
+            <span className="small muted">
+              · {t(lang, "forge.task.write.unavailable")}
+              {writeUnavailable === "" ? "" : ` (${writeUnavailable})`}
+            </span>
+          )}
         </label>
-        {mockSelected ? null : <span className="small muted">{t(lang, "forge.task.guarded")}</span>}
+        {writeSupported ? <span className="small muted">{t(lang, "forge.task.guarded")}</span> : null}
       </div>
       <div className="small muted forge-write-warning">{t(lang, "forge.task.write.warning")}</div>
 
@@ -1005,8 +1170,488 @@ export const Forge = ({
 
       <div className="grid overview">
         <div className="stack">
+          {/* -------------------------------------------------------------------- task
+              First in the workspace, and the reason is the owner's complaint: the questions used
+              to appear at the bottom of a long page. The idea form is the only thing here until
+              the first submit; from then on the clarification card takes its place at the top. */}
+          <div ref={taskCardRef}>
+            <Card className="rise">
+              <CardHead
+                title={t(lang, "forge.task.title")}
+                hint={t(lang, "forge.task.hint")}
+                action={
+                  <Badge tone={live ? "info" : backend.status === "loading" ? "neutral" : "warn"}>
+                    {backend.status === "loading" ? "…" : live ? "LIVE" : "OFFLINE"}
+                  </Badge>
+                }
+              />
+              <div className="stack" style={{ gap: 14 }}>
+                <StepRail lang={lang} phase={phase} />
+
+                {/* The idea stays above everything else, read-only, once it has been submitted. */}
+                {phase !== "idea" ? (
+                  <div className="forge-idea">
+                    <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+                      <span className="label">{t(lang, "forge.discovery.idea.saved")}</span>
+                      {confirmed ? null : (
+                        <button
+                          type="button"
+                          className="btn small ghost"
+                          onClick={() => {
+                            setDiscoveryNotice("");
+                            setPhase("idea");
+                          }}
+                        >
+                          {t(lang, "forge.discovery.idea.edit")}
+                        </button>
+                      )}
+                    </div>
+                    <div className="forge-idea-text">{ideaText}</div>
+                  </div>
+                ) : null}
+
+                {/* Step 1 — the idea. The only field that is the user's own words. */}
+                {phase === "idea" ? (
+                  <div className="stack" style={{ gap: 12 }}>
+                    <Field
+                      label={t(lang, "forge.discovery.goal.label")}
+                      hint={t(lang, "forge.discovery.goal.hint")}
+                      error={descriptionError}
+                    >
+                      <textarea
+                        className="input"
+                        rows={4}
+                        value={description}
+                        onChange={(event) => setDescription(event.target.value)}
+                        placeholder={t(lang, "forge.discovery.goal.placeholder")}
+                      />
+                    </Field>
+                    <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                      <Button
+                        tone="primary"
+                        disabled={discoveryBusy === "idea"}
+                        onClick={() => void continueFromIdea()}
+                      >
+                        <IconPlay size={15} />
+                        {discoveryBusy === "idea"
+                          ? t(lang, "runs.form.running")
+                          : t(lang, "forge.discovery.continue")}
+                      </Button>
+                      <span className="small muted">{t(lang, "forge.discovery.continue.note")}</span>
+                    </div>
+                  </div>
+                ) : null}
+
+                {/* The session the Core actually opened, named as it is stored. */}
+                {phase !== "idea" ? (
+                  <div className="small row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                    <span className="muted">{t(lang, "forge.discovery.session")}</span>
+                    <span className="mono">{text(sessionId, "—")}</span>
+                    <span className="muted">{t(lang, "forge.discovery.state")}</span>
+                    <Badge tone={confirmed ? "ok" : sessionState === "CANCELLED" ? "danger" : "info"}>
+                      {text(sessionState, t(lang, "runs.unknown"))}
+                    </Badge>
+                  </div>
+                ) : null}
+
+                {/* Step 2 — the typed questions. They replace the idea form, at the top. */}
+                {phase === "clarify" ? (
+                  <ClarificationCard
+                    lang={lang}
+                    questions={questions}
+                    drafts={drafts}
+                    onDraft={(questionId, draft) =>
+                      setDrafts((previous) => ({ ...previous, [questionId]: draft }))
+                    }
+                    busy={discoveryBusy}
+                    onSend={() => void sendAnswers()}
+                    onSkipRound={() => void skipClarification()}
+                    onCancel={() => void cancelSession()}
+                  />
+                ) : null}
+
+                {/* Step 3 — the specification, as a definition list from its own route. */}
+                {phase === "spec" ? (
+                  <div className="stack" style={{ gap: 12 }}>
+                    <div>
+                      <div className="label">{t(lang, "forge.discovery.spec.title")}</div>
+                      <div className="small muted">{t(lang, "forge.discovery.spec.hint")}</div>
+                    </div>
+                    {discoverySpec === null ? (
+                      <div className="small muted">
+                        {discoveryBusy === "spec"
+                          ? t(lang, "forge.discovery.spec.loading")
+                          : t(lang, "forge.discovery.spec.empty")}
+                      </div>
+                    ) : (
+                      <dl className="forge-spec">
+                        {SPEC_FIELDS.map(({ key, labelKey }) => {
+                          const value = specValue(discoverySpec.specification, key);
+                          return (
+                            <div className="forge-spec-row" key={key}>
+                              <dt className="label">{t(lang, labelKey)}</dt>
+                              <dd className={value === "" ? "muted" : ""}>
+                                {value === "" ? t(lang, "forge.discovery.spec.empty") : value}
+                              </dd>
+                            </div>
+                          );
+                        })}
+                      </dl>
+                    )}
+                    <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                      <Button
+                        tone="primary"
+                        disabled={discoveryBusy === "confirm"}
+                        onClick={() => void confirmSpecification()}
+                      >
+                        {discoveryBusy === "confirm"
+                          ? t(lang, "runs.form.running")
+                          : t(lang, "forge.discovery.spec.confirm")}
+                      </Button>
+                      <Button onClick={editAnswers}>{t(lang, "forge.discovery.spec.edit")}</Button>
+                      <Button
+                        tone="ghost"
+                        disabled={discoveryBusy === "cancel"}
+                        onClick={() => void cancelSession()}
+                      >
+                        {t(lang, "forge.discovery.cancel")}
+                      </Button>
+                    </div>
+                    {typeof discoverySpec?.task_text === "string" && discoverySpec.task_text !== "" ? (
+                      <details>
+                        <summary className="small muted" style={{ cursor: "pointer" }}>
+                          task_text
+                        </summary>
+                        <pre className="forge-output mono small">{discoverySpec.task_text}</pre>
+                      </details>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {/* Step 4 — the launch. Provider, model, cost and the run button appear here and
+                    nowhere earlier: the questions and the specification come first. */}
+                {phase === "run" ? (
+                  <div className="stack" style={{ gap: 14 }}>
+                    <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+                      <div className="label">{t(lang, "forge.discovery.run.title")}</div>
+                      <Badge tone={confirmed ? "ok" : "warn"}>
+                        {text(sessionState, t(lang, "runs.unknown"))}
+                      </Badge>
+                    </div>
+                    <div className={`notice ${confirmed ? "" : "warn"}`}>
+                      {confirmed
+                        ? t(lang, "forge.discovery.run.ready")
+                        : t(lang, "forge.discovery.run.preconfirm")}
+                    </div>
+                    <Field
+                      label={t(lang, "forge.discovery.run.task")}
+                      hint={t(lang, "forge.discovery.run.task.hint")}
+                      error={descriptionError}
+                    >
+                      <textarea
+                        className="input"
+                        rows={3}
+                        value={description}
+                        onChange={(event) => setDescription(event.target.value)}
+                        placeholder={t(lang, "forge.discovery.goal.placeholder")}
+                      />
+                    </Field>
+                    {runControls}
+                  </div>
+                ) : null}
+
+                {discoveryFailure !== null ? (
+                  <FailureNotice lang={lang} failure={discoveryFailure} />
+                ) : null}
+                {discoveryNotice !== "" ? <div className="notice">{discoveryNotice}</div> : null}
+              </div>
+            </Card>
+          </div>
+
+          {/* --------------------------------------------------------------- execution */}
+          <Card className="rise d2">
+            <CardHead
+              title={t(lang, "forge.execution.title")}
+              hint={t(lang, "forge.execution.hint").replace("{sec}", POLL_INTERVAL_LABEL)}
+              action={
+                <Badge tone={runId === "" ? "neutral" : terminal ? "ok" : polling ? "info" : "warn"}>
+                  {runId === ""
+                    ? "—"
+                    : terminal
+                      ? t(lang, "forge.execution.terminal")
+                      : polling
+                        ? t(lang, "forge.execution.polling")
+                        : t(lang, "forge.execution.waiting")}
+                </Badge>
+              }
+            />
+            {runId === "" ? (
+              <div className="small muted">{t(lang, "forge.execution.empty")}</div>
+            ) : recordFailure ? (
+              <FailureNotice
+                lang={lang}
+                failure={recordFailure}
+                onRetry={() => setPollNonce((value) => value + 1)}
+              />
+            ) : record === null ? (
+              <div className="small muted">
+                {recordLoading ? t(lang, "forge.execution.waiting") : t(lang, "forge.execution.empty")}
+              </div>
+            ) : (
+              <div className="stack" style={{ gap: 14 }}>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <Badge tone={record.classification?.is_success === true ? "ok" : "neutral"}>
+                    {text(record.state, t(lang, "runs.unknown"))}
+                  </Badge>
+                  {recordOutcome !== "" ? (
+                    <Badge
+                      tone={
+                        recordOutcome === "PROJECT_COMPLETED"
+                          ? "ok"
+                          : recordOutcome === "FAILED"
+                            ? "danger"
+                            : "warn"
+                      }
+                    >
+                      {recordOutcome}
+                    </Badge>
+                  ) : null}
+                  <span className="mono small muted">{text(record.run_id)}</span>
+                </div>
+                {/* The stages the record itself proves. A terminal record stops the pulse and
+                    prints its own state; no percentage is drawn anywhere. */}
+                <RunProgress lang={lang} record={record} />
+                <Facts
+                  items={[
+                    [t(lang, "forge.execution.state"), text(record.state)],
+                    [t(lang, "forge.execution.status"), text(record.status)],
+                    [t(lang, "forge.result.outcome"), text(recordOutcome)],
+                    [t(lang, "forge.execution.events"), text(record.event_count)],
+                    [t(lang, "forge.execution.sequence"), text(record.last_sequence_number)],
+                    [t(lang, "forge.execution.attempt"), text(record.attempt_number)],
+                    [t(lang, "forge.execution.interrupted"), yesNo(lang, record.interrupted)],
+                    [t(lang, "forge.execution.updated"), text(record.updated_at)],
+                    [t(lang, "forge.execution.classification"), text(record.classification?.outcome)],
+                    [t(lang, "forge.execution.reason"), text(record.classification?.reason)],
+                    [t(lang, "forge.execution.detail"), text(record.classification?.detail)],
+                  ]}
+                />
+                {record.classification?.evidence && record.classification.evidence.length > 0 ? (
+                  <div>
+                    <div className="label">{t(lang, "forge.execution.evidence")}</div>
+                    <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                      {record.classification.evidence.map((item) => (
+                        <Badge key={item} tone="neutral">
+                          {item}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </Card>
+
+          {/* --------------------------------------------------------------- code write */}
+          {codeWrite !== null || (requestedWriteMode && terminal) ? (
+            <CodeWriteCard lang={lang} write={codeWrite} />
+          ) : null}
+
+          {/* ----------------------------------------------------------------- result */}
+          <Card className="rise d3">
+            <CardHead
+              title={t(lang, "forge.result.title")}
+              hint={t(lang, "forge.result.hint")}
+              action={
+                dispatched ? (
+                  <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                    <Badge
+                      tone={
+                        dispatched.response.outcome === "PROJECT_COMPLETED"
+                          ? "ok"
+                          : dispatched.response.outcome === "FAILED"
+                            ? "danger"
+                            : "neutral"
+                      }
+                    >
+                      {text(dispatched.response.outcome, t(lang, "runs.unknown"))}
+                    </Badge>
+                    <Badge tone={dispatched.response.success === true ? "ok" : "warn"}>
+                      {text(dispatched.response.state, t(lang, "runs.unknown"))}
+                    </Badge>
+                  </span>
+                ) : null
+              }
+            />
+            {!dispatched ? (
+              <div className="small muted">{t(lang, "forge.result.empty")}</div>
+            ) : (
+              <div className="stack" style={{ gap: 14 }}>
+                {/* The three independent save facts, exactly as the response reports them. The old
+                    single «Запись сохранена: да» badge is gone: one boolean hid an empty project
+                    behind a stored run record. */}
+                <div>
+                  <div className="label">{t(lang, "forge.result.saved.title")}</div>
+                  <div style={{ marginTop: 8 }}>
+                    <Facts
+                      items={[
+                        [
+                          t(lang, "forge.result.saved.run"),
+                          yesNo(lang, dispatched.response.run_record_saved),
+                        ],
+                        [
+                          t(lang, "forge.result.saved.project"),
+                          yesNo(lang, dispatched.response.project_created),
+                        ],
+                        [
+                          t(lang, "forge.result.saved.files"),
+                          yesNo(lang, dispatched.response.project_files_created),
+                        ],
+                      ]}
+                    />
+                  </div>
+                </div>
+
+                {/* A run that stopped to ask questions lists them and offers the discovery
+                    session, instead of looking like a finished project. */}
+                {dispatched.response.outcome === "CLARIFICATION_REQUIRED" ? (
+                  <div className="notice warn">
+                    <div className="label">{t(lang, "forge.result.clarification.title")}</div>
+                    {Array.isArray(dispatched.response.clarification_questions) &&
+                    dispatched.response.clarification_questions.length > 0 ? (
+                      <ol className="forge-questions" style={{ marginTop: 8 }}>
+                        {dispatched.response.clarification_questions.map((question) => (
+                          <li className="forge-question" key={question}>
+                            {question}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <div className="small" style={{ marginTop: 6 }}>
+                        {t(lang, "forge.result.clarification.empty")}
+                      </div>
+                    )}
+                    <div className="row" style={{ marginTop: 10 }}>
+                      <Button size="small" tone="primary" onClick={() => void answerClarification()}>
+                        {t(lang, "forge.result.clarification.answer")}
+                      </Button>
+                    </div>
+                    <div className="small" style={{ marginTop: 6 }}>
+                      {t(lang, "forge.result.clarification.hint")}
+                    </div>
+                  </div>
+                ) : null}
+
+                <div>
+                  <div className="label">{t(lang, "forge.result.output")}</div>
+                  <pre className="forge-output mono small">
+                    {typeof dispatched.response.output === "string" && dispatched.response.output !== ""
+                      ? dispatched.response.output
+                      : t(lang, "forge.result.no_output")}
+                  </pre>
+                </div>
+
+                {dispatched.response.error ? (
+                  <div className="notice danger">{String(dispatched.response.error)}</div>
+                ) : null}
+
+                <Facts
+                  items={[
+                    [
+                      t(lang, "runs.result.tokens"),
+                      dispatched.response.tokens === null || dispatched.response.tokens === undefined
+                        ? t(lang, "runs.unknown")
+                        : String(dispatched.response.tokens),
+                    ],
+                    [
+                      t(lang, "runs.result.cost"),
+                      typeof dispatched.response.cost === "number"
+                        ? `$${fixed(dispatched.response.cost, 4)}`
+                        : t(lang, "runs.unknown"),
+                    ],
+                    [t(lang, "runs.result.duration"), fixed(dispatched.response.duration_seconds, 3)],
+                    [t(lang, "runs.result.provider"), text(dispatched.response.provider_used)],
+                    [t(lang, "runs.result.model"), text(dispatched.response.model_used)],
+                    [t(lang, "forge.result.outcome"), text(dispatched.response.outcome)],
+                    [t(lang, "forge.result.state"), text(dispatched.response.state)],
+                    [
+                      t(lang, "forge.result.files.created"),
+                      typeof dispatched.response.files_created === "number"
+                        ? String(dispatched.response.files_created)
+                        : t(lang, "runs.unknown"),
+                    ],
+                    [
+                      t(lang, "forge.result.manifest"),
+                      yesNo(lang, dispatched.response.artifact_manifest_saved),
+                    ],
+                    [
+                      t(lang, "forge.result.cost.tier"),
+                      text(dispatched.response.cost_tier, t(lang, "forge.launch.cost.unknown")),
+                    ],
+                    [t(lang, "forge.result.task"), text(dispatched.response.task_id)],
+                    [t(lang, "forge.result.project"), text(dispatched.response.project_id)],
+                    [t(lang, "forge.result.run"), text(dispatched.response.run_id)],
+                  ]}
+                />
+
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <Badge tone={dispatched.facts.usage_basis === "ACTUAL" ? "ok" : "warn"}>
+                    {t(lang, "runs.basis.usage")}:{" "}
+                    {text(dispatched.facts.usage_basis, t(lang, "runs.unknown"))}
+                  </Badge>
+                  <Badge tone={dispatched.facts.cost_basis === "ACTUAL" ? "ok" : "warn"}>
+                    {t(lang, "runs.basis.cost")}:{" "}
+                    {text(dispatched.facts.cost_basis, t(lang, "runs.unknown"))}
+                  </Badge>
+                  {dispatched.facts.idempotent_replay === true ? (
+                    <Badge tone="info">{t(lang, "runs.basis.replay")}</Badge>
+                  ) : null}
+                </div>
+
+                {!basisReported ? (
+                  <div className="small muted">{t(lang, "forge.result.basis.missing")}</div>
+                ) : null}
+              </div>
+            )}
+          </Card>
+
+          {/* -------------------------------------------------------------- artifacts
+              Only after a run exists: the card states that the route is missing, and before a run
+              there is nothing to state. */}
+          {dispatched !== null ? (
+            <Card className="rise d3">
+              <CardHead
+                title={t(lang, "forge.artifacts.title")}
+                action={<Badge tone="warn">{t(lang, "forge.artifacts.none")}</Badge>}
+              />
+              <div className="stack small" style={{ gap: 10 }}>
+                <div className="muted">{t(lang, "forge.artifacts.body")}</div>
+                <div className="muted">{t(lang, "forge.artifacts.review")}</div>
+                <div>
+                  <div className="label">{t(lang, "forge.artifacts.routes")}</div>
+                  <div className="stack mono small" style={{ gap: 4, marginTop: 6 }}>
+                    {[
+                      "GET  /api/status",
+                      "GET  /api/projects",
+                      "GET  /api/agents",
+                      "GET  /api/models",
+                      "POST /api/tasks/run",
+                      "GET  /api/runs/{run_id}",
+                    ].map((route) => (
+                      <span key={route} className="muted">
+                        {route}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </Card>
+          ) : null}
+        </div>
+
+        <div className="stack">
           {/* ---------------------------------------------------------------- projects */}
-          <Card className="rise">
+          <Card className="rise d1">
             <CardHead
               title={t(lang, "forge.projects.title")}
               hint={t(lang, "forge.projects.hint")}
@@ -1051,397 +1696,10 @@ export const Forge = ({
             )}
           </Card>
 
-          {/* -------------------------------------------------------------------- task */}
-          <Card className="rise d1">
-            <CardHead
-              title={t(lang, "forge.task.title")}
-              hint={t(lang, "forge.task.hint")}
-              action={
-                <Badge tone={live ? "info" : backend.status === "loading" ? "neutral" : "warn"}>
-                  {backend.status === "loading" ? "…" : live ? "LIVE" : "OFFLINE"}
-                </Badge>
-              }
-            />
-            <div className="stack" style={{ gap: 14 }}>
-              <StepRail lang={lang} phase={phase} />
-
-              {/* Step 1 — the idea. The only field that is the user's own words. */}
-              {phase === "idea" ? (
-                <div className="stack" style={{ gap: 12 }}>
-                  <Field
-                    label={t(lang, "forge.discovery.goal.label")}
-                    hint={t(lang, "forge.discovery.goal.hint")}
-                    error={descriptionError}
-                  >
-                    <textarea
-                      className="input"
-                      rows={4}
-                      value={description}
-                      onChange={(event) => setDescription(event.target.value)}
-                      placeholder={t(lang, "forge.discovery.goal.placeholder")}
-                    />
-                  </Field>
-                  <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-                    <Button
-                      tone="primary"
-                      disabled={discoveryBusy === "idea"}
-                      onClick={() => void continueFromIdea()}
-                    >
-                      <IconPlay size={15} />
-                      {discoveryBusy === "idea"
-                        ? t(lang, "runs.form.running")
-                        : t(lang, "forge.discovery.continue")}
-                    </Button>
-                    <span className="small muted">{t(lang, "forge.discovery.continue.note")}</span>
-                  </div>
-                </div>
-              ) : null}
-
-              {/* The session the Core actually opened, named as it is stored. */}
-              {phase !== "idea" ? (
-                <div className="small row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-                  <span className="muted">{t(lang, "forge.discovery.session")}</span>
-                  <span className="mono">{text(sessionId, "—")}</span>
-                  <span className="muted">{t(lang, "forge.discovery.state")}</span>
-                  <Badge tone={confirmed ? "ok" : sessionState === "CANCELLED" ? "danger" : "info"}>
-                    {text(sessionState, t(lang, "runs.unknown"))}
-                  </Badge>
-                </div>
-              ) : null}
-
-              {/* Step 2 — the questions the Core returned, as a numbered list. */}
-              {phase === "clarify" ? (
-                <div className="stack" style={{ gap: 12 }}>
-                  <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
-                    <div className="label">
-                      {t(lang, "forge.discovery.questions.title").replace("{n}", String(questions.length))}
-                    </div>
-                    <Badge tone={sessionState === "READY_FOR_PLANNING" ? "info" : "neutral"}>
-                      {text(sessionState, t(lang, "runs.unknown"))}
-                    </Badge>
-                  </div>
-                  {questions.length === 0 ? (
-                    <div className="small muted">{t(lang, "forge.discovery.questions.empty")}</div>
-                  ) : (
-                    <ol className="forge-questions">
-                      {questions.map((question) => {
-                        const id = String(question.id ?? "");
-                        return (
-                          <li className="forge-question" key={id}>
-                            <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
-                              <span style={{ fontWeight: 600 }}>{text(question.text)}</span>
-                              <Badge tone={question.required ? "warn" : "neutral"}>
-                                {question.required
-                                  ? t(lang, "forge.discovery.question.required")
-                                  : t(lang, "forge.discovery.question.optional")}
-                              </Badge>
-                            </div>
-                            <div className="small muted">
-                              {t(lang, "forge.discovery.question.why")} {text(question.why, "—")}
-                            </div>
-                            <input
-                              className="input"
-                              type="text"
-                              value={answerDraft[id] ?? ""}
-                              onChange={(event) =>
-                                setAnswerDraft((previous) => ({ ...previous, [id]: event.target.value }))
-                              }
-                              placeholder={t(lang, "forge.discovery.answer.placeholder")}
-                              aria-label={text(question.text)}
-                            />
-                          </li>
-                        );
-                      })}
-                    </ol>
-                  )}
-                  <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-                    <Button
-                      tone="primary"
-                      disabled={discoveryBusy === "answers"}
-                      onClick={() => void sendAnswers()}
-                    >
-                      {discoveryBusy === "answers"
-                        ? t(lang, "runs.form.running")
-                        : t(lang, "forge.discovery.send")}
-                    </Button>
-                    <Button
-                      disabled={discoveryBusy === "skip"}
-                      onClick={() => void skipClarification()}
-                    >
-                      {t(lang, "forge.discovery.skip")}
-                    </Button>
-                    <Button
-                      tone="ghost"
-                      disabled={discoveryBusy === "cancel"}
-                      onClick={() => void cancelSession()}
-                    >
-                      {t(lang, "forge.discovery.cancel")}
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
-
-              {/* Step 3 — the specification, as a definition list from its own route. */}
-              {phase === "spec" ? (
-                <div className="stack" style={{ gap: 12 }}>
-                  <div>
-                    <div className="label">{t(lang, "forge.discovery.spec.title")}</div>
-                    <div className="small muted">{t(lang, "forge.discovery.spec.hint")}</div>
-                  </div>
-                  {discoverySpec === null ? (
-                    <div className="small muted">
-                      {discoveryBusy === "spec"
-                        ? t(lang, "forge.discovery.spec.loading")
-                        : t(lang, "forge.discovery.spec.empty")}
-                    </div>
-                  ) : (
-                    <dl className="forge-spec">
-                      {SPEC_FIELDS.map(({ key, labelKey }) => {
-                        const value = specValue(discoverySpec.specification, key);
-                        return (
-                          <div className="forge-spec-row" key={key}>
-                            <dt className="label">{t(lang, labelKey)}</dt>
-                            <dd className={value === "" ? "muted" : ""}>
-                              {value === "" ? t(lang, "forge.discovery.spec.empty") : value}
-                            </dd>
-                          </div>
-                        );
-                      })}
-                    </dl>
-                  )}
-                  <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-                    <Button
-                      tone="primary"
-                      disabled={discoveryBusy === "confirm"}
-                      onClick={() => void confirmSpecification()}
-                    >
-                      {discoveryBusy === "confirm"
-                        ? t(lang, "runs.form.running")
-                        : t(lang, "forge.discovery.spec.confirm")}
-                    </Button>
-                    <Button onClick={editAnswers}>{t(lang, "forge.discovery.spec.edit")}</Button>
-                    <Button
-                      tone="ghost"
-                      disabled={discoveryBusy === "cancel"}
-                      onClick={() => void cancelSession()}
-                    >
-                      {t(lang, "forge.discovery.cancel")}
-                    </Button>
-                  </div>
-                  {typeof discoverySpec?.task_text === "string" && discoverySpec.task_text !== "" ? (
-                    <details>
-                      <summary className="small muted" style={{ cursor: "pointer" }}>
-                        task_text
-                      </summary>
-                      <pre className="forge-output mono small">{discoverySpec.task_text}</pre>
-                    </details>
-                  ) : null}
-                </div>
-              ) : null}
-
-              {/* Step 4 — the run. The same controls are reachable one step earlier on purpose:
-                  pressing "Запустить задачу" before confirming is exactly how the Core's 409
-                  guard becomes visible instead of hidden behind a disabled button. */}
-              {phase === "run" ? (
-                <div className="stack" style={{ gap: 14 }}>
-                  <div className={`notice ${confirmed ? "" : "warn"}`}>
-                    {confirmed ? t(lang, "forge.discovery.run.ready") : t(lang, "forge.discovery.run.preconfirm")}
-                  </div>
-                  <Field
-                    label={t(lang, "forge.discovery.run.task")}
-                    hint={t(lang, "forge.discovery.run.task.hint")}
-                    error={descriptionError}
-                  >
-                    <textarea
-                      className="input"
-                      rows={3}
-                      value={description}
-                      onChange={(event) => setDescription(event.target.value)}
-                      placeholder={t(lang, "forge.discovery.goal.placeholder")}
-                    />
-                  </Field>
-                  {runControls}
-                </div>
-              ) : null}
-
-              {phase === "clarify" || phase === "spec" ? (
-                <div className="stack" style={{ gap: 12 }}>
-                  <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
-                    <div className="label">{t(lang, "forge.discovery.run.title")}</div>
-                    <Badge tone="warn">HTTP 409</Badge>
-                  </div>
-                  <div className="notice warn">{t(lang, "forge.discovery.run.preconfirm")}</div>
-                  {runControls}
-                </div>
-              ) : null}
-
-              {discoveryFailure !== null ? (
-                <FailureNotice lang={lang} failure={discoveryFailure} />
-              ) : null}
-              {discoveryNotice !== "" ? <div className="notice">{discoveryNotice}</div> : null}
-            </div>
-          </Card>
-
-          {/* --------------------------------------------------------------- execution */}
+          {/* ----------------------------------------------------------------- agents
+              Collapsed to one line: the agent list, its models and its capabilities live in
+              «Провайдеры», which is the full diagnostics hub. */}
           <Card className="rise d2">
-            <CardHead
-              title={t(lang, "forge.execution.title")}
-              hint={t(lang, "forge.execution.hint").replace("{sec}", POLL_INTERVAL_LABEL)}
-              action={
-                <Badge tone={runId === "" ? "neutral" : terminal ? "ok" : polling ? "info" : "warn"}>
-                  {runId === ""
-                    ? "—"
-                    : terminal
-                      ? t(lang, "forge.execution.terminal")
-                      : polling
-                        ? t(lang, "forge.execution.polling")
-                        : t(lang, "forge.execution.waiting")}
-                </Badge>
-              }
-            />
-            {runId === "" ? (
-              <div className="small muted">{t(lang, "forge.execution.empty")}</div>
-            ) : recordFailure ? (
-              <FailureNotice
-                lang={lang}
-                failure={recordFailure}
-                onRetry={() => setPollNonce((value) => value + 1)}
-              />
-            ) : record === null ? (
-              <div className="small muted">
-                {recordLoading ? t(lang, "forge.execution.waiting") : t(lang, "forge.execution.empty")}
-              </div>
-            ) : (
-              <div className="stack" style={{ gap: 14 }}>
-                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                  <Badge tone={record.classification?.is_success === true ? "ok" : "neutral"}>
-                    {text(record.state, t(lang, "runs.unknown"))}
-                  </Badge>
-                  <span className="mono small muted">{text(record.run_id)}</span>
-                </div>
-                {/* The stages the record itself proves. A terminal record stops the pulse and
-                    prints its own state; no percentage is drawn anywhere. */}
-                <RunProgress lang={lang} record={record} />
-                <Facts
-                  items={[
-                    [t(lang, "forge.execution.state"), text(record.state)],
-                    [t(lang, "forge.execution.status"), text(record.status)],
-                    [t(lang, "forge.execution.events"), text(record.event_count)],
-                    [t(lang, "forge.execution.sequence"), text(record.last_sequence_number)],
-                    [t(lang, "forge.execution.attempt"), text(record.attempt_number)],
-                    [t(lang, "forge.execution.interrupted"), yesNo(lang, record.interrupted)],
-                    [t(lang, "forge.execution.updated"), text(record.updated_at)],
-                    [t(lang, "forge.execution.classification"), text(record.classification?.outcome)],
-                    [t(lang, "forge.execution.reason"), text(record.classification?.reason)],
-                    [t(lang, "forge.execution.detail"), text(record.classification?.detail)],
-                  ]}
-                />
-                {record.classification?.evidence && record.classification.evidence.length > 0 ? (
-                  <div>
-                    <div className="label">{t(lang, "forge.execution.evidence")}</div>
-                    <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
-                      {record.classification.evidence.map((item) => (
-                        <Badge key={item} tone="neutral">
-                          {item}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            )}
-          </Card>
-
-          {/* --------------------------------------------------------------- code write */}
-          {codeWrite !== null || (requestedWriteMode && terminal) ? (
-            <CodeWriteCard lang={lang} write={codeWrite} />
-          ) : null}
-
-          {/* ----------------------------------------------------------------- result */}
-          <Card className="rise d3">
-            <CardHead
-              title={t(lang, "forge.result.title")}
-              hint={t(lang, "forge.result.hint")}
-              action={
-                dispatched ? (
-                  <Badge tone={dispatched.response.success === true ? "ok" : "warn"}>
-                    {text(dispatched.response.state, t(lang, "runs.unknown"))}
-                  </Badge>
-                ) : null
-              }
-            />
-            {!dispatched ? (
-              <div className="small muted">{t(lang, "forge.result.empty")}</div>
-            ) : (
-              <div className="stack" style={{ gap: 14 }}>
-                <div>
-                  <div className="label">{t(lang, "forge.result.output")}</div>
-                  <pre className="forge-output mono small">
-                    {typeof dispatched.response.output === "string" && dispatched.response.output !== ""
-                      ? dispatched.response.output
-                      : t(lang, "forge.result.no_output")}
-                  </pre>
-                </div>
-
-                {dispatched.response.error ? (
-                  <div className="notice danger">{String(dispatched.response.error)}</div>
-                ) : null}
-
-                <Facts
-                  items={[
-                    [
-                      t(lang, "runs.result.tokens"),
-                      dispatched.response.tokens === null || dispatched.response.tokens === undefined
-                        ? t(lang, "runs.unknown")
-                        : String(dispatched.response.tokens),
-                    ],
-                    [
-                      t(lang, "runs.result.cost"),
-                      typeof dispatched.response.cost === "number"
-                        ? `$${fixed(dispatched.response.cost, 4)}`
-                        : t(lang, "runs.unknown"),
-                    ],
-                    [t(lang, "runs.result.duration"), fixed(dispatched.response.duration_seconds, 3)],
-                    [t(lang, "runs.result.provider"), text(dispatched.response.provider_used)],
-                    [t(lang, "runs.result.model"), text(dispatched.response.model_used)],
-                    [t(lang, "forge.result.task"), text(dispatched.response.task_id)],
-                    [t(lang, "forge.result.project"), text(dispatched.response.project_id)],
-                    [t(lang, "forge.result.run"), text(dispatched.response.run_id)],
-                  ]}
-                />
-
-                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                  <Badge tone={dispatched.facts.usage_basis === "ACTUAL" ? "ok" : "warn"}>
-                    {t(lang, "runs.basis.usage")}:{" "}
-                    {text(dispatched.facts.usage_basis, t(lang, "runs.unknown"))}
-                  </Badge>
-                  <Badge tone={dispatched.facts.cost_basis === "ACTUAL" ? "ok" : "warn"}>
-                    {t(lang, "runs.basis.cost")}:{" "}
-                    {text(dispatched.facts.cost_basis, t(lang, "runs.unknown"))}
-                  </Badge>
-                  {dispatched.facts.idempotent_replay === true ? (
-                    <Badge tone="info">{t(lang, "runs.basis.replay")}</Badge>
-                  ) : null}
-                  <Badge tone={historyPersisted === false ? "warn" : historyPersisted === true ? "ok" : "neutral"}>
-                    {t(lang, "forge.result.history")}: {yesNo(lang, historyPersisted)}
-                  </Badge>
-                </div>
-
-                {!basisReported ? (
-                  <div className="small muted">{t(lang, "forge.result.basis.missing")}</div>
-                ) : null}
-
-                {historyPersisted === false ? (
-                  <div className="notice warn">{t(lang, "runs.history.failed")}</div>
-                ) : null}
-              </div>
-            )}
-          </Card>
-        </div>
-
-        <div className="stack">
-          {/* ----------------------------------------------------------------- agents */}
-          <Card className="rise d1">
             <CardHead
               title={t(lang, "forge.agents.title")}
               hint={t(lang, "forge.agents.hint")}
@@ -1451,68 +1709,16 @@ export const Forge = ({
                 </Badge>
               }
             />
-            {backend.status === "loading" ? (
-              <div className="small muted">{t(lang, "state.loading")}</div>
-            ) : backend.status === "offline" ? (
-              <div className="notice danger">{t(lang, "forge.agents.error")}</div>
-            ) : backend.agents.length === 0 ? (
-              <div className="small muted">{t(lang, "forge.agents.empty")}</div>
-            ) : (
-              <div className="stack" style={{ gap: 8 }}>
-                {backend.agents.map((agent, index) => (
-                  <div className="forge-agent" key={`${String(agent.name ?? "agent")}-${index}`}>
-                    <div className="row between">
-                      <span className="row" style={{ gap: 8 }}>
-                        <StatusDot tone={agent.status === "available" ? "ok" : "warn"} />
-                        <span style={{ fontWeight: 600 }}>{text(agent.name)}</span>
-                      </span>
-                      <Badge tone={agent.status === "available" ? "ok" : "warn"}>
-                        {text(agent.status, t(lang, "runs.unknown"))}
-                      </Badge>
-                    </div>
-                    <div className="mono small muted">
-                      {text(agent.provider)} · {text(agent.model)}
-                    </div>
-                    {Array.isArray(agent.capabilities) && agent.capabilities.length > 0 ? (
-                      <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
-                        {agent.capabilities.map((capability) => (
-                          <Badge key={String(capability)} tone="neutral">
-                            {String(capability)}
-                          </Badge>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            )}
-          </Card>
-
-          {/* -------------------------------------------------------------- artifacts */}
-          <Card className="rise d2">
-            <CardHead
-              title={t(lang, "forge.artifacts.title")}
-              action={<Badge tone="warn">{t(lang, "forge.artifacts.none")}</Badge>}
-            />
             <div className="stack small" style={{ gap: 10 }}>
-              <div className="muted">{t(lang, "forge.artifacts.body")}</div>
-              <div className="muted">{t(lang, "forge.artifacts.review")}</div>
-              <div>
-                <div className="label">{t(lang, "forge.artifacts.routes")}</div>
-                <div className="stack mono small" style={{ gap: 4, marginTop: 6 }}>
-                  {[
-                    "GET  /api/status",
-                    "GET  /api/projects",
-                    "GET  /api/agents",
-                    "GET  /api/models",
-                    "POST /api/tasks/run",
-                    "GET  /api/runs/{run_id}",
-                  ].map((route) => (
-                    <span key={route} className="muted">
-                      {route}
-                    </span>
-                  ))}
-                </div>
+              <div className="muted">
+                {backend.status === "live" && backend.agents.length === 0
+                  ? t(lang, "forge.agents.empty")
+                  : t(lang, "forge.agents.link")}
+              </div>
+              <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                <Button size="small" onClick={onOpenProviders}>
+                  {t(lang, "forge.agents.open")}
+                </Button>
               </div>
             </div>
           </Card>

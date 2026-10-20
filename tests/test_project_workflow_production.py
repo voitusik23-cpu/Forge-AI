@@ -812,6 +812,19 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 "duration_seconds",
                 "provider_used",
                 "model_used",
+                # The outcome gate's contract: the provider-neutral outcome, the
+                # questions a clarification answer asked, and the four independent
+                # save indicators (plus the file count they describe).
+                "outcome",
+                "clarification_questions",
+                "needs_clarification",
+                "run_record_saved",
+                "project_created",
+                "project_files_created",
+                "artifact_manifest_saved",
+                "files_created",
+                "cost_tier",
+                "estimated_cost",
             },
         )
 

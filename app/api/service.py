@@ -45,6 +45,13 @@ from app.agent_runtime.idempotency_integration import (
 )
 from app.agent_runtime.tool_execution import ToolIntent
 from app.agent_runtime.models import HarnessRequest
+from app.agent_runtime.outcome import (
+    RunOutcome,
+    derive_outcome,
+    extract_clarifying_questions,
+    honest_state,
+    state_for_outcome,
+)
 from app.agent_runtime.code_writer import (
     STATUS_APPLIED,
     WriteResult,
@@ -410,6 +417,17 @@ class RunIdempotencyConflict(RuntimeError):
 
 class IdempotencyUnavailable(RuntimeError):
     """A key was supplied but the durable ledger cannot be used, so nothing was dispatched."""
+
+
+class PaidModelRequiresConfirmation(RuntimeError):
+    """A paid provider/model was about to be used without the caller naming it.
+
+    Raised before anything is dispatched, so a refusal spends nothing. The message
+    names the provider and the model (neither is a secret) and never a key, an
+    environment variable, a prefix or a length.
+    """
+
+    code = "paid_model_requires_confirmation"
 
 
 @dataclass(frozen=True)
@@ -1091,6 +1109,18 @@ class ForgeApiService:
         if record is None:
             return None
         summary = record.summary()
+        # The outcome is the durable half of the response gate: the task path records
+        # it in ``project_state``, and this read surfaces it beside the run's own
+        # ``state`` so a consumer reading the history sees the same verdict the
+        # response carried. It is omitted entirely when the run recorded none.
+        try:
+            snapshot = self._run_store.read_state(run_id.strip())
+        except Exception:  # noqa: BLE001 - an unreadable snapshot adds no key
+            snapshot = None
+        if snapshot is not None and isinstance(snapshot.project_state, Mapping):
+            recorded_outcome = snapshot.project_state.get("outcome")
+            if isinstance(recorded_outcome, str) and recorded_outcome.strip():
+                summary["outcome"] = recorded_outcome.strip()
         try:
             classification = self._run_store.classify_record(run_id.strip())
         except Exception:  # noqa: BLE001 - a read path must not fail on classification
@@ -2554,6 +2584,12 @@ class ForgeApiService:
                     }
                 )
             for model in registry.list_models():
+                # ``cost_tier`` is published as the fixed vocabulary the UI shows --
+                # FREE / CHEAP / PAID -- rather than as the enum's repr, so a client
+                # can compare it literally. ``estimated_cost`` is the registry's own
+                # unit price for 1M input tokens in USD, or ``null`` when the
+                # registry carries no rate: it is a unit price, not a forecast.
+                rate = getattr(model, "input_cost_per_1m", None)
                 models.append(
                     {
                         "provider_id": model.provider_id,
@@ -2562,8 +2598,13 @@ class ForgeApiService:
                         "context_window": int(model.context_window),
                         "max_output_tokens": int(model.max_output_tokens),
                         "capabilities": sorted(str(item) for item in model.capabilities),
-                        "cost_tier": str(model.cost_tier),
+                        "cost_tier": str(getattr(model.cost_tier, "value", model.cost_tier)).upper(),
                         "supports_system_prompt": bool(model.supports_system_prompt),
+                        "estimated_cost": (
+                            float(rate)
+                            if isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                            else None
+                        ),
                     }
                 )
             for account in registry.list_accounts():
@@ -2784,18 +2825,71 @@ class ForgeApiService:
                 )
                 provider = str(accounting.get("provider") or "")
                 model = str(accounting.get("model") or "")
+        # A replay answers with the recorded result, so it must not resurrect a
+        # success claim the gate has since retired. The *recorded* outcome is used
+        # when the original run stored one -- that is the whole point of the durable
+        # field, and it is the only way a replay can know a project was attached
+        # after the original response was assembled. Only a record that predates the
+        # outcome field falls back to re-deriving it from the state, and then with no
+        # project facts, so it still cannot claim a completed project.
+        replayed_state = state or str(getattr(record, "state", "") or "UNKNOWN")
+        replayed_success = state.upper() == "COMPLETED"
+        recorded_state: Mapping[str, object] = {}
+        if isinstance(record_payload, dict):
+            candidate = record_payload.get("project_state")
+            if isinstance(candidate, Mapping):
+                recorded_state = candidate
+        recorded_outcome = str(recorded_state.get("outcome") or "").strip()
+        outcome = None
+        if recorded_outcome:
+            for member in RunOutcome:
+                if member.value == recorded_outcome.upper():
+                    outcome = member
+                    break
+        if outcome is None:
+            outcome = derive_outcome(
+                run_state=replayed_state,
+                run_success=replayed_success,
+                error=None,
+                answer_text="",
+                project_exists=False,
+                artifact_count=0,
+                verification="",
+                acceptance="",
+                specification_confirmed=False,
+            )
+        recorded_files = recorded_state.get("files_created")
         return TaskRunResponse(
             run_id=run_id,
             task_id=req.task_id or "",
             project_id=project_id,
-            state=state or str(getattr(record, "state", "") or "UNKNOWN"),
-            success=state.upper() == "COMPLETED",
+            state=honest_state(replayed_state, outcome),
+            success=replayed_success,
             output="",
             error=None,
             tokens=tokens,
             cost=cost,
             provider_used=provider,
             model_used=model,
+            outcome=outcome.value,
+            clarification_questions=[
+                str(item)
+                for item in (recorded_state.get("clarification_questions") or [])
+            ],
+            needs_clarification=outcome is RunOutcome.CLARIFICATION_REQUIRED,
+            run_record_saved=bool(run_id),
+            project_created=bool(recorded_state.get("project_created", False)),
+            project_files_created=bool(
+                recorded_state.get("project_files_created", False)
+            ),
+            artifact_manifest_saved=bool(
+                recorded_state.get("artifact_manifest_saved", False)
+            ),
+            files_created=(
+                int(recorded_files)
+                if isinstance(recorded_files, int) and not isinstance(recorded_files, bool)
+                else 0
+            ),
         )
 
     def bind_authorized_project(self, project_id: str) -> None:
@@ -2855,6 +2949,173 @@ class ForgeApiService:
         if isinstance(configured, str) and configured.strip():
             return configured.strip()
         return ""
+
+    # ------------------------------------------------------------ cost policy
+    def _resolved_model_registry(self) -> object:
+        """The model registry this composition routes with, or ``None``.
+
+        Defense in depth, exactly as the catalogue resolves it: the service holder,
+        then the runtime, then the built-in default registry. A missing registry is
+        reported as ``None`` rather than replaced by an invented one.
+        """
+
+        registry = getattr(self, "_model_registry", None)
+        if registry is None:
+            runtime = getattr(self, "_runtime", None)
+            registry = (
+                getattr(runtime, "model_registry", None)
+                if runtime is not None
+                else None
+            )
+        if registry is None:
+            try:
+                from app.agents.providers.model_registry import create_default_registry
+
+                registry = create_default_registry()
+            except Exception:  # noqa: BLE001 - an absent registry is reported, not faked
+                registry = None
+        return registry
+
+    def _allow_paid_providers(self) -> bool:
+        """Whether the operator enabled paid providers for this composition.
+
+        The dispatcher's own value wins, because that is the value routing actually
+        honours; ``runtime.settings`` is the fallback for a runtime assembled by
+        hand, and a missing value is the fail-closed ``False``.
+        """
+
+        dispatcher = getattr(
+            getattr(self._runtime, "orchestrator", None), "_dispatcher", None
+        )
+        value = getattr(dispatcher, "_allow_paid_providers", None)
+        if isinstance(value, bool):
+            return value
+        settings = getattr(self._runtime, "settings", None)
+        value = getattr(settings, "allow_paid_providers", False)
+        return bool(value)
+
+    def _run_model_name(self, provider_name: str, requested_model: object) -> str:
+        """The model this run would use on ``provider_name``.
+
+        A model the caller named is used verbatim. Otherwise the provider's own
+        configured model is read from the provider instance the composition
+        registered -- the same value the provider would run. No model is invented:
+        an unknown one stays empty, and an empty model is never assumed to be paid.
+        """
+
+        requested = str(requested_model or "").strip()
+        if requested:
+            return requested
+        provider = str(provider_name or "").strip().lower()
+        if not provider:
+            return ""
+        registry = getattr(self._runtime, "provider_registry", None)
+        getter = getattr(registry, "get", None)
+        if not callable(getter):
+            return ""
+        try:
+            instance = getter(provider)
+        except Exception:  # noqa: BLE001 - an unregistered provider has no model
+            return ""
+        configured = getattr(getattr(instance, "config", None), "model_name", None)
+        return str(configured or "").strip()
+
+    def _model_cost_facts(
+        self, provider_name: str, model_name: str
+    ) -> tuple[Optional[str], Optional[float]]:
+        """``(cost_tier, unit_price)`` for one provider/model pair.
+
+        ``cost_tier`` is ``FREE``/``CHEAP``/``PAID`` (the words the run response and
+        the models payload publish), or ``None`` when neither the model registry nor
+        the provider capability registry knows the pair. ``unit_price`` is the
+        registry's own per-1M-input-token rate in USD, or ``None`` -- it is a unit
+        price, never a forecast of a run.
+        """
+
+        provider = str(provider_name or "").strip().lower()
+        model = str(model_name or "").strip()
+        tier_word: Optional[str] = None
+        unit_price: Optional[float] = None
+        registry = self._resolved_model_registry()
+        if registry is not None and provider and model:
+            try:
+                info = registry.get_model(model, provider_id=provider)
+            except Exception:  # noqa: BLE001 - an unregistered model has no tier
+                info = None
+            if info is not None:
+                raw_tier = getattr(getattr(info, "cost_tier", None), "value", None)
+                if isinstance(raw_tier, str) and raw_tier.strip():
+                    tier_word = raw_tier.strip().upper()
+                rate = getattr(info, "input_cost_per_1m", None)
+                if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+                    unit_price = float(rate)
+        if tier_word is None and provider:
+            # A provider whose own capability entry is PAID makes every one of its
+            # models paid, including a model the model registry does not list.
+            capabilities = getattr(self._runtime, "provider_capabilities", None)
+            getter = getattr(capabilities, "get", None)
+            if callable(getter):
+                try:
+                    capability = getter(provider)
+                except Exception:  # noqa: BLE001 - an unknown provider has no tier
+                    capability = None
+                raw_tier = getattr(
+                    getattr(capability, "cost_tier", None), "value", None
+                )
+                if isinstance(raw_tier, str) and raw_tier.strip():
+                    tier_word = raw_tier.strip().upper()
+        return tier_word, unit_price
+
+    def _enforce_paid_policy(self, req: TaskRunRequest) -> dict:
+        """Refuse a paid provider/model the caller did not explicitly choose.
+
+        Three facts decide, and all three are read from the composition rather than
+        from the request:
+
+        * the pair this run would actually use (selected provider, its model);
+        * that pair's ``cost_tier``;
+        * whether the operator enabled paid providers.
+
+        A ``PAID`` pair runs only when the caller named **both** the provider and the
+        model *and* the operator enabled paid providers. Everything else is refused
+        with :class:`PaidModelRequiresConfirmation` before any dispatch, so no
+        request can be billed without an explicit, deliberate choice.
+        """
+
+        provider = self._selected_provider_name(req).strip().lower()
+        model = self._run_model_name(provider, getattr(req, "model_name", None))
+        tier, unit_price = self._model_cost_facts(provider, model)
+        facts = {
+            "cost_tier": tier,
+            "estimated_unit_price": unit_price,
+            "model": model,
+            "provider": provider,
+        }
+        if tier != "PAID":
+            return facts
+
+        named_provider = str(getattr(req, "provider_name", "") or "").strip()
+        named_model = str(getattr(req, "model_name", "") or "").strip()
+        if named_provider and named_model and self._allow_paid_providers():
+            return facts
+
+        price = (
+            f" Its published rate is ${unit_price:g} per 1M input tokens."
+            if unit_price is not None
+            else ""
+        )
+        reason = (
+            "the request did not name both the provider and the model"
+            if not (named_provider and named_model)
+            else "paid providers are disabled for this deployment"
+        )
+        raise PaidModelRequiresConfirmation(
+            "paid_model_requires_confirmation: this run would use the paid model "
+            f"'{model or 'unknown'}' on provider '{provider or 'unknown'}', and "
+            f"{reason}, so nothing was dispatched and nothing was spent.{price} "
+            "Name the provider and the model explicitly (and enable paid providers "
+            "for this deployment) to run it."
+        )
 
     # ----------------------------------------------------------------- offline
     @staticmethod
@@ -3041,13 +3302,23 @@ class ForgeApiService:
         baseline records writes the snapshot the same way.
         """
 
+        return self._write_project_state_entries(store, run_id, {key: value})
+
+    def _write_project_state_entries(
+        self,
+        store: RunStore,
+        run_id: str,
+        entries: Mapping[str, Any],
+    ) -> bool:
+        """Merge several keys into the run's durable ``project_state`` in one write."""
+
         snapshot = store.read_state(run_id)
         if snapshot is None:
             return False
         project_state: Dict[str, Any] = (
             dict(snapshot.project_state) if snapshot.project_state else {}
         )
-        project_state[key] = value
+        project_state.update(dict(entries))
         persisted = None
         try:
             persisted = store.load(run_id)
@@ -3071,6 +3342,117 @@ class ForgeApiService:
             )
         )
         return True
+
+    def _record_run_outcome(
+        self,
+        store: Optional[RunStore],
+        run_id: str,
+        *,
+        outcome: RunOutcome,
+        questions: tuple,
+        saved: Mapping[str, Any],
+    ) -> bool:
+        """Record the outcome and the independent save facts beside the run.
+
+        This is the durable half of the gate: the HTTP response says what happened,
+        and the run record says the same thing, so an operator reading
+        ``GET /api/runs/{id}`` cannot see a different story from the one the UI was
+        given. Nothing is invented when the run has no snapshot.
+        """
+
+        if store is None or not run_id:
+            return False
+        clarification = outcome is RunOutcome.CLARIFICATION_REQUIRED
+        entries: Dict[str, Any] = {
+            "outcome": outcome.value,
+            "state": state_for_outcome(outcome),
+            "needs_clarification": clarification,
+            "clarification_questions": list(questions),
+        }
+        entries.update(dict(saved))
+        try:
+            return self._write_project_state_entries(store, run_id, entries)
+        except Exception:  # noqa: BLE001 - persistence must not rewrite a run
+            return False
+
+    def record_project_attach(
+        self,
+        run_id: str,
+        *,
+        project_status: object = "",
+        workspace_exists: bool = False,
+        files: Sequence[object] = (),
+        verification: object = "",
+        acceptance: object = "",
+        run_state: object = "",
+        run_success: bool = True,
+        error: object = "",
+    ) -> Dict[str, Any]:
+        """Re-derive the outcome now that the run's project attachment is known.
+
+        The run response is assembled before the project attach happens, so at that
+        moment the truthful fact is "no project record exists yet". Once the attach
+        has run, the same classifier is applied again -- this time with the project,
+        its workspace, its manifest, its verification and its acceptance -- and the
+        response fields it changes are returned so the caller can publish them.
+
+        The persisted run record is updated with the same facts, so the history and
+        the response cannot disagree. Only the facts passed in are used; nothing is
+        inferred from the project's *status* alone.
+        """
+
+        manifest = tuple(files or ())
+        project_status_word = str(
+            getattr(project_status, "value", project_status) or ""
+        ).strip().upper()
+        project_exists = bool(project_status_word)
+        outcome = derive_outcome(
+            run_state=run_state,
+            run_success=run_success,
+            error=error,
+            answer_text="",
+            project_exists=project_exists,
+            project_workspace_exists=bool(workspace_exists),
+            artifact_count=len(manifest),
+            artifact_manifest=manifest,
+            verification=verification,
+            acceptance=acceptance,
+            specification_confirmed=True,
+            # "No file result" is a fact the *project record* states, not something
+            # a response may claim for itself: it is true only when the attached
+            # project finished without recording an artifact.
+            no_file_result=not manifest and project_status_word == "COMPLETED",
+        )
+        fields: Dict[str, Any] = {
+            "outcome": outcome.value,
+            "state": honest_state(run_state, outcome),
+            "needs_clarification": outcome is RunOutcome.CLARIFICATION_REQUIRED,
+            "project_created": project_exists,
+            "project_files_created": bool(manifest),
+            "artifact_manifest_saved": bool(manifest),
+            "files_created": len(manifest),
+        }
+        store: Optional[RunStore] = None
+        if run_id:
+            try:
+                store = self._run_store.bind_run(run_id)
+            except Exception:  # noqa: BLE001 - persistence must not fail the attach
+                store = None
+        self._record_run_outcome(
+            store,
+            run_id,
+            outcome=outcome,
+            questions=(),
+            saved={
+                "project_created": fields["project_created"],
+                "project_files_created": fields["project_files_created"],
+                "artifact_manifest_saved": fields["artifact_manifest_saved"],
+                "files_created": fields["files_created"],
+                "project_status": project_status_word,
+            },
+        )
+        return fields
+
 
     def _provider_key_index(
         self, provider_name: str, run_id: str
@@ -3152,6 +3534,7 @@ class ForgeApiService:
         run_store: Optional[RunStore],
         started_at: float,
         write_mode: bool = False,
+        cost_facts: Optional[Mapping[str, Any]] = None,
     ) -> "RunDispatchResult":
         """Execute one submitted task with the deterministic offline run loop.
 
@@ -3363,12 +3746,50 @@ class ForgeApiService:
         history_recorded = bool(
             run_store is not None and self._run_store.exists(run_id)
         )
+
+        # THE OUTCOME GATE. The offline path produces a deterministic report and no
+        # project, so its truthful outcome is "the specification/answer is ready",
+        # never "the project is completed". It is derived by the same classifier the
+        # project lifecycle's completion gate calls, from the facts this path holds:
+        # no project record, no artifact, nothing verified.
+        files_created = (
+            len(write_result.files)
+            if write_mode and write_result.status == STATUS_APPLIED
+            else 0
+        )
+        outcome = derive_outcome(
+            run_state=state_name,
+            run_success=succeeded,
+            error=error,
+            # The offline path has no model answer to read: its "answer" is a
+            # deterministic report that quotes the caller's task text, so treating it
+            # as a clarification list would turn the caller's own question marks into
+            # the run's verdict.
+            answer_text="",
+            project_exists=False,
+            artifact_count=files_created,
+            verification="",
+            acceptance="",
+            specification_confirmed=False,
+        )
+        saved = {
+            "run_record_saved": history_recorded,
+            "project_created": False,
+            "project_files_created": False,
+            "artifact_manifest_saved": False,
+            "files_created": files_created,
+        }
+        self._record_run_outcome(
+            run_store, run_id, outcome=outcome, questions=(), saved=saved
+        )
         return RunDispatchResult(
             response=TaskRunResponse(
                 run_id=run_id,
                 task_id=task_id,
                 project_id=project_id,
-                state=state_name or "UNKNOWN",
+                # The state word follows the outcome; a report is not a completed
+                # project, and the response no longer claims one.
+                state=honest_state(state_name or "UNKNOWN", outcome) or "UNKNOWN",
                 success=succeeded,
                 output=output,
                 error=error,
@@ -3382,6 +3803,18 @@ class ForgeApiService:
                 # No model produced anything on this path, so the model field
                 # names the deterministic offline engine rather than a provider.
                 model_used="deterministic-offline",
+                outcome=outcome.value,
+                clarification_questions=[],
+                needs_clarification=outcome is RunOutcome.CLARIFICATION_REQUIRED,
+                run_record_saved=history_recorded,
+                project_created=False,
+                project_files_created=False,
+                artifact_manifest_saved=False,
+                files_created=files_created,
+                cost_tier=cost_facts.get("cost_tier"),
+                # No provider ran, so no cost was estimated: a measured 0.0, not an
+                # unknown. Unknown is reported as None elsewhere.
+                estimated_cost=0.0,
             ),
             idempotent_replay=False,
             history_recorded=history_recorded,
@@ -3391,6 +3824,7 @@ class ForgeApiService:
             usage_basis="MOCK",
             cost_basis="MOCK",
         )
+
 
     def _record_task_lifecycle(
         self, identity: object, *, success: bool, attempt_number: int
@@ -3434,6 +3868,13 @@ class ForgeApiService:
             category = TaskCategory(req.category.lower())
         except ValueError:
             category = TaskCategory.CODE
+
+        # THE PAID GATE comes before everything, including the idempotency claim: a
+        # refusal must spend nothing and claim nothing. It reads the pair this run
+        # would actually use and refuses a PAID one the request did not name. When
+        # the pair is free or cheap the same call returns its tier, which is
+        # published on the response.
+        cost_facts = self._enforce_paid_policy(req)
 
         # Idempotency is decided before anything is dispatched, so a replay cannot start a
         # second execution even in principle.
@@ -3539,6 +3980,7 @@ class ForgeApiService:
                 run_store=api_run_store,
                 started_at=t0,
                 write_mode=write_mode,
+                cost_facts=cost_facts,
             )
 
         # A model named in the request selects the provider model for THIS run. The dispatcher
@@ -3686,8 +4128,16 @@ class ForgeApiService:
         # verified; every other status is reported as a failure with its reason.
         # A dispatch that produced no usable answer is not retried or guessed at -
         # its own honest error stands and nothing is written.
+        #
+        # The provider's own text is kept separately from the composed `output`: the
+        # outcome classifier must read the *answer*, not the write report appended to
+        # it, or a report line ending in "?" would be mistaken for a question.
+        provider_answer = (
+            getattr(terminal, "output", "") if terminal is not None else ""
+        )
+        files_created = 0
         if write_mode:
-            answer = getattr(terminal, "output", "") if terminal is not None else ""
+            answer = provider_answer
             if success and isinstance(answer, str) and answer.strip():
                 write_result = self._apply_model_changes(
                     answer=answer,
@@ -3698,6 +4148,7 @@ class ForgeApiService:
                 )
                 output = f"{output or ''}\n\n{render_write_report(write_result)}".lstrip("\n")
                 success = write_result.status == STATUS_APPLIED
+                files_created = len(write_result.files) if success else 0
                 error = None if success else (
                     "write mode: no change was applied "
                     f"({write_result.status})"
@@ -3734,11 +4185,52 @@ class ForgeApiService:
                 attempt_number=int(getattr(run_acc, "total_attempts", 0) or 0),
             )
 
+        # THE OUTCOME GATE. A returned answer is not a finished project: this
+        # service holds no project record and writes no project files, so the
+        # classifier is told the facts that are true here rather than the ones a
+        # provider's success flag would imply. The state it publishes follows that
+        # outcome, which is what stops a list of clarifying questions from surfacing
+        # as "COMPLETED".
+        questions = extract_clarifying_questions(provider_answer)
+        outcome = derive_outcome(
+            run_state=run.state.value,
+            run_success=success,
+            error=error,
+            answer_text=provider_answer,
+            project_exists=False,
+            project_workspace_exists=False,
+            artifact_count=files_created,
+            verification="",
+            acceptance="",
+            specification_confirmed=False,
+        )
+        # The actual pair that ran decides the published tier, and the run's own
+        # accounting decides the estimate -- never the pre-run selection, which a
+        # fallback may have replaced.
+        actual_tier, _unit_price = self._model_cost_facts(provider_used, model_used)
+        estimated_cost = getattr(run_acc, "total_estimated_cost", None)
+        if not isinstance(estimated_cost, (int, float)) or isinstance(
+            estimated_cost, bool
+        ):
+            estimated_cost = None
+        else:
+            estimated_cost = round(float(estimated_cost), 6)
+        saved = {
+            "run_record_saved": history_recorded,
+            "project_created": False,
+            "project_files_created": False,
+            "artifact_manifest_saved": False,
+            "files_created": files_created,
+        }
+        self._record_run_outcome(
+            api_run_store, run_id, outcome=outcome, questions=questions, saved=saved
+        )
+
         response = TaskRunResponse(
             run_id=run_id,
             task_id=task_id,
             project_id=project_id,
-            state=run.state.value,
+            state=honest_state(run.state.value, outcome),
             success=success,
             output=output or "(Task execution completed)",
             error=error,
@@ -3748,6 +4240,16 @@ class ForgeApiService:
             duration_seconds=round(duration, 3),
             provider_used=provider_used,
             model_used=model_used,
+            outcome=outcome.value,
+            clarification_questions=list(questions),
+            needs_clarification=outcome is RunOutcome.CLARIFICATION_REQUIRED,
+            run_record_saved=history_recorded,
+            project_created=False,
+            project_files_created=False,
+            artifact_manifest_saved=False,
+            files_created=files_created,
+            cost_tier=actual_tier or cost_facts.get("cost_tier"),
+            estimated_cost=estimated_cost,
         )
         return RunDispatchResult(
             response=response,

@@ -6141,3 +6141,336 @@ describes the flow for the owner; `docs/ARCHITECTURE.md` describes the implement
 несущий подтверждённую сессию (поток «Кузницы»). Будущая ревизия может опубликовать связь только для
 чтения, что закрыло бы этот разрыв без изменения контракта записи. `docs/USER_MANUAL.md` описывает
 поток для владельца; `docs/ARCHITECTURE.md` описывает реализацию.
+
+## Run Outcome Gate and Paid-Model Policy v0.1
+
+### Context
+
+Two defects were measured together on the owner's machine, and both reported
+success that had not happened:
+
+1. **False completion.** The owner typed a short idea ("a small local web app for
+   household expenses"). The model answered with clarifying questions. The UI
+   showed `COMPLETED` / «Запись сохранена: да» -- although no project existed, no
+   file was written, the specification was never confirmed and the questions were
+   never answered. `TaskResult.success` (the provider returned text) was being
+   reported as a finished project.
+2. **An unbilled-but-billed run.** A run went to
+   `openrouter / anthropic/claude-haiku-4.5` without the caller naming that
+   provider or model. The row was registered `CHEAP` even though its published rate
+   is 1.00 / 5.00 USD per 1M tokens, so "cheap" was read as "free to run" and the
+   automatic route selected it while `allow_paid_providers` was false.
+
+### Decision
+
+1. **One provider-neutral outcome, in `app/agent_runtime/outcome.py`.** A pure,
+   deterministic `RunOutcome` (`CLARIFICATION_REQUIRED`, `SPECIFICATION_READY`,
+   `PLAN_READY`, `EXECUTION_RUNNING`, `VERIFICATION_REQUIRED`, `PROJECT_COMPLETED`,
+   `NEEDS_CHANGES`, `FAILED`) is derived from facts, in a fixed precedence:
+   error/settled-failure -> clarifying questions (a list of question lines, or a
+   discovery session still `NEEDS_CLARIFICATION`) -> no project record or an
+   unconfirmed specification (`PLAN_READY` when a plan waits for confirmation,
+   otherwise `SPECIFICATION_READY`) -> in flight (`EXECUTION_RUNNING`) ->
+   verification not run -> verification or acceptance failed -> only then, and only
+   with every fact (project, workspace, artifacts or an explicit no-file result,
+   `verification == passed`, `acceptance == passed`, non-empty manifest), is the
+   result `PROJECT_COMPLETED`.
+2. **The response follows the outcome.** `TaskRunResponse.outcome` carries it and
+   the user-facing `state` is derived from it. The gate may only *downgrade* a
+   success claim: `COMPLETED` is reachable from `PROJECT_COMPLETED` alone, so a
+   text-only answer can never surface as a completed project. The outcome and the
+   questions are also written into the run record's `project_state`, and
+   `GET /api/runs/{run_id}` republishes them read-only.
+3. **One completion rule, not two.** `app.projects.lifecycle.completion_blockers`
+   no longer restates the rule: it translates its event into the classifier's facts
+   and names the missing ones, so the lifecycle gate and the response gate cannot
+   disagree. Its public blocker vocabulary (`run_not_terminal_success`,
+   `verification_*`, `acceptance_*`, `artifacts_missing`) is preserved.
+4. **Independent save indicators.** `run_record_saved`, `project_created`,
+   `project_files_created` and `artifact_manifest_saved` are four separate
+   booleans, plus `files_created`. A single "saved" indicator is what hid an empty
+   project behind a stored run record.
+5. **A priced model is `PAID`.** `openrouter/anthropic/claude-haiku-4.5` is
+   registered `PAID`, so the automatic route (which asks for
+   `max_cost_tier=CHEAP` while `allow_paid_providers` is false) cannot select it.
+   Even with paid allowed, the free/cheap rows sort first; a paid row is reached
+   only by naming it.
+6. **A paid pair requires an explicit choice.** Before any dispatch, the service
+   resolves the pair the run would actually use and its `cost_tier`. A `PAID` pair
+   runs only when the caller named **both** the provider and the model *and* the
+   operator enabled paid providers. Otherwise the run is refused with
+   `paid_model_requires_confirmation` (409 over HTTP) and no provider is called.
+   The refusal names the provider and the model -- never a key, a variable name, a
+   prefix or a length.
+7. **`cost_tier` and `estimated_cost` are published** on the run response and on
+   every models-catalogue row, so a UI can show what a run costs. `cost_tier` is
+   exactly `FREE`/`CHEAP`/`PAID`; `estimated_cost` is nullable and is never
+   invented from a zero -- on the catalogue row it is the model's own per-1M-input
+   unit price, on a run it is the run's own estimated cost.
+
+### Rejected alternatives
+
+- **Add a boolean `project_completed` next to `success`.** It would preserve the
+  ambiguous `state` word and let two consumers disagree; the outcome is a value,
+  not a flag, and the state is derived from it.
+- **Derive `PROJECT_COMPLETED` from `success` plus `files_created > 0`.** A file
+  can exist in a run workspace that never became a project, and a project can be
+  completed by a run that wrote nothing (a read-only task). Both facts are
+  necessary and neither is sufficient.
+- **Keep the lifecycle's rule and re-implement it in the API.** That is exactly how
+  the two layers drifted; the brief required one source of truth.
+- **Keep `anthropic/claude-haiku-4.5` as `CHEAP` and refuse only at dispatch.** The
+  tier is what automatic routing reads, so leaving it `CHEAP` would keep the
+  mis-selection reachable by every other caller of the registry.
+- **Allow an explicitly named paid model while `allow_paid_providers` is false.**
+  The flag is the operator's own bound; letting a caller override it with a name
+  would make the deployment setting advisory.
+
+### Consequences
+
+`tests/test_false_completion_guard.py` pins the classifier precedence, the
+questions answer, the empty workspace, the text answer and the full positive path
+(a real `code_writer` write, verified and accepted). `tests/test_paid_model_policy.py`
+pins the refusal, the 409 code, the automatic preference for free rows, the
+explicit paid path and the payloads. Three existing assertions that required
+`state == "COMPLETED"` for text-only runs were corrected, because they encoded the
+defect. The remaining work is the interface: questions-first layout, structured
+question widgets, the provider panel on the launch step, and hiding the agents
+panel.
+
+## Гейт результата запуска и политика платных моделей v0.1 — русская версия
+
+### Контекст
+
+На машине владельца были измерены два дефекта, и оба сообщали о успехе, которого не
+было:
+
+1. **Ложное завершение.** Владелец ввёл короткую идею («небольшое локальное
+   веб-приложение для учёта домашних расходов»). Модель ответила уточняющими
+   вопросами. Интерфейс показал `COMPLETED` / «Запись сохранена: да» — хотя проекта
+   не было, ни один файл не записан, спецификация не подтверждена, а вопросы не
+   отвечены. `TaskResult.success` (провайдер вернул текст) выдавался за завершённый
+   проект.
+2. **Запуск, который стоил денег без выбора.** Запуск ушёл в
+   `openrouter / anthropic/claude-haiku-4.5` без того, чтобы вызывающий назвал этого
+   провайдера или модель. Строка была зарегистрирована как `CHEAP`, хотя её
+   опубликованная цена — 1.00 / 5.00 USD за 1M токенов, поэтому «дешёвая» читалась
+   как «бесплатная для запуска», и автоматическая маршрутизация выбрала её при
+   `allow_paid_providers` = false.
+
+### Решение
+
+1. **Один провайдеро-нейтральный результат в `app/agent_runtime/outcome.py`.**
+   Чистый детерминированный `RunOutcome` (`CLARIFICATION_REQUIRED`,
+   `SPECIFICATION_READY`, `PLAN_READY`, `EXECUTION_RUNNING`,
+   `VERIFICATION_REQUIRED`, `PROJECT_COMPLETED`, `NEEDS_CHANGES`, `FAILED`)
+   выводится из фактов в фиксированном порядке: ошибка/завершённая неудача →
+   уточняющие вопросы (список строк-вопросов или сессия уточнения всё ещё
+   `NEEDS_CLARIFICATION`) → нет записи проекта или спецификация не подтверждена
+   (`PLAN_READY`, если план ждёт подтверждения, иначе `SPECIFICATION_READY`) → запуск
+   идёт (`EXECUTION_RUNNING`) → проверка не выполнялась → проверка или приёмка не
+   прошли → и только затем, и только при всех фактах (проект, рабочая область,
+   артефакты или явный результат без файлов, `verification == passed`,
+   `acceptance == passed`, непустой манифест) результат — `PROJECT_COMPLETED`.
+2. **Ответ следует за результатом.** `TaskRunResponse.outcome` несёт его, а
+   пользовательский `state` выводится из него. Гейт может только *понижать* заявку
+   на успех: `COMPLETED` достижим только из `PROJECT_COMPLETED`, поэтому текстовый
+   ответ никогда не покажется завершённым проектом. Результат и вопросы также
+   записываются в `project_state` записи запуска, а `GET /api/runs/{run_id}`
+   переопубликовывает их только для чтения.
+3. **Одно правило завершения, а не два.** `app.projects.lifecycle.completion_blockers`
+   больше не пересказывает правило: он переводит своё событие в факты
+   классификатора и называет недостающие, поэтому гейт жизненного цикла и гейт ответа
+   не могут расходиться. Публичный словарь блокеров (`run_not_terminal_success`,
+   `verification_*`, `acceptance_*`, `artifacts_missing`) сохранён.
+4. **Независимые индикаторы сохранения.** `run_record_saved`, `project_created`,
+   `project_files_created` и `artifact_manifest_saved` — четыре отдельных булевых
+   значения, плюс `files_created`. Именно единый индикатор «сохранено» скрывал
+   пустой проект за сохранённой записью запуска.
+5. **Модель с ценой — это `PAID`.** `openrouter/anthropic/claude-haiku-4.5`
+   зарегистрирована как `PAID`, поэтому автоматический маршрут (он запрашивает
+   `max_cost_tier=CHEAP`, пока `allow_paid_providers` = false) не может её выбрать.
+   Даже при разрешённых платных строках бесплатные и дешёвые сортируются первыми;
+   платная строка достигается только именованием.
+6. **Платная пара требует явного выбора.** До любого запуска сервис определяет пару,
+   которая реально будет использована, и её `cost_tier`. Платная пара выполняется
+   только если вызывающий назвал **и** провайдера, **и** модель, **и** оператор
+   включил платных провайдеров. Иначе запуск отклоняется с
+   `paid_model_requires_confirmation` (409 по HTTP), и ни один провайдер не
+   вызывается. Отказ называет провайдера и модель — никогда ключ, имя переменной,
+   префикс или длину.
+7. **`cost_tier` и `estimated_cost` публикуются** в ответе запуска и в каждой строке
+   каталога моделей, чтобы интерфейс мог показать стоимость запуска. `cost_tier` —
+   ровно `FREE`/`CHEAP`/`PAID`; `estimated_cost` допускает `null` и никогда не
+   выдумывается из нуля — в строке каталога это собственная цена модели за 1M
+   входных токенов, в запуске — собственная оценка запуска.
+
+### Отклонённые альтернативы
+
+- **Добавить булев `project_completed` рядом с `success`.** Это сохранило бы
+  двусмысленное слово `state` и позволило бы двум потребителям расходиться;
+  результат — это значение, а не флаг, и состояние выводится из него.
+- **Выводить `PROJECT_COMPLETED` из `success` плюс `files_created > 0`.** Файл может
+  существовать в рабочей области запуска, который так и не стал проектом, а проект
+  может быть завершён запуском, который ничего не записал (задача только на чтение).
+  Оба факта необходимы, и ни один не достаточен.
+- **Оставить правило жизненного цикла и повторить его в API.** Именно так два слоя и
+  разошлись; задача требовала единственного источника истины.
+- **Оставить `anthropic/claude-haiku-4.5` как `CHEAP` и отклонять только при
+  запуске.** Уровень — это то, что читает автоматическая маршрутизация, поэтому
+  `CHEAP` сохранил бы ошибочный выбор достижимым для любого другого потребителя
+  реестра.
+- **Разрешать явно названную платную модель при `allow_paid_providers` = false.**
+  Флаг — это собственное ограничение оператора; позволить вызывающему обойти его
+  именем значило бы сделать настройку развёртывания совещательной.
+
+### Следствия
+
+`tests/test_false_completion_guard.py` фиксирует порядок правил классификатора, ответ
+с вопросами, пустую рабочую область, текстовый ответ и полный положительный путь
+(реальная запись `code_writer`, проверенная и принятая).
+`tests/test_paid_model_policy.py` фиксирует отказ, код 409, автоматическое
+предпочтение бесплатных строк, явный платный путь и полезные нагрузки. Три
+существующих утверждения, требовавших `state == "COMPLETED"` для текстовых
+запусков, были исправлены, потому что они кодировали дефект. Оставшаяся работа —
+интерфейс: схема «сначала вопросы», структурированные виджеты вопросов, панель
+провайдера на шаге запуска и скрытие панели агентов.
+
+## Project Truth Presentation v0.1
+
+**Context.** A project card could show `Files: 0`, `Verification: NOT RUN` and
+`Status: NEEDS_CHANGES` while the run that filled it said `COMPLETED`, and the
+reader took it for a finished project. Every single fact was true; there was no
+one place that put them in the owner's reading order, and no rule that could not
+say "done" about an empty project.
+
+**Decision.**
+
+1. **One presentation function, in Python.**
+   `app/projects/presentation.py::build_project_presentation` is the only place
+   where a backend status plus facts become the owner's words. It is pure: no
+   clock, no I/O, no store. `GET /api/projects/{id}` publishes its result under
+   `presentation`; the interface renders that and decides nothing itself. The
+   backend enum is not replaced -- `project.status`, `versions[].verification` and
+   `files` keep their own words in the same payload, and the raw words are repeated
+   inside `presentation.technical`, which the card renders collapsed.
+2. **The state word is derived from the facts, in this order.**
+   `АРХИВ` when archived, `ГОТОВО` only when the record is `COMPLETED` **and**
+   `files > 0` **and** verification passed **and** acceptance passed **and** the
+   workspace exists, `НЕ СОЗДАН` when nothing was written, otherwise
+   `НУЖНЫ ДОРАБОТКИ`. `Files: 0` can therefore never render `ГОТОВО`; it is a
+   structural consequence, not a check that a caller must remember.
+3. **Six save facts, answered separately.** `Запуск сохранён`,
+   `Спецификация сохранена`, `План сохранён`, `Файлы проекта сохранены`,
+   `Проверка выполнена`, `Проект готов`. One combined "saved" line is what hid an
+   empty project behind a stored run record. An unreadable fact is `неизвестно`,
+   never `да` by default.
+4. **Actions are gated by the files rule.** With no file the only creation action is
+   `Продолжить создание проекта` (plus `Ответить на вопросы` while a session is
+   open). With files, `Запустить локально` / `Открыть приложение` are offered only
+   when the manifest holds a launchable artifact (an HTML page, or an entry file);
+   otherwise they are hidden with a one-line reason. Every disabled action states
+   why, and where the backend has its own refusal sentence it is printed verbatim
+   beside the owner's reason.
+5. **A change run that writes nothing does not advance the version.** If
+   `files_created == 0`, the previous version stays current, the attempt is still
+   recorded, and the card says `Изменения не записаны: новой версии нет`. The status
+   word for that run is still `NEEDS_CHANGES`; nothing is invented to make the
+   version look successful.
+6. **The run response and the project card agree.** `_attach_project` now hands the
+   durable record's own `state` to `record_project_attach`, not the response's
+   already-downgraded word, so a project that really completed reports
+   `outcome=PROJECT_COMPLETED, state=COMPLETED` instead of
+   `outcome=PROJECT_COMPLETED, state=SPECIFICATION_READY`.
+
+**Rejected alternatives.**
+
+- **Map the statuses in the React client.** The rule would exist twice (once per
+  language), the Python suite could not assert it, and the two copies would drift
+  exactly the way the lifecycle gate and the API response once drifted.
+- **Add a `presentation_status` field to the project record.** That is a second
+  status vocabulary on the wire and in the store, and the stored value can be older
+  than the facts it summarises; the card must be a function of the facts read now.
+- **Hide the raw status and the technical facts entirely.** The defect was a
+  perception defect, and hiding evidence would have replaced a misleading card with
+  an unfalsifiable one. The technical block is collapsed, not removed.
+- **Treat acceptance alone as completion.** Acceptance is the run's own verdict and
+  says nothing about a file existing; the owner's card read exactly that way.
+
+**Consequences.** `tests/test_project_truth_presentation.py` (32 tests) fixes the
+mapping, the layout, the six save facts, the action gating and the version rule on
+pure fake data, plus a real-lifecycle check that a second version preserves the
+first. `app/smoke_project_truth.py` prints the two outcomes end to end, offline.
+`tests/test_project_lifecycle.py`, `tests/test_false_completion_guard.py`,
+`tests/test_api.py` and `tests/test_discovery.py` are unchanged and pass.
+
+## Презентация правды о проекте v0.1 — русская версия
+
+**Контекст.** Карточка проекта могла показывать `Files: 0`, `Verification: NOT RUN`
+и `Status: NEEDS_CHANGES`, тогда как заполнивший её запуск сообщал `COMPLETED`, и
+владелец читал это как готовый проект. Каждый факт по отдельности был верен; не
+было одного места, которое выстраивает их в порядок чтения владельца, и не было
+правила, которое не может сказать «готово» о пустом проекте.
+
+**Решение.**
+
+1. **Одна функция презентации, на Python.**
+   `app/projects/presentation.py::build_project_presentation` — единственное место,
+   где статус бэкенда и факты превращаются в слова владельца. Функция чистая: без
+   часов, ввода-вывода и хранилища. `GET /api/projects/{id}` публикует её результат
+   в поле `presentation`; интерфейс рисует его и сам ничего не решает. Перечисление
+   бэкенда не заменяется — `project.status`, `versions[].verification` и `files`
+   остаются в том же ответе со своими словами, а исходные слова повторяются в
+   `presentation.technical`, который карточка показывает свёрнутым.
+2. **Слово состояния выводится из фактов, в таком порядке.** `АРХИВ` для архива;
+   `ГОТОВО` только когда запись `COMPLETED` **и** `files > 0` **и** проверка
+   пройдена **и** приёмка пройдена **и** рабочая область существует; `НЕ СОЗДАН`,
+   когда ничего не записано; иначе `НУЖНЫ ДОРАБОТКИ`. Поэтому `Files: 0` не может
+   отрисовать `ГОТОВО` — это следствие структуры, а не проверка, о которой должен
+   помнить вызывающий.
+3. **Шесть фактов сохранения, каждый отдельно.** `Запуск сохранён`,
+   `Спецификация сохранена`, `План сохранён`, `Файлы проекта сохранены`,
+   `Проверка выполнена`, `Проект готов`. Именно одна общая строка «сохранено»
+   скрывала пустой проект за записанным журналом запуска. Нечитаемый факт —
+   `неизвестно`, а не `да` по умолчанию.
+4. **Действия ограничены правилом файлов.** Без файла единственное действие
+   создания — `Продолжить создание проекта` (плюс `Ответить на вопросы`, пока
+   открыта сессия). С файлами `Запустить локально` / `Открыть приложение`
+   предлагаются только когда в манифесте есть запускаемый артефакт (HTML-страница
+   или файл-точка входа); иначе они скрыты с однострочной причиной. Каждое
+   недоступное действие объясняет почему, а собственная фраза отказа бэкенда
+   печатается дословно рядом с причиной владельца.
+5. **Запуск доработки, ничего не записавший, не двигает версию.** Если
+   `files_created == 0`, предыдущая версия остаётся текущей, попытка всё равно
+   записывается, а карточка говорит `Изменения не записаны: новой версии нет`.
+   Статус такого запуска остаётся `NEEDS_CHANGES`; ничего не выдумывается, чтобы
+   версия выглядела успешной.
+6. **Ответ запуска и карточка проекта согласованы.** `_attach_project` теперь
+   передаёт в `record_project_attach` собственное `state` из журнала, а не уже
+   понижённое слово ответа, поэтому действительно завершённый проект сообщает
+   `outcome=PROJECT_COMPLETED, state=COMPLETED`, а не
+   `outcome=PROJECT_COMPLETED, state=SPECIFICATION_READY`.
+
+**Отклонённые альтернативы.**
+
+- **Сопоставлять статусы в React-клиенте.** Правило существовало бы дважды (по
+  одному на язык), набор тестов Python не мог бы его проверить, и копии разошлись
+  бы так же, как когда-то разошлись гейт жизненного цикла и ответ API.
+- **Добавить в запись проекта поле `presentation_status`.** Это второй словарь
+  статусов и в хранилище, и в ответе, а хранимое значение может быть старее
+  фактов, которые оно обобщает; карточка должна быть функцией фактов, прочитанных
+  сейчас.
+- **Скрыть исходный статус и технические факты совсем.** Дефект был дефектом
+  восприятия, и скрытие доказательств заменило бы вводящую в заблуждение карточку
+  на неопровержимую. Технический блок свёрнут, а не удалён.
+- **Считать приёмку достаточной для завершения.** Приёмка — это вердикт самого
+  запуска, и он ничего не говорит о существовании файла; карточка владельца
+  читалась ровно так.
+
+**Следствия.** `tests/test_project_truth_presentation.py` (32 теста) фиксирует
+сопоставление, порядок карточки, шесть фактов сохранения, ограничения действий и
+правило версий на чистых поддельных данных, плюс проверку на реальном жизненном
+цикле, что вторая версия сохраняет первую. `app/smoke_project_truth.py` печатает
+оба исхода от начала до конца, офлайн. `tests/test_project_lifecycle.py`,
+`tests/test_false_completion_guard.py`, `tests/test_api.py` и
+`tests/test_discovery.py` не менялись и проходят.

@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 __all__ = [
     "ArtifactRef",
     "ChangeRequest",
-    "Project",
+    "LifecycleProject",
     "ProjectError",
     "ProjectStatus",
     "ProjectVersion",
@@ -421,7 +421,7 @@ class ProjectError(Exception):
 
 
 @dataclass
-class Project:
+class LifecycleProject:
     """A persistent project: one specification, one workspace, many versions.
 
     Deliberately mutable as a value object: the service reads it, derives an
@@ -556,7 +556,7 @@ class Project:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "Project":
+    def from_dict(cls, data: Mapping[str, Any]) -> "LifecycleProject":
         raw_specification = data.get("specification")
         return cls(
             project_id=str(data["project_id"]),

@@ -35,7 +35,12 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from app.api.models import TaskRunRequest
-from app.api.service import ForgeApiService, RunIdempotencyConflict, IdempotencyUnavailable
+from app.api.service import (
+    ForgeApiService,
+    IdempotencyUnavailable,
+    PaidModelRequiresConfirmation,
+    RunIdempotencyConflict,
+)
 from app.runtime.run_store import is_safe_run_id
 
 logger = logging.getLogger("forge.api")
@@ -52,6 +57,28 @@ __all__ = [
     "resolve_ui_assets",
     "create_api_app",
 ]
+
+
+def _provider_registry_ids(api_service: Any) -> list[str]:
+    """The provider ids this composition actually registered, or ``[]``.
+
+    Read from the service's own runtime rather than from settings: a provider that is
+    configured but not registered cannot serve a run, and the card's technical block
+    must name what exists, not what is hoped for. Any failure yields an empty list,
+    which the card prints as "—" instead of a guess.
+    """
+
+    runtime = getattr(api_service, "runtime", None)
+    registry = getattr(runtime, "provider_registry", None)
+    lister = getattr(registry, "list_providers", None)
+    if not callable(lister):
+        return []
+    try:
+        names = lister()
+    except Exception:  # noqa: BLE001 - an unreadable registry is an unknown fact
+        return []
+    return sorted({str(name) for name in names if str(name or "").strip()})
+
 
 
 #: Loopback by default. A caller that needs a wider binding must say so explicitly.
@@ -376,7 +403,25 @@ def create_api_app(
     projects = (
         project_service if project_service is not None else ProjectService()
     )
-    register_project_routes(app, projects)
+    # The card's technical block needs facts the project store does not hold: the
+    # run's own durable record, the provider registry ids and the route list. They
+    # are supplied as read-only callables from this composition, so the project
+    # layer keeps knowing nothing about the run store or the HTTP surface.
+    register_project_routes(
+        app,
+        projects,
+        run_record_loader=api_service.get_run_record,
+        environment_facts=lambda: {
+            "provider_registry_ids": _provider_registry_ids(api_service),
+            "api_routes": sorted(
+                {
+                    str(getattr(route, "path", "") or "")
+                    for route in app.routes
+                    if getattr(route, "path", None)
+                }
+            ),
+        },
+    )
 
     # One discovery service for this process, composed here exactly like the
     # operating surface: the store root comes from the deployment, never from a
@@ -389,27 +434,36 @@ def create_api_app(
     )
     register_discovery_routes(app, discovery, projects)
 
-    def _attach_project(session_id: Optional[str], outcome: Any) -> str:
+    def _attach_project(
+        session_id: Optional[str], outcome: Any
+    ) -> tuple[str, Optional[dict[str, Any]]]:
         """Attach one finished run to the project its discovery session produced.
 
-        Returns the fact for the ``X-Forge-Project-Attach`` header: ``none`` when no
-        session was named or no project is linked, ``ok`` when the run was recorded,
-        ``already_attached`` when that very run id is already a version (an
-        idempotent replay must not produce a second version), and
-        ``error:<Type>`` when the attachment failed -- in which case the failure is
-        logged here and the run's own response is left exactly as it was.
+        Returns ``(status, facts)``. ``status`` is the fact for the
+        ``X-Forge-Project-Attach`` header: ``none`` when no session was named or no
+        project is linked, ``ok`` when the run was recorded, ``already_attached``
+        when that very run id is already a version (an idempotent replay must not
+        produce a second version), and ``error:<Type>`` when the attachment failed --
+        in which case the failure is logged here and the run's own response is left
+        exactly as it was.
+
+        ``facts`` is the project evidence the outcome gate needs *after* the attach:
+        the project's status, whether its workspace exists, its artifact manifest,
+        and the version's verification and acceptance. It is ``None`` when nothing
+        was attached, so the caller publishes the outcome it already has rather than
+        inventing a project.
         """
 
         if not isinstance(session_id, str) or not session_id.strip():
-            return "none"
+            return "none", None
         try:
             project_id = projects.project_for_session(session_id)
             if not project_id:
-                return "none"
+                return "none", None
             run_id = str(getattr(outcome.response, "run_id", "") or "")
             project = projects.open_project(project_id)
             if any(item.run_id == run_id for item in project.versions):
-                return "already_attached"
+                return "already_attached", None
             # The durable record is the evidence: it carries the classification the
             # run store derived from the persisted snapshot and the writer's own
             # outcome. ``provider_used``/``model_used`` are fields of the response,
@@ -431,15 +485,37 @@ def create_api_app(
                 source["acceptance"] = (
                     "passed" if getattr(outcome.response, "success", False) else "failed"
                 )
-            projects.attach_run(
+            attached = projects.attach_run(
                 project_id, source, source_root=api_service.workspace.root
             )
-            return "ok"
+            version = attached.current() or attached.latest_version
+            files = tuple(getattr(version, "files", ()) or ())
+            facts = {
+                "project_status": getattr(
+                    getattr(attached, "status", None), "value", attached.status
+                ),
+                # The workspace identity is created with the record; a project that
+                # has one has a workspace the artifacts live in.
+                "workspace_exists": bool(getattr(attached, "workspace_id", "")),
+                "files": files,
+                "verification": getattr(version, "verification", "") if version else "",
+                "acceptance": getattr(version, "acceptance", "") if version else "",
+                # The record's own state word, not the response's. The response's
+                # ``state`` has already been downgraded by the outcome gate, so feeding
+                # it back in would make the re-derivation keep the downgraded word even
+                # when the project really does justify ``COMPLETED``: measured as
+                # ``outcome=PROJECT_COMPLETED`` beside ``state=SPECIFICATION_READY``.
+                "run_state": str(source.get("state") or "")
+                or str(getattr(outcome.response, "state", "") or ""),
+                "run_success": bool(getattr(outcome.response, "success", False)),
+                "error": str(getattr(outcome.response, "error", "") or ""),
+            }
+            return "ok", facts
         except Exception as exc:  # noqa: BLE001 - the run's own result stands
             logger.exception(
                 "project attach failed for discovery session %s", session_id
             )
-            return f"error:{type(exc).__name__}"
+            return f"error:{type(exc).__name__}", None
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -614,29 +690,55 @@ def create_api_app(
         )
         try:
             outcome = api_service.run_task_detailed(req, idempotency_key=idempotency_key)
+        except PaidModelRequiresConfirmation as paid:
+            # A refusal, not an error: the request was well-formed and the server
+            # declined to spend money. 409 says exactly that, and nothing was
+            # dispatched. The body carries the fixed error code so a client can act
+            # on it without parsing prose.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **error_body(
+                        error_code=paid.code,
+                        code=paid.code,
+                    ),
+                    "error": str(paid),
+                },
+            ) from paid
         except RunIdempotencyConflict as conflict:
             raise HTTPException(status_code=409, detail=str(conflict)) from conflict
         except IdempotencyUnavailable as unavailable:
             # Fail closed: nothing was executed, and the caller is told why.
             raise HTTPException(status_code=503, detail=str(unavailable)) from unavailable
-        response = JSONResponse(outcome.response.to_dict())
+        # THE PROJECT ATTACH. When the caller named a confirmed discovery session,
+        # the run that just finished belongs to that session's project: its written
+        # files are copied into the project workspace, a version is recorded, and
+        # the lifecycle advances. This runs AFTER the existing run path returned and
+        # reads the run's durable record, so nothing above it changes and a failure
+        # here can never reinterpret the run's own result.
+        #
+        # It runs BEFORE the body is serialized so that the one outcome the caller
+        # sees is the truthful one: while the response was assembled no project
+        # existed, but once the attach has happened the same classifier is applied
+        # to the project's own facts and the response is updated with them. Without
+        # this the response would say "specification ready" for a project that was
+        # in fact created and completed a moment later.
+        attach_status, attach_facts = _attach_project(discovery_session_id, outcome)
+        body = outcome.response.to_dict()
+        if attach_facts:
+            body.update(
+                api_service.record_project_attach(
+                    outcome.response.run_id, **attach_facts
+                )
+            )
+        response = JSONResponse(body)
         response.headers["X-Forge-Idempotent-Replay"] = "true" if outcome.idempotent_replay else "false"
         response.headers["X-Forge-History-Recorded"] = "true" if outcome.history_recorded else "false"
         response.headers["X-Forge-Usage-Basis"] = outcome.usage_basis
         response.headers["X-Forge-Cost-Basis"] = outcome.cost_basis
         if outcome.history_error:
             response.headers["X-Forge-History-Error"] = outcome.history_error
-        # THE PROJECT ATTACH. When the caller named a confirmed discovery session,
-        # the run that just finished belongs to that session's project: its written
-        # files are copied into the project workspace, a version is recorded, and
-        # the lifecycle advances. This runs AFTER the existing run path returned and
-        # reads the run's durable record, so nothing above it changes and a failure
-        # here can never reinterpret the run's own result -- which is why the fact is
-        # reported in a header instead of being folded into the response body.
-        response.headers["X-Forge-Project-Attach"] = _attach_project(
-            discovery_session_id,
-            outcome,
-        )
+        response.headers["X-Forge-Project-Attach"] = attach_status
         return response
 
     @app.get("/api/runs/{run_id}")

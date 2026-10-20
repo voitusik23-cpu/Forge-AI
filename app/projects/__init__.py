@@ -7,10 +7,15 @@ Two layers live in this package:
   lifecycle layer and is unchanged;
 * the persistent project lifecycle: :mod:`app.projects.models` (records),
   :mod:`app.projects.store` (storage), :mod:`app.projects.lifecycle` (the
-  transition table and the completion gate) and :mod:`app.projects.service` (the
-  operations a caller uses).
+  transition table and the completion gate), :mod:`app.projects.service` (the
+  operations a caller uses) and :mod:`app.projects.presentation` (the one place
+  where a status plus its facts become the words the owner reads).
 """
 
+from app.projects.presentation import (
+    ProjectPresentation,
+    build_project_presentation,
+)
 from app.projects.lifecycle import (
     ALLOWED_TRANSITIONS,
     CompletionNotAllowed,
@@ -23,7 +28,7 @@ from app.projects.lifecycle import (
 from app.projects.models import (
     ArtifactRef,
     ChangeRequest,
-    Project,
+    LifecycleProject,
     ProjectError,
     ProjectStatus,
     ProjectVersion,
@@ -58,7 +63,7 @@ __all__ = [
     # Lifecycle records
     "ArtifactRef",
     "ChangeRequest",
-    "Project",
+    "LifecycleProject",
     "ProjectError",
     "ProjectStatus",
     "ProjectVersion",
@@ -84,4 +89,7 @@ __all__ = [
     "RunFacts",
     "UnknownProjectVersion",
     "run_facts",
+    # Presentation (owner-facing words, derived from the facts above)
+    "ProjectPresentation",
+    "build_project_presentation",
 ]

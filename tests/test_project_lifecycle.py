@@ -49,7 +49,7 @@ from app.projects.lifecycle import (
 )
 from app.projects.models import (
     ArtifactRef,
-    Project,
+    LifecycleProject,
     ProjectStatus,
     ProjectVersion,
     utc_now,
@@ -169,12 +169,12 @@ class _ProjectTestCase(unittest.TestCase):
         self.projects = ProjectService(self.store)
 
     # ------------------------------------------------------------------ helpers
-    def _create(self, goal: str = "A small expense tracker", **kwargs) -> Project:
+    def _create(self, goal: str = "A small expense tracker", **kwargs) -> LifecycleProject:
         return self.projects.create_from_discovery(_session(goal), **kwargs)
 
-    def _project_at(self, status: ProjectStatus) -> Project:
+    def _project_at(self, status: ProjectStatus) -> LifecycleProject:
         now = utc_now()
-        return Project(
+        return LifecycleProject(
             project_id=new_project_id(),
             name="transition fixture",
             status=status,
@@ -445,7 +445,7 @@ class TransitionTests(_ProjectTestCase):
 
 
 class CompletionGateTests(_ProjectTestCase):
-    def _reviewing(self) -> Project:
+    def _reviewing(self) -> LifecycleProject:
         return self._project_at(ProjectStatus.REVIEWING)
 
     def test_11_completed_requires_a_passed_verification(self) -> None:
@@ -652,7 +652,7 @@ class AttachRunTests(_ProjectTestCase):
 
 
 class NewVersionTests(_ProjectTestCase):
-    def _completed_project(self) -> Project:
+    def _completed_project(self) -> LifecycleProject:
         project = self._create()
         self.projects.confirm(project.project_id)
         return self.projects.attach_run(
@@ -734,7 +734,7 @@ class NewVersionTests(_ProjectTestCase):
                 self.projects.new_version(project.project_id, bad)
         self.assertEqual(project.current_version, 0)
 
-    def create_and_confirm(self) -> Project:
+    def create_and_confirm(self) -> LifecycleProject:
         project = self._create()
         return self.projects.confirm(project.project_id)
 
@@ -943,7 +943,7 @@ class PayloadSafetyTests(_ProjectTestCase):
 
 
 class VerifyAgainTests(_ProjectTestCase):
-    def _completed(self) -> Project:
+    def _completed(self) -> LifecycleProject:
         project = self._create()
         self.projects.confirm(project.project_id)
         return self.projects.attach_run(
@@ -1016,7 +1016,7 @@ class ProjectApiTests(_ProjectTestCase):
         )
         return TestClient(app)
 
-    def _completed_project(self) -> Project:
+    def _completed_project(self) -> LifecycleProject:
         project = self._create()
         self.projects.confirm(project.project_id)
         return self.projects.attach_run(

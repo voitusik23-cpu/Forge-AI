@@ -12,16 +12,18 @@ Two things live here and nothing else:
    request. :func:`completion_blockers` states the evidence a run must carry, and
    :func:`advance` refuses the transition unless every one of them holds.
 
-The gate, stated exactly:
+The gate, stated exactly -- and it is *one* rule, implemented in
+:func:`app.agent_runtime.outcome.derive_outcome`, which the run response calls too:
 
 * the run state is terminal-success (``COMPLETED``/``SUCCESS``) and the run did
   not fail with a provider or execution error;
 * ``verification == passed``;
 * ``acceptance == passed``;
-* if the run wrote files, at least one artifact was recorded.
+* if the run wrote files, at least one artifact was recorded -- a run that wrote
+  nothing has no artifact to record, and claiming one would be a fabrication.
 
-A run that finished but does not satisfy all four lands in ``NEEDS_CHANGES``
-(its verification or acceptance did not pass, or its artifacts are missing) or in
+A run that finished but does not satisfy all four is ``NEEDS_CHANGES`` (its
+verification or acceptance did not pass, or its artifacts are missing) or
 ``FAILED`` (it carried a provider/execution error). "Finished" is never treated as
 "successful", and there is no optimistic completion path anywhere in this module.
 """
@@ -32,11 +34,9 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Optional, Tuple
 
 from app.projects.models import (
-    ACCEPTANCE_PASSED,
-    Project,
+    LifecycleProject,
     ProjectError,
     ProjectStatus,
-    VERIFICATION_PASSED,
     utc_now,
 )
 
@@ -193,6 +193,12 @@ _ARCHIVE_EVENT = "archived"
 def completion_blockers(event: LifecycleEvent) -> Tuple[str, ...]:
     """Why ``event`` does not justify ``COMPLETED``; empty when it does.
 
+    The **decision** is not made here. It is made by
+    :func:`app.agent_runtime.outcome.derive_outcome`, the single completion rule
+    shared with the API response assembly, so the lifecycle and the run response
+    can never disagree about what ``COMPLETED`` means. This function only
+    translates the event into that classifier's facts and names the missing ones.
+
     A tuple rather than a boolean so the refusal names every missing fact at once,
     and so a test can assert the exact rule that fired. The last rule is
     conditional on purpose: a run that wrote nothing has no artifact to record, and
@@ -203,18 +209,20 @@ def completion_blockers(event: LifecycleEvent) -> Tuple[str, ...]:
     verification, acceptance and the artifact rule all still apply.
     """
 
-    blockers: list[str] = []
-    if not event.reverified and not event.is_terminal_success:
-        blockers.append("run_not_terminal_success")
-    if event.verification != VERIFICATION_PASSED:
-        blockers.append(
-            f"verification_{event.verification or 'missing'}"
-        )
-    if event.acceptance != ACCEPTANCE_PASSED:
-        blockers.append(f"acceptance_{event.acceptance or 'missing'}")
-    if event.wrote_files and event.artifact_count <= 0:
-        blockers.append("artifacts_missing")
-    return tuple(blockers)
+    # Imported here, not at module scope: ``app.agent_runtime`` pulls in the
+    # canonical harness, which imports ``app.projects.state``, so a module-scope
+    # import would close a cycle between the project layer and the runtime.
+    from app.agent_runtime.outcome import completion_blockers as _gate
+
+    return _gate(
+        run_state=event.run_state,
+        failed=event.failed,
+        verification=event.verification,
+        acceptance=event.acceptance,
+        artifact_count=event.artifact_count,
+        wrote_files=event.wrote_files,
+        reverified=event.reverified,
+    )
 
 
 def _coerce_event(event: object) -> LifecycleEvent:
@@ -225,7 +233,7 @@ def _coerce_event(event: object) -> LifecycleEvent:
     raise TypeError("a lifecycle event must be a LifecycleEvent or an event name")
 
 
-def advance(project: Project, event: object, *, now: str = "") -> Project:
+def advance(project: LifecycleProject, event: object, *, now: str = "") -> LifecycleProject:
     """Apply one event to ``project`` and return the updated record.
 
     The input record is not mutated: the caller persists the returned copy, so a

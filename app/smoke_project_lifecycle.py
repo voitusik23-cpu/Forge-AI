@@ -45,7 +45,7 @@ from app.discovery.store import DiscoveryStore
 from app.orchestrator.models import Run, RunState, TaskResult
 from app.planning.planner import Planner
 from app.projects.lifecycle import LifecycleEvent, advance
-from app.projects.models import ArtifactRef, Project, ProjectStatus, ProjectVersion
+from app.projects.models import ArtifactRef, LifecycleProject, ProjectStatus, ProjectVersion
 from app.projects.service import ProjectService
 from app.projects.store import ProjectStore, repository_root
 from app.runtime.bootstrap import create_runtime
@@ -186,7 +186,7 @@ def _print_journal(store: RunStore, run_id: str, *, limit: int = 40) -> int:
     return len(events)
 
 
-def _print_artifacts(project: Project, artifacts: Sequence[ArtifactRef]) -> None:
+def _print_artifacts(project: LifecycleProject, artifacts: Sequence[ArtifactRef]) -> None:
     if not artifacts:
         print("  Artifacts: none (the run wrote no file)")
         return

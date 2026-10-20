@@ -459,6 +459,93 @@ select.input { cursor: pointer; }
 
 .forge-fact .label { color: var(--text-muted); }
 
+/* ---------------------------------------------------------------- project truth
+ *
+ * The owner-facing status block. It is the first thing in the card, it is large,
+ * and its colour follows the fact-derived state word (`data-state`), never a raw
+ * backend enum. Everything technical lives in `.tech-details` below.
+ */
+.project-truth {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+  align-items: start;
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  background: var(--surface-sunken);
+}
+
+@media (max-width: 720px) {
+  .project-truth { grid-template-columns: minmax(0, 1fr); }
+}
+
+.project-truth[data-state="ГОТОВО"] {
+  border-left-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 7%, var(--surface-sunken));
+}
+
+.project-truth[data-state="НУЖНЫ ДОРАБОТКИ"],
+.project-truth[data-state="НЕ СОЗДАН"] {
+  border-left-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, var(--surface-sunken));
+}
+
+.project-truth[data-state="АРХИВ"] { border-left-color: var(--text-muted); }
+
+.project-truth-state {
+  font-size: var(--t-title);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.project-truth-lines { min-width: 0; }
+
+.save-facts {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.save-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface-sunken);
+}
+
+.save-fact .label { color: var(--text-muted); }
+.save-fact[data-known="no"] .label { font-style: italic; }
+
+.tech-details {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.tech-details > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--t-small);
+  letter-spacing: 0.02em;
+  text-transform: none;
+  list-style: none;
+}
+
+.tech-details > summary::before {
+  content: "▸ ";
+  color: var(--text-muted);
+}
+
+.tech-details[open] > summary::before { content: "▾ "; }
+.tech-details[open] > summary { color: var(--text); }
+
 .forge-project {
   display: flex;
   flex-direction: column;
@@ -611,6 +698,77 @@ select.input { cursor: pointer; }
 
 .forge-toggle.disabled { cursor: default; color: var(--text-muted); }
 .forge-toggle input[type="checkbox"]:disabled { cursor: default; accent-color: var(--text-muted); }
+
+/* ------------------------------------------------- questions-first (Кузница)
+   The idea stays above the questions as read-only text, and every question is answered with a
+   typed control: a chip, a radio-like chip group, a select, or one short line. None of these
+   rules carries meaning -- the control's `aria-pressed` and the label text do. */
+.forge-idea {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  border-left: 2px solid color-mix(in srgb, var(--workbench-accent) 40%, transparent);
+  background: var(--surface-sunken);
+}
+
+.forge-idea-text {
+  color: var(--text);
+  font-size: var(--t-small);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.forge-answers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.forge-chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-size: var(--t-small);
+  line-height: 1.3;
+  cursor: pointer;
+  transition: border-color var(--speed) var(--ease), background var(--speed) var(--ease);
+}
+
+.forge-chip:hover { border-color: color-mix(in srgb, var(--workbench-accent) 45%, transparent); }
+
+.forge-chip[aria-pressed="true"] {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--workbench-accent) 60%, transparent);
+  background: color-mix(in srgb, var(--workbench-accent) 16%, transparent);
+  font-weight: 650;
+}
+
+.forge-answer-other { max-width: 320px; margin-top: 2px; }
+
+/* «Не знаю» / «Пропустить» chosen: the control stops accepting a value, and says why beside it. */
+.forge-answer-disabled { opacity: 0.45; pointer-events: none; }
+
+.forge-question-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+/* provider · model · cost_tier · estimated_cost, all four read from the catalogue row. */
+.forge-cost {
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface-sunken);
+}
 
 /* ------------------------------------------------- live run progress (Кузница)
    The nine stages are marked from the run record only: a done stage has evidence, an unproven

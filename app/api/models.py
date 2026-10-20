@@ -109,6 +109,31 @@ class TaskRunResponse:
     duration_seconds: float = 0.0
     provider_used: str = ""
     model_used: str = ""
+    #: The provider-neutral outcome of the run's *work*
+    #: (``app.agent_runtime.outcome.RunOutcome``). ``state`` is the user-facing
+    #: word derived from it, so ``COMPLETED`` appears only for
+    #: ``PROJECT_COMPLETED``. The empty string means "this entry point produces no
+    #: project outcome" -- an unknown outcome, never a completed one.
+    outcome: str = ""
+    #: The questions the answer asked, when ``outcome`` is
+    #: ``CLARIFICATION_REQUIRED``. A plain list of strings, in answer order.
+    clarification_questions: List[str] = field(default_factory=list)
+    #: True exactly when the work stopped because the model asked for answers.
+    needs_clarification: bool = False
+    #: Four independent save facts. They are separate booleans on purpose: one
+    #: combined "saved" indicator hid an empty project behind a stored run record.
+    run_record_saved: bool = False
+    project_created: bool = False
+    project_files_created: bool = False
+    artifact_manifest_saved: bool = False
+    #: How many files this run actually wrote (0 for a text-only answer).
+    files_created: int = 0
+    #: The coarse price category of the provider/model this run used:
+    #: ``FREE``, ``CHEAP`` or ``PAID``; ``None`` when the registries do not know it.
+    cost_tier: Optional[str] = None
+    #: The run's own estimated cost in USD, or ``None`` when no estimate exists.
+    #: It is never invented from a zero: unknown is reported as unknown.
+    estimated_cost: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -124,6 +149,16 @@ class TaskRunResponse:
             "duration_seconds": self.duration_seconds,
             "provider_used": self.provider_used,
             "model_used": self.model_used,
+            "outcome": self.outcome,
+            "clarification_questions": list(self.clarification_questions),
+            "needs_clarification": self.needs_clarification,
+            "run_record_saved": self.run_record_saved,
+            "project_created": self.project_created,
+            "project_files_created": self.project_files_created,
+            "artifact_manifest_saved": self.artifact_manifest_saved,
+            "files_created": self.files_created,
+            "cost_tier": self.cost_tier,
+            "estimated_cost": self.estimated_cost,
         }
 
 

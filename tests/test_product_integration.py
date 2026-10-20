@@ -3561,6 +3561,13 @@ class CompatibilityTests(Block8Case):
                 "run_id", "task_id", "project_id", "state", "success", "output",
                 "error", "tokens", "cost", "duration_seconds", "provider_used",
                 "model_used",
+                # The outcome gate and the independent save indicators. They are
+                # additive: every field that existed before is unchanged, and no
+                # client that reads only those fields is affected.
+                "outcome", "clarification_questions", "needs_clarification",
+                "run_record_saved", "project_created", "project_files_created",
+                "artifact_manifest_saved", "files_created",
+                "cost_tier", "estimated_cost",
             },
         )
         status = SystemStatusResponse("c", "a", "READY", 1, 1).to_dict()

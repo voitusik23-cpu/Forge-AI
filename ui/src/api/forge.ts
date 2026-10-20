@@ -57,6 +57,31 @@ export type TaskRunResponse = {
   duration_seconds?: number;
   provider_used?: string;
   model_used?: string;
+  /**
+   * `app.agent_runtime.outcome.RunOutcome`: what the run's *work* truthfully produced.
+   * `state` is the user-facing word derived from it, so `COMPLETED` appears only for
+   * `PROJECT_COMPLETED`. An empty string means this entry point produces no project
+   * outcome — an unknown outcome, never a completed one.
+   */
+  outcome?: string;
+  /** The questions the answer asked, when `outcome` is `CLARIFICATION_REQUIRED`. */
+  clarification_questions?: string[];
+  /** True exactly when the work stopped because the model asked for answers. */
+  needs_clarification?: boolean;
+  /**
+   * Four independent save facts. They are separate booleans on purpose: one combined
+   * "saved" indicator hid an empty project behind a stored run record.
+   */
+  run_record_saved?: boolean;
+  project_created?: boolean;
+  project_files_created?: boolean;
+  artifact_manifest_saved?: boolean;
+  /** How many files this run actually wrote (0 for a text-only answer). */
+  files_created?: number;
+  /** `FREE` | `CHEAP` | `PAID`, or null when the registries do not know the pair. */
+  cost_tier?: string | null;
+  /** The registry's own rate/estimate, or null when no estimate exists. */
+  estimated_cost?: number | null;
 };
 
 /**
@@ -83,8 +108,57 @@ export type DispatchResult = {
  *
  * The registry answers `provider_id` / `model_id` per row (verified against the live payload), so
  * the model list is filtered by the provider the form actually sends, not by a display name.
+ * `cost_tier` and `estimated_cost` are the backend's own words/numbers for that row: the tier is
+ * `FREE`/`CHEAP`/`PAID` and the cost is the registry's price per 1M input tokens, `null` when it
+ * carries no rate. Neither is ever derived here.
  */
-export type CatalogueModel = { provider_id?: string; model_id?: string; display_name?: string };
+export type CatalogueModel = {
+  provider_id?: string;
+  model_id?: string;
+  display_name?: string;
+  cost_tier?: string | null;
+  estimated_cost?: number | null;
+};
+
+/** One catalogue row, as the launch step needs it: the id, its tier and its unit price. */
+export type CatalogueEntry = {
+  model_id: string;
+  /** `FREE` | `CHEAP` | `PAID`, or "" when the row carries no tier. */
+  cost_tier: string;
+  /** Price per 1M input tokens in USD, or null when the registry lists none. */
+  estimated_cost: number | null;
+};
+
+/**
+ * The catalogue row for one provider/model pair, or `null` when the pair is not listed.
+ *
+ * `null` is the honest answer "the registry does not describe this pair", which the launch step
+ * shows as an unknown tier instead of assuming the model is free.
+ */
+export const catalogueEntryFor = (
+  catalogue: Record<string, unknown> | null,
+  provider: string,
+  model: string
+): CatalogueEntry | null => {
+  if (!catalogue || provider === "" || model === "") return null;
+  const rows = catalogue.models;
+  if (!Array.isArray(rows)) return null;
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const record = row as CatalogueModel;
+    if (String(record.provider_id ?? "") !== provider) continue;
+    if (String(record.model_id ?? "") !== model) continue;
+    const rawTier = String(record.cost_tier ?? "").trim().toUpperCase();
+    const rawCost = record.estimated_cost;
+    return {
+      model_id: model,
+      cost_tier: rawTier,
+      estimated_cost:
+        typeof rawCost === "number" && Number.isFinite(rawCost) ? rawCost : null,
+    };
+  }
+  return null;
+};
 
 /**
  * The model ids `/api/models` lists for one provider, sorted by id.
@@ -608,10 +682,16 @@ const discoveryPath = (sessionId: string, suffix: string): string =>
 export const startDiscovery = (goal: string): Promise<Result<DiscoverySessionPayload>> =>
   postJson<DiscoverySessionPayload>("/api/discovery/sessions", { goal });
 
-/** `POST .../answers` — record the user's own words, then re-derive the spec and the next round. */
+/**
+ * `POST .../answers` — record the user's own words, then re-derive the spec and the next round.
+ *
+ * `skipped` is the route's own field for an explicit non-answer («Не знаю»): the Core stores it as
+ * a skipped answer, so the area is not asked again while the specification keeps saying the value
+ * is unknown. A question that is simply omitted is not answered at all and may come back.
+ */
 export const sendDiscoveryAnswers = (
   sessionId: string,
-  answers: Array<{ question_id: string; text: string }>
+  answers: Array<{ question_id: string; text: string; skipped?: boolean }>
 ): Promise<Result<DiscoverySessionPayload>> =>
   postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/answers"), { answers });
 
@@ -733,7 +813,69 @@ export type LifecycleDetail = {
   project?: LifecycleProject;
   versions?: LifecycleVersion[];
   files?: LifecycleArtifact[];
+  presentation?: ProjectPresentation;
 };
+
+/**
+ * The owner-facing card, derived by the backend in `app/projects/presentation.py`.
+ *
+ * It is a *presentation* of facts, never a replacement for them: `project.status`,
+ * `versions[].verification` and `files` keep their own words in this payload, and
+ * the raw words are repeated inside `technical`, which the card renders collapsed.
+ * Rendering this instead of re-deriving the words in the client is what makes one
+ * screening rule exist instead of two.
+ *
+ * `project_state` is one of `НЕ СОЗДАН`, `НУЖНЫ ДОРАБОТКИ`, `ГОТОВО` (or `АРХИВ`),
+ * and it is derived from the facts -- so a project with no file can never say
+ * `ГОТОВО`. `stage_label` is the finer word for the current stage (`ЧЕРНОВИК`,
+ * `ОЖИДАЮТ УТОЧНЕНИЯ`, `ПЛАН ГОТОВ`, ...).
+ */
+export type ProjectPresentation = {
+  project_state?: string;
+  stage_label?: string;
+  backend_status?: string;
+  files_count?: number;
+  last_action?: string;
+  next_step?: string;
+  verification_line?: string;
+  verification_not_run?: boolean;
+  notices?: string[];
+  notice?: string;
+  /** `[label, value]` rows: the four lines the owner reads first, in order. */
+  headline?: string[][];
+  /** `[label, value]` rows: workspace, repository-relative folder, files, versions, run. */
+  facts?: string[][];
+  save_facts?: PresentationSaveFact[];
+  actions?: PresentationAction[];
+  technical?: { collapsed?: boolean; fields?: PresentationField[] };
+  change_not_written?: boolean;
+  /** `open` for an HTML page, `run` for an entry file, `""` when nothing is launchable. */
+  launch_role?: string;
+  /** The artifact's workspace-relative path (joined to `project_path` for display). */
+  launch_path?: string;
+};
+
+/** One of the six save facts: `да` / `нет` / `неизвестно`, each answered separately. */
+export type PresentationSaveFact = {
+  key?: string;
+  label?: string;
+  value?: string;
+  known?: boolean;
+};
+
+/** One action the card may offer. `visible: false` means "not offered at all". */
+export type PresentationAction = {
+  id?: string;
+  label?: string;
+  enabled?: boolean;
+  visible?: boolean;
+  primary?: boolean;
+  /** Why the action is not offered; empty when it is. */
+  reason?: string;
+};
+
+export type PresentationField = { key?: string; label?: string; value?: string };
+
 
 /** `POST /api/projects/{id}/versions`: the staged version and the task text the run path executes. */
 export type LifecycleNewVersion = {

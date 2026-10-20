@@ -34,18 +34,33 @@ from typing import Any, Dict, List, Optional
 __all__ = ["register_project_routes"]
 
 
-def register_project_routes(app: Any, projects: Any) -> None:
+def register_project_routes(
+    app: Any,
+    projects: Any,
+    *,
+    run_record_loader: Any = None,
+    environment_facts: Any = None,
+) -> None:
     """Attach the lifecycle routes to ``app`` and publish the service on its state.
 
     The service is created once, at composition, so every request of one process
     shares one store and one view of the projects -- exactly as the discovery
     service is composed.
+
+    ``run_record_loader`` (``run_id -> record | None``) and ``environment_facts``
+    (``() -> {"provider_registry_ids": [...], "api_routes": [...]}``) are optional
+    and read-only: they let the detail route publish the *technical* block of the
+    card (the run's classification, its counters, the provider registry ids and the
+    route list) without the project store having to know about the run store or the
+    composition. Both are called inside a request and neither can raise into the
+    response.
     """
 
     from fastapi import HTTPException
 
     from app.api.routes import body_error_exception, error_body
     from app.projects.lifecycle import IllegalTransition
+    from app.projects.presentation import build_project_presentation
     from app.projects.service import InvalidChangeRequest, UnknownProjectVersion
     from app.projects.store import UnknownProject
 
@@ -80,6 +95,52 @@ def register_project_routes(app: Any, projects: Any) -> None:
             "location": f"{project.project_path}/{artifact.path}",
         }
 
+    def _presentation(project: Any) -> Dict[str, Any]:
+        """The owner-facing card, derived from this project's own facts.
+
+        Everything the card says comes from the record, its current version's
+        manifest and (when it can be read) the run's durable record. A fact that
+        cannot be read is passed as unknown and the card reports it as unknown; it
+        is never filled in from the project's status alone.
+        """
+
+        current = project.current()
+        files = tuple(getattr(current, "files", ()) or ())
+        run_id = str(getattr(current, "run_id", "") or "")
+        run_record: Any = None
+        if run_id and callable(run_record_loader):
+            try:
+                run_record = run_record_loader(run_id)
+            except Exception:  # noqa: BLE001 - an unreadable record is an unknown fact
+                run_record = None
+        facts: Dict[str, Any] = {}
+        if callable(environment_facts):
+            try:
+                facts = dict(environment_facts() or {})
+            except Exception:  # noqa: BLE001 - the composition is not a response
+                facts = {}
+        workspace_exists: Optional[bool] = None
+        try:
+            workspace_exists = bool(
+                projects.store.workspace_path(project.project_id).is_dir()
+            )
+        except Exception:  # noqa: BLE001 - an unreadable workspace is an unknown fact
+            workspace_exists = None
+        status_word = str(getattr(project.status, "value", project.status) or "")
+        return build_project_presentation(
+            project=project.to_dict(),
+            versions=[item.summary() for item in reversed(project.versions)],
+            files=[_artifact_payload(project, artifact) for artifact in files],
+            run_record=(
+                run_record if isinstance(run_record, dict) else None
+            ),
+            workspace_exists=workspace_exists,
+            session_open=status_word == "NEEDS_CLARIFICATION",
+            questions_open=status_word == "NEEDS_CLARIFICATION",
+            provider_registry_ids=tuple(facts.get("provider_registry_ids") or ()),
+            api_routes=tuple(facts.get("api_routes") or ()),
+        ).to_dict()
+
     def _detail(project: Any) -> Dict[str, Any]:
         return {
             "project": project.to_dict(),
@@ -88,6 +149,7 @@ def register_project_routes(app: Any, projects: Any) -> None:
                 _artifact_payload(project, artifact)
                 for artifact in (project.current().files if project.current() else ())
             ],
+            "presentation": _presentation(project),
         }
 
     def _guard(call: Any) -> Any:

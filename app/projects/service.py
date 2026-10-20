@@ -52,7 +52,7 @@ from app.projects.models import (
     ARTIFACT_CHANGE_CREATE,
     ARTIFACT_CHANGE_UPDATE,
     MAX_VERSION_FILES,
-    Project,
+    LifecycleProject,
     ProjectError,
     ProjectStatus,
     ProjectVersion,
@@ -308,7 +308,7 @@ class NewVersionTask:
     discovery session's specification is still prepended there.
     """
 
-    project: Project
+    project: LifecycleProject
     version: int
     task_text: str
     change_request: ChangeRequest
@@ -330,14 +330,14 @@ class ProjectService:
     def store(self) -> ProjectStore:
         return self._store
 
-    def open_project(self, project_id: object) -> Project:
+    def open_project(self, project_id: object) -> LifecycleProject:
         """The stored record, or :class:`UnknownProject`."""
 
         if not is_safe_project_id(project_id):
             raise UnknownProject(str(project_id))
         return self._store.require(project_id)
 
-    def list_projects(self, *, include_archived: bool = True) -> Tuple[Project, ...]:
+    def list_projects(self, *, include_archived: bool = True) -> Tuple[LifecycleProject, ...]:
         return tuple(
             self._store.list_projects(include_archived=include_archived)
         )
@@ -383,7 +383,7 @@ class ProjectService:
     # ------------------------------------------------------------- creation
     def create_from_discovery(
         self, session: object, *, plan_ref: str = ""
-    ) -> Project:
+    ) -> LifecycleProject:
         """Create the durable project record for a confirmed discovery session.
 
         The record is born in ``WAITING_FOR_CONFIRMATION``: its specification is
@@ -409,7 +409,7 @@ class ProjectService:
         project_id = new_project_id()
         now = utc_now()
         workspace = self._store.workspace_path(project_id, create=True)
-        project = Project(
+        project = LifecycleProject(
             project_id=project_id,
             name=_project_name(goal or specification.get("project_type", "")),
             status=ProjectStatus.WAITING_FOR_CONFIRMATION,
@@ -434,7 +434,7 @@ class ProjectService:
         self._store.link_session(session_id, project_id)
         return project
 
-    def confirm(self, project_id: object, *, plan_ref: str = "") -> Project:
+    def confirm(self, project_id: object, *, plan_ref: str = "") -> LifecycleProject:
         """Advance a new project from ``WAITING_FOR_CONFIRMATION`` to ``PLANNED``.
 
         Confirming an already planned project is a no-op (it is the same fact), not
@@ -459,7 +459,7 @@ class ProjectService:
         *,
         source_root: Optional[object] = None,
         now: str = "",
-    ) -> Project:
+    ) -> LifecycleProject:
         """Record a finished run against a project and advance its lifecycle.
 
         Order of operations, all derived from the run's own record:
@@ -544,13 +544,24 @@ class ProjectService:
             model=facts.model,
             reason=copy_problem,
         )
+        # A **change** request that wrote nothing does not advance the project. The
+        # version it staged is still recorded (so the attempt is not hidden), but the
+        # previous version stays current, because what the workspace contains is still
+        # the previous version's files. Without this rule a text-only model answer
+        # moved the project to a newer, empty version and the card read "the current
+        # version has no files" while the earlier files were still on disk.
+        staged = project.pending_version
+        requested_change = staged is not None and staged.change_request is not None
+        becomes_current = bool(artifacts) or not facts.failed
+        if requested_change and not artifacts and not facts.failed:
+            becomes_current = False
         project = self._fill_version(
             project,
             facts,
             artifacts=artifacts,
             verification=verification,
             acceptance=facts.acceptance,
-            becomes_current=bool(artifacts) or not facts.failed,
+            becomes_current=becomes_current,
             now=timestamp,
         )
         event_name = "completed" if not completion_blockers(evidence) else "changes_required"
@@ -637,7 +648,7 @@ class ProjectService:
         )
 
     # -------------------------------------------------------------- archive
-    def archive(self, project_id: object) -> Project:
+    def archive(self, project_id: object) -> LifecycleProject:
         """Freeze a project without deleting anything.
 
         Every field is kept, the workspace is kept, and ``previous_status`` records
@@ -649,7 +660,7 @@ class ProjectService:
         self._store.write(archived)
         return archived
 
-    def restore(self, project_id: object) -> Project:
+    def restore(self, project_id: object) -> LifecycleProject:
         """Return an archived project to the status it had before archiving."""
 
         project = self.open_project(project_id)
@@ -658,7 +669,7 @@ class ProjectService:
         return restored
 
     # --------------------------------------------------------------- re-verify
-    def verify_again(self, project_id: object) -> Project:
+    def verify_again(self, project_id: object) -> LifecycleProject:
         """Re-judge the recorded artifacts, then advance the lifecycle.
 
         No provider is called and no run is started. The re-check is real: every
@@ -726,7 +737,7 @@ class ProjectService:
 
     def _fill_version(
         self,
-        project: Project,
+        project: LifecycleProject,
         facts: RunFacts,
         *,
         artifacts: Tuple[ArtifactRef, ...],
@@ -734,7 +745,7 @@ class ProjectService:
         acceptance: str,
         becomes_current: bool,
         now: str,
-    ) -> Project:
+    ) -> LifecycleProject:
         """Fill the staged version (or append one) with this run's evidence."""
 
         pending = project.pending_version
@@ -771,7 +782,7 @@ class ProjectService:
 
     def _materialise(
         self,
-        project: Project,
+        project: LifecycleProject,
         facts: RunFacts,
         source_root: Optional[object],
     ) -> Tuple[Tuple[ArtifactRef, ...], str]:
@@ -844,7 +855,7 @@ class ProjectService:
         return tuple(artifacts), ""
 
     def _recompute_verification(
-        self, project: Project, version: ProjectVersion
+        self, project: LifecycleProject, version: ProjectVersion
     ) -> str:
         """Re-check the recorded artifacts against what is on disk now."""
 
@@ -914,7 +925,7 @@ def _project_name(text: object) -> str:
     return collapsed[:MAX_PROJECT_NAME_CHARS]
 
 
-def _version_task_text(project: Project, version: int, change_text: str) -> str:
+def _version_task_text(project: LifecycleProject, version: int, change_text: str) -> str:
     """The task text for one version, bounded and self-describing.
 
     It names the project, the version and the change. The confirmed

@@ -712,8 +712,12 @@ class FailedRunReportsItsReasonTests(unittest.TestCase):
         response = service.run_task(TaskRunRequest(description="probe"))
 
         self.assertTrue(response.success)
-        self.assertEqual(response.state, "COMPLETED")
+        # The guard must not turn a success into a failure -- and it must not turn a
+        # returned answer into a completed project either. The offline path produces
+        # a report and no project, so the state is the honest outcome word.
         self.assertIsNone(response.error)
+        self.assertEqual(response.outcome, "SPECIFICATION_READY")
+        self.assertEqual(response.state, "SPECIFICATION_READY")
 
 
 class AttemptAccountingTests(unittest.TestCase):

@@ -38,6 +38,7 @@ from app.discovery import (
     InvalidClarificationAnswer,
     UnknownDiscoverySession,
 )
+from app.discovery.analyzer import analyze_goal
 from app.discovery.store import DiscoveryStore
 from app.runtime.run_store import RunStore
 from offline_runtime import offline_runtime
@@ -574,12 +575,53 @@ class DiscoveryApiTests(_DiscoveryTestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
-        self.assertEqual(body["state"], "COMPLETED", body)
+        # The offline path executes the confirmed specification, but it creates no
+        # project record and writes no file, so the outcome gate refuses to call the
+        # work a completed project. This assertion used to require "COMPLETED" -- the
+        # false completion the gate now prevents.
+        self.assertNotEqual(body["state"], "COMPLETED", body)
+        self.assertNotEqual(body["outcome"], "PROJECT_COMPLETED", body)
+        self.assertEqual(body["outcome"], "SPECIFICATION_READY", body)
+        self.assertEqual(body["files_created"], 0, body)
+        self.assertTrue(body["run_record_saved"], body)
         self.assertTrue(body["success"], body)
         # The existing offline path reports its own loop and received both texts.
         self.assertIn("OFFLINE TASK EXECUTION", body["output"])
         self.assertIn("PROJECT SPECIFICATION", body["output"])
         self.assertIn("перечислить содержимое корня репозитория", body["output"])
+
+
+class NegativeInstructionTests(_DiscoveryTestCase):
+    """A refusal is not a requirement, and nothing may be derived from one.
+
+    The owner's example: «не использовать онлайн-платежи» used to become
+    ``Интеграции: платежи`` in the specification -- a value the user explicitly
+    refused. The derivation is the only place that can invent such a value, so the
+    guard lives there and the specification simply stays empty ("не указано").
+    """
+
+    NEGATIVE_GOAL = (
+        "Хочу приложение для учёта личных расходов, не использовать онлайн-платежи"
+    )
+
+    def test_01_a_negated_mention_is_not_derived(self) -> None:
+        analysis = analyze_goal(self.NEGATIVE_GOAL)
+
+        self.assertEqual(analysis.integrations, ())
+
+    def test_02_the_specification_names_no_value_from_a_refusal(self) -> None:
+        session = self.discovery.start(self.NEGATIVE_GOAL)
+        specification = self.discovery.specification(session.session_id)
+
+        self.assertEqual(specification.integrations, ())
+        self.assertNotIn("Интеграции: платежи", specification.as_task_text())
+
+    def test_03_a_stated_need_is_still_derived(self) -> None:
+        self.assertEqual(analyze_goal("Трекер расходов с оплатой").integrations, ("платежи",))
+        # A comma ends the negation's scope: the payment is stated, not refused.
+        self.assertEqual(
+            analyze_goal("Это не бот, а сайт с оплатой").integrations, ("платежи",)
+        )
 
 
 if __name__ == "__main__":

@@ -566,7 +566,14 @@ def create_default_registry() -> ModelRegistry:
                 ModelCapability.FAST,
                 ModelCapability.STREAMING,
             }),
-            cost_tier=CostTier.CHEAP,
+            # PAID, not CHEAP, and the price is the reason. This row was registered
+            # CHEAP, and automatic routing therefore selected it while
+            # ``allow_paid_providers`` was false -- and the owner was billed for a run
+            # nobody asked to pay for (measured: provider ``openrouter``, model
+            # ``anthropic/claude-haiku-4.5``). A model whose published rate is above
+            # zero is not free to run: "cheap" is not a synonym for "may be spent
+            # without an explicit choice". It stays selectable by name.
+            cost_tier=CostTier.PAID,
             input_cost_per_1m=1.00,
             output_cost_per_1m=5.00,
         )

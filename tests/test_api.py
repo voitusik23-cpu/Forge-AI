@@ -68,7 +68,16 @@ class ApiTests(unittest.TestCase):
         )
         self.assertTrue(res.run_id.startswith("run-api-"))
         self.assertTrue(res.task_id.startswith("task-"))
-        self.assertEqual(res.state, "COMPLETED")
+        # A returned answer is not a completed project: nothing was created, nothing
+        # was verified and no file was written, so the response reports the outcome
+        # the work truthfully reached. This assertion used to require "COMPLETED".
+        self.assertNotEqual(res.state, "COMPLETED")
+        self.assertEqual(res.outcome, "SPECIFICATION_READY")
+        self.assertEqual(res.files_created, 0)
+        self.assertTrue(res.run_record_saved)
+        self.assertFalse(res.project_created)
+        self.assertFalse(res.project_files_created)
+        self.assertFalse(res.artifact_manifest_saved)
         self.assertTrue(res.success)
         self.assertTrue(len(res.output) > 0)
         self.assertIsNone(res.error)

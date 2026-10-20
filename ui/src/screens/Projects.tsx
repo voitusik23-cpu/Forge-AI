@@ -21,7 +21,7 @@
 //   clickable and the backend's 409 is printed with its code and message: an archived project
 //   must be able to demonstrate that it is frozen.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
 import { IconRefresh } from "../components/Icons";
 import { t, type Lang } from "../i18n";
@@ -50,14 +50,12 @@ import {
   type LifecycleProject,
   type LifecycleSummary,
   type LifecycleVersion,
+  type ProjectPresentation,
   type RunRecord,
 } from "../api/forge";
 
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
-
-const yes = (lang: Lang): string => (lang === "ru" ? "да" : "yes");
-const no = (lang: Lang): string => (lang === "ru" ? "нет" : "no");
 
 const bytesLabel = (size: unknown): string => {
   const value = typeof size === "number" && Number.isFinite(size) ? size : null;
@@ -67,26 +65,13 @@ const bytesLabel = (size: unknown): string => {
   return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
 };
 
-/** The status vocabulary the backend publishes, in the order the product uses it. */
-const STATUS_ORDER = [
-  "DISCOVERY",
-  "NEEDS_CLARIFICATION",
-  "READY_FOR_PLANNING",
-  "PLANNED",
-  "WAITING_FOR_CONFIRMATION",
-  "RUNNING",
-  "REVIEWING",
-  "NEEDS_CHANGES",
-  "COMPLETED",
-  "FAILED",
-  "ARCHIVED",
-] as const;
-
 /**
- * The tone a status word is drawn with.
+ * The tone a raw status word is drawn with, for the *list*.
  *
- * The word is always printed next to the colour, so a colour-blind reader loses nothing; the
- * tone only adds emphasis. An unknown word keeps the neutral tone and is printed verbatim.
+ * The list shows the backend's own word next to its owner-facing stage; the card
+ * itself draws only the owner's word (the raw one lives in «Технические детали»).
+ * The word is always printed next to the colour, so a colour-blind reader loses
+ * nothing.
  */
 const statusTone = (status: unknown): "ok" | "warn" | "danger" | "info" | "neutral" => {
   const word = String(status ?? "").toUpperCase();
@@ -96,13 +81,6 @@ const statusTone = (status: unknown): "ok" | "warn" | "danger" | "info" | "neutr
   if (word === "ARCHIVED") return "neutral";
   if (word === "WAITING_FOR_CONFIRMATION" || word === "NEEDS_CLARIFICATION") return "warn";
   return "neutral";
-};
-
-const statusHint = (lang: Lang, status: unknown): string => {
-  const word = String(status ?? "").toUpperCase();
-  const known = (STATUS_ORDER as readonly string[]).includes(word);
-  if (!known) return lang === "ru" ? "неизвестный статус" : "unknown status";
-  return t(lang, `projects.status.${word}`);
 };
 
 type Load<T> = { status: "loading" } | { status: "ready"; value: T } | { status: "failed"; failure: Failure };
@@ -199,6 +177,7 @@ const ArtifactTable = ({ lang, artifacts }: { lang: Lang; artifacts: LifecycleAr
 const ProjectCard = ({
   lang,
   backend,
+  presentation,
   project,
   versions,
   files,
@@ -235,6 +214,8 @@ const ProjectCard = ({
 }: {
   lang: Lang;
   backend: BackendState;
+  /** The owner-facing card, derived by the backend from this project's own facts. */
+  presentation: ProjectPresentation;
   project: LifecycleProject;
   versions: LifecycleVersion[];
   files: LifecycleArtifact[];
@@ -269,7 +250,6 @@ const ProjectCard = ({
   actionFailure: Failure | null;
   actionNotice: string;
 }) => {
-  const status = String(project.status ?? "");
   const archived = project.archived === true;
   const currentVersion = typeof project.current_version === "number" ? project.current_version : 0;
   const specification = project.specification ?? {};
@@ -295,16 +275,78 @@ const ProjectCard = ({
   };
 
   const current = versions.find((item) => item.version === currentVersion) ?? versions[0] ?? null;
-  const canVerify = status === "COMPLETED" || status === "NEEDS_CHANGES";
-  const verifyReason = canVerify
-    ? t(lang, "projects.verify.hint")
-    : t(lang, "projects.verify.disabled").replace("{status}", text(status));
   const outcome = String(current?.verification ?? "");
   const acceptance = String(current?.acceptance ?? "");
 
   // The run's own classification is the only place a reason exists; the project record
-  // deliberately stores verdicts, not prose. When the record cannot be read the block says so.
+  // deliberately stores verdicts, not prose. It is shown inside «Технические детали»,
+  // never above the fold.
   const classification = runRecord?.classification ?? null;
+
+  // ------------------------------------------------------------------ the truth block
+  // Every word below comes from `presentation`, which the backend derives from this
+  // project's own facts (app/projects/presentation.py). Nothing here re-decides a
+  // status, so the card cannot contradict the record it is describing.
+  const state = String(presentation.project_state ?? "");
+  const stageLabel = String(presentation.stage_label ?? "");
+  const stateTone = (value: string): "ok" | "warn" | "danger" | "info" | "neutral" => {
+    if (value === "ГОТОВО") return "ok";
+    if (value === "НУЖНЫ ДОРАБОТКИ") return "warn";
+    if (value === "НЕ СОЗДАН") return "warn";
+    if (value === "АРХИВ") return "neutral";
+    return "info";
+  };
+  const saveFacts = presentation.save_facts ?? [];
+  const headline: Array<[string, string]> = (presentation.headline ?? []).map((row) => [
+    String(row?.[0] ?? ""),
+    String(row?.[1] ?? ""),
+  ]);
+  const factRows: Array<[string, string]> = (presentation.facts ?? []).map((row) => [
+    String(row?.[0] ?? ""),
+    String(row?.[1] ?? ""),
+  ]);
+  const actions = (presentation.actions ?? []).filter((item) => item.visible !== false);
+  const hiddenActions = (presentation.actions ?? []).filter((item) => item.visible === false);
+  const technicalFields = presentation.technical?.fields ?? [];
+  // Whether a run was ever recorded for the current version. It is a technical fact,
+  // so it is read from the technical block rather than re-derived here.
+  const runIdValue = String((technicalFields.find((field) => field.key === "run_id") ?? {}).value ?? "");
+  const hasRun = runIdValue !== "" && runIdValue !== "—";
+  const notices = presentation.notices ?? [];
+
+  const [launchNote, setLaunchNote] = useState("");
+  const changeRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // One handler for the whole action vocabulary: the card offers what the backend
+  // allows and nothing else, so an unknown id can only be a client/server mismatch.
+  const runAction = (id: string): void => {
+    setLaunchNote("");
+    if (id === "reverify") {
+      onVerify();
+      return;
+    }
+    if (id === "new_version") {
+      onNewVersion();
+      return;
+    }
+    if (id === "view_files") {
+      document.getElementById("project-artifacts")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (id === "continue_creation" || id === "add_feature" || id === "answer_questions") {
+      changeRef.current?.focus();
+      return;
+    }
+    if (id === "open_app" || id === "launch_local") {
+      // There is no route that serves a generated project, so the card says where the
+      // file is instead of pretending to start it.
+      const target = String(presentation.launch_path ?? "");
+      const folder = String(project.project_path ?? "");
+      setLaunchNote(
+        `${t(lang, "projects.launch.notice")}: ${folder}/${target} (${t(lang, "projects.launch.manual")})`
+      );
+    }
+  };
 
   return (
     <Card className="rise d1">
@@ -313,49 +355,99 @@ const ProjectCard = ({
         hint={`${text(project.project_id)} · ${t(lang, "projects.card.hint")}`}
         action={
           <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
-            <Badge tone={statusTone(status)}>{text(status, t(lang, "runs.unknown"))}</Badge>
+            {/* The owner's word for the stage, never the backend's raw enum. The raw
+                word is in «Технические детали», collapsed. */}
+            <Badge tone={stateTone(state)}>{text(stageLabel, t(lang, "runs.unknown"))}</Badge>
             {archived ? <Badge tone="neutral">{t(lang, "projects.badge.archived")}</Badge> : null}
           </span>
         }
       />
 
       <div className="stack" style={{ gap: 16 }}>
-        <div className="small muted">{statusHint(lang, status)}</div>
-
         {actionFailure !== null ? <Refusal lang={lang} failure={actionFailure} /> : null}
         {actionNotice !== "" ? <div className="notice">{actionNotice}</div> : null}
 
-        {/* ---------------------------------------------------------------- where */}
+        {/* ------------------------------------------------------------ the truth */}
+        <div className="project-truth" data-state={state}>
+          <div className="stack" style={{ gap: 6 }}>
+            <div className="label">{t(lang, "projects.truth.title")}</div>
+            <div className="project-truth-state">{text(state)}</div>
+            <div className="small muted">
+              {t(lang, "projects.truth.stage")}: {text(stageLabel)}
+            </div>
+          </div>
+          <div className="stack project-truth-lines" style={{ gap: 4 }}>
+            {headline
+              .filter(([label]) => label !== t(lang, "projects.truth.title"))
+              .map(([label, value]) => (
+                <div className="row between" key={label} style={{ gap: 12, alignItems: "flex-start" }}>
+                  <span className="small muted" style={{ flex: "0 0 180px" }}>
+                    {label}
+                  </span>
+                  <span className="small" style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}>
+                    {value}
+                  </span>
+                </div>
+              ))}
+            <div className="row between" style={{ gap: 12, alignItems: "flex-start", marginTop: 4 }}>
+              <span className="small muted" style={{ flex: "0 0 180px" }}>
+                {t(lang, "projects.truth.verification")}
+              </span>
+              <span
+                className={`small${presentation.verification_not_run === true ? " muted" : ""}`}
+                style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}
+              >
+                {text(presentation.verification_line)}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {notices.map((line) => (
+          <div className="notice warn" key={line}>
+            {line}
+          </div>
+        ))}
+
+        {/* -------------------------------------------------------- the save facts */}
+        <div>
+          <div className="label">{t(lang, "projects.save.title")}</div>
+          <div className="save-facts" style={{ marginTop: 8 }}>
+            {saveFacts.map((item) => {
+              const known = item.known === true;
+              const value = String(item.value ?? t(lang, "projects.save.unknown"));
+              const tone = !known ? "neutral" : value === "да" || value === "yes" ? "ok" : value === "неизвестно" ? "neutral" : "neutral";
+              return (
+                <div className="save-fact" key={String(item.key ?? item.label ?? "")} data-known={known ? "yes" : "no"}>
+                  <div className="label">{text(item.label)}</div>
+                  <Badge tone={tone}>{value}</Badge>
+                </div>
+              );
+            })}
+          </div>
+          <div className="small muted" style={{ marginTop: 6 }}>
+            {t(lang, "projects.save.hint")}
+          </div>
+        </div>
+
+        {/* ------------------------------------------------------------- the facts */}
         <div>
           <div className="label">{t(lang, "projects.where.title")}</div>
-          <div className="stack mono small" style={{ gap: 4, marginTop: 8 }}>
-            <span>Workspace: {text(project.workspace_id ?? project.project_id)}</span>
-            <span>Project folder: {text(project.project_path)}</span>
-            <span>Files: {typeof current?.file_count === "number" ? current.file_count : files.length}</span>
-            <span>Last version: {currentVersion === 0 ? "—" : `v${currentVersion}`}</span>
+          <div className="stack" style={{ gap: 4, marginTop: 8 }}>
+            {factRows.map(([label, value]) => (
+              <div className="row between" key={label} style={{ gap: 12, alignItems: "flex-start" }}>
+                <span className="small muted" style={{ flex: "0 0 180px" }}>
+                  {label}
+                </span>
+                <span className="mono small" style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}>
+                  {value}
+                </span>
+              </div>
+            ))}
           </div>
           <div className="small muted" style={{ marginTop: 6 }}>
             {t(lang, "projects.where.note")}
           </div>
-        </div>
-
-        {/* ----------------------------------------------------------------- record */}
-        <div>
-          <div className="label">{t(lang, "projects.record.title")}</div>
-          <Facts
-            items={[
-              [t(lang, "projects.col.id"), text(project.project_id)],
-              [t(lang, "projects.col.status"), text(status)],
-              [t(lang, "projects.col.archived"), archived ? yes(lang) : no(lang)],
-              [t(lang, "projects.col.prevstatus"), text(project.previous_status)],
-              [t(lang, "projects.col.created"), text(project.created_at)],
-              [t(lang, "projects.col.updated"), text(project.updated_at)],
-              [t(lang, "projects.col.lastrun"), text(project.last_run_at)],
-              [t(lang, "projects.col.version"), currentVersion === 0 ? "—" : `v${currentVersion}`],
-              [t(lang, "projects.col.plan"), text(project.plan_ref)],
-              [t(lang, "projects.col.workspace"), text(project.workspace_id)],
-            ]}
-          />
         </div>
 
         {/* ------------------------------------------------------------ specification */}
@@ -455,7 +547,7 @@ const ProjectCard = ({
         </div>
 
         {/* -------------------------------------------------------------- artifacts */}
-        <div>
+        <div id="project-artifacts">
           <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
             <div className="label">{t(lang, "projects.artifacts.title")}</div>
             <Badge tone="neutral">{`v${filesVersion}`}</Badge>
@@ -474,86 +566,58 @@ const ProjectCard = ({
           )}
         </div>
 
-        {/* ---------------------------------------------------------------- outcome */}
+        {/* --------------------------------------------------------------- actions */}
+        {/* The offered set is the backend's: an action that is not visible is not
+            offered at all, and every disabled one carries its reason below. */}
         <div>
-          <div className="label">{t(lang, "projects.outcome.title")}</div>
-          {status === "COMPLETED" ? (
-            <div className="stack" style={{ gap: 8, marginTop: 8 }}>
-              <div className="notice ok">{t(lang, "projects.outcome.completed")}</div>
-              <Facts
-                items={[
-                  [t(lang, "projects.outcome.files"), `${files.length} · ${text(project.project_path)}`],
-                  [t(lang, "projects.outcome.verify"), verificationLabel(lang, outcome)],
-                  [t(lang, "projects.outcome.accept"), acceptanceLabel(lang, acceptance)],
-                  [t(lang, "projects.outcome.route"), `${text(current?.provider)} · ${text(current?.model)}`],
-                  [
-                    t(lang, "projects.outcome.duration"),
-                    dispatched && typeof dispatched.response.duration_seconds === "number"
-                      ? `${dispatched.response.duration_seconds.toFixed(3)} s`
-                      : t(lang, "projects.outcome.duration.unpublished"),
-                  ],
-                ]}
-              />
-              <div className="small muted">{t(lang, "projects.outcome.next")}</div>
-            </div>
-          ) : status === "NEEDS_CHANGES" ? (
-            <div className="stack" style={{ gap: 8, marginTop: 8 }}>
-              <div className="notice warn">{t(lang, "projects.outcome.needs_changes")}</div>
-              <Facts
-                items={[
-                  [t(lang, "projects.outcome.verify"), verificationLabel(lang, outcome)],
-                  [t(lang, "projects.outcome.accept"), acceptanceLabel(lang, acceptance)],
-                  [t(lang, "projects.outcome.route"), `${text(current?.provider)} · ${text(current?.model)}`],
-                  [t(lang, "projects.outcome.files"), String(files.length)],
-                ]}
-              />
-              <div>
-                <div className="label">{t(lang, "projects.outcome.why")}</div>
-                <div className="small" style={{ marginTop: 6, overflowWrap: "anywhere" }}>
-                  {classification
-                    ? `${text(classification.outcome)} · ${text(classification.reason)} · ${text(classification.detail)}`
-                    : runLoading
-                      ? t(lang, "projects.outcome.reason.loading")
-                      : runFailure !== null
-                        ? `${t(lang, "projects.outcome.reason.unreadable")}: HTTP ${runFailure.status}`
-                        : t(lang, "projects.outcome.reason.absent")}
+          <div className="label">{t(lang, "projects.actions.title")}</div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+            {actions.map((item) => {
+              const id = String(item.id ?? "");
+              const enabled = item.enabled !== false;
+              return (
+                <Button
+                  key={id}
+                  size="small"
+                  tone={item.primary === true ? "primary" : "ghost"}
+                  disabled={!enabled || busy === "verify"}
+                  onClick={() => runAction(id)}
+                >
+                  {busy === "verify" && id === "reverify"
+                    ? t(lang, "projects.verify.running")
+                    : text(item.label, id)}
+                </Button>
+              );
+            })}
+          </div>
+          {/* A reason is printed for every action that cannot be used, and for a
+              hidden one when its absence would otherwise be a mystery. */}
+          <div className="stack" style={{ gap: 2, marginTop: 8 }}>
+            {actions
+              .filter((item) => item.enabled === false && String(item.reason ?? "") !== "")
+              .map((item) => (
+                <div className="small muted" key={`why-${String(item.id)}`}>
+                  {text(item.label)}: {text(item.reason)}
                 </div>
-                {classification?.evidence && classification.evidence.length > 0 ? (
-                  <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
-                    {classification.evidence.map((item) => (
-                      <Badge key={item} tone="neutral">
-                        {item}
-                      </Badge>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-              <div className="small muted">{t(lang, "projects.outcome.needs_changes.next")}</div>
+              ))}
+            {hiddenActions
+              .filter((item) => String(item.reason ?? "") !== "")
+              .map((item) => (
+                <div className="small muted" key={`hidden-${String(item.id)}`}>
+                  {text(item.label)} {t(lang, "projects.actions.hidden")}: {text(item.reason)}
+                </div>
+              ))}
+          </div>
+          {launchNote !== "" ? (
+            <div className="notice" style={{ marginTop: 8 }}>
+              {launchNote}
             </div>
-          ) : status === "FAILED" ? (
-            <div className="stack" style={{ gap: 8, marginTop: 8 }}>
-              <div className="notice danger">{t(lang, "projects.outcome.failed")}</div>
-              <div className="small" style={{ overflowWrap: "anywhere" }}>
-                {classification
-                  ? `${text(classification.outcome)} · ${text(classification.reason)} · ${text(classification.detail)}`
-                  : runLoading
-                    ? t(lang, "projects.outcome.reason.loading")
-                    : t(lang, "projects.outcome.failed.safe")}
-              </div>
-              <div className="small muted">{t(lang, "projects.outcome.failed.next")}</div>
-            </div>
-          ) : (
-            <div className="small muted" style={{ marginTop: 8 }}>
-              {t(lang, "projects.outcome.pending").replace("{status}", text(status))}
-            </div>
-          )}
+          ) : null}
         </div>
 
-        {/* --------------------------------------------------------------- actions */}
+        {/* The record operations. They are not part of the creation action set: they
+            act on the record itself and stay available whatever it contains. */}
         <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <Button size="small" disabled={busy === "verify"} onClick={onVerify}>
-            {busy === "verify" ? t(lang, "projects.verify.running") : t(lang, "projects.action.verify")}
-          </Button>
           <Button size="small" tone="ghost" onClick={onArchive}>
             {busy === "archive" ? t(lang, "projects.archive.running") : t(lang, "projects.action.archive")}
           </Button>
@@ -564,8 +628,6 @@ const ProjectCard = ({
             {t(lang, "projects.action.history")}
           </Button>
         </div>
-        {/* Every limitation is stated where the action is, not in a manual nobody opens. */}
-        <div className="small muted">{verifyReason}</div>
 
         {/* ----------------------------------------------------------- new version */}
         <div>
@@ -579,6 +641,7 @@ const ProjectCard = ({
               <textarea
                 className="input"
                 rows={3}
+                ref={changeRef}
                 value={change}
                 onChange={(event) => onChange(event.target.value)}
                 placeholder={t(lang, "projects.newversion.placeholder")}
@@ -674,6 +737,83 @@ const ProjectCard = ({
             ) : null}
           </div>
         </div>
+
+        {/* ------------------------------------------------------- technical details */}
+        {/* Everything a reader needs to trace the card back to the record, and nothing
+            that belongs to the owner's reading. It is collapsed until asked for. */}
+        <details className="tech-details">
+          <summary>{t(lang, "projects.tech.title")}</summary>
+          <div className="stack" style={{ gap: 4, marginTop: 8 }}>
+            {technicalFields.map((field) => {
+              const value = text(field.value);
+              // A long list (the route table) stays complete but scrolls, so it cannot
+              // push every other technical fact off the block.
+              const long = value.length > 240;
+              return (
+                <div className="row between" key={String(field.key ?? field.label ?? "")} style={{ gap: 12, alignItems: "flex-start" }}>
+                  <span className="small muted" style={{ flex: "0 0 200px" }}>
+                    {text(field.label)}
+                  </span>
+                  <span
+                    className="mono small"
+                    style={{
+                      flex: "1 1 auto",
+                      textAlign: "right",
+                      overflowWrap: "anywhere",
+                      ...(long ? { maxHeight: 130, overflowY: "auto", display: "block" } : {}),
+                    }}
+                  >
+                    {value}
+                  </span>
+                </div>
+              );
+            })}
+            {classification !== null ? (
+              <div className="row between" style={{ gap: 12, alignItems: "flex-start" }}>
+                <span className="small muted" style={{ flex: "0 0 200px" }}>
+                  {t(lang, "projects.tech.evidence")}
+                </span>
+                <span className="mono small" style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}>
+                  {(classification.evidence ?? []).join(", ") || "—"}
+                </span>
+              </div>
+            ) : null}
+            <div className="row between" style={{ gap: 12, alignItems: "flex-start" }}>
+              <span className="small muted" style={{ flex: "0 0 200px" }}>
+                {t(lang, "projects.tech.runrecord")}
+              </span>
+              <span className="mono small" style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}>
+                {runLoading
+                  ? t(lang, "projects.outcome.reason.loading")
+                  : runFailure !== null
+                    ? `${t(lang, "projects.outcome.reason.unreadable")}: HTTP ${runFailure.status}`
+                    : hasRun
+                      ? classification === null
+                        ? t(lang, "projects.outcome.reason.absent")
+                        : t(lang, "projects.tech.readable")
+                      : t(lang, "projects.tech.norun")}
+              </span>
+            </div>
+            <div className="row between" style={{ gap: 12, alignItems: "flex-start" }}>
+              <span className="small muted" style={{ flex: "0 0 200px" }}>
+                {t(lang, "projects.tech.savefacts")}
+              </span>
+              <span className="mono small" style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}>
+                {saveFacts.map((item) => `${text(item.label)}=${text(item.value)}`).join(" · ") || "—"}
+              </span>
+            </div>
+            <div className="row between" style={{ gap: 12, alignItems: "flex-start" }}>
+              <span className="small muted" style={{ flex: "0 0 200px" }}>
+                {t(lang, "projects.tech.verdicts")}
+              </span>
+              <span className="mono small" style={{ flex: "1 1 auto", textAlign: "right", overflowWrap: "anywhere" }}>
+                {currentVersion === 0
+                  ? t(lang, "projects.tech.noversion")
+                  : `${t(lang, "projects.outcome.verify")}=${verificationLabel(lang, outcome)} · ${t(lang, "projects.outcome.accept")}=${acceptanceLabel(lang, acceptance)}`}
+              </span>
+            </div>
+          </div>
+        </details>
       </div>
     </Card>
   );
@@ -1065,6 +1205,7 @@ export const Projects = ({
         <ProjectCard
           lang={lang}
           backend={backend}
+          presentation={detail?.value?.presentation ?? {}}
           project={project}
           versions={versions}
           files={artifacts}
