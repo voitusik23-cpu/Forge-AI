@@ -5997,3 +5997,147 @@ fail-closed значения по умолчанию, идемпотентнос
   провайдера/модели, автоматическая маршрутизация, классификация, цепочка fallback,
   cost-aware маршрутизация, замороженный `RunScope` и все границы безопасности не
   изменяются.
+
+## Project lifecycle v0.1
+
+### Context
+
+The discovery layer freezes a specification, and the run path produces evidence about one execution.
+Nothing kept the thing in between: after a confirmation there was no durable record with a status, no
+place where a later run's files and verdicts belonged, and no way to ask "is this project finished?"
+without reading a run. The owner needed one answer per project, and needed it to be auditable.
+
+### Accepted decisions
+
+- **A project is a record, not a run.** `app/projects` stores one JSON per project plus
+  `index.json` under `.forge/projects`; the run store stays the execution evidence and the project
+  store references it by `run_id`. The two are never merged: a project precedes a run and outlives
+  it.
+- **One JSON per project, and the session link lives in the index.** The record keeps exactly the
+  documented field set; the link from a confirmed discovery session to its project is kept in
+  `index.json` (`sessions`), because it is a lookup, not a property of the project. Losing the index
+  costs the link, never the project: the directory is the truth.
+- **Statuses are a table, not branches.** `ALLOWED_TRANSITIONS` in `app/projects/lifecycle.py` is
+  data; an unlisted move raises `IllegalTransition` and is never coerced to a "nearest legal"
+  state, so every status is the result of a named event from a named status.
+- **`previous_status` makes restore honest.** Archiving records the status the project had, and
+  `restore` returns exactly that value; when it is missing the restore is refused rather than
+  invented. While archived, every other event is refused.
+- **The completion gate: a write-less run can never be `COMPLETED`.** Completion requires a
+  terminal-success run, `verification == passed`, `acceptance == passed` and — when the run wrote
+  files — at least one recorded artifact. "Finished" is never treated as "successful", and there is
+  no optimistic completion path anywhere.
+- **Re-verification re-checks bytes, not prose.** `verify_again` confirms every recorded artifact at
+  its recorded size and SHA-256 and compiles every recorded Python artifact; the acceptance verdict
+  is the recorded one. The re-judgement event therefore skips only the run-state row of the gate, and
+  verification, acceptance and the artifact rule still apply.
+- **Artifacts travel as descriptions, never as content.** A recorded file is a path, a kind, a size,
+  a SHA-256, a `create`/`update` change and a verification relevance. The bytes stay in the project
+  workspace, so a record can be listed, compared and archived without carrying code or a credential
+  that ended up in it.
+- **No absolute path reaches a payload.** `project_path` is repository-relative
+  (`.forge/projects/<id>/workspace`) and an artifact publishes a repository-relative `location`
+  composed by the backend, so a client never joins two fields into a host path.
+- **Additive wiring only.** The existing `GET /api/projects` (workspace list) is untouched; the
+  lifecycle list has its own path and is registered before `/{project_id}`. Confirmation gains an
+  additive `project` field, and `POST /api/tasks/run` attaches its run through the existing
+  confirmed-session guard, reporting the outcome in `X-Forge-Project-Attach` without ever changing
+  the run's own response.
+- **The UI reports, it does not judge.** The screen selects the outcome block by the project's own
+  status, prints verdicts as the backend words them, keeps a refused action clickable so the real
+  409 is visible, and labels a `mock` run as "an answer without file changes" with the write switch
+  disabled. Live progress is derived only from the run record, with no percentage anywhere.
+
+### Rejected alternatives
+
+- **Store the project inside the run record.** A project outlives many runs and is not evidence of
+  one execution; merging them would make the run store's schema carry planning state.
+- **Keep a status field on the run and derive the project from it.** That loses the transition
+  history and makes "who moved this project" unanswerable; the explicit table is auditable instead.
+- **Let a finished run imply `COMPLETED`.** A run that wrote nothing, or whose verification did not
+  pass, would be reported as a finished project. The gate exists precisely to refuse that.
+- **Publish the discovery session id on the project record.** It was rejected to keep the record's
+  field set exactly as documented; the cost is that a version submitted from the project screen
+  carries no `discovery_session_id`, which the UI states rather than hides.
+- **Show a percentage or an ETA while a run is in flight.** The backend publishes neither a per-step
+  document nor a rate, so any percentage would be invented.
+
+### Consequences and open items
+
+The consequence of the session-link decision is visible and documented: attaching a version happens
+through a run that carries the confirmed session (the Кузница flow). A future revision may expose the
+link read-only, which would close that gap without changing the record's contract. `docs/USER_MANUAL.md`
+describes the flow for the owner; `docs/ARCHITECTURE.md` describes the implementation.
+
+## Project lifecycle v0.1 — русская версия
+
+### Контекст
+
+Слой уточнения фиксирует спецификацию, а путь запуска даёт доказательства об одном исполнении.
+Ничего не хранило то, что между ними: после подтверждения не было долговечной записи со статусом, не
+было места, куда попадут файлы и вердикты более позднего запуска, и нельзя было спросить «этот проект
+завершён?», не читая запуск. Владельцу нужен один ответ на проект, и он должен быть проверяемым.
+
+### Принятые решения
+
+- **Проект — это запись, а не запуск.** `app/projects` хранит один JSON на проект плюс
+  `index.json` под `.forge/projects`; хранилище запусков остаётся доказательством исполнения, а
+  хранилище проектов ссылается на него через `run_id`. Они никогда не сливаются: проект
+  предшествует запуску и переживает его.
+- **Один JSON на проект, а связь сессии живёт в индексе.** Запись сохраняет ровно
+  задокументированный набор полей; связь подтверждённой сессии уточнения с её проектом хранится в
+  `index.json` (`sessions`), потому что это поиск, а не свойство проекта. Потеря индекса стоит связи,
+  но не проекта: каталог — это истина.
+- **Статусы — таблица, а не ветки.** `ALLOWED_TRANSITIONS` в `app/projects/lifecycle.py` — это
+  данные; переход, которого нет в таблице, выбрасывает `IllegalTransition` и никогда не приводится к
+  «ближайшему законному» состоянию, поэтому каждый статус — результат именованного события из
+  именованного статуса.
+- **`previous_status` делает восстановление честным.** Архивация записывает статус, который был, а
+  `restore` возвращает ровно его; если значение отсутствует, восстановление отклоняется, а не
+  придумывается. Пока проект в архиве, любое другое событие отклоняется.
+- **Гейт завершения: запуск без записи файлов никогда не станет `COMPLETED`.** Завершение требует
+  терминально успешного запуска, `verification == passed`, `acceptance == passed` и — если запуск
+  писал файлы — хотя бы одного записанного артефакта. «Завершился» никогда не считается «успешен», и
+  оптимистического пути к завершению нет нигде.
+- **Повторная проверка сверяет байты, а не прозу.** `verify_again` подтверждает каждый записанный
+  артефакт по записанным размеру и SHA-256 и компилирует каждый записанный Python-артефакт; вердикт
+  приёмки берётся записанный. Поэтому событие повторного суждения пропускает только строку состояния
+  запуска в гейте, а проверка, приёмка и правило артефактов продолжают действовать.
+- **Артефакты передаются описаниями, никогда содержимым.** Записанный файл — это путь, вид, размер,
+  SHA-256, изменение `create`/`update` и значимость для проверки. Байты остаются в рабочей области
+  проекта, поэтому запись можно перечислять, сравнивать и архивировать, не перенося код или секрет,
+  оказавшийся в нём.
+- **Абсолютный путь не попадает в ответ.** `project_path` относителен репозиторию
+  (`.forge/projects/<id>/workspace`), а артефакт публикует относительный к репозиторию `location`,
+  составленный backend'ом, поэтому клиент никогда не склеивает два поля в путь хоста.
+- **Только аддитивная проводка.** Существующий `GET /api/projects` (список рабочих пространств) не
+  изменён; у списка жизненного цикла свой путь, и он регистрируется до `/{project_id}`.
+  Подтверждение получает аддитивное поле `project`, а `POST /api/tasks/run` привязывает свой запуск
+  через существующую защиту подтверждённой сессии, сообщая итог в `X-Forge-Project-Attach` и никогда
+  не меняя собственный ответ запуска.
+- **Интерфейс сообщает, а не судит.** Экран выбирает блок итога по статусу самого проекта, печатает
+  вердикты словами backend, оставляет отклонённое действие кликабельным, чтобы настоящий 409 был
+  виден, и помечает запуск `mock` как «ответ без изменения файлов», блокируя переключатель записи.
+  Ход выполнения выводится только из записи запуска, без процентов.
+
+### Отклонённые альтернативы
+
+- **Хранить проект внутри записи запуска.** Проект переживает много запусков и не является
+  доказательством одного исполнения; слияние заставило бы схему Run Store нести состояние
+  планирования.
+- **Держать поле статуса на запуске и выводить проект из него.** Это теряет историю переходов и
+  делает вопрос «кто сдвинул проект» безответным; явная таблица вместо этого проверяема.
+- **Считать завершённый запуск признаком `COMPLETED`.** Запуск, который ничего не записал или не
+  прошёл проверку, был бы показан как завершённый проект. Гейт существует именно чтобы это отклонить.
+- **Публиковать идентификатор сессии уточнения в записи проекта.** Отклонено, чтобы набор полей
+  записи оставался ровно задокументированным; цена — версия, отправленная с экрана проекта, не несёт
+  `discovery_session_id`, и интерфейс это сообщает, а не скрывает.
+- **Показывать процент или оценку времени, пока запуск идёт.** Backend не публикует ни пошаговый
+  документ, ни темп, поэтому любой процент был бы выдумкой.
+
+### Следствия и открытые пункты
+
+Следствие решения о связи сессии видно и задокументировано: привязка версии происходит через запуск,
+несущий подтверждённую сессию (поток «Кузницы»). Будущая ревизия может опубликовать связь только для
+чтения, что закрыло бы этот разрыв без изменения контракта записи. `docs/USER_MANUAL.md` описывает
+поток для владельца; `docs/ARCHITECTURE.md` описывает реализацию.

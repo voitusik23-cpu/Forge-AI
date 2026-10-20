@@ -4505,3 +4505,240 @@ specification, created_at, updated_at, skipped, skip_reason)` с состоян�
 
 **Не реализовано.** Для этого слоя нет браузерного UI, нет изменения навигации и нет
 закоммиченной истории. Слой уточнения доступен по HTTP и из Python.
+
+## Project lifecycle v0.1
+
+A persistent project is what remains after a confirmation: one specification, one workspace and an
+append-only list of versions. The discovery layer freezes the specification; this layer keeps it,
+advances its status and records what each run proved. It calls no model and opens no socket.
+
+### Records and statuses
+
+`app/projects/models.py` defines the vocabulary and nothing else. `Project` holds `project_id`,
+`name`, `status`, `workspace_id`, **repository-relative** `project_path`, timestamps,
+`current_version`, `versions`, `archived`, `specification`, `plan_ref` and `previous_status`.
+`ProjectVersion` is one recorded attempt: `version`, `created_at`, `run_id`, `files`,
+`verification`, `acceptance`, `provider`, `model` and the `change_request` that produced it.
+`ArtifactRef` describes one written file by path, kind, size, SHA-256, `create`/`update` change and
+verification relevance — never by content.
+
+The eleven statuses are exactly the product's words: `DISCOVERY`, `NEEDS_CLARIFICATION`,
+`READY_FOR_PLANNING`, `PLANNED`, `WAITING_FOR_CONFIRMATION`, `RUNNING`, `REVIEWING`,
+`NEEDS_CHANGES`, `COMPLETED`, `FAILED`, `ARCHIVED`.
+
+### One JSON per project, and the index's session link
+
+`app/projects/store.py` writes one small JSON file per project under `FORGE_PROJECTS_ROOT`
+(default `<repository>/.forge/projects`) plus `index.json`. The layout is
+`<project_id>.json`, `<project_id>/workspace/` and `index.json`. Mechanics are the proven ones from
+the Run Store — a conservative id allow-list (`proj-[0-9a-f]{12}`), a re-proved containment check on
+every resolution, a temporary file, fsync and `os.replace` with a bounded retry for Windows sharing
+violations. The **directory is the truth**: a record present on disk is listed even when the index
+was lost.
+
+`index.json` is a cache of summaries *and* the one place that keeps the link from a confirmed
+discovery session to the project it produced (`sessions: {session_id: project_id}`). The link lives
+in the index rather than in the record so the record's field set stays exactly the documented
+contract; losing the index costs the link, never the project.
+
+### The transition table, `previous_status`, and the completion gate
+
+`app/projects/lifecycle.py` is data plus one gate. `ALLOWED_TRANSITIONS` maps
+`from_status -> event -> to_status`; a move that is not a row raises `IllegalTransition` and nothing
+is coerced to a "nearest legal" state. Archiving is legal from every working status and sets
+`previous_status` to the status the project had; `restore` returns it to exactly that value, and
+refuses when the value is absent rather than inventing one. While a project is `ARCHIVED` every
+other event is refused.
+
+`COMPLETED` is not a status a caller may request. `completion_blockers` states the evidence a run
+must carry, and `advance` refuses the transition unless all of it holds: the run state is a terminal
+success (`COMPLETED`/`SUCCESS`) and not failed; `verification == passed`; `acceptance == passed`;
+and, **if the run wrote files**, at least one artifact was recorded. A run that finishes but does not
+satisfy all four lands in `NEEDS_CHANGES`; a run carrying a provider/execution error lands in
+`FAILED`. A run that wrote nothing has no artifact to record, and claiming one would be a
+fabrication — so **a write-less run can never reach `COMPLETED`**.
+
+### Attach, artifacts and re-verification
+
+`app/projects/service.py` is the only writer. `create_from_discovery` stores the confirmed
+specification, links the session and returns the record in `WAITING_FOR_CONFIRMATION`; `confirm`
+advances it to `PLANNED`. `attach_run` reads the run's own facts (`RunFacts`: state, failed,
+verification, acceptance, written files) and fills the pending version — the previous versions are
+never overwritten, and a failed run leaves the previous version current while the project becomes
+`FAILED`. Artifacts are copied into the project workspace by kind-agnostic byte copy and recorded
+with size and SHA-256; the bytes never enter the record. `new_version` stages the next version and
+returns the task text the **existing** run path executes; it refuses an archived or early-status
+project with `IllegalTransition`.
+
+`verify_again` (re-verification) calls no provider: every recorded artifact must still exist at its
+recorded size and SHA-256, and every recorded Python artifact must still compile. The acceptance
+verdict is the one already recorded for the version — a statement about the run, not re-derived —
+which is why the re-judgement event carries `reverified=True` and skips only the run-state row of the
+gate. Verification, acceptance and the artifact rule still apply, so re-verification can only ever
+confirm or withdraw a completion, never grant one without evidence.
+
+### API
+
+`app/api/project_routes.py`, registered from `app/api/server.py`, publishes eight read-mostly routes
+over one service instance composed with the application:
+`GET /api/projects/lifecycle`, `GET /api/projects/{id}`,
+`POST /api/projects/{id}/versions` `{change}`, `POST /api/projects/{id}/archive`,
+`POST /api/projects/{id}/restore`, `GET /api/projects/{id}/history`,
+`GET /api/projects/{id}/files?version=`, `POST /api/projects/{id}/verify`. The lifecycle list is
+registered **before** `/{project_id}` so the literal segment can never be captured as an id. The
+existing `GET /api/projects` (the workspace list) is untouched.
+
+No absolute path and no file content reaches a payload: a project publishes its repository-relative
+`project_path`, an artifact publishes a workspace-relative path, a repository-relative `location`, a
+size, a SHA-256, its change and its verification relevance. Refusals keep the surface's contract:
+`404` `unknown_project`/`unknown_project_version`, `400` `invalid_change_request`, `409`
+`illegal_project_transition`/`project_not_completable` with the layer's own sentence.
+
+`POST /api/discovery/sessions/{id}/confirm` additionally creates the record (additive `project`
+field in the response), and `POST /api/tasks/run` attaches a finished run to the project of the
+session it was given, then reports the outcome in the `X-Forge-Project-Attach` header
+(`none`, `ok`, `already_attached`, `error:<Type>`); an attachment failure never changes the run's own
+response.
+
+### UI
+
+`ui/src/screens/Projects.tsx` consumes those routes only: a list with `Активные`/`Архив` filters, a
+card that repeats every field the record returns, the «Где находится проект» block (workspace,
+repository-relative folder, file count, last version), the versions list, the current or selected
+version's artifacts, an outcome block chosen by the project's own status, and the actions
+(open, add a feature/new version, verify, history, archive, restore). A refused action stays
+clickable and prints the backend's status, code and sentence; nothing on the screen computes a
+verdict of its own.
+
+`ui/src/components/RunProgress.tsx` renders the nine pipeline stages of a run from the run record
+only (`event_count`, `state`, `classification`): a stage is marked only when the record proves it,
+a terminal record prints its state and stops the animation, and reduced motion turns the list into
+plain text. No percentage is computed anywhere.
+
+### Smoke and tests
+
+`python -m app.smoke_project_lifecycle` runs the whole sequence offline — discovery, plan, project,
+run, verification/acceptance/artifacts, new version, archive/restore — under
+`.forge/smoke-project-lifecycle` and exits 0. `tests/test_project_lifecycle.py` covers the transition
+table, the gate (including the write-less run), the store's containment and atomicity, attach,
+artifacts, re-verification, archive/restore and the HTTP contract; `tests/test_discovery.py` covers
+the confirmation creating the record and the run attaching to it.
+
+## Project lifecycle v0.1 — русская версия
+
+Постоянный проект — это то, что остаётся после подтверждения: одна спецификация, одна рабочая
+область и список версий, к которому только добавляют. Слой уточнения фиксирует спецификацию; этот
+слой её хранит, двигает статус и записывает, что доказал каждый запуск. Он не вызывает модель и не
+открывает сокет.
+
+### Записи и статусы
+
+`app/projects/models.py` определяет словарь и ничего больше. `Project` хранит `project_id`, `name`,
+`status`, `workspace_id`, **относительный к репозиторию** `project_path`, отметки времени,
+`current_version`, `versions`, `archived`, `specification`, `plan_ref` и `previous_status`.
+`ProjectVersion` — один записанный подход: `version`, `created_at`, `run_id`, `files`,
+`verification`, `acceptance`, `provider`, `model` и `change_request`, из которого версия появилась.
+`ArtifactRef` описывает записанный файл путём, видом, размером, SHA-256, изменением
+`create`/`update` и значимостью для проверки — но никогда содержимым.
+
+Одиннадцать статусов — ровно слова продукта: `DISCOVERY`, `NEEDS_CLARIFICATION`,
+`READY_FOR_PLANNING`, `PLANNED`, `WAITING_FOR_CONFIRMATION`, `RUNNING`, `REVIEWING`,
+`NEEDS_CHANGES`, `COMPLETED`, `FAILED`, `ARCHIVED`.
+
+### Один JSON на проект и связь сессии в индексе
+
+`app/projects/store.py` пишет один небольшой JSON-файл на проект под `FORGE_PROJECTS_ROOT` (по
+умолчанию `<repository>/.forge/projects`) плюс `index.json`. Раскладка:
+`<project_id>.json`, `<project_id>/workspace/`, `index.json`. Механики — проверенные из Run Store:
+консервативный allow-list идентификаторов (`proj-[0-9a-f]{12}`), повторно доказываемая проверка
+вложенности при каждом разрешении пути, временный файл, fsync и `os.replace` с ограниченным
+повтором на случай Windows sharing violation. **Каталог — это истина**: запись, лежащая на диске,
+попадает в список даже если индекс потерян.
+
+`index.json` — кэш сводок и единственное место, где хранится связь подтверждённой сессии уточнения с
+созданным ею проектом (`sessions: {session_id: project_id}`). Связь живёт в индексе, а не в записи,
+чтобы набор полей записи оставался ровно задокументированным контрактом; потеря индекса стоит связи,
+но не проекта.
+
+### Таблица переходов, `previous_status` и гейт завершения
+
+`app/projects/lifecycle.py` — это данные плюс один гейт. `ALLOWED_TRANSITIONS` отображает
+`from_status -> event -> to_status`; переход, которого нет строкой, выбрасывает
+`IllegalTransition`, и ничего не приводится к «ближайшему законному» состоянию. Архивация законна из
+любого рабочего статуса и записывает в `previous_status` статус, который был; `restore` возвращает
+ровно его и отказывает, если значение отсутствует, вместо того чтобы его придумать. Пока проект в
+`ARCHIVED`, любое другое событие отклоняется.
+
+`COMPLETED` — не статус, который можно просто запросить. `completion_blockers` перечисляет
+доказательства, которые обязан нести запуск, и `advance` отклоняет переход, если выполнено не всё:
+состояние запуска — терминальный успех (`COMPLETED`/`SUCCESS`) и не ошибка;
+`verification == passed`; `acceptance == passed`; и, **если запуск писал файлы**, записан хотя бы
+один артефакт. Запуск, который завершился, но не удовлетворил всем четырём условиям, попадает в
+`NEEDS_CHANGES`; запуск с ошибкой провайдера/исполнения — в `FAILED`. У запуска, который ничего не
+писал, нет артефакта, и заявить его было бы выдумкой — поэтому **запуск без записи файлов никогда не
+достигает `COMPLETED`**.
+
+### Привязка, артефакты и повторная проверка
+
+`app/projects/service.py` — единственный писатель. `create_from_discovery` сохраняет
+подтверждённую спецификацию, связывает сессию и возвращает запись в `WAITING_FOR_CONFIRMATION`;
+`confirm` переводит её в `PLANNED`. `attach_run` читает собственные факты запуска (`RunFacts`:
+состояние, признак ошибки, проверка, приёмка, записанные файлы) и заполняет ожидающую версию —
+предыдущие версии никогда не перезаписываются, а неудачный запуск оставляет предыдущую версию
+текущей, пока проект становится `FAILED`. Артефакты копируются в рабочую область проекта побайтово,
+без учёта вида, и записываются с размером и SHA-256; сами байты в запись не попадают. `new_version`
+подготавливает следующую версию и возвращает текст задачи, который исполняет **существующий** путь
+запуска; для архивного или слишком раннего проекта он отказывает через `IllegalTransition`.
+
+`verify_again` (повторная проверка) не вызывает провайдера: каждый записанный артефакт должен
+по-прежнему существовать с записанным размером и SHA-256, а каждый записанный Python-артефакт —
+компилироваться. Вердикт приёмки — тот, что уже записан для версии, то есть утверждение о запуске, а
+не выведенное заново; поэтому событие повторного суждения несёт `reverified=True` и пропускает только
+строку состояния запуска в гейте. Проверка, приёмка и правило артефактов продолжают действовать,
+поэтому повторная проверка может только подтвердить или отозвать завершение, но никогда не выдать его
+без доказательств.
+
+### API
+
+`app/api/project_routes.py`, регистрируемый из `app/api/server.py`, публикует восемь read-mostly
+маршрутов над одним экземпляром сервиса, собранным вместе с приложением:
+`GET /api/projects/lifecycle`, `GET /api/projects/{id}`,
+`POST /api/projects/{id}/versions` `{change}`, `POST /api/projects/{id}/archive`,
+`POST /api/projects/{id}/restore`, `GET /api/projects/{id}/history`,
+`GET /api/projects/{id}/files?version=`, `POST /api/projects/{id}/verify`. Список жизненного цикла
+регистрируется **до** `/{project_id}`, чтобы литеральный сегмент никогда не был прочитан как id.
+Существующий `GET /api/projects` (список рабочих пространств) не изменён.
+
+Ни абсолютный путь, ни содержимое файла в ответ не попадают: проект публикует относительный к
+репозиторию `project_path`, артефакт — путь относительно рабочей области, относительный к репозиторию
+`location`, размер, SHA-256, изменение и значимость для проверки. Отказы сохраняют контракт
+поверхности: `404` `unknown_project`/`unknown_project_version`, `400` `invalid_change_request`, `409`
+`illegal_project_transition`/`project_not_completable` с собственной фразой слоя.
+
+`POST /api/discovery/sessions/{id}/confirm` дополнительно создаёт запись (аддитивное поле `project`
+в ответе), а `POST /api/tasks/run` привязывает завершённый запуск к проекту той сессии, которая была
+названа, и сообщает итог в заголовке `X-Forge-Project-Attach` (`none`, `ok`, `already_attached`,
+`error:<Type>`); сбой привязки никогда не меняет собственный ответ запуска.
+
+### Интерфейс
+
+`ui/src/screens/Projects.tsx` использует только эти маршруты: список с фильтрами «Активные»/«Архив»,
+карточку, повторяющую каждое поле записи, блок «Где находится проект» (рабочая область, папка
+относительно репозитория, число файлов, последняя версия), список версий, артефакты текущей или
+выбранной версии, блок итога, выбранный по статусу самого проекта, и действия (открыть, добавить
+функцию/новую версию, проверить, история, архивировать, восстановить). Отклонённое действие остаётся
+кликабельным и печатает статус, код и фразу backend; экран не вычисляет собственный вердикт.
+
+`ui/src/components/RunProgress.tsx` рисует девять этапов конвейера запуска только по записи запуска
+(`event_count`, `state`, `classification`): этап отмечается лишь когда запись это доказывает,
+терминальная запись печатает своё состояние и останавливает анимацию, а уменьшенная анимация
+превращает список в простой текст. Процент не вычисляется нигде.
+
+### Smoke и тесты
+
+`python -m app.smoke_project_lifecycle` прогоняет всю последовательность offline — уточнение, план,
+проект, запуск, проверка/приёмка/артефакты, новая версия, архив/восстановление — под
+`.forge/smoke-project-lifecycle` и завершается с кодом 0. `tests/test_project_lifecycle.py` покрывает
+таблицу переходов, гейт (включая запуск без записи файлов), вложенность и атомарность хранилища,
+привязку, артефакты, повторную проверку, архив/восстановление и HTTP-контракт; `tests/test_discovery.py`
+покрывает создание записи при подтверждении и привязку к ней запуска.

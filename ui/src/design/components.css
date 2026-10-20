@@ -612,6 +612,77 @@ select.input { cursor: pointer; }
 .forge-toggle.disabled { cursor: default; color: var(--text-muted); }
 .forge-toggle input[type="checkbox"]:disabled { cursor: default; accent-color: var(--text-muted); }
 
+/* ------------------------------------------------- live run progress (Кузница)
+   The nine stages are marked from the run record only: a done stage has evidence, an unproven
+   one is simply not marked. There is no width, no fill and no percentage anywhere -- a bar would
+   promise a rate the backend never publishes. The pulse exists only while the record is running,
+   and it is removed for reduced motion and by the explicit plain list. */
+.run-progress { display: flex; flex-direction: column; gap: 8px; }
+
+.run-stages {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-stage {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: var(--t-small);
+}
+
+.run-stage.done { color: var(--text); }
+.run-stage.current { color: var(--text); font-weight: 650; }
+
+.run-stage-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-size: var(--t-micro);
+  line-height: 1;
+}
+
+.run-stage.done .run-stage-mark {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+}
+
+.run-stage.current .run-stage-mark {
+  color: var(--text);
+  border-color: transparent;
+  background: color-mix(in srgb, var(--workbench-accent, var(--violet-hi)) 30%, transparent);
+  animation: run-stage-pulse 1500ms ease-in-out infinite;
+}
+
+@keyframes run-stage-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; opacity: 0.65; }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--workbench-accent, var(--violet-hi)) 18%, transparent); opacity: 1; }
+}
+
+/* Reduced motion: the OS setting, this interface's own switch, and the plain list all agree. */
+.run-stages.plain .run-stage-mark { animation: none; }
+.run-stages.plain .run-stage.current .run-stage-mark { opacity: 1; box-shadow: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .run-stage-mark { animation: none !important; box-shadow: none !important; }
+}
+
+:root[data-motion="reduced"] .run-stage-mark {
+  animation: none !important;
+  box-shadow: none !important;
+}
+
 /* --------------------------------------------------- Провайдеры (navigation hub) */
 .nav-sub {
   display: flex;

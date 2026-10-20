@@ -635,3 +635,245 @@ export const confirmDiscovery = (sessionId: string): Promise<Result<DiscoverySes
 /** `POST .../cancel` — close the session without planning anything. */
 export const cancelDiscovery = (sessionId: string): Promise<Result<DiscoverySessionPayload>> =>
   postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/cancel"));
+
+/* ---------------------------------------------------------------------------------------------
+ * Persistent project lifecycle
+ *
+ * Mirrors `app/api/project_routes.py` and `app/projects/models.py`. A project is one
+ * specification, one workspace and an append-only list of versions; a version is one recorded
+ * attempt with its run, its artifacts and two verdicts (`verification`, `acceptance`).
+ *
+ * Three rules are carried by the shapes below, not by this comment:
+ *
+ * * `project_path` is **repository-relative** (`.forge/projects/<id>/workspace`). No absolute
+ *   path is ever published, so nothing here can print one.
+ * * an artifact carries a path, a size, a SHA-256 and a `create`/`update` change -- never the
+ *   bytes, so a list can be shown without carrying code or a credential that ended up in it;
+ * * a refusal keeps the surface's own code (`409 illegal_project_transition`, `404
+ *   unknown_project`, `400 invalid_change_request`), which `failureOf` already preserves.
+ *
+ * These routes are additive: `GET /api/projects` is still the workspace list, and the lifecycle
+ * list lives on its own path.
+ * ------------------------------------------------------------------------------------------- */
+
+/** One file a run wrote, as `ArtifactRef.to_dict()` plus the joined repository-relative location. */
+export type LifecycleArtifact = {
+  path?: string;
+  kind?: string;
+  size?: number;
+  sha256?: string;
+  /** `create` | `update` */
+  change?: string;
+  /** `compiled` | `not_compiled` — stated, never implied. */
+  verification_relevance?: string;
+  /** `project_path/path`, composed by the backend so a client never joins two fields itself. */
+  location?: string;
+};
+
+export type LifecycleChangeRequest = {
+  text?: string;
+  version?: number;
+  created_at?: string;
+};
+
+/** `ProjectVersion`: one recorded attempt. A pending slot has no `run_id`. */
+export type LifecycleVersion = {
+  version?: number;
+  created_at?: string;
+  run_id?: string;
+  /** `passed` | `failed` | `not_applicable` | `not_run` | `pending` */
+  verification?: string;
+  /** `passed` | `failed` | `not_evaluated` | `pending` */
+  acceptance?: string;
+  provider?: string;
+  model?: string;
+  file_count?: number;
+  pending?: boolean;
+  change_request?: LifecycleChangeRequest | null;
+  files?: LifecycleArtifact[];
+};
+
+/** `Project.summary()`: the one-line projection of the lifecycle list. */
+export type LifecycleSummary = {
+  project_id?: string;
+  name?: string;
+  status?: string;
+  archived?: boolean;
+  current_version?: number;
+  last_run_at?: string;
+  file_count?: number;
+  project_path?: string;
+};
+
+/**
+ * `Project.to_dict()`: the full record.
+ *
+ * `specification` is user text that the backend screened before storage, so an empty field
+ * means "still unknown" and is never filled with a guess here either.
+ */
+export type LifecycleProject = {
+  project_id?: string;
+  name?: string;
+  status?: string;
+  workspace_id?: string;
+  project_path?: string;
+  created_at?: string;
+  updated_at?: string;
+  last_run_at?: string;
+  current_version?: number;
+  versions?: LifecycleVersion[];
+  archived?: boolean;
+  specification?: Record<string, unknown>;
+  plan_ref?: string;
+  previous_status?: string | null;
+};
+
+/** `GET /api/projects/{id}`: the record, every version (newest first) and the current artifacts. */
+export type LifecycleDetail = {
+  project?: LifecycleProject;
+  versions?: LifecycleVersion[];
+  files?: LifecycleArtifact[];
+};
+
+/** `POST /api/projects/{id}/versions`: the staged version and the task text the run path executes. */
+export type LifecycleNewVersion = {
+  project?: LifecycleProject;
+  version?: number;
+  task_text?: string;
+  change_request?: LifecycleChangeRequest;
+};
+
+/** `GET /api/projects/{id}/history`: every version, newest first. */
+export type LifecycleHistory = {
+  project_id?: string;
+  count?: number;
+  versions?: LifecycleVersion[];
+};
+
+/** `POST /api/projects/{id}/verify`: the re-judged record, with its verdicts kept verbatim. */
+export type LifecycleVerification = {
+  project?: LifecycleProject;
+  verified?: boolean;
+  verification?: string;
+  acceptance?: string;
+  status?: string;
+};
+
+const projectPath = (projectId: string, suffix: string): string =>
+  `/api/projects/${encodeURIComponent(projectId)}${suffix}`;
+
+/**
+ * `GET /api/projects/lifecycle` — every project, newest change first.
+ *
+ * The archived filter is applied here rather than by the query parameter: one request answers
+ * both tabs, so switching tabs cannot show a list that disagrees with itself.
+ */
+export const loadProjectLifecycle = async (): Promise<Result<LifecycleSummary[]>> => {
+  const outcome = await readJson<LifecycleSummary[]>("/api/projects/lifecycle");
+  if (!outcome.ok) return outcome;
+  if (!Array.isArray(outcome.value)) {
+    return {
+      ok: false,
+      failure: {
+        kind: "error",
+        status: 200,
+        path: "/api/projects/lifecycle",
+        detail: "the response is not a list of projects",
+      },
+    };
+  }
+  return outcome;
+};
+
+/** `GET /api/projects/{id}` — the record, its versions and the current version's artifacts. */
+export const loadProjectDetail = (projectId: string): Promise<Result<LifecycleDetail>> =>
+  readJson<LifecycleDetail>(projectPath(projectId, ""));
+
+/** `GET /api/projects/{id}/files?version=` — one version's artifact manifest. */
+export const loadProjectFiles = (
+  projectId: string,
+  version?: number
+): Promise<Result<{ project_id?: string; version?: number; count?: number; files?: LifecycleArtifact[] }>> =>
+  readJson(
+    projectPath(
+      projectId,
+      typeof version === "number" ? `/files?version=${encodeURIComponent(String(version))}` : "/files"
+    )
+  );
+
+/** `POST /api/projects/{id}/versions` — stage the next version; the backend composes the task text. */
+export const createProjectVersion = (
+  projectId: string,
+  change: string
+): Promise<Result<LifecycleNewVersion>> =>
+  postJson<LifecycleNewVersion>(projectPath(projectId, "/versions"), { change });
+
+/** `POST /api/projects/{id}/archive` — freeze the record without deleting anything. */
+export const archiveProject = (projectId: string): Promise<Result<{ project?: LifecycleProject }>> =>
+  postJson<{ project?: LifecycleProject }>(projectPath(projectId, "/archive"));
+
+/** `POST /api/projects/{id}/restore` — return it to the status it had before archiving. */
+export const restoreProject = (projectId: string): Promise<Result<{ project?: LifecycleProject }>> =>
+  postJson<{ project?: LifecycleProject }>(projectPath(projectId, "/restore"));
+
+/** `GET /api/projects/{id}/history` — every version, newest first. */
+export const loadProjectHistory = (projectId: string): Promise<Result<LifecycleHistory>> =>
+  readJson<LifecycleHistory>(projectPath(projectId, "/history"));
+
+/** `POST /api/projects/{id}/verify` — re-check the recorded artifacts; no provider is called. */
+export const verifyProject = (projectId: string): Promise<Result<LifecycleVerification>> =>
+  postJson<LifecycleVerification>(projectPath(projectId, "/verify"));
+
+/**
+ * How one verdict word reads, without inventing a meaning the backend did not publish.
+ *
+ * A value outside the five the backend documents is shown verbatim, because an unknown word is
+ * evidence that the client and the surface disagree -- and hiding it would hide that.
+ */
+export const verificationLabel = (lang: "ru" | "en", value: unknown): string => {
+  const word = String(value ?? "");
+  const ru: Record<string, string> = {
+    passed: "пройдена",
+    failed: "не пройдена",
+    not_applicable: "нечего проверять (нет .py)",
+    not_run: "не выполнялась",
+    pending: "ожидает запуска",
+  };
+  const en: Record<string, string> = {
+    passed: "passed",
+    failed: "failed",
+    not_applicable: "nothing to check (no .py)",
+    not_run: "not run",
+    pending: "waiting for a run",
+  };
+  const table = lang === "ru" ? ru : en;
+  return table[word] ?? (word === "" ? (lang === "ru" ? "неизвестно" : "unknown") : word);
+};
+
+/** The acceptance verdict, in the same conservative style. */
+export const acceptanceLabel = (lang: "ru" | "en", value: unknown): string => {
+  const word = String(value ?? "");
+  const ru: Record<string, string> = {
+    passed: "принят",
+    failed: "не принят",
+    not_evaluated: "не оценивался",
+    pending: "ожидает запуска",
+  };
+  const en: Record<string, string> = {
+    passed: "accepted",
+    failed: "rejected",
+    not_evaluated: "not evaluated",
+    pending: "waiting for a run",
+  };
+  const table = lang === "ru" ? ru : en;
+  return table[word] ?? (word === "" ? (lang === "ru" ? "неизвестно" : "unknown") : word);
+};
+
+/**
+ * The provider the installed runtime uses for its offline, deterministic answer.
+ *
+ * It comes from `app/config/settings.py::OFFLINE_PROVIDER_NAME`, which `POST /api/tasks/run`
+ * refuses to write files for: the guarded writer is only reached by a real provider. The screen
+ * therefore keeps the write toggle disabled for this one name instead of promising a file.
+ */
+export const OFFLINE_PROVIDER = "mock";

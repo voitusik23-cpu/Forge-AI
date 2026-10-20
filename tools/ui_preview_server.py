@@ -40,12 +40,56 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path.split("?", 1)[0] == "/ui-defaults.json":
             self._ui_defaults()
             return
+        if self.path.split("?", 1)[0].startswith("/docs/"):
+            self._docs_file()
+            return
         if self.path.startswith("/api/"):
             self._proxy("GET")
             return
         if self.path in ("/", "") or self.path.startswith("/?"):
             self.path = "/index.html"
         super().do_GET()
+
+    def _docs_file(self) -> None:
+        """Serve one Markdown file from ``docs/`` so the interface can link to the manual.
+
+        The «Справка» screen links to ``/docs/USER_MANUAL.md``. The bundle lives in ``ui/dist``,
+        so without this handler that link answers 404 and the guide would be a broken promise.
+
+        The handler is read-only and confined: one path segment, an allow-listed charset, a
+        ``.md`` suffix, and the resolved target must sit inside ``docs/``. Nothing outside that
+        directory is reachable, and no repository file is listed.
+        """
+
+        import re
+
+        document = self.path.split("?", 1)[0][len("/docs/"):]
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,120}\.md", document) is None or ".." in document:
+            self._docs_refusal(400, "the document name is not an allowed markdown file")
+            return
+        root = (REPO_ROOT / "docs").resolve()
+        target = (root / document).resolve()
+        if root not in target.parents:
+            self._docs_refusal(403, "the document escapes docs/")
+            return
+        if not target.is_file():
+            self._docs_refusal(404, "no such document in docs/")
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _docs_refusal(self, status: int, reason: str) -> None:
+        body = f'{{"error": "{reason}"}}'.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _ui_defaults(self) -> None:
         """The provider and model the installed configuration defaults to.

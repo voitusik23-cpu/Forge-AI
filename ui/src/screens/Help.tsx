@@ -5,12 +5,33 @@ import { HELP_TOPICS, HELP_TOPIC_BY_ID } from "../help-content";
 import { t, type Lang } from "../i18n";
 import type { Status } from "../api/client";
 
+/** Where the owner's manual lives, repository-relative. Never an absolute host path. */
+const MANUAL_PATH = "/docs/USER_MANUAL.md";
+
 export const Help = ({ lang, topic, status }: { lang: Lang; topic: string; status: Status | null }) => {
   const [active, setActive] = useState(topic || HELP_TOPICS[0].id);
+  // Whether the shell server actually serves the manual. A link that answers 404 is worse than
+  // no link, so the card asks once and states the answer instead of promising a page.
+  const [manualServed, setManualServed] = useState<boolean | null>(null);
 
   useEffect(() => {
     setActive(topic || HELP_TOPICS[0].id);
   }, [topic]);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const response = await fetch(MANUAL_PATH, { headers: { accept: "text/markdown, text/plain" } });
+        if (alive) setManualServed(response.ok);
+      } catch {
+        if (alive) setManualServed(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const current = HELP_TOPIC_BY_ID(active) ?? HELP_TOPICS[0];
 
@@ -74,6 +95,20 @@ export const Help = ({ lang, topic, status }: { lang: Lang; topic: string; statu
                 <span className="label">{item.title[lang]}</span>
               </button>
             ))}
+          </div>
+        </Card>
+
+        {/* The owner's manual: one link, and an honest statement when the shell cannot serve it. */}
+        <Card className="rise d2" tight>
+          <CardHead title={t(lang, "help.manual.title")} hint={t(lang, "help.manual.hint")} />
+          <div className="stack small" style={{ gap: 8 }}>
+            <a href={MANUAL_PATH} target="_blank" rel="noopener noreferrer" className="mono small">
+              {t(lang, "help.manual.open")}
+            </a>
+            <div className="muted">{t(lang, "help.manual.note")}</div>
+            {manualServed === false ? (
+              <div className="notice warn">{t(lang, "help.manual.missing")}</div>
+            ) : null}
           </div>
         </Card>
       </div>

@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
+import { RunProgress } from "../components/RunProgress";
 import { t, type Lang } from "../i18n";
 import type { BackendState } from "../api/client";
 import {
@@ -1318,6 +1319,9 @@ export const Forge = ({
                   </Badge>
                   <span className="mono small muted">{text(record.run_id)}</span>
                 </div>
+                {/* The stages the record itself proves. A terminal record stops the pulse and
+                    prints its own state; no percentage is drawn anywhere. */}
+                <RunProgress lang={lang} record={record} />
                 <Facts
                   items={[
                     [t(lang, "forge.execution.state"), text(record.state)],
