@@ -137,6 +137,7 @@ export const App = () => {
             onLanguage={setLang}
             onHelp={() => openHelp(CONTEXT_TOPIC.forge)}
             onOpenProviders={() => selectSection("providers")}
+            onOpenProjects={() => selectSection("projects")}
           />
         ) : null}
         {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}

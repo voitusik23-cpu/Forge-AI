@@ -795,6 +795,76 @@ select.input { cursor: pointer; }
 
 .run-stage.done { color: var(--text); }
 .run-stage.current { color: var(--text); font-weight: 650; }
+/* A terminal success that wrote no file: the last stage is drawn, never checked. */
+.run-stage.no-files { color: var(--warn-text); }
+.run-stage.no-files .run-stage-mark {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
+/* ------------------------------------------------------------ run result headline
+ *
+ * ONE sentence, chosen from the facts (files written? questions asked? a plan instead of
+ * files?), never from the backend `state` word. It reuses the project-truth block so a
+ * finished run and a finished project read the same way, but it is a single column: the
+ * sentence is the whole point and it may wrap.
+ */
+.result-headline {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.result-headline-text {
+  font-size: var(--t-heading);
+  font-weight: 650;
+  line-height: 1.35;
+  letter-spacing: 0.005em;
+  overflow-wrap: anywhere;
+}
+
+.project-truth[data-state="ОШИБКА"] {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface-sunken));
+}
+
+.project-truth[data-state="ФАЙЛЫ СОЗДАНЫ"] { border-left-color: var(--info, #60a5fa); }
+
+/* ------------------------------------------------------------------ first-run guide
+ *
+ * «Как это работает»: collapsed by default, five short steps and the one promise that the
+ * file format is Forge's job. Deliberately quiet -- it is help, not a task.
+ */
+.forge-guide {
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-sunken);
+}
+
+.forge-guide > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--t-small);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  list-style: none;
+}
+
+.forge-guide > summary::before {
+  content: "▸ ";
+  color: var(--text-muted);
+}
+
+.forge-guide[open] > summary::before { content: "▾ "; }
+.forge-guide[open] > summary { color: var(--text); }
+
+.forge-guide-steps {
+  display: grid;
+  gap: 4px;
+  margin: 10px 0 8px;
+  padding-left: 20px;
+  font-size: var(--t-small);
+}
 
 .run-stage-mark {
   display: inline-flex;

@@ -58,7 +58,13 @@ from app.agent_runtime.code_writer import (
     WriteResult,
     apply_changes,
     build_workspace_context,
+    carries_file_changes,
     render_write_report,
+)
+from app.agent_runtime.output_contract import (
+    MAX_WRITE_RETRIES,
+    append_output_contract,
+    build_retry_prompt,
 )
 from app.agent_runtime.offline_task import (
     OfflineTaskDecisionProvider,
@@ -330,6 +336,18 @@ WRITE_MODES = frozenset({WRITE_MODE_MOCK_DETERMINISTIC, WRITE_MODE_REAL_PROVIDER
 
 #: The ``project_state`` key of a materialisation into a project's own workspace.
 MATERIALIZATION_PROJECT_STATE_KEY = "project_materialization"
+
+#: The ``project_state`` key recording the single write-mode retry. An answer that
+#: carried no file block is asked for once more with a harder instruction
+#: (:mod:`app.agent_runtime.output_contract`); this key is the durable proof that
+#: the second dispatch happened, so "the model was asked twice" is auditable
+#: instead of being inferred from a call count.
+#:
+#: It is *not* a new ``TaskRunResponse`` field: that response is byte-pinned by the
+#: repository's contract tests, so the fact travels in the run's durable state
+#: beside ``code_write`` -- the same rule ``PROVIDER_KEY_INDEX_PROJECT_STATE_KEY``
+#: follows.
+WRITE_RETRY_PROJECT_STATE_KEY = "write_retry"
 
 
 from pathlib import Path
@@ -3217,7 +3235,7 @@ class ForgeApiService:
     def _write_task_description(
         self, description: str, workspace: object = None
     ) -> str:
-        """The task text handed to the model: the task plus bounded context.
+        """The task text handed to the model: the task, bounded context, contract.
 
         Only the *names* of the workspace's files are added, and only in write
         mode. The listing is produced by the code writer's own bounded walk, so it
@@ -3225,13 +3243,32 @@ class ForgeApiService:
         dependencies, or the run store. ``workspace`` is the tree the run will write
         into -- a lifecycle project's own folder when there is one -- so the context
         names the files the answer may extend instead of the repository's.
+
+        The deterministic output contract
+        (:mod:`app.agent_runtime.output_contract`) is appended last. It is the app's
+        own instruction, never the owner's wording: nobody using Forge should have to
+        know that a file must arrive in a fenced block with a ``path=`` header. It
+        goes last on purpose -- the text a model reads last decides the answer's
+        shape -- and it is appended even when the workspace is empty, because an
+        empty tree is exactly the case where the contract matters most.
         """
 
         target = workspace if workspace is not None else self._workspace
         context = build_workspace_context(target)
-        if not context:
-            return description
-        return f"{description}\n\n{context}"
+        prompt = f"{description}\n\n{context}" if context else description
+        return append_output_contract(prompt)
+
+    def _write_retry_description(self, workspace: object = None) -> str:
+        """The task text for the single retry: a shorter, harder instruction.
+
+        It repeats the same bounded, name-only workspace listing so the answer can
+        still name a real path, and nothing else: no task text, no contract prose.
+        The point is that the previous answer carried no file, so this one says only
+        what to return.
+        """
+
+        target = workspace if workspace is not None else self._workspace
+        return build_retry_prompt(build_workspace_context(target))
 
     @staticmethod
     def _offline_write_answer(plan: object) -> str:
@@ -3420,6 +3457,52 @@ class ForgeApiService:
                 return
             self._write_project_state_entry(
                 store, run_id, CODE_WRITE_PROJECT_STATE_KEY, result.to_dict()
+            )
+        except Exception:  # noqa: BLE001 - persistence must not block a run
+            pass
+
+    def _record_write_retry(
+        self,
+        store: Optional[RunStore],
+        run_id: str,
+        task_id: str,
+    ) -> None:
+        """Record that the single write-mode retry was issued.
+
+        The retry is a corrective dispatch, and a reader of the run has to be able
+        to tell "the model was asked once and answered nothing" from "it was asked
+        twice". The fact goes into the run's existing durable ``project_state``
+        beside every other write record, plus a bounded event, and it carries no
+        model text -- only that the second dispatch happened and its cap.
+
+        Best effort by contract: a retry that already happened is a fact the
+        outcome must not lose, but a store failure may not rewrite the run either.
+        """
+
+        if store is None:
+            return
+        try:
+            store.append_event(
+                EventType.PROJECT_STATE_UPDATED,
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "write_retry_attempted": True,
+                    "write_retry_max_attempts": MAX_WRITE_RETRIES,
+                },
+                run_id=run_id,
+                task_id=task_id,
+            )
+            self._write_project_state_entry(
+                store,
+                run_id,
+                WRITE_RETRY_PROJECT_STATE_KEY,
+                {
+                    "attempted": True,
+                    "attempts": 1,
+                    "max_attempts": MAX_WRITE_RETRIES,
+                    "reason": "the answer carried no fenced block with a path header",
+                },
             )
         except Exception:  # noqa: BLE001 - persistence must not block a run
             pass
@@ -4182,26 +4265,81 @@ class ForgeApiService:
         # ended the run with "Provider fallback chain exhausted" and openrouter was never tried,
         # even though FORGE_PROVIDER_FALLBACK_CHAIN listed it. A run that names a provider itself
         # stays pinned: the caller asked for that provider.
-        run = self._runtime.run_executor.execute(
-            task=task,
-            provider_name=(self._selected_provider_name(req) or None),
-            allow_fallback=not (req.provider_name or "").strip(),
-            workspace=self._workspace,
-            run_id=run_id,
-            run_scope=scope,
-            allowed_tool_ids=effective_tool_ids,
-            run_store=api_run_store,
-            # Host process execution authority. With no declarations the factory
-            # is None and the derived allowlist is empty, so the executor requests
-            # nothing and no process is reachable. The factory is server-side only
-            # and never sourced from the request.
-            allowed_execution_commands=scope.allowed_execution_commands,
-            execution_request_factory=(
-                execution_request_factory or self._execution_request_factory
-            ),
-            approval_policy=self._approval_policy,
-            approval_resolver=self._approval_resolver,
+        provider_for_run = self._selected_provider_name(req) or None
+        allow_fallback = not (req.provider_name or "").strip()
+
+        def dispatch_once(
+            dispatch_task: Task,
+            *,
+            reuse_run: object = None,
+            attempt_number: int = 0,
+        ) -> object:
+            """One execution through the existing ``RunExecutor``.
+
+            The single write-mode retry below reuses exactly this call -- same
+            frozen scope, same provider pin, same store, same workspace -- and
+            changes only the task text and the executor's own attempt number. It
+            mints no authority: the scope was frozen before the first dispatch and
+            is passed unchanged.
+            """
+
+            revision_seam: Dict[str, object] = {}
+            if reuse_run is not None:
+                revision_seam["_run"] = reuse_run
+                revision_seam["_attempt_number"] = attempt_number
+            return self._runtime.run_executor.execute(
+                task=dispatch_task,
+                provider_name=provider_for_run,
+                allow_fallback=allow_fallback,
+                workspace=self._workspace,
+                run_id=run_id,
+                run_scope=scope,
+                allowed_tool_ids=effective_tool_ids,
+                run_store=api_run_store,
+                # Host process execution authority. With no declarations the factory
+                # is None and the derived allowlist is empty, so the executor requests
+                # nothing and no process is reachable. The factory is server-side only
+                # and never sourced from the request.
+                allowed_execution_commands=scope.allowed_execution_commands,
+                execution_request_factory=(
+                    execution_request_factory or self._execution_request_factory
+                ),
+                approval_policy=self._approval_policy,
+                approval_resolver=self._approval_resolver,
+                **revision_seam,
+            )
+
+        run = dispatch_once(task)
+
+        # THE SINGLE WRITE-MODE RETRY. A model that answers a code task with a plan,
+        # a report, or the question "which option, A/B/C?" has not failed -- it was
+        # asked badly. The prompt now carries the output contract; if the answer still
+        # carries no file block at all, Forge asks ONCE more with the shorter, harder
+        # instruction, then stops. The rule is a pure read of the answer
+        # (``carries_file_changes`` parses, it does not write), so nothing can be
+        # written twice: the retry only ever replaces the answer that applied nothing.
+        # ``MAX_WRITE_RETRIES`` is 1 and there is no loop around this block.
+        write_retry_attempted = False
+        first_answer = (
+            str(getattr(run.result, "output", "") or "")
+            if run.state == RunState.COMPLETED and run.result is not None
+            else ""
         )
+        if (
+            write_mode
+            and MAX_WRITE_RETRIES >= 1
+            and first_answer.strip()
+            and not carries_file_changes(first_answer)
+        ):
+            write_retry_attempted = True
+            retry_run = dispatch_once(
+                replace(task, description=self._write_retry_description(project_workspace)),
+                reuse_run=run,
+                attempt_number=1,
+            )
+            if retry_run is not None:
+                run = retry_run
+
         duration = time.perf_counter() - t0
         if api_run_store is not None:
             try:
@@ -4212,6 +4350,8 @@ class ForgeApiService:
                 )
             except Exception:  # noqa: BLE001 - persistence must not block a run
                 pass
+        if write_retry_attempted:
+            self._record_write_retry(api_run_store, run_id, task_id)
 
         # Retrieve run accounting
         run_acc = self._fabric.get_run_accounting(

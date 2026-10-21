@@ -10,6 +10,30 @@ export type HelpTopic = {
 
 export const HELP_TOPICS: HelpTopic[] = [
   {
+    id: "first-run",
+    title: { ru: "Как это работает: первые пять шагов", en: "How it works: the first five steps" },
+    body: {
+      ru: [
+        "Напишите идею одним-двумя предложениями.",
+        "Ответьте на 2–3 вопроса.",
+        "Проверьте, что Forge понял, и нажмите «Подтвердить».",
+        "Forge создаст файлы и покажет, где они лежат.",
+        "Нажмите «Запустить локально», чтобы открыть результат.",
+        "Ничего писать про формат файлов не нужно — Forge сам попросит модель об этом.",
+        "Те же шесть строк открываются на «Кузнице» из свёрнутой панели «Как это работает», так что читать руководство, чтобы начать, не нужно.",
+      ],
+      en: [
+        "Describe the idea in one or two sentences.",
+        "Answer 2–3 questions.",
+        "Check what Forge understood and press «Confirm».",
+        "Forge creates the files and shows where they are.",
+        "Press «Run locally» to open the result.",
+        "You never have to describe a file format — Forge asks the model for it.",
+        "The same six lines open on «Кузница» from the collapsed «How it works» panel, so nobody has to read a manual to start.",
+      ],
+    },
+  },
+  {
     id: "project",
     title: { ru: "Проект: что это и как он появляется", en: "Projects: what they are and how they appear" },
     body: {
@@ -186,7 +210,7 @@ export const HELP_TOPIC_BY_ID = (id: string): HelpTopic | undefined =>
 
 // Which topic each screen should offer through its "How does this work?" link.
 export const CONTEXT_TOPIC: Record<string, string> = {
-  forge: "run",
+  forge: "first-run",
   overview: "status",
   providers: "providers",
   agents: "agents",

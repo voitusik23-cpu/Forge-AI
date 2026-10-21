@@ -6977,3 +6977,82 @@ security_forbidden_content:secret`; провайдер не вызывался, 
 `tests/test_context_selector.py` остаются зелёными. Граница безопасности не ослаблена
 там, где это важно: любое значение-секрет по-прежнему отказывается, и ни одно новое
 сообщение его не содержит.
+
+## Decision: the app asks the model for files, and asks exactly once more (v0.2)
+
+**Context.** The measured product failure was not a model failure. A `code` task in write mode
+(«создать безопасный экран проверки настроенных API-провайдеров», `deepseek/deepseek-flash`)
+came back as a plan plus the question "which option, A/B/C?", the writer honestly recorded
+`code_write.status = no_changes`, and the run was still presented as finished: `state=COMPLETED`,
+nine ✅ chips and a «Запись сохранена: да» badge over a project that did not exist. Nothing in
+the app had ever told the model what shape of answer the writer can apply, so getting a file
+required the owner to know the ```` ```html path=… ```` convention himself.
+
+**Decision.** The write-mode prompt is assembled by the code path, never by the owner, and it
+carries a deterministic output contract (`app/agent_runtime/output_contract.py`): one fenced block
+per file with a relative `path=`, the allowed write root, the forbidden `.env`/secret/`.git`
+paths, "only what the plan needs", and the statement that a `code` run in write mode owes files.
+The contract is appended after the task text and the bounded workspace listing, because the
+instruction a model reads last is the one it follows; it is idempotent and adds nothing to a
+read-only prompt. If the answer still carries no file block at all, the service asks **once**
+more with a shorter, harder instruction, by re-entering the existing `RunExecutor` at its
+revision seam (`_run`, `_attempt_number=1`) — the same frozen scope, provider pin and store, a
+new task text. `MAX_WRITE_RETRIES = 1`; there is no loop. The retry is recorded in
+`project_state["write_retry"]` and published as `write_retry_attempted`, so "asked twice" is a
+durable fact rather than an inference from a call count. An answer that *does* carry file blocks
+is never retried, and an empty answer is not retried either (there is nothing to ask again).
+
+**Rejected alternatives.** Putting the contract in the owner's own task text: that is exactly the
+prompt engineering the change exists to remove. A loop or an escalating retry budget: it spends
+tokens on a model that has already ignored the instruction, and it hides a bad answer instead of
+reporting it. Retrying on `no_changes` from any reason: "no change survived validation" is a
+refusal, not a missing file block. Using the revision loop for this: acceptance-driven revision is
+about failed *criteria*, and a run that wrote nothing has none.
+
+**Consequences.** A model that answers with prose is asked once more and then reported honestly:
+the result card now says «Проект не создан: модель вернула план вместо файлов» with a «Повторить»
+button, and `COMPLETED` appears only inside the collapsed «Технические детали». The card's one
+headline sentence is derived from the facts in `ui/src/forge-result.ts` (files, writer status,
+verification, questions, error), never from the run's `state`; the raw `state`, `run_id`,
+`event_count`, `classification.outcome`, the English `code_write.reason` and the diff live in that
+collapsed block only, and the ninth chip reads «Завершено без файлов» when no file was written.
+
+## Решение: приложение само просит у модели файлы и просит ровно один раз (v0.2)
+
+**Контекст.** Измеренный продуктовый провал не был провалом модели. Задача `code` в режиме
+записи («создать безопасный экран проверки настроенных API-провайдеров»,
+`deepseek/deepseek-flash`) вернулась планом и вопросом «какой вариант выбираем A/B/C?», писатель
+честно записал `code_write.status = no_changes`, а запуск всё равно был показан завершённым:
+`state=COMPLETED`, девять ✅ и бейдж «Запись сохранена: да» над несуществующим проектом. Нигде в
+приложении модель не получала форму ответа, которую писатель умеет применять, поэтому для
+получения файла владельцу нужно было самому знать соглашение ```` ```html path=… ````.
+
+**Решение.** Prompt режима записи собирает код, а не владелец, и он несёт детерминированный
+контракт (`app/agent_runtime/output_contract.py`): по одному фенсед-блоку на файл с относительным
+`path=`, разрешённый корень записи, запрет `.env`/секретов/`.git`, «только то, что нужно плану» и
+утверждение, что запуск `code` в режиме записи обязан вернуть файлы. Контракт добавляется после
+текста задачи и ограниченного списка файлов рабочей папки — инструкция, которую модель читает
+последней, и выполняется последней; он идемпотентен и ничего не добавляет в read-only prompt.
+Если в ответе всё равно нет ни одного файлового блока, сервис спрашивает **один** раз более
+короткой и жёсткой инструкцией, входя в существующий `RunExecutor` через его шов ревизий
+(`_run`, `_attempt_number=1`): та же замороженная область, тот же провайдер и store, новый текст
+задачи. `MAX_WRITE_RETRIES = 1`; цикла нет. Повтор пишется в `project_state["write_retry"]` и
+публикуется как `write_retry_attempted`, поэтому «спрашивали дважды» — долговечный факт, а не
+вывод из числа вызовов. Ответ, в котором файловые блоки есть, не повторяется, и пустой ответ тоже
+(спрашивать не о чем).
+
+**Отклонённые альтернативы.** Контракт в тексте владельца: это ровно тот prompt engineering,
+который изменение и убирает. Цикл или растущий бюджет повторов: он тратит токены на модель,
+которая уже проигнорировала инструкцию, и скрывает плохой ответ вместо того, чтобы сообщить о нём.
+Повтор при любом `no_changes`: «no change survived validation» — это отказ, а не отсутствие
+файловых блоков. Использовать цикл ревизий: ревизия по acceptance — про проваленные *критерии*, а
+у запуска, который ничего не записал, их нет.
+
+**Следствия.** Модель, ответившая прозой, получает один дополнительный вопрос, после чего о
+результате сообщается честно: карточка результата говорит «Проект не создан: модель вернула план
+вместо файлов» с кнопкой «Повторить», а `COMPLETED` появляется только внутри свёрнутых
+«Технических деталей». Единственная фраза карточки выводится из фактов в `ui/src/forge-result.ts`
+(файлы, статус писателя, проверка, вопросы, ошибка) и никогда из `state` запуска; сырые `state`,
+`run_id`, `event_count`, `classification.outcome`, английский `code_write.reason` и diff живут
+только в этом свёрнутом блоке, а девятый шаг читается как «Завершено без файлов», когда ни один
+файл не записан.

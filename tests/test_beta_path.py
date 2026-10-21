@@ -600,7 +600,12 @@ class NegativeCheckTests(_BetaCase):
             )
         )
         response = result.response
-        self.assertEqual(len(provider.requests), 1)
+        # TWO dispatches, on purpose: the first answer carried no file block at all, so Forge
+        # asked once more with the shorter, harder instruction
+        # (``app/agent_runtime/output_contract.py``) and then stopped. The retry is the app's
+        # job -- the owner's text never asks for a file format.
+        self.assertEqual(len(provider.requests), 2)
+        self.assertIn("не вернул ни одного файла", provider.requests[1].prompt)
         # The writer was asked and refused: prose is not a change.
         self.assertFalse(response.success, response.error)
         self.assertEqual(response.files_created, 0)
@@ -608,6 +613,12 @@ class NegativeCheckTests(_BetaCase):
         self.assertFalse(response.project_files_created)
         self.assertNotEqual(response.outcome, "PROJECT_COMPLETED")
         self.assertNotEqual(response.state, "COMPLETED")
+        # The retry is recorded in the run's own durable state, not by growing the
+        # byte-pinned response.
+        record = service.get_run_record(response.run_id) or {}
+        self.assertIs(
+            (record.get("project_state") or {}).get("write_retry", {}).get("attempted"), True
+        )
         # No project record was created by a text-only run.
         self.assertEqual(self.projects.list_projects(), ())
 

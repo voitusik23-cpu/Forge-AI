@@ -2,16 +2,22 @@
 //
 // The workspace is **questions first**. One screen, and the order on it is the order of the work:
 //
+//   0. «Как это работает» — five short lines, collapsed by default, for someone who has never seen
+//      the app. It says the one thing the owner had to learn the hard way: the file format is
+//      Forge's job, not the user's;
 //   1. «Задача» (top of the page) — the idea, then the clarification card that replaces the idea
 //      form the moment the first submit returned questions, then the specification, then the launch
 //      step (provider · model · cost_tier · estimated_cost, the write switch and the run button);
-//   2. «Выполнение» — GET /api/runs/{run_id}, polled every 1.75 s until the record is terminal;
-//   3. «Запись в проект» — only when the run recorded a code_write;
-//   4. «Результат» — the POST /api/tasks/run answer, its outcome and the three independent save
-//      facts (run record / project / project files) the response carries;
-//   5. «Артефакты и изменения» — only once a run exists (there is no artifact route in
+//   2. «Выполнение» — GET /api/runs/{run_id}, polled every 1.75 s until the record is terminal. The
+//      nine chips and the raw state word live here, the technical facts are collapsed;
+//   3. «Результат» — ONE plain-language sentence derived from the facts (files written? questions
+//      asked? a plan instead of files?), its action, and only then the collapsed «Технические
+//      детали»: the raw `state`/`status`/`run_id`/`event_count`/`classification`, the English
+//      `code_write.reason`, the diff and the raw output. `COMPLETED` is never the headline, because
+//      the word describes the dispatch finishing, not a project existing;
+//   4. «Артефакты и изменения» — only once a run exists (there is no artifact route in
 //      app/api/server.py, and the card says so instead of drawing an invented list);
-//   6. «Проекты» and «Настройки» in the right-hand column. The agent list lives in «Провайдеры»,
+//   5. «Проекты» and «Настройки» in the right-hand column. The agent list lives in «Провайдеры»,
 //      which is the full diagnostics hub, so the workspace is not half-filled with it.
 //
 // Every number on this screen is copied from a response; none is computed to look like progress.
@@ -27,6 +33,7 @@ import {
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { RunProgress } from "../components/RunProgress";
 import { t, type Lang } from "../i18n";
+import { deriveRunHeadline, answerAskedQuestions, type ResultActionId, type ResultHeadline } from "../forge-result";
 import type { BackendState } from "../api/client";
 import {
   TASK_CATEGORIES,
@@ -68,6 +75,32 @@ const fixed = (value: unknown, digits: number): string =>
 const yesNo = (lang: Lang, value: unknown): string => {
   if (typeof value !== "boolean") return t(lang, "runs.unknown");
   return value ? (lang === "ru" ? "да" : "yes") : (lang === "ru" ? "нет" : "no");
+};
+
+/** The label of each action a headline may offer. Every word lives in `i18n.ts`. */
+const RESULT_ACTION_LABELS: Record<ResultActionId, string> = {
+  open_files: "forge.result.action.open_files",
+  launch_local: "forge.result.action.launch_local",
+  verify: "forge.result.action.verify",
+  answer: "forge.result.action.answer",
+  retry: "forge.result.action.retry",
+};
+
+/**
+ * One headline sentence, with its `{n}` count and its `{reason}` sentence filled in.
+ *
+ * The reason is itself an i18n key (`forge.reason.*`), so no raw English writer reason and no
+ * backend enum ever reaches this text.
+ */
+const headlineText = (lang: Lang, headline: ResultHeadline): string => {
+  let sentence = t(lang, headline.key);
+  if (headline.params.n !== undefined) {
+    sentence = sentence.replace("{n}", headline.params.n);
+  }
+  if (headline.params.reason !== undefined) {
+    sentence = sentence.replace("{reason}", t(lang, headline.params.reason));
+  }
+  return sentence;
 };
 
 const newIdempotencyKey = (): string =>
@@ -284,11 +317,13 @@ const WRITE_TONES: Record<string, "ok" | "warn" | "danger" | "neutral"> = {
 /**
  * What the guarded writer actually did, read from `project_state.code_write` of the run.
  *
- * Every line here comes from the record: the status, the post-write verification, the exact
- * per-file +/- counts and the unified diff. When the record carries no `code_write` at all the
- * card says so instead of drawing an empty list that would read as "nothing to report".
+ * This is the *technical* half and it lives inside the collapsed «Технические детали»: the raw
+ * status word, the post-write verification word, the English writer reason, the per-file +/-
+ * counts and the unified diff. Every line comes from the record, so a reader who opens it sees
+ * exactly what was recorded -- and a reader who does not never meets `WRITER: no_changes`,
+ * `diff пуст` or the English reason above the fold.
  */
-const CodeWriteCard = ({ lang, write }: { lang: Lang; write: CodeWriteResult | null }) => {
+const CodeWriteDetails = ({ lang, write }: { lang: Lang; write: CodeWriteResult | null }) => {
   const status = write ? String(write.status ?? "") : "";
   const tone = WRITE_TONES[status] ?? "neutral";
   const files: Array<Record<string, unknown>> = Array.isArray(write?.files)
@@ -298,36 +333,30 @@ const CodeWriteCard = ({ lang, write }: { lang: Lang; write: CodeWriteResult | n
   const reason = text(write?.reason, t(lang, "forge.write.reason.empty"));
 
   return (
-    <Card className="rise d2">
-      <CardHead
-        title={t(lang, "forge.write.title")}
-        hint={t(lang, "forge.write.hint")}
-        action={
-          <Badge tone={write ? tone : "neutral"}>
-            {write ? text(status, t(lang, "runs.unknown")) : t(lang, "forge.write.none")}
-          </Badge>
-        }
-      />
+    <div>
+      <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+        <div className="label">{t(lang, "forge.write.title")}</div>
+        <Badge tone={write ? tone : "neutral"}>
+          {write ? text(status, t(lang, "runs.unknown")) : t(lang, "forge.write.none")}
+        </Badge>
+      </div>
+      <div className="small muted" style={{ marginTop: 4 }}>
+        {t(lang, "forge.write.hint")}
+      </div>
       {write === null ? (
-        <div className="notice warn">{t(lang, "forge.write.absent")}</div>
+        <div className="small muted" style={{ marginTop: 6 }}>
+          {t(lang, "forge.write.absent")}
+        </div>
       ) : (
-        <div className="stack" style={{ gap: 14 }}>
+        <div className="stack" style={{ gap: 10, marginTop: 6 }}>
           <Facts
             items={[
               [t(lang, "forge.write.status"), text(status, t(lang, "runs.unknown"))],
               [t(lang, "forge.write.verification"), text(write.verification, t(lang, "runs.unknown"))],
               [t(lang, "forge.write.files.count"), String(files.length)],
+              [t(lang, "forge.write.reason"), reason],
             ]}
           />
-
-          {status !== "applied" ? (
-            <div className={`notice ${status === "rejected" ? "danger" : "warn"}`}>
-              <div className="label">{t(lang, "forge.write.reason")}</div>
-              <div className="mono small" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
-                {reason}
-              </div>
-            </div>
-          ) : null}
 
           {files.length === 0 ? (
             <div className="small muted">{t(lang, "forge.write.files.empty")}</div>
@@ -367,7 +396,7 @@ const CodeWriteCard = ({ lang, write }: { lang: Lang; write: CodeWriteResult | n
           )}
         </div>
       )}
-    </Card>
+    </div>
   );
 };
 
@@ -378,6 +407,7 @@ export const Forge = ({
   onLanguage,
   onHelp,
   onOpenProviders,
+  onOpenProjects,
 }: {
   lang: Lang;
   backend: BackendState;
@@ -386,6 +416,8 @@ export const Forge = ({
   onHelp: () => void;
   /** Opens «Провайдеры»: the agent list is the hub's job, not the workspace's. */
   onOpenProviders: () => void;
+  /** Opens «Проекты», where the project's files, its check and the local run really live. */
+  onOpenProjects: () => void;
 }) => {
   const live = backend.status === "live";
   const status = live ? backend.core : null;
@@ -810,6 +842,54 @@ export const Forge = ({
   const codeWrite = codeWriteOf(record);
 
   /**
+   * The facts the result card is allowed to read. `files_created` is the response's own count of
+   * files the writer applied; the questions are the ones the *final* answer asked (after the
+   * single retry, when one happened).
+   */
+  const filesCreated =
+    typeof dispatched?.response.files_created === "number" ? dispatched.response.files_created : 0;
+  const responseQuestions = Array.isArray(dispatched?.response.clarification_questions)
+    ? dispatched.response.clarification_questions
+        .map((item) => String(item ?? ""))
+        .filter((item) => item.trim() !== "")
+    : [];
+  const resultFacts = {
+    filesCreated,
+    writeStatus: String(codeWrite?.status ?? ""),
+    verification: String(codeWrite?.verification ?? ""),
+    writeReason: String(codeWrite?.reason ?? ""),
+    questions: responseQuestions,
+    needsClarification: dispatched?.response.needs_clarification === true,
+    error: String(dispatched?.response.error ?? ""),
+    writeRequested: requestedWriteMode,
+  };
+
+  /**
+   * The one plain-language sentence this run's result card says, derived from the facts only.
+   *
+   * The facts are the response's own `files_created`, the writer record's status/verification/reason
+   * and the questions the answer asked. `state` is deliberately not one of them: `COMPLETED` means
+   * "the dispatch finished", and the measured failure had it over a project that was never created.
+   * The derivation itself lives in `forge-result.ts` so the rule is one testable function, not JSX.
+   */
+  const headline = deriveRunHeadline(lang, resultFacts);
+  /** True only when the answer really asked (a plan ending in "?" is not a question list). */
+  const askedQuestions = answerAskedQuestions(resultFacts);
+
+  /** What each headline action does. Files, the check and the local run live in «Проекты». */
+  const runResultAction = (action: ResultActionId) => {
+    if (action === "answer") {
+      void answerClarification();
+      return;
+    }
+    if (action === "retry") {
+      void submit();
+      return;
+    }
+    onOpenProjects();
+  };
+
+  /**
    * The provider-neutral outcome the run record itself carries (`project_state.outcome`).
    *
    * The record's own `state` is the run's terminal word (`COMPLETED` as soon as the run finished),
@@ -821,6 +901,22 @@ export const Forge = ({
     if (!projectState || typeof projectState !== "object") return "";
     const value = (projectState as Record<string, unknown>).outcome;
     return typeof value === "string" ? value.trim() : "";
+  })();
+
+  /**
+   * `project_state.write_retry`: whether Forge asked the model a second time.
+   *
+   * `null` means the record has not said — the run recorded no retry at all, or the record has
+   * not arrived yet. `TaskRunResponse` is byte-pinned, so this fact lives in the run's durable
+   * state beside `code_write` instead of in the response body.
+   */
+  const writeRetryAttempted = (() => {
+    const projectState = record?.project_state;
+    if (!projectState || typeof projectState !== "object") return null;
+    const value = (projectState as Record<string, unknown>).write_retry;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const attempted = (value as Record<string, unknown>).attempted;
+    return typeof attempted === "boolean" ? attempted : null;
   })();
 
   // Poll GET /api/runs/{run_id} while the record is not terminal. A read failure stops the
@@ -1255,6 +1351,26 @@ export const Forge = ({
         </div>
       ) : null}
 
+      {/* ------------------------------------------------------------ first-run guide
+          Five lines for a friend who has never seen Forge, collapsed by default so it never gets
+          in the way of the work, and the one line the owner had to learn the hard way: the file
+          format is Forge's job, not the user's. The same six lines are a topic in «Справка». */}
+      <details className="forge-guide">
+        <summary>{t(lang, "forge.guide.title")}</summary>
+        <ol className="forge-guide-steps">
+          {[
+            "forge.guide.step1",
+            "forge.guide.step2",
+            "forge.guide.step3",
+            "forge.guide.step4",
+            "forge.guide.step5",
+          ].map((key) => (
+            <li key={key}>{t(lang, key)}</li>
+          ))}
+        </ol>
+        <div className="small muted">{t(lang, "forge.guide.note")}</div>
+      </details>
+
       <div className="grid overview">
         <div className="stack">
           {/* -------------------------------------------------------------------- task
@@ -1508,229 +1624,226 @@ export const Forge = ({
               </div>
             ) : (
               <div className="stack" style={{ gap: 14 }}>
-                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                  <Badge tone={record.classification?.is_success === true ? "ok" : "neutral"}>
-                    {text(record.state, t(lang, "runs.unknown"))}
-                  </Badge>
-                  {recordOutcome !== "" ? (
-                    <Badge
-                      tone={
-                        recordOutcome === "PROJECT_COMPLETED"
-                          ? "ok"
-                          : recordOutcome === "FAILED"
-                            ? "danger"
-                            : "warn"
-                      }
-                    >
-                      {recordOutcome}
-                    </Badge>
-                  ) : null}
-                  <span className="mono small muted">{text(record.run_id)}</span>
-                </div>
-                {/* The stages the record itself proves. A terminal record stops the pulse and
-                    prints its own state; no percentage is drawn anywhere. */}
-                <RunProgress lang={lang} record={record} />
-                <Facts
-                  items={[
-                    [t(lang, "forge.execution.state"), text(record.state)],
-                    [t(lang, "forge.execution.status"), text(record.status)],
-                    [t(lang, "forge.result.outcome"), text(recordOutcome)],
-                    [t(lang, "forge.execution.events"), text(record.event_count)],
-                    [t(lang, "forge.execution.sequence"), text(record.last_sequence_number)],
-                    [t(lang, "forge.execution.attempt"), text(record.attempt_number)],
-                    [t(lang, "forge.execution.interrupted"), yesNo(lang, record.interrupted)],
-                    [t(lang, "forge.execution.updated"), text(record.updated_at)],
-                    [t(lang, "forge.execution.classification"), text(record.classification?.outcome)],
-                    [t(lang, "forge.execution.reason"), text(record.classification?.reason)],
-                    [t(lang, "forge.execution.detail"), text(record.classification?.detail)],
-                  ]}
-                />
-                {record.classification?.evidence && record.classification.evidence.length > 0 ? (
-                  <div>
-                    <div className="label">{t(lang, "forge.execution.evidence")}</div>
-                    <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
-                      {record.classification.evidence.map((item) => (
-                        <Badge key={item} tone="neutral">
-                          {item}
-                        </Badge>
-                      ))}
-                    </div>
+                {/* The stages the record itself proves. The last stage is claimed only when files
+                    were really written, so nine ✅ can never sit over an empty project; without
+                    files it reads «Завершено без файлов». */}
+                <RunProgress lang={lang} record={record} filesCreated={filesCreated} />
+                {/* Everything technical about the *record* is here, collapsed: `state`, `status`,
+                    `run_id`, `event_count`, the sequence number and the read-time classification.
+                    None of it is above the fold any more. */}
+                <details className="tech-details">
+                  <summary>{t(lang, "forge.result.tech")}</summary>
+                  <div className="stack" style={{ gap: 10, marginTop: 10 }}>
+                    <Facts
+                      items={[
+                        [t(lang, "forge.execution.state"), text(record.state)],
+                        [t(lang, "forge.execution.status"), text(record.status)],
+                        [t(lang, "forge.result.outcome"), text(recordOutcome)],
+                        [t(lang, "forge.result.run"), text(record.run_id)],
+                        [t(lang, "forge.execution.events"), text(record.event_count)],
+                        [t(lang, "forge.execution.sequence"), text(record.last_sequence_number)],
+                        [t(lang, "forge.execution.attempt"), text(record.attempt_number)],
+                        [t(lang, "forge.execution.interrupted"), yesNo(lang, record.interrupted)],
+                        [t(lang, "forge.execution.updated"), text(record.updated_at)],
+                        [t(lang, "forge.execution.classification"), text(record.classification?.outcome)],
+                        [t(lang, "forge.execution.reason"), text(record.classification?.reason)],
+                        [t(lang, "forge.execution.detail"), text(record.classification?.detail)],
+                      ]}
+                    />
+                    {record.classification?.evidence && record.classification.evidence.length > 0 ? (
+                      <div>
+                        <div className="label">{t(lang, "forge.execution.evidence")}</div>
+                        <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                          {record.classification.evidence.map((item) => (
+                            <Badge key={item} tone="neutral">
+                              {item}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
-                ) : null}
+                </details>
               </div>
             )}
           </Card>
 
-          {/* --------------------------------------------------------------- code write */}
-          {codeWrite !== null || (requestedWriteMode && terminal) ? (
-            <CodeWriteCard lang={lang} write={codeWrite} />
-          ) : null}
-
           {/* ----------------------------------------------------------------- result */}
           <Card className="rise d3">
-            <CardHead
-              title={t(lang, "forge.result.title")}
-              hint={t(lang, "forge.result.hint")}
-              action={
-                dispatched ? (
-                  <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
-                    <Badge
-                      tone={
-                        dispatched.response.outcome === "PROJECT_COMPLETED"
-                          ? "ok"
-                          : dispatched.response.outcome === "FAILED"
-                            ? "danger"
-                            : "neutral"
-                      }
-                    >
-                      {text(dispatched.response.outcome, t(lang, "runs.unknown"))}
-                    </Badge>
-                    <Badge tone={dispatched.response.success === true ? "ok" : "warn"}>
-                      {text(dispatched.response.state, t(lang, "runs.unknown"))}
-                    </Badge>
-                  </span>
-                ) : null
-              }
-            />
+            <CardHead title={t(lang, "forge.result.title")} hint={t(lang, "forge.result.hint")} />
             {!dispatched ? (
               <div className="small muted">{t(lang, "forge.result.empty")}</div>
             ) : (
               <div className="stack" style={{ gap: 14 }}>
-                {/* The three independent save facts, exactly as the response reports them. The old
-                    single «Запись сохранена: да» badge is gone: one boolean hid an empty project
-                    behind a stored run record. */}
-                <div>
-                  <div className="label">{t(lang, "forge.result.saved.title")}</div>
-                  <div style={{ marginTop: 8 }}>
-                    <Facts
-                      items={[
-                        [
-                          t(lang, "forge.result.saved.run"),
-                          yesNo(lang, dispatched.response.run_record_saved),
-                        ],
-                        [
-                          t(lang, "forge.result.saved.project"),
-                          yesNo(lang, dispatched.response.project_created),
-                        ],
-                        [
-                          t(lang, "forge.result.saved.files"),
-                          yesNo(lang, dispatched.response.project_files_created),
-                        ],
-                      ]}
-                    />
+                {/* ONE plain-language sentence, chosen from the facts and never from `state`. The
+                    first thing a reader meets is whether a project exists -- not COMPLETED. */}
+                <div className="project-truth result-headline" data-state={headline.state}>
+                  <div className="stack" style={{ gap: 10 }}>
+                    <div className="label">{t(lang, "forge.result.headline.label")}</div>
+                    <div className="result-headline-text">{headlineText(lang, headline)}</div>
+                    {headline.actions.length > 0 ? (
+                      <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                        {headline.actions.map((action) => (
+                          <Button
+                            key={action}
+                            size="small"
+                            tone={action === "retry" || action === "answer" ? "primary" : "ghost"}
+                            disabled={action === "retry" && dispatch.status === "pending"}
+                            onClick={() => runResultAction(action)}
+                          >
+                            {t(lang, RESULT_ACTION_LABELS[action])}
+                          </Button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {headline.kind === "ready" || headline.kind === "unverified" ? (
+                      <div className="small muted">{t(lang, "forge.result.action.note")}</div>
+                    ) : null}
+                    {headline.kind === "plan" ? (
+                      <div className="small muted">{t(lang, "forge.result.retry.note")}</div>
+                    ) : null}
                   </div>
                 </div>
 
-                {/* A run that stopped to ask questions lists them and offers the discovery
-                    session, instead of looking like a finished project. */}
-                {dispatched.response.outcome === "CLARIFICATION_REQUIRED" ? (
+                {/* The questions the final answer asked, when it really asked any — listed as
+                    they arrived, never re-worded. A plan that merely ends in "?" is not a
+                    question list: that case is the «plan instead of files» headline above. */}
+                {askedQuestions ? (
                   <div className="notice warn">
-                    <div className="label">{t(lang, "forge.result.clarification.title")}</div>
-                    {Array.isArray(dispatched.response.clarification_questions) &&
-                    dispatched.response.clarification_questions.length > 0 ? (
-                      <ol className="forge-questions" style={{ marginTop: 8 }}>
-                        {dispatched.response.clarification_questions.map((question) => (
-                          <li className="forge-question" key={question}>
-                            {question}
-                          </li>
-                        ))}
-                      </ol>
-                    ) : (
-                      <div className="small" style={{ marginTop: 6 }}>
-                        {t(lang, "forge.result.clarification.empty")}
-                      </div>
-                    )}
-                    <div className="row" style={{ marginTop: 10 }}>
-                      <Button size="small" tone="primary" onClick={() => void answerClarification()}>
-                        {t(lang, "forge.result.clarification.answer")}
-                      </Button>
-                    </div>
+                    <div className="label">{t(lang, "forge.result.questions")}</div>
+                    <ol className="forge-questions" style={{ marginTop: 8 }}>
+                      {responseQuestions.map((question) => (
+                        <li className="forge-question" key={question}>
+                          {question}
+                        </li>
+                      ))}
+                    </ol>
                     <div className="small" style={{ marginTop: 6 }}>
                       {t(lang, "forge.result.clarification.hint")}
                     </div>
                   </div>
                 ) : null}
 
-                <div>
-                  <div className="label">{t(lang, "forge.result.output")}</div>
-                  <pre className="forge-output mono small">
-                    {typeof dispatched.response.output === "string" && dispatched.response.output !== ""
-                      ? dispatched.response.output
-                      : t(lang, "forge.result.no_output")}
-                  </pre>
-                </div>
+                {/* Everything technical about the *answer* is here, collapsed: the raw output,
+                    the response facts, the save facts, the writer's own status and English reason,
+                    and the diff. */}
+                <details className="tech-details">
+                  <summary>{t(lang, "forge.result.tech")}</summary>
+                  <div className="stack" style={{ gap: 14, marginTop: 12 }}>
+                    <div>
+                      <div className="label">{t(lang, "forge.result.output")}</div>
+                      <pre className="forge-output mono small">
+                        {typeof dispatched.response.output === "string" && dispatched.response.output !== ""
+                          ? dispatched.response.output
+                          : t(lang, "forge.result.no_output")}
+                      </pre>
+                    </div>
 
-                {dispatched.response.error ? (
-                  <div className="notice danger">{String(dispatched.response.error)}</div>
-                ) : null}
+                    {dispatched.response.error ? (
+                      <div className="notice danger">{String(dispatched.response.error)}</div>
+                    ) : null}
 
-                {/* Files were really written: the entry point and the local preview are on the
-                    project card, so this line points there instead of promising a launch here. */}
-                {typeof dispatched.response.files_created === "number" &&
-                dispatched.response.files_created > 0 ? (
-                  <div className="notice">{t(lang, "forge.result.launch_note")}</div>
-                ) : null}
+                    <Facts
+                      items={[
+                        [
+                          t(lang, "runs.result.tokens"),
+                          dispatched.response.tokens === null || dispatched.response.tokens === undefined
+                            ? t(lang, "runs.unknown")
+                            : String(dispatched.response.tokens),
+                        ],
+                        [
+                          t(lang, "runs.result.cost"),
+                          typeof dispatched.response.cost === "number"
+                            ? `$${fixed(dispatched.response.cost, 4)}`
+                            : t(lang, "runs.unknown"),
+                        ],
+                        [t(lang, "runs.result.duration"), fixed(dispatched.response.duration_seconds, 3)],
+                        [t(lang, "runs.result.provider"), text(dispatched.response.provider_used)],
+                        [t(lang, "runs.result.model"), text(dispatched.response.model_used)],
+                        [t(lang, "forge.result.outcome"), text(dispatched.response.outcome)],
+                        [t(lang, "forge.result.state"), text(dispatched.response.state)],
+                        [
+                          t(lang, "forge.result.files.created"),
+                          typeof dispatched.response.files_created === "number"
+                            ? String(dispatched.response.files_created)
+                            : t(lang, "runs.unknown"),
+                        ],
+                        [
+                          t(lang, "forge.result.write_mode"),
+                          text(dispatched.response.write_mode, t(lang, "forge.launch.write.none")),
+                        ],
+                        // The retry is a write-mode fact from the run's own record; a run that
+                        // did not write has nothing to say about it, so the line is omitted.
+                        ...(requestedWriteMode
+                          ? ([
+                              [
+                                t(lang, "forge.result.retry"),
+                                writeRetryAttempted === null
+                                  ? t(lang, "runs.unknown")
+                                  : yesNo(lang, writeRetryAttempted),
+                              ],
+                            ] as Array<[string, string]>)
+                          : []),
+                        [
+                          t(lang, "forge.result.manifest"),
+                          yesNo(lang, dispatched.response.artifact_manifest_saved),
+                        ],
+                        [
+                          t(lang, "forge.result.cost.tier"),
+                          text(dispatched.response.cost_tier, t(lang, "forge.launch.cost.unknown")),
+                        ],
+                        [t(lang, "forge.result.task"), text(dispatched.response.task_id)],
+                        [t(lang, "forge.result.project"), text(dispatched.response.project_id)],
+                        [t(lang, "forge.result.run"), text(dispatched.response.run_id)],
+                      ]}
+                    />
 
-                <Facts
-                  items={[
-                    [
-                      t(lang, "runs.result.tokens"),
-                      dispatched.response.tokens === null || dispatched.response.tokens === undefined
-                        ? t(lang, "runs.unknown")
-                        : String(dispatched.response.tokens),
-                    ],
-                    [
-                      t(lang, "runs.result.cost"),
-                      typeof dispatched.response.cost === "number"
-                        ? `$${fixed(dispatched.response.cost, 4)}`
-                        : t(lang, "runs.unknown"),
-                    ],
-                    [t(lang, "runs.result.duration"), fixed(dispatched.response.duration_seconds, 3)],
-                    [t(lang, "runs.result.provider"), text(dispatched.response.provider_used)],
-                    [t(lang, "runs.result.model"), text(dispatched.response.model_used)],
-                    [t(lang, "forge.result.outcome"), text(dispatched.response.outcome)],
-                    [t(lang, "forge.result.state"), text(dispatched.response.state)],
-                    [
-                      t(lang, "forge.result.files.created"),
-                      typeof dispatched.response.files_created === "number"
-                        ? String(dispatched.response.files_created)
-                        : t(lang, "runs.unknown"),
-                    ],
-                    [
-                      t(lang, "forge.result.write_mode"),
-                      text(dispatched.response.write_mode, t(lang, "forge.launch.write.none")),
-                    ],
-                    [
-                      t(lang, "forge.result.manifest"),
-                      yesNo(lang, dispatched.response.artifact_manifest_saved),
-                    ],
-                    [
-                      t(lang, "forge.result.cost.tier"),
-                      text(dispatched.response.cost_tier, t(lang, "forge.launch.cost.unknown")),
-                    ],
-                    [t(lang, "forge.result.task"), text(dispatched.response.task_id)],
-                    [t(lang, "forge.result.project"), text(dispatched.response.project_id)],
-                    [t(lang, "forge.result.run"), text(dispatched.response.run_id)],
-                  ]}
-                />
+                    {/* The three independent save facts the response carries. They used to be
+                        stated above the fold, where one boolean hid an empty project behind a
+                        stored run record; they are facts for an auditor, so they moved here. */}
+                    <div>
+                      <div className="label">{t(lang, "forge.result.saved.title")}</div>
+                      <div style={{ marginTop: 8 }}>
+                        <Facts
+                          items={[
+                            [
+                              t(lang, "forge.result.saved.run"),
+                              yesNo(lang, dispatched.response.run_record_saved),
+                            ],
+                            [
+                              t(lang, "forge.result.saved.project"),
+                              yesNo(lang, dispatched.response.project_created),
+                            ],
+                            [
+                              t(lang, "forge.result.saved.files"),
+                              yesNo(lang, dispatched.response.project_files_created),
+                            ],
+                          ]}
+                        />
+                      </div>
+                    </div>
 
-                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                  <Badge tone={dispatched.facts.usage_basis === "ACTUAL" ? "ok" : "warn"}>
-                    {t(lang, "runs.basis.usage")}:{" "}
-                    {text(dispatched.facts.usage_basis, t(lang, "runs.unknown"))}
-                  </Badge>
-                  <Badge tone={dispatched.facts.cost_basis === "ACTUAL" ? "ok" : "warn"}>
-                    {t(lang, "runs.basis.cost")}:{" "}
-                    {text(dispatched.facts.cost_basis, t(lang, "runs.unknown"))}
-                  </Badge>
-                  {dispatched.facts.idempotent_replay === true ? (
-                    <Badge tone="info">{t(lang, "runs.basis.replay")}</Badge>
-                  ) : null}
-                </div>
+                    <CodeWriteDetails lang={lang} write={codeWrite} />
 
-                {!basisReported ? (
-                  <div className="small muted">{t(lang, "forge.result.basis.missing")}</div>
-                ) : null}
+                    <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                      <Badge tone={dispatched.facts.usage_basis === "ACTUAL" ? "ok" : "warn"}>
+                        {t(lang, "runs.basis.usage")}:{" "}
+                        {text(dispatched.facts.usage_basis, t(lang, "runs.unknown"))}
+                      </Badge>
+                      <Badge tone={dispatched.facts.cost_basis === "ACTUAL" ? "ok" : "warn"}>
+                        {t(lang, "runs.basis.cost")}:{" "}
+                        {text(dispatched.facts.cost_basis, t(lang, "runs.unknown"))}
+                      </Badge>
+                      {dispatched.facts.idempotent_replay === true ? (
+                        <Badge tone="info">{t(lang, "runs.basis.replay")}</Badge>
+                      ) : null}
+                    </div>
+
+                    {!basisReported ? (
+                      <div className="small muted">{t(lang, "forge.result.basis.missing")}</div>
+                    ) : null}
+                  </div>
+                </details>
               </div>
             )}
           </Card>

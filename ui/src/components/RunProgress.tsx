@@ -6,9 +6,11 @@
 // and nothing else:
 //
 //   * a run with events proves the pipeline moved past acceptance;
-//   * a terminal-success record proves every stage was passed (the run reached COMPLETED);
-//   * a terminal record that is not a success never claims the last stage: the outcome exists, but
-//     it is a failure, and «Готовим итог» is the successful stage this run did not reach;
+//   * a terminal-success record proves the pipeline ran, but it does NOT prove a project was
+//     created: the measured failure had `state=COMPLETED` and nine ✅ chips over an empty project.
+//     The last stage («Готовим итог») is therefore marked only when the writer really wrote files;
+//     without files it is drawn as «Завершено без файлов» instead of a check.
+//   * a terminal record that is not a success never claims the last stage either;
 //   * while the run is not terminal, one stage per four recorded events is marked, capped at
 //     eight, so the final stage is never claimed before the record itself is terminal.
 //
@@ -40,6 +42,8 @@ export type RunProgressFacts = {
   /** True when the record is terminal: the pulse stops and the terminal state is printed. */
   terminal: boolean;
   success: boolean;
+  /** True when this run really wrote at least one file. The last stage depends on it. */
+  filesWritten: boolean;
   /** The raw number of events the record persisted. */
   events: number;
   state: string;
@@ -50,19 +54,35 @@ export type RunProgressFacts = {
 const EVENTS_PER_STAGE = 4;
 const RUNNING_CAP = RUN_STAGES.length - 1;
 
-export const runProgressOf = (record: RunRecord | null): RunProgressFacts => {
+export const runProgressOf = (
+  record: RunRecord | null,
+  filesCreated = 0
+): RunProgressFacts => {
   if (!record) {
-    return { reached: 0, terminal: false, success: false, events: 0, state: "", outcome: "" };
+    return {
+      reached: 0,
+      terminal: false,
+      success: false,
+      filesWritten: false,
+      events: 0,
+      state: "",
+      outcome: "",
+    };
   }
   const events = typeof record.event_count === "number" && Number.isFinite(record.event_count) ? record.event_count : 0;
   const terminal = isTerminalRecord(record);
   const success = record.classification?.is_success === true;
+  const filesWritten =
+    typeof filesCreated === "number" && Number.isFinite(filesCreated) && filesCreated > 0;
   const proven = Math.min(RUNNING_CAP, Math.max(0, Math.floor(events / EVENTS_PER_STAGE)));
-  const reached = terminal ? (success ? RUN_STAGES.length : proven) : proven;
+  // A terminal success with no file wrote nothing a reader may take for a finished project, so
+  // the last stage the record "proves" is capped below it.
+  const reached = terminal ? (success && filesWritten ? RUN_STAGES.length : proven) : proven;
   return {
     reached,
     terminal,
     success,
+    filesWritten,
     events,
     state: String(record.state ?? record.status ?? ""),
     outcome: String(record.classification?.outcome ?? ""),
@@ -83,10 +103,20 @@ const useReducedMotion = (): boolean => {
   return reduced;
 };
 
-export const RunProgress = ({ lang, record }: { lang: Lang; record: RunRecord | null }) => {
+export const RunProgress = ({
+  lang,
+  record,
+  filesCreated = 0,
+}: {
+  lang: Lang;
+  record: RunRecord | null;
+  /** How many files the run really wrote; 0 means the last stage is never claimed. */
+  filesCreated?: number;
+}) => {
   const reduced = useReducedMotion();
-  const facts = runProgressOf(record);
-  const tone = facts.terminal ? (facts.success ? "ok" : "warn") : "info";
+  const facts = runProgressOf(record, filesCreated);
+  const finishedWithoutFiles = facts.terminal && facts.success && !facts.filesWritten;
+  const tone = facts.terminal ? (facts.success && facts.filesWritten ? "ok" : "warn") : "info";
 
   return (
     <div className="run-progress">
@@ -96,31 +126,39 @@ export const RunProgress = ({ lang, record }: { lang: Lang; record: RunRecord | 
           <Badge tone="neutral">
             {t(lang, "forge.progress.events")}: {facts.events}
           </Badge>
+          {/* The owner's word for what the record proves -- never the raw state word. That one
+              lives in the collapsed «Технические детали». */}
           <Badge tone={tone}>
-            {facts.terminal
-              ? `${t(lang, "forge.progress.terminal")}: ${facts.state || facts.outcome || t(lang, "runs.unknown")}`
-              : t(lang, "forge.progress.running")}
+            {finishedWithoutFiles
+              ? t(lang, "forge.progress.no_files")
+              : facts.terminal
+                ? t(lang, "forge.progress.terminal")
+                : t(lang, "forge.progress.running")}
           </Badge>
         </span>
       </div>
 
       <ol className={`run-stages${reduced ? " plain" : ""}`}>
         {RUN_STAGES.map((key, index) => {
+          const isLast = index === RUN_STAGES.length - 1;
+          const withoutFiles = isLast && finishedWithoutFiles && index >= facts.reached;
           const done = index < facts.reached;
           const current = !facts.terminal && index === facts.reached;
-          const state = done ? "done" : current ? "current" : "pending";
+          const state = done ? "done" : current ? "current" : withoutFiles ? "no-files" : "pending";
           return (
             <li className={`run-stage ${state}`} key={key}>
               <span className="run-stage-mark" aria-hidden="true">
-                {done ? "✓" : current ? "•" : "·"}
+                {done ? "✓" : withoutFiles ? "—" : current ? "•" : "·"}
               </span>
               <span>{t(lang, key)}</span>
               <span className="small muted">
                 {done
                   ? `· ${t(lang, "forge.progress.done")}`
-                  : current
-                    ? `· ${t(lang, "forge.progress.current")}`
-                    : `· ${t(lang, "forge.progress.pending")}`}
+                  : withoutFiles
+                    ? `· ${t(lang, "forge.progress.no_files")}`
+                    : current
+                      ? `· ${t(lang, "forge.progress.current")}`
+                      : `· ${t(lang, "forge.progress.pending")}`}
               </span>
             </li>
           );

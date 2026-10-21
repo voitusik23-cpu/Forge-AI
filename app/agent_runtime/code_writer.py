@@ -769,6 +769,30 @@ def _rollback(records: list[tuple[_PlannedFile, Path | None]]) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def carries_file_changes(answer: object) -> bool:
+    """True when the answer carries at least one file change the writer would read.
+
+    Read-only by contract: it parses the answer and returns a boolean, so a caller
+    can decide whether the answer is worth asking the model about *before* anything
+    is written (this is what the single write-mode retry keys on). It never writes,
+    never raises and never guesses a path.
+
+    An answer that looks like a change but cannot be read deterministically reports
+    True: the writer's own refusal, with its parse error, is the honest outcome
+    there -- asking the model again would not make a malformed block valid.
+    """
+
+    text = answer if isinstance(answer, str) else ""
+    if not text.strip():
+        return False
+    try:
+        if _parse_unified_diff(text):
+            return True
+    except _ParseError:
+        return True
+    return bool(_parse_fenced(text))
+
+
 def apply_changes(
     answer: object,
     *,
