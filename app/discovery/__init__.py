@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from app.discovery.models import (
     ClarificationAnswer,
+    ClarificationOption,
     ClarificationQuestion,
     DiscoveryError,
     DiscoveryNotConfirmed,
@@ -27,15 +28,18 @@ from app.discovery.models import (
     DiscoveryStateConflict,
     InvalidClarificationAnswer,
     ProjectSpecification,
+    RequiredQuestionSkipped,
     UnknownDiscoverySession,
 )
 from app.discovery.service import (
     DiscoveryService,
     apply_specification,
+    value_origins,
 )
 
 __all__ = [
     "ClarificationAnswer",
+    "ClarificationOption",
     "ClarificationQuestion",
     "DiscoveryError",
     "DiscoveryNotConfirmed",
@@ -46,6 +50,8 @@ __all__ = [
     "DiscoveryStateConflict",
     "InvalidClarificationAnswer",
     "ProjectSpecification",
+    "RequiredQuestionSkipped",
     "UnknownDiscoverySession",
     "apply_specification",
+    "value_origins",
 ]

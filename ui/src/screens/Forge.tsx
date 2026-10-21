@@ -18,7 +18,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
-import { ClarificationCard, emptyAnswerDraft, type AnswerDraft } from "../components/ClarificationCard";
+import {
+  ClarificationCard,
+  draftHasAnswer,
+  emptyAnswerDraft,
+  type AnswerDraft,
+} from "../components/ClarificationCard";
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { RunProgress } from "../components/RunProgress";
 import { t, type Lang } from "../i18n";
@@ -109,6 +114,36 @@ const SPEC_FIELDS: Array<{ key: SpecKey; labelKey: string }> = [
   { key: "acceptance_criteria", labelKey: "forge.discovery.spec.acceptance_criteria" },
   { key: "priorities", labelKey: "forge.discovery.spec.priorities" },
 ];
+
+/** The human name of one specification field, for the chosen/auto-selected lists. */
+const specLabel = (lang: Lang, field: string): string => {
+  const entry = SPEC_FIELDS.find((candidate) => candidate.key === field);
+  return entry ? t(lang, entry.labelKey) : field;
+};
+
+/** One `field -> values` record rendered as «поле: значение; значение». */
+const OriginList = ({
+  lang,
+  origins,
+  empty,
+}: {
+  lang: Lang;
+  origins: Array<{ field?: string; values?: string[] }>;
+  empty: string;
+}) => {
+  const rows = origins.filter((origin) => (origin.values ?? []).length > 0);
+  if (rows.length === 0) return <div className="small muted">{empty}</div>;
+  return (
+    <ul className="forge-spec">
+      {rows.map((origin) => (
+        <li className="forge-spec-row" key={String(origin.field ?? "")}>
+          <span className="label">{specLabel(lang, String(origin.field ?? ""))}</span>
+          <span>{(origin.values ?? []).join("; ")}</span>
+        </li>
+      ))}
+    </ul>
+  );
+};
 
 /** The one honest sentence per failure, with the status kept visible next to it. */
 const failureLabel = (lang: Lang, failure: Failure): string => {
@@ -535,12 +570,16 @@ export const Forge = ({
       const id = String(answer.question_id ?? "");
       if (id === "") continue;
       const storedText = typeof answer.text === "string" ? answer.text : "";
-      // An answer the Core stored as skipped with no text was an explicit «не знаю»; it stays
-      // visible as that, instead of looking like a question nobody touched.
+      const storedValues = Array.isArray(answer.values) ? answer.values.map(String) : [];
+      const storedCustom = typeof answer.custom === "string" ? answer.custom : "";
+      // An answer the Core stored as skipped with no text was «Пропустить»/«Не знаю» with nothing
+      // to record; an answer with `auto_selected` stays visible as Forge's own choice instead of
+      // looking like something the user typed.
       next[id] = {
-        text: storedText,
-        unknown: answer.skipped === true && storedText === "",
-        skip: false,
+        values: storedValues,
+        custom: storedCustom || (storedValues.length === 0 ? storedText : ""),
+        unknown: answer.auto_selected === true,
+        skip: answer.skipped === true && storedText === "",
       };
     }
     setDrafts(next);
@@ -607,25 +646,54 @@ export const Forge = ({
   /**
    * Step 2: the answers the owner actually gave through the widgets.
    *
-   * Three shapes leave here, and each one means something different to the Core:
-   * `{text}` is a real answer, `{text: "", skipped: true}` is «Не знаю» (recorded as an explicit
-   * unknown, never asked again), and a question with «Пропустить» is not sent at all, so it stays
-   * open for the next round. An untouched question is not sent either.
+   * Four shapes leave here, and each one means something different to the Core:
+   * `{values, custom}` is a real answer built from the clicked options and the «Свой вариант»
+   * field, `{unknown: true}` is «Не знаю — выбери оптимальный вариант» (the Core stores the
+   * recommended option and marks it auto-selected), `{skipped: true}` is «Пропустить» and is
+   * sent only for an optional question, and an untouched question is not sent at all, so it
+   * stays open for the next round.
    */
   const sendAnswers = async () => {
     if (discoveryBusy !== "" || sessionId === "") return;
-    const answers: Array<{ question_id: string; text: string; skipped?: boolean }> = [];
+    const answers: Array<{
+      question_id: string;
+      values?: string[];
+      custom?: string;
+      unknown?: boolean;
+      skipped?: boolean;
+    }> = [];
+    const skippedRequired: string[] = [];
     for (const question of questions) {
       const id = String(question.id ?? "");
       if (id === "") continue;
       const draft = drafts[id] ?? emptyAnswerDraft();
-      if (draft.skip) continue;
-      if (draft.unknown) {
-        answers.push({ question_id: id, text: "", skipped: true });
+      const required = question.required !== false && question.optional !== true;
+      if (draft.skip) {
+        if (required) {
+          // A required decision cannot be silently dropped: the Core refuses it, so it is
+          // never sent and the user is told below instead of being handed a 400.
+          skippedRequired.push(String(question.text ?? id));
+          continue;
+        }
+        answers.push({ question_id: id, skipped: true });
         continue;
       }
-      const text = draft.text.trim();
-      if (text !== "") answers.push({ question_id: id, text });
+      if (draft.unknown) {
+        answers.push({ question_id: id, unknown: true });
+        continue;
+      }
+      if (!draftHasAnswer(draft)) continue;
+      answers.push({
+        question_id: id,
+        values: draft.values,
+        custom: draft.custom.trim(),
+      });
+    }
+    if (skippedRequired.length > 0) {
+      setDiscoveryNotice(
+        `${t(lang, "forge.discovery.questions.skip.required")} ${skippedRequired.join("; ")}`
+      );
+      return;
     }
     if (answers.length === 0) {
       setDiscoveryNotice(t(lang, "forge.discovery.answers.empty"));
@@ -1293,7 +1361,7 @@ export const Forge = ({
                 {phase === "spec" ? (
                   <div className="stack" style={{ gap: 12 }}>
                     <div>
-                      <div className="label">{t(lang, "forge.discovery.spec.title")}</div>
+                      <div className="label">{t(lang, "forge.discovery.spec.understood")}</div>
                       <div className="small muted">{t(lang, "forge.discovery.spec.hint")}</div>
                     </div>
                     {discoverySpec === null ? (
@@ -1316,6 +1384,28 @@ export const Forge = ({
                           );
                         })}
                       </dl>
+                    )}
+                    {/* Two separate records, never merged: a decision the owner made and a value
+                        Forge picked through «Не знаю — выбери оптимальный вариант». */}
+                    {discoverySpec === null ? null : (
+                      <div className="stack" style={{ gap: 8 }}>
+                        <div>
+                          <div className="label">{t(lang, "forge.discovery.spec.chosen")}</div>
+                          <OriginList
+                            lang={lang}
+                            origins={discoverySpec.chosen ?? []}
+                            empty={t(lang, "forge.discovery.spec.chosen.empty")}
+                          />
+                        </div>
+                        <div>
+                          <div className="label">{t(lang, "forge.discovery.spec.auto")}</div>
+                          <OriginList
+                            lang={lang}
+                            origins={discoverySpec.auto_selected ?? []}
+                            empty={t(lang, "forge.discovery.spec.auto.empty")}
+                          />
+                        </div>
+                      </div>
                     )}
                     <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
                       <Button

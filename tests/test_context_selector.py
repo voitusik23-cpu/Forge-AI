@@ -191,6 +191,15 @@ class TestContextSelector(unittest.TestCase):
         self.assertIn("req-huge", report.dropped_item_ids)
 
     def test_sensitivity_and_forbidden_substring_filtering(self) -> None:
+        """A credential-shaped value is dropped; so are the two sensitive items.
+
+        The value carries an assignment with credential-shaped material on purpose. A
+        sentence that merely *names* an ``api_key`` is ordinary prose and is admissible
+        since the classification fix in ``tests/test_secret_filter_classification.py``:
+        the word is not the secret, the value is. The intent of this test is unchanged --
+        a leaked credential never reaches the model's context.
+        """
+
         policy = ContextBudgetPolicy(total_context_window=32_768)
         selector = ContextSelector(policy=policy)
 
@@ -212,7 +221,7 @@ class TestContextSelector(unittest.TestCase):
             item_id="item-token-leak",
             item_type="note",
             source_type=ContextSourceType.PROJECT_MEMORY,
-            value="Here is the api_key for the remote system",
+            value="Here is the api_key=a1B2c3D4e5F6g7H8i9J0k1L2 for the remote system",
             sensitivity=ContextSensitivity.INTERNAL,
         )
         valid_item = ContextItem(

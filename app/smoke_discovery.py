@@ -65,6 +65,14 @@ def _print_questions(questions) -> None:
         required = "required" if question.required else "optional"
         print(f"  {index}. [{required}] {question.text}")
         print(f"     field: {question.field} — {question.why}")
+        if question.options:
+            labels = " · ".join(
+                f"{option.label}{' (рекомендуется)' if option.recommended else ''}"
+                for option in question.options
+            )
+            print(f"     control: {question.control} — {labels}")
+        else:
+            print(f"     control: {question.control}")
 
 
 def main() -> int:
@@ -83,19 +91,40 @@ def main() -> int:
 
     print("")
     print("ANSWERS")
-    answers = [
-        {"question_id": question.id, "text": FIXTURE_ANSWERS[question.field]}
-        for question in session.questions
-        if question.field in FIXTURE_ANSWERS
-    ]
-    for item in answers:
-        print(f"  {item['question_id']}: {item['text']}")
-    session = discovery.answer(session.session_id, answers)
-    print(f"  state after answers: {session.state.value}")
+    # One round asks at most three questions, so the fixture answers the round it is asked in
+    # and lets Forge pick the recommended option («Не знаю — выбери оптимальный вариант») for
+    # anything the fixture has no opinion about. Answering round by round is exactly what the
+    # bound is for: the conversation stays short and never repeats an answered area.
+    for round_number in range(1, 5):
+        if not session.questions:
+            break
+        answers = []
+        for question in session.questions:
+            if question.field in FIXTURE_ANSWERS:
+                answers.append(
+                    {"question_id": question.id, "text": FIXTURE_ANSWERS[question.field]}
+                )
+            else:
+                answers.append({"question_id": question.id, "unknown": True})
+        print(f"  round {round_number}:")
+        for item in answers:
+            if "text" in item:
+                print(f"    {item['question_id']}: {item['text']}")
+            else:
+                print(f"    {item['question_id']}: «Не знаю — выбери оптимальный вариант»")
+        session = discovery.answer(session.session_id, answers)
+        print(f"  state after answers: {session.state.value}")
+
+    print("")
+    print("WHAT THE USER CHOSE / WHAT FORGE PICKED")
+    specification = discovery.specification(session.session_id)
+    for field_name, values in specification.chosen_values.items():
+        print(f"  chosen    {field_name}: {'; '.join(values)}")
+    for field_name, values in specification.auto_selected_values.items():
+        print(f"  auto      {field_name}: {'; '.join(values)}")
 
     print("")
     print("PROJECT SPECIFICATION")
-    specification = discovery.specification(session.session_id)
     for line in specification.as_task_text().splitlines()[1:]:
         print(f"  {line}")
 
@@ -140,10 +169,11 @@ def main() -> int:
 
 def _known_count(specification) -> int:
     data = specification.to_dict()
+    meta = {"source_answers", "chosen_values", "auto_selected_values"}
     return sum(
         1
         for key, value in data.items()
-        if key != "source_answers" and bool(value)
+        if key not in meta and bool(value)
     )
 
 

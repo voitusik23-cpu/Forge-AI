@@ -29,6 +29,34 @@ FORBIDDEN_CONTEXT_SUBSTRINGS: tuple[str, ...] = (
     "file_content",
 )
 
+#: The words that mark a *structural* thing a prompt must not carry (a raw stream, a
+#: chain of thought, a file body). They stay refused when they appear in a context
+#: value, because they are not prose about the work: an item that says "stdout" is a
+#: raw stream being pushed into the model's context.
+STRUCTURAL_VALUE_MARKERS: tuple[str, ...] = (
+    "stdout",
+    "stderr",
+    "raw_output",
+    "prompt",
+    "chain_of_thought",
+    "source_code",
+    "file_content",
+)
+
+#: The credential words. Measured defect: a *word* was refused as if it were material.
+#: «Секреты нельзя добавлять в проект», a sentence naming an ``API key``, the noun
+#: ``credentials``, the word ``password`` in architecture prose, an ``.env.example`` with
+#: empty values and a ``Bearer <placeholder>`` are all normal text -- a user task that
+#: mentioned them was refused with ``security_forbidden_content:secret``, one event was
+#: recorded and the provider was never called.
+#:
+#: They are therefore no longer matched on their own in a *value*: the words "secret",
+#: "password", "api_key" and "credential" name a thing, they are not the thing. They
+#: still block a metadata *key*, where they name what is being carried (see
+#: ``sanitize_context_metadata``), and each of them still refuses a secret-shaped VALUE
+#: through the patterns below.
+CREDENTIAL_WORDS: tuple[str, ...] = ("secret", "password", "api_key", "credential")
+
 #: Field names an operator's engineering text may legitimately mention. The word "token"
 #: inside one of these is a *count* or a *limit*, not secret material. Measured: a task
 #: description that named ``tokens_in``/``tokens_out`` was refused with
@@ -48,26 +76,52 @@ TOKEN_FIELD_NAMES: tuple[str, ...] = (
     "tokenization",
 )
 
-#: Patterns for actual secret *material*, each paired with the reason word it reports.
+#: patterns for an actual secret *material*, each paired with the reason word it reports.
 #: The reasons stay the existing vocabulary (``token``/``api_key``/``password``/
 #: ``secret``/``credential``) so a real positive keeps its existing refusal message.
 #: A bare word such as "token" is not material on its own, but these are: a ``Bearer``
 #: credential, a JWT, a provider key prefix, and an assigned credential. A long
-#: random-looking value is checked separately by :func:`_looks_random`.
-_SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("token", re.compile(r"\bbearer\s+[A-Za-z0-9\-_.=+/]{40,}", re.IGNORECASE)),
-    ("token", re.compile(r"\beyJ[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}")),
-    ("api_key", re.compile(r"\bsk-[A-Za-z0-9\-_]{16,}")),
-    ("api_key", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}")),
+#: random-looking value is checked separately by :func:`_random_match`.
+#:
+#: Every pattern describes a *value*, never a word:
+#:
+#: * the assignment patterns require the value on the **same line**, so
+#:   ``API_KEY=`` followed by the next line's ``SECRET_KEY=`` is not read as one
+#:   assignment (that measure alone refused an ``.env.example`` with empty values);
+#: * the value has to have the shape of key material -- 20+ characters, or a shorter
+#:   but clearly machine-made string -- so ``API_KEY=your-key-here`` stays an example;
+#: * a recognisable placeholder is never material, whatever its length.
+_SECRET_VALUE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
+    ("bearer_token", "token", re.compile(r"\bbearer\s+[A-Za-z0-9\-_.=+/]{40,}", re.IGNORECASE)),
+    ("jwt", "token", re.compile(r"\beyJ[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}")),
     (
+        "provider_key_prefix",
         "api_key",
         re.compile(
-            r"(?i)\b(?:api[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token)\b"
-            r"\s*[:=]\s*\S{8,}"
+            r"\b(?:sk|pk|rk)[-_][A-Za-z0-9\-_]{16,}"
+            r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
+            r"|\bxox[abposr]-[A-Za-z0-9\-]{10,}"
+            r"|\bAKIA[0-9A-Z]{16}\b"
         ),
     ),
-    ("password", re.compile(r"(?i)\bpassw(?:or)?d\b\s*[:=]\s*\S{1,}")),
-    ("credential", re.compile(r"(?i)\bcredentials?\b\s*[:=]\s*\S{8,}")),
+    (
+        "assigned_api_key",
+        "api_key",
+        re.compile(
+            r"(?i)\b(?:api[_-]?key|access[_-]?key|secret[_-]?key|auth[_-]?token|client[_-]?secret)"
+            r"\b[ \t]*[:=][ \t]*(?P<value>[^\s\"']+)"
+        ),
+    ),
+    (
+        "password_assignment",
+        "password",
+        re.compile(r"(?i)\bpassw(?:or)?d\b[ \t]*[:=][ \t]*(?P<value>[^\s\"']+)"),
+    ),
+    (
+        "credentials_assignment",
+        "credential",
+        re.compile(r"(?i)\bcredentials?\b[ \t]*[:=][ \t]*(?P<value>[^\s\"']+)"),
+    ),
 )
 
 #: A single long, unbroken, machine-looking run of characters: the shape of a generated
@@ -77,18 +131,52 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 #: run that assembled an understanding snapshot.
 _RANDOM_LOOKING_CANDIDATE = re.compile(r"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b")
 
+#: A value that names no secret at all: an angle/quoted placeholder, a repeat of one
+#: character, an ellipsis, or a word that says "put your own value here". Such a value is
+#: documentation, so an assignment carrying it stays admissible.
+_PLACEHOLDER_VALUE_MARKERS: tuple[str, ...] = (
+    "<",
+    ">",
+    "...",
+    "${",
+    "%",
+    "your",
+    "example",
+    "placeholder",
+    "change_me",
+    "changeme",
+    "dummy",
+    "sample",
+    "redacted",
+    "todo",
+    "tbd",
+)
+
+#: A short value still counts as material when it is machine-made: at least one digit and
+#: at least one letter, which no ordinary English or Russian word has.
+_SHORT_VALUE_MIN_LENGTH = 20
+_SHORT_VALUE_CREDENTIAL_SHAPED_LENGTH = 8
+
 
 def _has_bare_token(text_lower: str) -> bool:
-    """Whether "token" appears outside a recognised field name such as ``max_tokens``."""
+    """Whether "token" appears as a word of its own, outside a field name.
+
+    Two narrowings, both measured. A recognised field name (``max_tokens``,
+    ``tokens_in``) is scrubbed first, and the remaining match must then be a standalone
+    word: an identifier such as ``AUTH_TOKEN`` or ``FORGE_TOKEN`` names a *variable*, so
+    an ``.env.example`` that documents it -- with an empty or placeholder value -- is not
+    a credential. A sentence such as "the token is rotated nightly" still is prose about
+    a credential and keeps its refusal.
+    """
 
     scrubbed = text_lower
     for name in sorted(TOKEN_FIELD_NAMES, key=len, reverse=True):
         scrubbed = scrubbed.replace(name, " ")
-    return "token" in scrubbed
+    return re.search(r"(?<![a-z0-9_])tokens?(?![a-z0-9_])", scrubbed) is not None
 
 
-def _looks_random(value: str) -> bool:
-    """Whether ``value`` carries a credential-shaped random run, i.e. key-like material."""
+def _random_match(value: str) -> str | None:
+    """The credential-shaped random run inside ``value``, or ``None``."""
 
     for candidate in _RANDOM_LOOKING_CANDIDATE.findall(value):
         digits = sum(character.isdigit() for character in candidate)
@@ -97,35 +185,174 @@ def _looks_random(value: str) -> bool:
         has_lower = any(character.islower() for character in candidate)
         has_upper = any(character.isupper() for character in candidate)
         if has_lower and has_upper:
-            return True
-    return False
+            return candidate
+    return None
+
+
+def _has_bare_marker(text_lower: str, marker: str) -> bool:
+    """Whether a structural marker appears as a word of its own."""
+
+    if marker == "raw_output":
+        return "raw_output" in text_lower or "raw output" in text_lower
+    if marker == "chain_of_thought":
+        return "chain_of_thought" in text_lower or "chain of thought" in text_lower
+    if marker == "source_code":
+        return "source_code" in text_lower or "source code" in text_lower
+    if marker == "file_content":
+        return "file_content" in text_lower or "file content" in text_lower
+    pattern = rf"(?<![a-z0-9_]){re.escape(marker)}(?![a-z0-9_])"
+    return re.search(pattern, text_lower) is not None
+
+
+def _is_placeholder_value(value: str) -> bool:
+    """Whether an assigned value is documentation rather than material."""
+
+    lowered = value.strip().strip("\"'").casefold()
+    if not lowered:
+        return True
+    if len(set(lowered)) == 1:
+        # "xxx", "***", "---": one repeated character is never a key.
+        return True
+    return any(marker in lowered for marker in _PLACEHOLDER_VALUE_MARKERS)
+
+
+def _is_material_value(value: str) -> bool:
+    """Whether a value that follows ``=``/``:`` is secret-shaped rather than a placeholder."""
+
+    if _is_placeholder_value(value):
+        return False
+    if len(value) >= _SHORT_VALUE_MIN_LENGTH:
+        return True
+    if len(value) < _SHORT_VALUE_CREDENTIAL_SHAPED_LENGTH:
+        return False
+    has_digit = any(character.isdigit() for character in value)
+    has_letter = any(character.isalpha() for character in value)
+    return has_digit and has_letter
+
+
+def length_bucket(length: int) -> str:
+    """A coarse, content-free size class for a refused fragment.
+
+    A bucket is a length *range*, never a value and never a prefix, so an operator learns
+    what kind of thing tripped the rule without the refused text being recoverable.
+    """
+
+    if length <= 0:
+        return "0"
+    if length < 8:
+        return "1-7"
+    if length < 20:
+        return "8-19"
+    if length < 40:
+        return "20-39"
+    if length <= 64:
+        return "40-64"
+    return "65+"
+
+
+@dataclass(frozen=True)
+class SecretFinding:
+    """One deterministic classification: which rule fired, and which reason it reports.
+
+    ``reason`` keeps the refusal vocabulary the product already publishes
+    (``token``/``api_key``/``password``/``secret``/``credential`` plus the structural
+    markers), so an existing positive keeps its existing message. ``rule`` is a stable,
+    human-readable rule id for diagnostics. Nothing here carries the refused text: only
+    a coarse ``length_bucket`` survives, and the fragment itself is discarded.
+    """
+
+    reason: str
+    rule: str
+    length_bucket: str = "0"
+
+    def describe(self, location: str = "context_item") -> str:
+        """A human sentence plus a content-free hint, safe to log and to show.
+
+        The sentence never contains the refused fragment, not even a prefix: only the
+        rule id, a length *bucket* and where the text came from.
+        """
+
+        return (
+            "Текст содержит значение, похожее на секрет "
+            f"(rule={self.rule}, length_bucket={self.length_bucket}, location={location})"
+        )
+
+
+def scan_value_content(value: object) -> SecretFinding | None:
+    """Classify one context value, or return ``None`` when nothing fires.
+
+    The security boundary is unchanged where it matters: every secret-shaped VALUE is
+    still refused, with the reason word it always had. What changed is the opposite
+    direction -- a word that merely *names* a credential is not a credential, so prose,
+    documentation and an ``.env.example`` with empty values are admissible.
+    """
+
+    if not isinstance(value, str) or not value:
+        return None
+    for rule, reason, pattern in _SECRET_VALUE_PATTERNS:
+        match = pattern.search(value)
+        if match is None:
+            continue
+        candidate = match.group("value") if "value" in pattern.groupindex else match.group(0)
+        if "value" in pattern.groupindex and not _is_material_value(candidate):
+            continue
+        return SecretFinding(
+            reason=reason,
+            rule=rule,
+            length_bucket=length_bucket(len(candidate)),
+        )
+    random_run = _random_match(value)
+    if random_run is not None:
+        return SecretFinding(
+            reason="secret",
+            rule="high_entropy",
+            length_bucket=length_bucket(len(random_run)),
+        )
+    text_lower = value.lower()
+    for marker in STRUCTURAL_VALUE_MARKERS:
+        if _has_bare_marker(text_lower, marker):
+            return SecretFinding(
+                reason=marker,
+                rule=f"marker_{marker}",
+                length_bucket=length_bucket(len(value)),
+            )
+    if _has_bare_token(text_lower):
+        return SecretFinding(
+            reason="token",
+            rule="bare_token_word",
+            length_bucket=length_bucket(len(value)),
+        )
+    return None
+
+
+def location_for_item(item: object) -> str:
+    """Where a refused value came from, for the diagnostic. Never the value itself."""
+
+    item_type = str(getattr(item, "item_type", "") or "").lower()
+    if item_type in {"user_task", "task_description"}:
+        return "task_description"
+    if item_type == "task_context":
+        return "task_context"
+    return "context_item"
 
 
 def find_forbidden_value_content(value: str) -> str | None:
     """The forbidden marker present in one context *value*, or ``None`` when it is clean.
 
-    Secret material is refused exactly as before, with the same reason words. The one
-    narrowing is that "token" no longer matches when every occurrence is part of a field
-    name (``tokens_in``, ``max_tokens``, ...), because describing such a field is normal
-    engineering text and not a credential.
+    Secret material is refused exactly as before, with the same reason words. Two
+    narrowings apply, both measured:
+
+    * "token" no longer matches when every occurrence is part of a field name
+      (``tokens_in``, ``max_tokens``, ...), because describing such a field is normal
+      engineering text and not a credential;
+    * the credential nouns (``secret``, ``password``, ``api_key``, ``credential``) no
+      longer match on their own. A sentence that *names* a credential used to refuse the
+      whole user task before dispatch; a secret-shaped value still refuses it.
     """
 
-    if not isinstance(value, str) or not value:
-        return None
-    for reason, pattern in _SECRET_VALUE_PATTERNS:
-        if pattern.search(value):
-            return reason
-    if _looks_random(value):
-        return "secret"
-    text_lower = value.lower()
-    for bad in FORBIDDEN_CONTEXT_SUBSTRINGS:
-        if bad == "token":
-            if _has_bare_token(text_lower):
-                return "token"
-            continue
-        if bad in text_lower:
-            return bad
-    return None
+    finding = scan_value_content(value)
+    return finding.reason if finding is not None else None
+
 
 
 def sanitize_context_metadata(metadata: Mapping[str, object] | None) -> dict[str, object]:

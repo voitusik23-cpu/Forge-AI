@@ -39,7 +39,7 @@ from app.discovery.models import (
     InvalidClarificationAnswer,
     UnknownDiscoverySession,
 )
-from app.discovery.service import DiscoveryService
+from app.discovery.service import DiscoveryService, value_origins
 
 __all__ = ["register_discovery_routes"]
 
@@ -94,6 +94,13 @@ def register_discovery_routes(
             "session": session.to_dict(),
             "questions": [question.to_dict() for question in session.questions],
         }
+        specification = session.specification
+        if specification is not None:
+            # Two flat lists, never merged: a decision the user made and a value Forge
+            # picked through «Не знаю — выбери оптимальный вариант» are different facts.
+            chosen, auto_selected = value_origins(specification)
+            payload["chosen"] = chosen
+            payload["auto_selected"] = auto_selected
         if project is not None:
             # Additive: the record's own summary, so a client learns the project id
             # and status without a second request.
@@ -132,13 +139,21 @@ def register_discovery_routes(
                 raise body_error_exception(
                     "each answer must be an object with 'question_id' and 'text'"
                 )
-            answers.append(
-                {
-                    "question_id": item.get("question_id"),
-                    "text": item.get("text", ""),
-                    "skipped": bool(item.get("skipped", False)),
-                }
-            )
+            # The typed shapes travel through unchanged: clicked `values`, the
+            # «Свой вариант» text, «Не знаю» and «Пропустить». Validation, option
+            # resolution and the required-question refusal all live in the service,
+            # so the route adds no rule of its own.
+            answer: dict[str, Any] = {
+                "question_id": item.get("question_id"),
+                "text": item.get("text", ""),
+                "skipped": bool(item.get("skipped", False)),
+                "unknown": bool(item.get("unknown", False)),
+                "custom": item.get("custom", ""),
+            }
+            values = item.get("values")
+            if isinstance(values, list):
+                answer["values"] = [str(value) for value in values]
+            answers.append(answer)
         try:
             session = discovery.answer(_session_id(session_id), answers)
         except DiscoveryError as exc:
@@ -163,9 +178,14 @@ def register_discovery_routes(
             specification = discovery.specification(_session_id(session_id))
         except DiscoveryError as exc:
             raise _refusal(exc) from exc
+        chosen, auto_selected = value_origins(specification)
         return {
             "specification": specification.to_dict(),
             "task_text": specification.as_task_text(),
+            # The same two lists the session routes publish, so the review step can show
+            # «вы выбрали» and «Forge выбрал за вас» without a second request.
+            "chosen": chosen,
+            "auto_selected": auto_selected,
         }
 
     @app.post("/api/discovery/sessions/{session_id}/confirm")

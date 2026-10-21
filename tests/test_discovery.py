@@ -111,17 +111,29 @@ class _DiscoveryTestCase(unittest.TestCase):
         return self.store.path_for(session_id).read_text(encoding="utf-8")
 
     def _answer_all(self, session, overrides=None):
+        """Answer round after round until the session has no question left.
+
+        The product bounds one round to a few questions (three for a short idea), so a
+        caller that wants every area filled has to answer the next round too -- that is
+        the point of the bound, not an accident of it. ``overrides`` is keyed by field
+        and applies wherever that field is asked.
+        """
+
         overrides = dict(overrides or {})
-        answers = [
-            {
-                "question_id": question.id,
-                "text": overrides.get(
-                    question.field, f"ответ для {question.field}"
-                ),
-            }
-            for question in session.questions
-        ]
-        return self.discovery.answer(session.session_id, answers)
+        for _ in range(8):
+            if not session.questions:
+                break
+            answers = [
+                {
+                    "question_id": question.id,
+                    "text": overrides.get(
+                        question.field, f"ответ для {question.field}"
+                    ),
+                }
+                for question in session.questions
+            ]
+            session = self.discovery.answer(session.session_id, answers)
+        return session
 
 
 class DiscoverySessionTests(_DiscoveryTestCase):

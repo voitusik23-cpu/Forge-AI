@@ -4216,15 +4216,16 @@ POST /api/tasks/run  { category: "code", write_mode: true }
 ## Discovery / Clarification v0.1
 
 A clarification layer now sits **in front of** the existing pipeline. It decides
-whether Forge knows enough to plan, asks at most six short practical questions when
-it does not, derives a `ProjectSpecification`, and refuses to let anything plan or
-execute until the user confirms. It creates no executor: after confirmation the
-existing Planner / Dispatcher / Run path runs, unchanged.
+whether Forge knows enough to plan, asks at most `MAX_QUESTIONS = 5` short practical
+questions when it does not (three for a short idea), derives a `ProjectSpecification`,
+and refuses to let anything plan or execute until the user confirms. It creates no
+executor: after confirmation the existing Planner / Dispatcher / Run path runs,
+unchanged.
 
 ```text
 user idea
   -> DiscoveryService.start(goal)
-  -> ClarificationQuestion[1..6]        (only the still-missing areas)
+  -> ClarificationQuestion[1..5]        (only the still-missing areas)
   -> answers
   -> ProjectSpecification               (derived + answered, never guessed)
   -> confirm()                          (skip() + confirm() is the explicit short path)
@@ -4236,9 +4237,13 @@ user idea
 ### Models and determinism
 
 `app/discovery/models.py` holds plain, immutable dataclasses with no I/O:
-`ClarificationQuestion(id, text, field, why, required)`,
-`ClarificationAnswer(question_id, text, skipped, redacted)`,
-`ProjectSpecification(...12 fields..., source_answers)` and
+`ClarificationQuestion(id, text, field, why, required, control, options,
+allow_custom, allow_unknown)` (`optional` is the readable inverse of `required`),
+`ClarificationOption(value, label, recommended)`,
+`ClarificationAnswer(question_id, text, skipped, redacted, values, custom,
+auto_selected, declined)`,
+`ProjectSpecification(...12 fields..., source_answers, chosen_values,
+auto_selected_values)` and
 `DiscoverySession(session_id, initial_goal, state, questions, answers,
 specification, created_at, updated_at, skipped, skip_reason)`, with the states
 `NEEDS_CLARIFICATION`, `READY_FOR_PLANNING`, `CONFIRMED`, `CANCELLED`.
@@ -4248,12 +4253,12 @@ only -- no model, no provider call, no network:
 
 | area | deterministic rule (goal text, case-folded) |
 | --- | --- |
-| `project_type` | Telegram + bot; booking/hotel; shop/e-commerce; dashboard; api; cli; site/web/app |
-| `platform` | Telegram; site/web; mobile; desktop; cli; bot |
-| `users` | administrator; staff/manager; guest; client/customer; user; student |
-| `core_features` | booking; search; payment; catalogue; reports; tasks; sign-up; notifications; export |
+| `project_type` | Telegram + bot; bot; booking/hotel; shop/e-commerce; dashboard; desktop ("рабочий стол", desktop, windows); mobile; api; cli; site/web |
+| `platform` | Telegram; site/web; desktop; mobile; cli; bot; "локально"/"на этом компьютере"/offline; "в интернете"/"в сети"/online/deploy |
+| `users` | administrator; staff/manager; guest; client/customer; family; "только я"/"для себя"/"личн"; user; student |
+| `core_features` | booking; expenses; categories; search; filtering; payment; catalogue; reports; tasks; sign-up; notifications; import; export, plus a bulleted or colon-introduced enumeration and a run of feature verbs |
 | `integrations` | payment; Telegram; email; SMS; CRM/1C; calendar |
-| `data_storage` | PostgreSQL / MySQL / SQLite / "database" / files |
+| `data_storage` | PostgreSQL / MySQL / SQLite / "база"/"database" / files/JSON |
 | `auth` | explicit "no auth" wins; otherwise auth/login/sign-up |
 | `notifications` | notification/reminder/broadcast; confirmation + email |
 | `constraints` | budget; deadline; local/offline; no external services |
@@ -4264,10 +4269,16 @@ The fixed area set and its order are `AREA_ORDER` (goal, project_type, users,
 core_features, platform, integrations, data_storage, auth, notifications,
 constraints, acceptance_criteria, priorities). `ESSENTIAL_AREAS` is the first five.
 `missing_areas()` reports every area neither the goal nor an answer covers; an
-unstated area stays **empty** and is asked about, never guessed.
+unstated area stays **empty** and is asked about, never guessed. A negated mention
+(«не использовать онлайн-платежи») is a refusal, never a derived value.
 
-`app/discovery/questions.py` turns missing areas into at most `MAX_QUESTIONS = 6`
-short Russian questions (one per area, each with a one-line `why`). The list is
+`app/discovery/questions.py` turns missing areas into at most `MAX_QUESTIONS = 5`
+short Russian questions (one per area, each with a one-line `why`), and at most
+`SHORT_IDEA_MAX_QUESTIONS = 3` for a short idea (`is_short_idea`: at most 240
+characters and four lines). Every question carries the typed form the answer
+deserves -- `radio`, `checkbox`, `select`, `yes_no` or `text` -- with labelled
+options, one `recommended` default, `allow_custom` («Свой вариант») and
+`allow_unknown` («Не знаю — выбери оптимальный вариант»). The list is
 deterministic, essential areas come first so the cap can never drop a required
 question, and an area that already has an answer -- or an explicit skip -- is never
 asked again. An optional LLM phrasing hook behind the existing `Provider` interface
@@ -4313,6 +4324,16 @@ answer, and the value never reaches the specification, the session file, or any
 response. A secret-shaped **goal** is likewise not stored: the session opens with
 an empty goal and asks for it. Answers are user text only.
 
+An answer is one of the typed shapes: `{question_id, text}` (the user's own words),
+`{question_id, values: [...]}`, `{question_id, values, custom}` («Свой вариант»),
+`{question_id, unknown: true}` («Не знаю — выбери оптимальный вариант»: the
+recommended option is recorded with `auto_selected=True`) or `{question_id,
+skipped: true}`. A skip is allowed only for an `optional` question; a required one
+raises `RequiredQuestionSkipped` (`required_question_skipped`), so a required
+decision cannot disappear silently. The specification records `chosen_values` and
+`auto_selected_values` separately, and both are published as two flat lists
+(`chosen`, `auto_selected`) by the session and specification routes.
+
 ### API
 
 `app/api/discovery_routes.py`, registered from `app/api/server.py`, adds seven
@@ -4322,7 +4343,7 @@ read-only-in-effect routes over the one service instance composed at app creatio
 | --- | --- |
 | `POST /api/discovery/sessions` `{goal}` | create a session, return it with its questions |
 | `GET /api/discovery/sessions/{id}` | read the session |
-| `POST /api/discovery/sessions/{id}/answers` `{answers:[{question_id,text}]}` | record answers |
+| `POST /api/discovery/sessions/{id}/answers` `{answers:[{question_id,text}` \| `{question_id,values,custom}` \| `{question_id,unknown}` \| `{question_id,skipped}]}` | record answers |
 | `POST /api/discovery/sessions/{id}/skip` `{reason?}` | end the clarification round |
 | `GET /api/discovery/sessions/{id}/specification` | the specification and its task text |
 | `POST /api/discovery/sessions/{id}/confirm` | confirm it |
@@ -4333,7 +4354,7 @@ the specification and its task text). Failures reuse the surface's existing erro
 contract: 404 for an unknown session, 400 for a malformed body, 409 for a state
 conflict, each with the machine code published verbatim
 (`unknown_discovery_session`, `discovery_not_confirmed`, `discovery_not_ready`,
-`discovery_state_conflict`, `invalid_discovery_answer`).
+`discovery_state_conflict`, `invalid_discovery_answer`, `required_question_skipped`).
 
 ### Hand-off into the existing pipeline
 
@@ -4370,16 +4391,16 @@ Python.
 ## Discovery / Clarification v0.1 — русская версия
 
 Слой уточнения теперь стоит **перед** существующим конвейером. Он решает, знает ли
-Forge достаточно для планирования, задаёт не более шести коротких практических
-вопросов, если нет, выводит `ProjectSpecification` и не позволяет ничего
-планировать или выполнять до подтверждения пользователем. Собственного исполнителя
-он не создаёт: после подтверждения работает существующий путь
-Planner / Dispatcher / Run, без изменений.
+Forge достаточно для планирования, задаёт не более `MAX_QUESTIONS = 5` коротких
+практических вопросов, если нет (три для короткой идеи), выводит
+`ProjectSpecification` и не позволяет ничего планировать или выполнять до
+подтверждения пользователем. Собственного исполнителя он не создаёт: после
+подтверждения работает существующий путь Planner / Dispatcher / Run, без изменений.
 
 ```text
 идея пользователя
   -> DiscoveryService.start(goal)
-  -> ClarificationQuestion[1..6]        (только ещё неизвестные области)
+  -> ClarificationQuestion[1..5]        (только ещё неизвестные области)
   -> ответы
   -> ProjectSpecification               (выведенное + отвеченное, без догадок)
   -> confirm()                          (skip() + confirm() — явный короткий путь)
@@ -4391,31 +4412,44 @@ Planner / Dispatcher / Run, без изменений.
 ### Модели и детерминизм
 
 `app/discovery/models.py` содержит простые неизменяемые dataclass-объекты без I/O:
-`ClarificationQuestion(id, text, field, why, required)`,
-`ClarificationAnswer(question_id, text, skipped, redacted)`,
-`ProjectSpecification(...12 полей..., source_answers)` и
+`ClarificationQuestion(id, text, field, why, required, control, options,
+allow_custom, allow_unknown)` (`optional` — читаемая противоположность `required`),
+`ClarificationOption(value, label, recommended)`,
+`ClarificationAnswer(question_id, text, skipped, redacted, values, custom,
+auto_selected, declined)`,
+`ProjectSpecification(...12 полей..., source_answers, chosen_values,
+auto_selected_values)` и
 `DiscoverySession(session_id, initial_goal, state, questions, answers,
 specification, created_at, updated_at, skipped, skip_reason)` с состояниями
 `NEEDS_CLARIFICATION`, `READY_FOR_PLANNING`, `CONFIRMED`, `CANCELLED`.
 
 `app/discovery/analyzer.py` выводит то, что цель уже говорит прямо, только
 правилами — без модели, без вызова провайдера, без сети: тип проекта (Telegram-бот,
-бронирование/отель, магазин, дашборд, api, cli, сайт/web), платформа, роли
-пользователей, ключевые функции, интеграции (оплата, Telegram, email, SMS, CRM/1C,
-календарь), хранение (PostgreSQL/MySQL/SQLite/«база данных»/файлы), авторизация,
-уведомления, ограничения (бюджет, срок, локальный запуск), критерии приёмки и
-приоритеты. Фиксированный набор и порядок областей — `AREA_ORDER`; `ESSENTIAL_AREAS`
-— первые пять. `missing_areas()` сообщает области, которые не покрыты ни целью, ни
-ответом; неизвестная область остаётся **пустой** и о ней спрашивают, её никогда не
-угадывают.
+бот, бронирование/отель, магазин, дашборд, десктоп — «рабочий стол»/desktop/windows,
+мобильное, api, cli, сайт/web), платформа (включая развёртывание: «локально»/«на этом
+компьютере»/offline и «в интернете»/«в сети»/online/deploy), роли пользователей
+(включая «только я»/«для себя»/«личн» и семью), ключевые функции (домен, а также
+перечисление списком или через двоеточие и набор глаголов), интеграции (оплата,
+Telegram, email, SMS, CRM/1C, календарь), хранение (PostgreSQL/MySQL/SQLite/«база»/
+файлы/JSON), авторизация, уведомления, ограничения (бюджет, срок, локальный запуск),
+критерии приёмки и приоритеты. Фиксированный набор и порядок областей — `AREA_ORDER`;
+`ESSENTIAL_AREAS` — первые пять. `missing_areas()` сообщает области, которые не
+покрыты ни целью, ни ответом; неизвестная область остаётся **пустой** и о ней
+спрашивают, её никогда не угадывают. Упоминание под отрицанием («не использовать
+онлайн-платежи») — это отказ, а не выведенное значение.
 
 `app/discovery/questions.py` превращает неизвестные области в не более чем
-`MAX_QUESTIONS = 6` коротких русских вопросов (по одному на область, с одной строкой
-`why`). Список детерминирован, существенные области идут первыми, поэтому ограничение
-не может отбросить обязательный вопрос, а область, на которую уже есть ответ (или
-явный пропуск), больше не спрашивается. Необязательный LLM-хук формулировок за
-существующим интерфейсом `Provider` намеренно **не** реализован и нигде не требуется:
-тесты, smoke-команда и развёртывание без провайдера дают одинаковые вопросы.
+`MAX_QUESTIONS = 5` коротких русских вопросов (по одному на область, с одной строкой
+`why`), а для короткой идеи — не более `SHORT_IDEA_MAX_QUESTIONS = 3` (`is_short_idea`:
+до 240 символов и до четырёх строк). Каждый вопрос несёт типизированную форму ответа —
+`radio`, `checkbox`, `select`, `yes_no` или `text` — с подписанными вариантами, одним
+`recommended` по умолчанию, `allow_custom` («Свой вариант») и `allow_unknown`
+(«Не знаю — выбери оптимальный вариант»). Список детерминирован, существенные области
+идут первыми, поэтому ограничение не может отбросить обязательный вопрос, а область, на
+которую уже есть ответ (или явный пропуск), больше не спрашивается. Необязательный
+LLM-хук формулировок за существующим интерфейсом `Provider` намеренно **не** реализован
+и нигде не требуется: тесты, smoke-команда и развёртывание без провайдера дают
+одинаковые вопросы.
 
 ### Машина состояний и защита
 
@@ -4456,13 +4490,25 @@ specification, created_at, updated_at, skipped, skip_reason)` с состоян�
 Похожая на секрет **цель** также не сохраняется: сессия открывается с пустой целью и
 спрашивает её. Ответы — только текст пользователя.
 
+Ответ приходит в одной из типизированных форм: `{question_id, text}` (свои слова
+пользователя), `{question_id, values: [...]}`, `{question_id, values, custom}`
+(«Свой вариант»), `{question_id, unknown: true}` («Не знаю — выбери оптимальный
+вариант»: записывается рекомендованный вариант с `auto_selected=True`) или
+`{question_id, skipped: true}`. Пропуск разрешён только для необязательного вопроса;
+на обязательном возникает `RequiredQuestionSkipped` (`required_question_skipped`),
+поэтому обязательное решение не может исчезнуть молча. Спецификация хранит
+`chosen_values` и `auto_selected_values` раздельно, и оба списка публикуются как два
+плоских списка (`chosen`, `auto_selected`) в маршрутах сессии и спецификации.
+
 ### API
 
 `app/api/discovery_routes.py`, регистрируемый из `app/api/server.py`, добавляет семь
 маршрутов над одним экземпляром сервиса, собранным при создании приложения:
 `POST /api/discovery/sessions` `{goal}` (создать сессию и вернуть её с вопросами),
 `GET /api/discovery/sessions/{id}`, `POST /api/discovery/sessions/{id}/answers`
-`{answers:[{question_id,text}]}`, `POST /api/discovery/sessions/{id}/skip` `{reason?}`,
+`{answers:[{question_id,text}` | `{question_id,values,custom}` |
+`{question_id,unknown}` | `{question_id,skipped}]}`,
+`POST /api/discovery/sessions/{id}/skip` `{reason?}`,
 `GET /api/discovery/sessions/{id}/specification`,
 `POST /api/discovery/sessions/{id}/confirm`,
 `POST /api/discovery/sessions/{id}/cancel`.
@@ -4472,7 +4518,8 @@ specification, created_at, updated_at, skipped, skip_reason)` с состоян�
 существующий контракт ошибок поверхности: 404 для неизвестной сессии, 400 для
 некорректного тела, 409 для конфликта состояния, с машинным кодом
 (`unknown_discovery_session`, `discovery_not_confirmed`, `discovery_not_ready`,
-`discovery_state_conflict`, `invalid_discovery_answer`).
+`discovery_state_conflict`, `invalid_discovery_answer`,
+`required_question_skipped`).
 
 ### Передача в существующий конвейер
 

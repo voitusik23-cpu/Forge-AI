@@ -593,12 +593,29 @@ export const isTerminalRecord = (record: RunRecord | null): boolean => {
  * screen shows the answer it received; it never assumes the guard passed.
  * ------------------------------------------------------------------------------------------- */
 
+/** One clickable answer: `value` is what the Core stores, `label` is what the user reads. */
+export type DiscoveryOption = {
+  value?: string;
+  label?: string;
+  /** The option «Не знаю — выбери оптимальный вариант» picks. Exactly one per question. */
+  recommended?: boolean;
+};
+
 export type DiscoveryQuestion = {
   id?: string;
   text?: string;
   field?: string;
   why?: string;
   required?: boolean;
+  /** The readable side of `required`: a client needs no negation to show the badge. */
+  optional?: boolean;
+  /** `radio` | `checkbox` | `select` | `yes_no` | `text`, decided by the Core. */
+  control?: string;
+  options?: DiscoveryOption[];
+  /** «Свой вариант»: a click is the fast path, not a cage. */
+  allow_custom?: boolean;
+  /** «Не знаю — выбери оптимальный вариант» is offered only when the Core can honour it. */
+  allow_unknown?: boolean;
 };
 
 export type DiscoveryAnswer = {
@@ -606,6 +623,20 @@ export type DiscoveryAnswer = {
   text?: string;
   skipped?: boolean;
   redacted?: boolean;
+  /** The option values the user clicked. */
+  values?: string[];
+  /** The «Свой вариант» text, stored beside the clicked values. */
+  custom?: string;
+  /** True when the Core picked the recommended option, not the user. */
+  auto_selected?: boolean;
+  /** An explicit "no" to a yes/no question: answered, but the field stays unknown. */
+  declined?: boolean;
+};
+
+/** One `field -> values` record of what was chosen, or of what was auto-selected. */
+export type DiscoveryValueOrigin = {
+  field?: string;
+  values?: string[];
 };
 
 /** `ProjectSpecification.to_dict()`: an empty field means "still unknown", never a guess. */
@@ -623,6 +654,10 @@ export type DiscoverySpecification = {
   acceptance_criteria?: string[];
   priorities?: string[];
   source_answers?: Record<string, string>;
+  /** What the user picked, per field. Never merged with the auto-selected values. */
+  chosen_values?: Record<string, string[]>;
+  /** What «Не знаю — выбери оптимальный вариант» picked for the user, per field. */
+  auto_selected_values?: Record<string, string[]>;
 };
 
 export type DiscoverySession = {
@@ -643,12 +678,18 @@ export type DiscoverySession = {
 export type DiscoverySessionPayload = {
   session?: DiscoverySession;
   questions?: DiscoveryQuestion[];
+  /** What the user chose so far, field by field. */
+  chosen?: DiscoveryValueOrigin[];
+  /** What the Core auto-selected so far, field by field. */
+  auto_selected?: DiscoveryValueOrigin[];
 };
 
 /** `GET .../specification` answers the derived spec plus the text a task would carry. */
 export type DiscoverySpecificationPayload = {
   specification?: DiscoverySpecification;
   task_text?: string;
+  chosen?: DiscoveryValueOrigin[];
+  auto_selected?: DiscoveryValueOrigin[];
 };
 
 /**
@@ -689,15 +730,28 @@ export const startDiscovery = (goal: string): Promise<Result<DiscoverySessionPay
   postJson<DiscoverySessionPayload>("/api/discovery/sessions", { goal });
 
 /**
- * `POST .../answers` — record the user's own words, then re-derive the spec and the next round.
+ * `POST .../answers` — record what the user chose, then re-derive the spec and the next round.
  *
- * `skipped` is the route's own field for an explicit non-answer («Не знаю»): the Core stores it as
- * a skipped answer, so the area is not asked again while the specification keeps saying the value
- * is unknown. A question that is simply omitted is not answered at all and may come back.
+ * Five shapes travel here, and the Core means something different by each:
+ *
+ * - `{values}` — the options the user clicked;
+ * - `{values, custom}` — clicked options plus the «Свой вариант» text;
+ * - `{unknown: true}` — «Не знаю — выбери оптимальный вариант»: the Core stores the
+ *   recommended option and marks it `auto_selected`, so the review step can say so;
+ * - `{skipped: true}` — «Пропустить», allowed only for an `optional` question; the Core
+ *   refuses a required one with `required_question_skipped`;
+ * - `{text}` — the user's own words, unchanged from before the widgets existed.
  */
 export const sendDiscoveryAnswers = (
   sessionId: string,
-  answers: Array<{ question_id: string; text: string; skipped?: boolean }>
+  answers: Array<{
+    question_id: string;
+    text?: string;
+    values?: string[];
+    custom?: string;
+    unknown?: boolean;
+    skipped?: boolean;
+  }>
 ): Promise<Result<DiscoverySessionPayload>> =>
   postJson<DiscoverySessionPayload>(discoveryPath(sessionId, "/answers"), { answers });
 

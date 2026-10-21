@@ -14,7 +14,10 @@ from app.context.models import (
     ContextSourceType,
     ContextTrustLevel,
 )
-from app.context.validation import find_forbidden_value_content
+from app.context.validation import (
+    location_for_item,
+    scan_value_content,
+)
 
 if TYPE_CHECKING:
     from app.agents.providers.models import ProviderModelInfo
@@ -296,6 +299,7 @@ class ContextSelector:
         total_candidates = len(candidate_list)
 
         dropped_reasons: dict[str, str] = {}
+        dropped_diagnostics: dict[str, str] = {}
         item_scores: dict[str, float] = {}
         valid_candidates: list[tuple[float, ContextItem]] = []
 
@@ -308,9 +312,16 @@ class ContextSelector:
                 dropped_reasons[item_id] = f"security_sensitivity_exclusion:{sens_val}"
                 continue
 
-            bad_found = find_forbidden_value_content(item.value)
-            if bad_found:
-                dropped_reasons[item_id] = f"security_forbidden_content:{bad_found}"
+            finding = scan_value_content(item.value)
+            if finding is not None:
+                # The reason word stays exactly what it always was, so an existing
+                # positive keeps its message. The diagnostic beside it is content-free:
+                # a rule id, a length *bucket* and the location -- never the value and
+                # never a prefix of it.
+                dropped_reasons[item_id] = f"security_forbidden_content:{finding.reason}"
+                dropped_diagnostics[item_id] = finding.describe(
+                    location_for_item(item)
+                )
                 continue
 
             score = self.score_item(item)
@@ -416,6 +427,11 @@ class ContextSelector:
             raise CriticalContextUnfitError(
                 f"Critical Tier 1 context item '{first_crit_id}' cannot fit into available budget "
                 f"({reported_budget} tokens, max_items={max_items}). Reason: {reason}"
+                + (
+                    f". {dropped_diagnostics[first_crit_id]}"
+                    if first_crit_id in dropped_diagnostics
+                    else ""
+                )
             )
 
         return tuple(selected_items), report

@@ -5922,10 +5922,11 @@ fail-closed значения по умолчанию, идемпотентнос
 ## Discovery / Clarification v0.1
 
 - **Clarification sits in front of the pipeline, and owns no execution.** The layer
-  (`app/discovery`) decides whether the idea says enough to plan, asks at most six
-  short questions, derives a `ProjectSpecification`, and refuses planning/execution
-  until the user confirms. After confirmation the existing Planner / Dispatcher /
-  Run path runs unchanged; there is no second executor and no second run system.
+  (`app/discovery`) decides whether the idea says enough to plan, asks at most five
+  short questions (three for a short idea), derives a `ProjectSpecification`, and
+  refuses planning/execution until the user confirms. After confirmation the existing
+  Planner / Dispatcher / Run path runs unchanged; there is no second executor and no
+  second run system.
 - **The obvious fields are derived by rules, not by a model.** Project type,
   platform, users, core features, integrations, storage, auth and notifications are
   matched with fixed keyword rules (`app/discovery/analyzer.py`), so the same goal
@@ -5934,9 +5935,19 @@ fail-closed значения по умолчанию, идемпотентнос
   not implemented.
 - **Unstated means unknown, never guessed.** The area set is fixed (twelve areas);
   an area neither the goal nor an answer covers stays empty and is asked about.
-- **The question list is capped and ordered.** At most six questions, essential
-  areas first, so the cap can never drop a required question; an answered or
-  explicitly skipped area is never asked again.
+- **The question list is capped and ordered.** At most five questions (`MAX_QUESTIONS`)
+  and at most three for a short idea (`SHORT_IDEA_MAX_QUESTIONS`), essential areas
+  first, so the cap can never drop a required question; an answered or explicitly
+  skipped area is never asked again. A short idea is a sentence or two (at most 240
+  characters, four lines), and it must not turn into a questionnaire.
+- **Every question is clickable, and knows why it is asked.** `ClarificationQuestion`
+  carries `control` (`radio|checkbox|select|yes_no|text`), labelled `options` with one
+  `recommended` default, `allow_custom` («Свой вариант») and `allow_unknown` («Не знаю —
+  выбери оптимальный вариант»). «Не знаю» records the recommended option with
+  `auto_selected=True`; «Пропустить» is allowed only for an `optional` question and a
+  required one is refused with `RequiredQuestionSkipped`, so a required decision cannot
+  vanish silently. The specification keeps `chosen_values` and
+  `auto_selected_values` apart, and both are published as two lists.
 - **Confirmation is the only way in.** `require_confirmed()` raises
   `DiscoveryNotConfirmed` unless the state is `CONFIRMED`. `skip()` moves the
   session to `READY_FOR_PLANNING`, not to `CONFIRMED`, so a skip is never a bypass:
@@ -5961,10 +5972,10 @@ fail-closed значения по умолчанию, идемпотентнос
 
 - **Уточнение стоит перед конвейером и не владеет выполнением.** Слой
   (`app/discovery`) решает, достаточно ли идея говорит для планирования, задаёт не
-  более шести коротких вопросов, выводит `ProjectSpecification` и не позволяет
-  планировать/выполнять до подтверждения. После подтверждения существующий путь
-  Planner / Dispatcher / Run работает без изменений; второго исполнителя и второй
-  системы запусков нет.
+  более пяти коротких вопросов (три для короткой идеи), выводит
+  `ProjectSpecification` и не позволяет планировать/выполнять до подтверждения. После
+  подтверждения существующий путь Planner / Dispatcher / Run работает без изменений;
+  второго исполнителя и второй системы запусков нет.
 - **Очевидные поля выводятся правилами, а не моделью.** Тип проекта, платформа,
   пользователи, ключевые функции, интеграции, хранение, авторизация и уведомления
   сопоставляются фиксированными ключевыми правилами (`app/discovery/analyzer.py`),
@@ -5974,9 +5985,20 @@ fail-closed значения по умолчанию, идемпотентнос
 - **Не сказано — значит неизвестно, а не угадано.** Набор областей фиксирован
   (двенадцать); область, не покрытая ни целью, ни ответом, остаётся пустой и о ней
   спрашивают.
-- **Список вопросов ограничен и упорядочен.** Не более шести вопросов, существенные
-  области идут первыми, поэтому ограничение не может отбросить обязательный вопрос;
-  область с ответом или с явным пропуском больше не спрашивается.
+- **Список вопросов ограничен и упорядочен.** Не более пяти вопросов (`MAX_QUESTIONS`)
+  и не более трёх для короткой идеи (`SHORT_IDEA_MAX_QUESTIONS`), существенные области
+  идут первыми, поэтому ограничение не может отбросить обязательный вопрос; область с
+  ответом или с явным пропуском больше не спрашивается. Короткая идея — это одно-два
+  предложения (до 240 символов, до четырёх строк), и она не должна превращаться в
+  анкету.
+- **Каждый вопрос нажимаемый и знает, зачем он задан.** `ClarificationQuestion` несёт
+  `control` (`radio|checkbox|select|yes_no|text`), подписанные `options` с одним
+  `recommended` по умолчанию, `allow_custom` («Свой вариант») и `allow_unknown»
+  («Не знаю — выбери оптимальный вариант»). «Не знаю» записывает рекомендованный
+  вариант с `auto_selected=True`; «Пропустить» разрешён только для необязательного
+  вопроса, а на обязательном возникает `RequiredQuestionSkipped`, поэтому обязательное
+  решение не может исчезнуть молча. Спецификация хранит `chosen_values` и
+  `auto_selected_values` раздельно, и оба списка публикуются.
 - **Единственный вход — подтверждение.** `require_confirmed()` выбрасывает
   `DiscoveryNotConfirmed`, если состояние не `CONFIRMED`. `skip()` переводит сессию в
   `READY_FOR_PLANNING`, а не в `CONFIRMED`, поэтому пропуск не является обходом:
@@ -6853,3 +6875,105 @@ declared" rather than an invented one.
 кодом 0, не открывая сокет. Точки входа, которые не парсят ответ модели
 (детерминированный офлайн-путь, replay, attach проекта), публикуют пустое отображение —
 честное «намерение не заявлено» вместо выдуманного.
+
+## Decision: a credential word is not a credential value (v0.1)
+
+**Measured defect.** The owner's own manual run stopped after a single event with
+`Critical Tier 1 context item 'task:…' cannot fit … Reason:
+security_forbidden_content:secret`; the provider was never called and every later
+stage stayed «ожидается». The refused item was the task description itself, and the
+rule that fired was not a credential check: `find_forbidden_value_content` matched the
+bare substring `secret` inside ordinary prose about not adding secrets to a project.
+The same rule refused `password`, `credentials` and `API_KEY=` with an empty value, so
+a normal idea that mentioned credential *hygiene* could not run at all. The
+clarification layer was hit by the same rule: a secret-shaped *goal* is deliberately
+not stored, so that session opened with an empty idea, derived nothing, and asked a
+generic questionnaire.
+
+**Decision.** Classify by *value*, never by *word*, and keep the boundary where it
+matters:
+
+1. The credential nouns (`secret`, `password`, `api_key`, `credential`) no longer match
+   on their own in a context value. They still block a metadata *key*, where they name
+   the thing being carried.
+2. A secret-shaped VALUE is still refused, with the reason word it always had: a
+   `Bearer` credential of 40+ characters, a JWT, a provider key prefix
+   (`sk-`, `ghp_…`, `xoxb-…`, `AKIA…`), an assigned key, a password or credentials
+   assignment carrying a real value, and a 40+ character high-entropy run.
+3. An assignment pattern reads only the value on its **same line** and only when that
+   value is machine-shaped, so an `.env.example` with empty values and
+   `API_KEY=your-key-here` are documentation, not material.
+4. The structural markers (`stdout`, `stderr`, `prompt`, `chain_of_thought`,
+   `source_code`, `file_content`) and a bare `token` word stay refused: this decision
+   narrows the credential nouns only.
+5. The refusal publishes `security_forbidden_content:<reason>` unchanged, plus a
+   content-free diagnostic -- `rule=<id>`, `length_bucket=<range>`,
+   `location=<task_description|task_context|context_item>` -- and never the value and
+   never a prefix of it.
+
+**Rejected alternatives.** Matching the word and only relaxing the capitalisation: the
+measured text is prose, not a key. Dropping the scanner from the task context: the task
+description is user input, and a real token pasted into it must still be refused.
+Raising the assigned-value threshold to 20 characters alone: a shorter but clearly
+machine-made value would have slipped through, so the shape check stays beside it.
+
+**Consequences.** `app/context/validation.py` owns `scan_value_content` (a finding with
+`reason`, `rule`, `length_bucket`), `find_forbidden_value_content` keeps its signature
+and its vocabulary, and `ContextSelector` raises with the safe sentence.
+`tests/test_secret_filter_classification.py` (19 tests) pins the admissible prose, the
+still-refused material, the no-echo rule and the fact that a safe task reaches the
+provider; `tests/test_discovery.py`, `tests/test_context_secret_scanning.py`,
+`tests/test_task_context_budget.py` and `tests/test_context_selector.py` stay green.
+The security boundary is unchanged where it matters: every secret-shaped value is still
+refused, and none of the new messages carries it.
+
+## Решение: слово-креденшл — не значение-секрет (v0.1)
+
+**Измеренный дефект.** Ручной запуск владельца остановился после одного события с
+`Critical Tier 1 context item 'task:…' cannot fit … Reason:
+security_forbidden_content:secret`; провайдер не вызывался, а все следующие стадии
+остались «ожидается». Отказанным элементом было само описание задачи, а сработало не
+проверка секрета: `find_forbidden_value_content` находил подстроку `secret` в обычной
+прозе о том, что секреты нельзя добавлять в проект. То же правило отказывало
+`password`, `credentials` и `API_KEY=` с пустым значением, поэтому нормальная идея,
+упоминающая *гигиену* креденшлов, не могла запуститься вообще. Слой уточнения страдал
+от того же правила: похожая на секрет **цель** намеренно не сохраняется, поэтому такая
+сессия открывалась с пустой идеей, ничего не выводила и задавала общую анкету.
+
+**Решение.** Классифицировать по *значению*, а не по *слову*, и сохранить границу там,
+где она важна:
+
+1. Слова-креденшлы (`secret`, `password`, `api_key`, `credential`) больше не совпадают
+   сами по себе в значении контекста. Как *ключ* метаданных они по-прежнему запрещены:
+   там они называют то, что несут.
+2. Похожее на секрет ЗНАЧЕНИЕ по-прежнему отказывается, с прежним словом причины:
+   `Bearer`-креденшл из 40+ символов, JWT, префикс ключа провайдера (`sk-`, `ghp_…`,
+   `xoxb-…`, `AKIA…`), присвоенный ключ, присвоение пароля или креденшлов с реальным
+   значением и случайный набор из 40+ символов с высокой энтропией.
+3. Шаблон присвоения читает только значение на **той же строке** и только если оно
+   машинной формы, поэтому `.env.example` с пустыми значениями и
+   `API_KEY=your-key-here` — документация, а не материал.
+4. Структурные маркеры (`stdout`, `stderr`, `prompt`, `chain_of_thought`,
+   `source_code`, `file_content`) и отдельное слово `token` остаются запрещёнными:
+   решение сужает только слова-креденшлы.
+5. Отказ публикует прежний `security_forbidden_content:<reason>` и безопасную
+   диагностику — `rule=<id>`, `length_bucket=<диапазон>`,
+   `location=<task_description|task_context|context_item>`, — и никогда само значение
+   и никогда его префикс.
+
+**Отклонённые альтернативы.** Совпадение по слову с ослаблением регистра: измеренный
+текст — проза, а не ключ. Убрать сканер из контекста задачи: описание задачи — ввод
+пользователя, и настоящий токен, вставленный в него, должен по-прежнему отказываться.
+Поднять порог присвоенного значения только до 20 символов: более короткое, но явно
+машинное значение проскочило бы, поэтому проверка формы остаётся рядом.
+
+**Следствия.** `app/context/validation.py` владеет `scan_value_content` (находка с
+`reason`, `rule`, `length_bucket`), `find_forbidden_value_content` сохраняет сигнатуру и
+словарь причин, а `ContextSelector` выбрасывает исключение с безопасной фразой.
+`tests/test_secret_filter_classification.py` (19 тестов) фиксирует допустимую прозу,
+по-прежнему отказываемый материал, правило «без эха» и тот факт, что безопасная задача
+доходит до провайдера; `tests/test_discovery.py`,
+`tests/test_context_secret_scanning.py`, `tests/test_task_context_budget.py` и
+`tests/test_context_selector.py` остаются зелёными. Граница безопасности не ослаблена
+там, где это важно: любое значение-секрет по-прежнему отказывается, и ни одно новое
+сообщение его не содержит.

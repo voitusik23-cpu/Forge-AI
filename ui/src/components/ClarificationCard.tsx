@@ -1,151 +1,148 @@
 // The questions card of Кузница.
 //
-// Every question gets a **typed control** chosen by its `field`, so the owner answers by clicking
-// instead of writing a new prompt. The controls only produce the answer text; the shape that leaves
-// this component is the one the discovery route already accepts (`{question_id, text}`), with the
-// multi-select values joined by `"; "`.
+// Every question is rendered from the **backend's own** `control` and `options`, so the Core
+// decides what a question looks like and the client never has to guess from a field name: a
+// `radio`/`select`/`yes_no` question offers exactly one answer, a `checkbox` offers several
+// («можно выбрать несколько»), and a `text` question is free-form.
 //
-// Three rules are carried by the rendering, not by a comment:
+// Four rules are carried by the rendering, not by a comment:
 //
-// * a question the backend marked `required: false` says «Необязательный вопрос», and when every
+// * a question the backend marked `required: false` says «необязательный», and when every
 //   remaining question is optional the card says they do not block planning;
-// * «Не знаю» and «Пропустить» are per question and mean different things: «Не знаю» is recorded as
-//   an explicit unknown (the backend stores it as a skipped answer and stops asking), while
-//   «Пропустить» simply is not sent in this round, so the question stays open;
-// * at most `QUESTIONS_PER_PAGE` (5) questions are drawn at once; the rest are reached by «Далее».
+// * «Не знаю — выбери оптимальный вариант» is a real answer: the Core stores the recommended
+//   option, and records that it was auto-selected. «Пропустить» is different — it is offered
+//   only for an optional question, and a required one has to be answered;
+// * «Свой вариант» is always at the bottom of the question, under the options;
+// * the card says in one line what happens after the answers are sent, so nobody has to guess
+//   whether the click started a run.
+//
+// At most `QUESTIONS_PER_PAGE` (5) questions are drawn at once; the rest are reached by «Далее».
 
 import { useEffect, useMemo, useState } from "react";
 import { Badge } from "./Primitives";
 import { t, type Lang } from "../i18n";
-import type { DiscoveryQuestion } from "../api/forge";
+import type { DiscoveryOption, DiscoveryQuestion } from "../api/forge";
 
-/** One question's answer as the owner is editing it. `text` is what will be sent. */
+/** One question's answer as the owner is editing it. */
 export type AnswerDraft = {
-  text: string;
-  /** «Не знаю»: sent as `{text: "", skipped: true}`. */
+  /** The option values the user clicked. */
+  values: string[];
+  /** The «Свой вариант» text, sent beside the clicked values. */
+  custom: string;
+  /** «Не знаю — выбери оптимальный вариант»: sent as `{unknown: true}`. */
   unknown: boolean;
-  /** «Пропустить»: not sent at all in this round. */
+  /** «Пропустить»: sent as `{skipped: true}`, and only for an optional question. */
   skip: boolean;
 };
 
-export const emptyAnswerDraft = (): AnswerDraft => ({ text: "", unknown: false, skip: false });
+export const emptyAnswerDraft = (): AnswerDraft => ({
+  values: [],
+  custom: "",
+  unknown: false,
+  skip: false,
+});
+
+/** Whether a draft carries something worth sending. */
+export const draftHasAnswer = (draft: AnswerDraft): boolean =>
+  draft.unknown || draft.values.length > 0 || draft.custom.trim() !== "";
 
 /** A few questions per step, never a long interrogation. */
 export const QUESTIONS_PER_PAGE = 5;
 
-/** The separator the backend itself uses for a list answer (`_split_values`). */
-const JOIN = "; ";
-
-const OTHER_VALUE = "__other__";
-
-type Control =
-  | { kind: "select"; options: string[]; other?: boolean }
-  | { kind: "radio"; options: string[]; other?: boolean }
-  | { kind: "checkbox"; options: string[]; other?: boolean }
-  | { kind: "chips"; options: string[]; other?: boolean }
-  | { kind: "text" };
-
-/** The options an expense tracker actually offers, shared by the two feature questions. */
-const FEATURE_OPTIONS = [
-  "добавление",
-  "редактирование",
-  "удаление",
-  "месячный отчёт",
-  "отчёт по категориям",
-  "импорт",
-  "экспорт",
-];
-
-/**
- * `field -> control`, exactly as the brief defines it.
- *
- * A field outside this table gets the generic chips control with a one-line «Другое» field, so an
- * area added to the backend later still renders as *something* answerable instead of a bare input
- * nobody expects. The option values are the product's own words and are sent verbatim.
- */
-const CONTROLS: Record<string, Control> = {
-  currency: { kind: "select", options: ["RUB", "USD", "EUR"], other: true },
-  categories: { kind: "checkbox", options: FEATURE_OPTIONS },
-  core_features: { kind: "checkbox", options: FEATURE_OPTIONS },
-  auth: { kind: "radio", options: ["без авторизации", "локальный пароль", "вход по email"] },
-  data_storage: { kind: "select", options: ["SQLite", "JSON-файл", "PostgreSQL", "не знаю"] },
-  platform: { kind: "radio", options: ["локально", "публикация в интернет"] },
-  deployment: { kind: "radio", options: ["локально", "публикация в интернет"] },
-  constraints: { kind: "text" },
-  project_type: {
-    kind: "chips",
-    options: ["веб-приложение", "Telegram-бот", "API", "дашборд", "CLI"],
-    other: true,
-  },
-  users: { kind: "chips", options: ["один пользователь", "семья", "команда", "внешние клиенты"], other: true },
-  integrations: { kind: "chips", options: ["email", "Telegram", "SMS", "оплата"], other: true },
-  notifications: { kind: "chips", options: ["email", "Telegram", "push", "не нужны"], other: true },
-  acceptance_criteria: {
-    kind: "chips",
-    options: ["всё работает локально", "отчёт формируется", "данные сохраняются"],
-    other: true,
-  },
-  priorities: { kind: "chips", options: ["скорость", "функции", "качество"], other: true },
+/** Options used when an older backend sends a question with no `options` field at all. */
+const FALLBACK_OPTIONS: Record<string, Array<{ value: string; label: string }>> = {
+  project_type: [
+    { value: "веб-приложение", label: "веб-приложение" },
+    { value: "приложение для Windows", label: "приложение для Windows" },
+    { value: "Telegram-бот", label: "Telegram-бот" },
+    { value: "мобильное приложение", label: "мобильное приложение" },
+    { value: "API-сервис", label: "API-сервис" },
+    { value: "CLI", label: "CLI" },
+  ],
 };
 
-const controlFor = (field: string): Control => CONTROLS[field] ?? { kind: "chips", options: [], other: true };
-
-/** The parts of an answer text, split the same way the discovery service splits it. */
-const partsOf = (text: string): string[] =>
-  text
-    .split(JOIN)
-    .map((part) => part.trim())
-    .filter((part) => part !== "");
-
-const chosenOptions = (text: string, options: string[]): string[] =>
-  partsOf(text).filter((part) => options.includes(part));
-
-const customText = (text: string, options: string[]): string =>
-  partsOf(text)
-    .filter((part) => !options.includes(part))
-    .join(JOIN);
-
-const joinAnswer = (chosen: string[], other: string): string => {
-  const items = [...chosen];
-  const custom = other.trim();
-  if (custom !== "") items.push(custom);
-  return items.join(JOIN);
+const FALLBACK_CONTROLS: Record<string, string> = {
+  project_type: "radio",
+  users: "radio",
+  platform: "radio",
+  data_storage: "select",
+  core_features: "checkbox",
+  priorities: "radio",
+  auth: "yes_no",
+  notifications: "yes_no",
+  integrations: "yes_no",
 };
+
+const controlOf = (question: DiscoveryQuestion): string =>
+  String(question.control ?? "") ||
+  FALLBACK_CONTROLS[String(question.field ?? "")] ||
+  "text";
+
+const optionsOf = (question: DiscoveryQuestion): DiscoveryOption[] => {
+  const provided = Array.isArray(question.options) ? question.options : [];
+  const usable = provided.filter(
+    (option) => String(option.value ?? "").trim() !== "" && String(option.label ?? "").trim() !== ""
+  );
+  if (usable.length > 0) return usable;
+  return (FALLBACK_OPTIONS[String(question.field ?? "")] ?? []).map((option) => ({ ...option }));
+};
+
+const optionValue = (option: DiscoveryOption): string => String(option.value ?? "");
+const optionLabel = (option: DiscoveryOption): string =>
+  String(option.label ?? "") || optionValue(option);
 
 const Chip = ({
   label,
   pressed,
+  disabled,
   onClick,
+  role,
 }: {
   label: string;
   pressed: boolean;
+  disabled?: boolean;
   onClick: () => void;
+  role?: "radio" | "checkbox";
 }) => (
-  <button type="button" className="forge-chip" aria-pressed={pressed} onClick={onClick}>
+  <button
+    type="button"
+    className="forge-chip"
+    aria-pressed={pressed}
+    role={role}
+    disabled={disabled}
+    onClick={onClick}
+  >
     {label}
   </button>
 );
 
-const OtherInput = ({
+/** The «Свой вариант» field, always at the bottom of a question. */
+const CustomInput = ({
   lang,
   value,
   onChange,
+  disabled,
 }: {
   lang: Lang;
   value: string;
   onChange: (value: string) => void;
+  disabled: boolean;
 }) => (
-  <input
-    className="input forge-answer-other"
-    type="text"
-    value={value}
-    placeholder={t(lang, "forge.discovery.question.other.placeholder")}
-    aria-label={t(lang, "forge.discovery.question.other")}
-    onChange={(event) => onChange(event.target.value)}
-  />
+  <label className="stack" style={{ gap: 4 }}>
+    <span className="small muted">{t(lang, "forge.discovery.question.custom")}</span>
+    <input
+      className="input forge-answer-other"
+      type="text"
+      value={value}
+      disabled={disabled}
+      placeholder={t(lang, "forge.discovery.question.other.placeholder")}
+      aria-label={t(lang, "forge.discovery.question.custom")}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  </label>
 );
 
-/** One question: its text, the typed control, and the two explicit non-answers. */
+/** One question: its text, the typed control, «Свой вариант», and the two explicit non-answers. */
 const QuestionRow = ({
   lang,
   question,
@@ -157,106 +154,102 @@ const QuestionRow = ({
   draft: AnswerDraft;
   onDraft: (draft: AnswerDraft) => void;
 }) => {
-  const field = String(question.field ?? "");
-  const control = controlFor(field);
+  const control = controlOf(question);
+  const options = optionsOf(question);
   const disabled = draft.unknown || draft.skip;
-  const other = t(lang, "forge.discovery.question.other");
+  const required = question.required !== false && question.optional !== true;
+  const allowCustom = question.allow_custom !== false && control !== "yes_no";
+  const allowUnknown = question.allow_unknown !== false;
+  const multi = control === "checkbox";
 
-  const setText = (text: string) => onDraft({ text, unknown: false, skip: false });
+  const setValues = (values: string[]) =>
+    onDraft({ ...draft, values, custom: draft.custom, unknown: false, skip: false });
 
-  const chips = (options: string[], allowOther: boolean) => {
-    const chosen = chosenOptions(draft.text, options);
-    const rest = customText(draft.text, options);
-    return (
-      <>
-        <div className="forge-answers">
-          {options.map((option) => (
-            <Chip
-              key={option}
-              label={option}
-              pressed={chosen.includes(option)}
-              onClick={() =>
-                setText(
-                  joinAnswer(
-                    chosen.includes(option)
-                      ? chosen.filter((item) => item !== option)
-                      : [...chosen, option],
-                    rest
-                  )
-                )
-              }
-            />
-          ))}
-        </div>
-        {allowOther ? (
-          <OtherInput
-            lang={lang}
-            value={rest}
-            onChange={(value) => setText(joinAnswer(chosen, value))}
-          />
-        ) : null}
-      </>
-    );
+  const toggle = (value: string) => {
+    if (multi) {
+      setValues(
+        draft.values.includes(value)
+          ? draft.values.filter((item) => item !== value)
+          : [...draft.values, value]
+      );
+      return;
+    }
+    setValues(draft.values.includes(value) ? [] : [value]);
   };
 
-  const single = (options: string[], allowOther: boolean) => {
-    const value = draft.text.trim();
-    const isOther = value !== "" && !options.includes(value);
-    return (
-      <>
-        <select
-          className="input"
-          value={isOther ? OTHER_VALUE : value}
-          aria-label={String(question.text ?? "")}
-          onChange={(event) => {
-            const next = event.target.value;
-            setText(next === OTHER_VALUE ? other : next);
-          }}
-        >
-          <option value="">—</option>
-          {options.map((option) => (
-            <option key={option} value={option}>
-              {option}
-            </option>
-          ))}
-          {allowOther ? <option value={OTHER_VALUE}>{other}</option> : null}
-        </select>
-        {isOther ? (
-          <OtherInput
-            lang={lang}
-            value={value === other ? "" : value}
-            onChange={(next) => setText(next.trim() === "" ? other : next)}
-          />
-        ) : null}
-      </>
-    );
-  };
+  const radio = () => (
+    <div className="forge-answers" role="radiogroup" aria-label={String(question.text ?? "")}>
+      {options.map((option) => (
+        <Chip
+          key={optionValue(option)}
+          label={optionLabel(option)}
+          pressed={draft.values.includes(optionValue(option))}
+          disabled={disabled}
+          role="radio"
+          onClick={() => toggle(optionValue(option))}
+        />
+      ))}
+    </div>
+  );
 
-  // A radio: exactly one option, so picking another replaces the value and picking
-  // the chosen one clears the answer. Rendered as chips because the options are two
-  // or three short words, but the behaviour is a single choice, not a set.
-  const oneOf = (options: string[]) => {
-    const value = draft.text.trim();
-    return (
-      <div className="forge-answers">
+  const checkboxes = () => (
+    <>
+      <div className="small muted">{t(lang, "forge.discovery.question.multi")}</div>
+      <div className="forge-answers" role="group" aria-label={String(question.text ?? "")}>
         {options.map((option) => (
           <Chip
-            key={option}
-            label={option}
-            pressed={value === option}
-            onClick={() => setText(value === option ? "" : option)}
+            key={optionValue(option)}
+            label={optionLabel(option)}
+            pressed={draft.values.includes(optionValue(option))}
+            disabled={disabled}
+            role="checkbox"
+            onClick={() => toggle(optionValue(option))}
           />
         ))}
       </div>
-    );
-  };
+    </>
+  );
+
+  const select = () => (
+    <select
+      className="input"
+      value={draft.values[0] ?? ""}
+      disabled={disabled}
+      aria-label={String(question.text ?? "")}
+      onChange={(event) => setValues(event.target.value === "" ? [] : [event.target.value])}
+    >
+      <option value="">—</option>
+      {options.map((option) => (
+        <option key={optionValue(option)} value={optionValue(option)}>
+          {optionLabel(option)}
+        </option>
+      ))}
+    </select>
+  );
+
+  // A yes/no question is a two-position switch: the two labels are the whole answer set, so
+  // there is nothing to type and no «Свой вариант» to offer.
+  const yesNo = () => (
+    <div className="forge-answers forge-switch" role="radiogroup" aria-label={String(question.text ?? "")}>
+      {options.slice(0, 2).map((option) => (
+        <Chip
+          key={optionValue(option)}
+          label={optionLabel(option)}
+          pressed={draft.values.includes(optionValue(option))}
+          disabled={disabled}
+          role="radio"
+          onClick={() => toggle(optionValue(option))}
+        />
+      ))}
+    </div>
+  );
 
   return (
     <li className="forge-question">
       <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
         <span style={{ fontWeight: 600 }}>{String(question.text ?? "")}</span>
-        <Badge tone={question.required ? "warn" : "neutral"}>
-          {question.required
+        <Badge tone={required ? "warn" : "neutral"}>
+          {required
             ? t(lang, "forge.discovery.question.required")
             : t(lang, "forge.discovery.question.optional")}
         </Badge>
@@ -266,41 +259,63 @@ const QuestionRow = ({
       </div>
 
       <div className={disabled ? "forge-answer-disabled" : ""}>
-        {control.kind === "text" ? (
+        {control === "text" ? (
           <input
             className="input"
             type="text"
-            value={draft.text}
+            value={draft.custom}
             disabled={disabled}
             placeholder={t(lang, "forge.discovery.answer.placeholder")}
             aria-label={String(question.text ?? "")}
-            onChange={(event) => setText(event.target.value)}
+            onChange={(event) =>
+              onDraft({ ...draft, custom: event.target.value, unknown: false, skip: false })
+            }
           />
-        ) : control.kind === "select" ? (
-          single(control.options, control.other === true)
-        ) : control.kind === "radio" ? (
-          oneOf(control.options)
+        ) : control === "checkbox" ? (
+          checkboxes()
+        ) : control === "select" ? (
+          select()
+        ) : control === "yes_no" ? (
+          yesNo()
         ) : (
-          chips(control.options, control.other !== false)
+          radio()
         )}
+        {control !== "text" && allowCustom ? (
+          <CustomInput
+            lang={lang}
+            value={draft.custom}
+            disabled={disabled}
+            onChange={(value) => onDraft({ ...draft, custom: value, unknown: false, skip: false })}
+          />
+        ) : null}
       </div>
 
       <div className="forge-question-actions">
-        <Chip
-          label={t(lang, "forge.discovery.question.unknown")}
-          pressed={draft.unknown}
-          onClick={() => onDraft({ text: "", unknown: !draft.unknown, skip: false })}
-        />
+        {allowUnknown ? (
+          <Chip
+            label={t(lang, "forge.discovery.question.unknown")}
+            pressed={draft.unknown}
+            onClick={() =>
+              onDraft({ values: [], custom: "", unknown: !draft.unknown, skip: false })
+            }
+          />
+        ) : null}
         <Chip
           label={t(lang, "forge.discovery.question.skip")}
           pressed={draft.skip}
-          onClick={() => onDraft({ text: "", unknown: false, skip: !draft.skip })}
+          disabled={required}
+          onClick={() =>
+            onDraft({ values: [], custom: "", unknown: false, skip: !draft.skip })
+          }
         />
         {draft.unknown ? (
           <span className="small muted">{t(lang, "forge.discovery.question.unknown.note")}</span>
         ) : null}
         {draft.skip ? (
           <span className="small muted">{t(lang, "forge.discovery.question.skip.note")}</span>
+        ) : null}
+        {required ? (
+          <span className="small muted">{t(lang, "forge.discovery.question.required.note")}</span>
         ) : null}
       </div>
     </li>
@@ -310,8 +325,8 @@ const QuestionRow = ({
 /**
  * The whole questions card: at most five typed questions, a pager, and the round's buttons.
  *
- * `onSend` receives only the answers worth sending; the parent builds the `{question_id, text}`
- * list from `drafts`, this component only decides what belongs on screen.
+ * `onSend` receives nothing: the parent builds the answer list from `drafts`, because it is the
+ * parent that knows which question ids this round actually asked.
  */
 export const ClarificationCard = ({
   lang,
@@ -368,6 +383,8 @@ export const ClarificationCard = ({
       {allOptional ? (
         <div className="notice">{t(lang, "forge.discovery.questions.optional.free")}</div>
       ) : null}
+      {/* One line, once: what a click here actually does, and what it does not do. */}
+      <div className="small muted">{t(lang, "forge.discovery.question.after")}</div>
 
       {count === 0 ? (
         <div className="small muted">{t(lang, "forge.discovery.questions.empty")}</div>

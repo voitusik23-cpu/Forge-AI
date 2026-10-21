@@ -82,6 +82,14 @@ class RunExecutorLegacyAdapterTests(unittest.TestCase):
         self.assertEqual(fec["items"][1]["content"], "reference documentation text")
 
     def test_forbidden_substring_in_explicit_input_is_dropped_by_selector(self) -> None:
+        """A leaked credential in an explicit input never reaches the model.
+
+        The input carries an assigned, credential-shaped value. A phrase that merely
+        names an ``api_key`` is prose, and since the classification fix
+        (``tests/test_secret_filter_classification.py``) it is admissible: the word is
+        not the secret, the value is.
+        """
+
         orchestrator = Orchestrator(self.agent_registry, default_provider="mock")
         executor = RunExecutor(orchestrator)
         task = Task(id="task-leak-test", description="Summarize input")
@@ -89,7 +97,7 @@ class RunExecutorLegacyAdapterTests(unittest.TestCase):
         leaked_input = ContextItem(
             id="leaked-token",
             kind="api_credential",
-            content="Here is the api_key for the internal database",
+            content="Here is the api_key=a1B2c3D4e5F6g7H8i9J0k1L2 for the internal database",
             source=ContextSource.EXPLICIT_INPUT,
             trust=ContextTrust.UNTRUSTED,
             freshness=ContextFreshness.UNKNOWN,

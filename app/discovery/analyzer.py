@@ -20,9 +20,11 @@ __all__ = [
     "AREA_ORDER",
     "ESSENTIAL_AREAS",
     "LIST_AREAS",
+    "SHORT_IDEA_MAX_QUESTIONS",
     "GoalAnalysis",
     "analyze_goal",
     "answered_fields",
+    "is_short_idea",
     "missing_areas",
 ]
 
@@ -55,6 +57,134 @@ ESSENTIAL_AREAS = frozenset(
 LIST_AREAS = frozenset(
     {"core_features", "integrations", "constraints", "acceptance_criteria", "priorities"}
 )
+
+#: A short idea is a sentence or two. It gets at most three questions: the owner's rule
+#: is that a short idea must not turn into a questionnaire. A longer brief may have more
+#: open decisions, and :data:`app.discovery.questions.MAX_QUESTIONS` is its hard bound.
+SHORT_IDEA_MAX_QUESTIONS = 3
+SHORT_IDEA_MAX_CHARACTERS = 240
+SHORT_IDEA_MAX_LINES = 4
+
+
+def is_short_idea(text: object) -> bool:
+    """Whether ``text`` is a short idea rather than a detailed brief.
+
+    Deterministic and length-only: no provider, no model, no guess about meaning. A
+    multi-line brief or a long paragraph is "detailed"; everything else is "short".
+    """
+
+    value = str(text or "").strip()
+    if not value:
+        return True
+    return (
+        len(value) <= SHORT_IDEA_MAX_CHARACTERS
+        and len(value.splitlines()) <= SHORT_IDEA_MAX_LINES
+    )
+
+
+#: Surface words that name a *kind* of program, most specific first. Each entry is
+#: ``(label, *needles)``; the label is what the specification records. Order matters,
+#: so «приложение для рабочего стола» is a desktop app and never a "сайт", while
+#: «сайт с оплатой» is still a web app. The two bot kinds are handled by
+#: :func:`_bot_mentioned`, because "бот" as a bare stem also matches «работать».
+PROJECT_TYPE_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("система бронирования", ("бронир", "booking", "отель", "hotel")),
+    (
+        "интернет-магазин",
+        ("интернет-магазин", "e-commerce", "ecommerce", "магазин", "shop", "store"),
+    ),
+    ("дашборд", ("дашборд", "dashboard", "админ-панель", "панель управления")),
+    (
+        "десктоп-приложение",
+        ("рабочий стол", "рабочем столе", "рабочего стола", "десктоп", "desktop", "windows"),
+    ),
+    ("мобильное приложение", ("мобильн", "mobile", "android", "ios", "смартфон")),
+    # "апи" is deliberately absent: as a bare Cyrillic stem it also occurs inside
+    # «записи», which turned a normal expense brief into an API service. The Latin
+    # "api" is matched on word boundaries and is the form a brief actually uses.
+    ("API-сервис", ("api", "микросервис", "rest", "сервис")),
+    ("CLI-инструмент", ("cli", "консольн", "командная строка", "терминал")),
+    ("веб-приложение", ("сайт", "лендинг", "web", "веб")),
+)
+
+#: Surface and deployment words for the ``platform`` area, most specific first. The
+#: first group names where it runs, the second says how it is deployed -- the owner's
+#: «локально» / «на этом компьютере» / «в интернете» / «в сети» all answer it.
+PLATFORM_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("Telegram", ("telegram",)),
+    ("веб-сайт", ("сайт", "лендинг", "web", "веб")),
+    (
+        "десктоп-приложение",
+        ("рабочий стол", "рабочем столе", "рабочего стола", "десктоп", "desktop", "windows"),
+    ),
+    ("мобильное приложение", ("мобильн", "mobile", "android", "ios", "смартфон")),
+    ("CLI", ("cli", "консольн", "командная строка", "терминал")),
+    (
+        "локальный запуск",
+        ("локальн", "на этом компьютер", "на моем компьютер", "на моём компьютер", "офлайн", "offline", "local"),
+    ),
+    (
+        "публикация в интернет",
+        ("в интернете", "в сети", "в облаке", "online", "deploy", "задепло", "опубликова"),
+    ),
+)
+
+#: A bot is mentioned by the word "бот" as a word, not by "работать" or "обработка".
+#: Latin "bot"/"bots" keeps a word boundary, which ``_has`` already enforces.
+_BOT_MENTION = re.compile(r"(?<![а-яёa-z])(?:бот|бота|боты|боту|ботом|ботов|боте)(?![а-яёa-z])")
+
+#: User groups, most specific first. «для себя» and «личн» are the owner's own words for
+#: a single-user tool, so they are recognised like any other role.
+USER_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("администраторы", ("админ", "admin")),
+    ("сотрудники", ("сотрудник", "менеджер", "manager")),
+    ("гости", ("гост", "guest")),
+    ("клиенты", ("клиент", "покупател", "customer")),
+    ("семья", ("семь", "семейн")),
+    ("один пользователь", ("только я", "для себя", "личн", "себя")),
+    ("пользователи", ("пользовател", "user")),
+    ("студенты", ("студент", "ученик", "student")),
+)
+
+#: Domain features the idea can state as a word. The first group is generic, the rest
+#: are recognised business areas; the labels are what the specification records.
+FEATURE_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("бронирование", ("бронир",)),
+    ("учёт расходов", ("учёт расходов", "учет расходов", "расход", "трат", "затрат", "бюджет")),
+    ("категории", ("категор",)),
+    ("поиск", ("поиск", "search")),
+    ("фильтрация", ("фильтр", "filter")),
+    ("оплата", ("оплат", "платеж", "платёж", "payment")),
+    ("каталог", ("каталог", "catalog")),
+    ("отчёты", ("отчет", "отчёт", "report", "аналитик")),
+    ("управление задачами", ("задач", "task", "todo")),
+    ("регистрация", ("регистрац",)),
+    ("уведомления", ("уведомл",)),
+    ("импорт", ("импорт", "import")),
+    ("экспорт", ("экспорт", "export")),
+)
+
+#: Verbs a short idea uses to list what the program does. Two of them are an
+#: enumeration of features even without a colon -- «добавлять и видеть итог». Each entry
+#: is ``(label, *needles)``; the label is what the specification records, never the stem.
+FEATURE_VERB_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("добавление записей", ("добавл", "вносить")),
+    ("редактирование", ("редактир",)),
+    ("удаление", ("удал",)),
+    ("просмотр", ("видеть", "смотр", "показ")),
+    ("расчёты", ("считать",)),
+    ("хранение", ("хранить",)),
+    ("учёт", ("вести",)),
+)
+
+#: How many enumerated items are read from one idea, and how long one may be. A bound
+#: keeps an enumeration from turning into a pasted document.
+MAX_ENUMERATED_FEATURES = 6
+MAX_ENUMERATED_ITEM_CHARACTERS = 60
+
+#: A bulleted line is an enumeration the idea itself wrote down.
+_BULLET = re.compile(r"^[ \t]*[-*•—][ \t]+(?P<item>.+?)[ \t]*$")
+
 
 
 def _is_latin_token(needle: str) -> bool:
@@ -167,6 +297,124 @@ def _list_from(text: str, *patterns: Tuple[str, ...]) -> Tuple[str, ...]:
     return tuple(found)
 
 
+def _labels_from(
+    text: str, rules: Tuple[Tuple[str, Tuple[str, ...]], ...]
+) -> Tuple[str, ...]:
+    """The labels of ``rules`` the text states, in the rules' own order."""
+
+    return tuple(label for label, needles in rules if _has(text, *needles))
+
+
+def _rule_label(text: str, rules: Tuple[Tuple[str, Tuple[str, ...]], ...]) -> str:
+    """The first label whose needles the text states, or ``""``."""
+
+    for label, needles in rules:
+        if _has(text, *needles):
+            return label
+    return ""
+
+
+def _bot_mentioned(text: str) -> bool:
+    """Whether the text says "бот"/"bot" as a word. «Работать» is not a bot."""
+
+    return _BOT_MENTION.search(text) is not None or _has(text, "bot")
+
+
+def _project_type(text: str) -> str:
+    """The kind of program the idea states, or ``""`` when it states none."""
+
+    if _bot_mentioned(text):
+        return "Telegram-бот" if _has(text, "telegram") else "чат-бот"
+    return _rule_label(text, PROJECT_TYPE_RULES)
+
+
+def _platform(text: str) -> str:
+    """Where the program runs or is deployed, as the idea states it."""
+
+    if _has(text, "telegram"):
+        return "Telegram"
+    if _bot_mentioned(text):
+        return "чат-бот"
+    return _rule_label(text, PLATFORM_RULES)
+
+
+def _enumerated_items(text: str) -> Tuple[str, ...]:
+    """The items of the first real enumeration the idea writes down.
+
+    Three bounded forms are recognised, and nothing else:
+
+    * a **bulleted** list ("- добавлять расходы", ...) -- the way a brief writes features;
+    * a **colon-introduced** comma list («…расходов: список трат, категории, месячный
+      отчёт»);
+    * a run of feature **verbs** («добавлять и видеть итог»), which is an enumeration
+      without either marker.
+
+    A comma alone is never an enumeration, and an item that carries a clause, a
+    negation («не использовать …») or a sentence is not a feature.
+    """
+
+    bullets = [
+        " ".join(match.group("item").split()).strip(" .;")
+        for match in (_BULLET.match(line) for line in str(text).splitlines())
+        if match is not None
+    ]
+    bullets = [item for item in bullets if _is_enumerated_feature(item)]
+    if len(bullets) >= 2:
+        return tuple(bullets[:MAX_ENUMERATED_FEATURES])
+
+    for line in str(text).splitlines() or [str(text)]:
+        if ":" not in line:
+            continue
+        chunk = line.split(":", 1)[1]
+        items = [" ".join(item.split()).strip(" .;") for item in chunk.split(",")]
+        if len(items) < 2:
+            continue
+        if any(not _is_enumerated_feature(item) for item in items):
+            continue
+        return tuple(items[:MAX_ENUMERATED_FEATURES])
+    return ()
+
+
+def _is_enumerated_feature(item: str) -> bool:
+    """Whether one enumerated item reads as a feature rather than a clause."""
+
+    if not item or len(item) > MAX_ENUMERATED_ITEM_CHARACTERS:
+        return False
+    if any(character in item for character in ";:!?"):
+        return False
+    if len(item.split()) > 5:
+        return False
+    return not _NEGATION.search(f" {item} ")
+
+
+def _verb_features(text: str) -> Tuple[str, ...]:
+    """The feature verbs the idea states -- an enumeration without a colon or a bullet."""
+
+    stated = _labels_from(text, FEATURE_VERB_RULES)
+    return stated if len(stated) >= 2 else ()
+
+
+def _features(text: str) -> Tuple[str, ...]:
+    """Everything the idea says the program must do, in a stable order, deduplicated."""
+
+    ordered: list[str] = []
+    for label in _labels_from(text, FEATURE_RULES):
+        ordered.append(label)
+    for item in _enumerated_items(text):
+        ordered.append(item)
+    for verb in _verb_features(text):
+        ordered.append(verb)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in ordered:
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return tuple(unique)
+
+
 def analyze_goal(goal: object) -> GoalAnalysis:
     """Derive every area the goal text states, deterministically.
 
@@ -179,60 +427,13 @@ def analyze_goal(goal: object) -> GoalAnalysis:
         return GoalAnalysis()
     text = " ".join(goal.casefold().split())
 
-    project_type = ""
-    if _has(text, "telegram") and _has(text, "бот", "bot"):
-        project_type = "Telegram-бот"
-    elif _has(text, "бронир", "booking", "отель", "hotel"):
-        project_type = "система бронирования"
-    elif _has(
-        text, "интернет-магазин", "e-commerce", "ecommerce", "магазин", "shop", "store"
-    ):
-        project_type = "интернет-магазин"
-    elif _has(text, "дашборд", "dashboard", "админ-панель", "панель управления"):
-        project_type = "дашборд"
-    elif _has(text, "api", "апи", "микросервис", "rest"):
-        project_type = "API-сервис"
-    elif _has(text, "cli", "консольн", "командная строка"):
-        project_type = "CLI-инструмент"
-    elif _has(text, "сайт", "лендинг", "web", "веб", "приложени"):
-        project_type = "веб-приложение"
-
-    platform = ""
-    if _has(text, "telegram"):
-        platform = "Telegram"
-    elif _has(text, "сайт", "лендинг", "web", "веб"):
-        platform = "веб-сайт"
-    elif _has(text, "мобильн", "mobile", "android", "ios"):
-        platform = "мобильное приложение"
-    elif _has(text, "десктоп", "desktop"):
-        platform = "десктоп-приложение"
-    elif _has(text, "cli", "консольн", "командная строка"):
-        platform = "CLI"
-    elif _has(text, "бот", "bot"):
-        platform = "чат-бот"
-
-    roles = _list_from(
-        text,
-        ("администраторы", "админ", "admin"),
-        ("сотрудники", "сотрудник", "менеджер", "manager"),
-        ("гости", "гост", "guest"),
-        ("клиенты", "клиент", "покупател", "customer"),
-        ("пользователи", "пользовател", "user"),
-        ("студенты", "студент", "ученик", "student"),
-    )
-
-    features = _list_from(
-        text,
-        ("бронирование", "бронир"),
-        ("поиск", "search", "фильтр"),
-        ("оплата", "оплат", "платеж", "платёж", "payment"),
-        ("каталог", "catalog"),
-        ("отчёты", "отчет", "report", "аналитик"),
-        ("управление задачами", "задач", "task", "todo"),
-        ("регистрация", "регистрац"),
-        ("уведомления", "уведомл"),
-        ("экспорт", "export"),
-    )
+    # The kind of program and where it runs are read from the same surface words, most
+    # specific first, so «приложение для рабочего стола» is a desktop app rather than a
+    # web app with a stray mention of the desktop.
+    project_type = _project_type(text)
+    platform = _platform(text)
+    roles = _labels_from(text, USER_RULES)
+    features = _features(text)
 
     integrations = _list_from(
         text,
@@ -251,7 +452,7 @@ def analyze_goal(goal: object) -> GoalAnalysis:
         data_storage = "MySQL"
     elif _has(text, "sqlite"):
         data_storage = "SQLite"
-    elif _has(text, "база данных", "бд", "database", "sql"):
+    elif _has(text, "база", "бд", "database", "sql"):
         data_storage = "реляционная база данных"
     elif _has(text, "файл", "json", "csv", "excel"):
         data_storage = "файловое хранилище"
