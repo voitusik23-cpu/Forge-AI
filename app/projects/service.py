@@ -698,10 +698,16 @@ class ProjectService:
 
         return self._store.restore_deleted(_project_id(project_id))
 
-    def deleted_projects(self) -> Tuple[Dict[str, Any], ...]:
-        """The trash listing, newest first. Read-only."""
+    def deleted_projects(
+        self, *, limit: Optional[int] = None, offset: int = 0
+    ) -> Tuple[Dict[str, Any], ...]:
+        """The trash listing, newest first. Read-only.
 
-        return tuple(self._store.list_deleted())
+        ``limit``/``offset`` window the same newest-first list; omitted, nothing
+        changes for a caller that reads the whole trash.
+        """
+
+        return tuple(self._store.list_deleted(limit=limit, offset=offset))
 
     def empty_cleanup_candidates(self) -> Tuple[LifecycleProject, ...]:
         """The projects a bulk cleanup is allowed to remove.

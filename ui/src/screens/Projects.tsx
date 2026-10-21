@@ -70,6 +70,17 @@ import {
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
 
+/**
+ * How many trash rows the «Удалённые проекты» section draws at a time.
+ *
+ * A real trash held 42 entries and the section rendered all of them in one table. The
+ * bound is a rendering decision only: the count in the heading stays the real count,
+ * «Показать ещё» reveals the next page, and the backend answer is still the full
+ * listing (the endpoint also accepts additive `limit`/`offset` for a caller that wants
+ * to page server-side).
+ */
+const TRASH_PAGE_SIZE = 20;
+
 const bytesLabel = (size: unknown): string => {
   const value = typeof size === "number" && Number.isFinite(size) ? size : null;
   if (value === null) return "—";
@@ -1689,6 +1700,12 @@ export const Projects = ({
   const [trashBusy, setTrashBusy] = useState("");
   const [trashNotice, setTrashNotice] = useState("");
   const [trashFailure, setTrashFailure] = useState<Failure | null>(null);
+  // A real trash on this machine held 42 entries, and the screen used to render every
+  // one of them: a bounded view keeps the section usable without hiding anything --
+  // the count is always the real count, and «Показать ещё» reveals the next page. This
+  // is a *rendering* bound only: the answer of `GET /api/projects/deleted` is still the
+  // whole listing, and the endpoint's meaning is unchanged.
+  const [trashShown, setTrashShown] = useState(TRASH_PAGE_SIZE);
 
   const loadTrash = useCallback(async () => {
     const outcome = await loadDeletedProjects();
@@ -1701,6 +1718,7 @@ export const Projects = ({
 
   const trashItems = trash.status === "ready" ? trash.value : [];
   const trashCount = trashItems.length;
+  const trashRows = trashItems.slice(0, Math.max(TRASH_PAGE_SIZE, trashShown));
 
   const restoreFromTrash = async (identifier: string) => {
     setTrashTarget("");
@@ -2099,6 +2117,7 @@ export const Projects = ({
         ) : trashItems.length === 0 ? (
           <div className="small muted">{t(lang, "projects.trash.empty")}</div>
         ) : (
+          <>
           <table className="table">
             <thead>
               <tr>
@@ -2110,7 +2129,7 @@ export const Projects = ({
               </tr>
             </thead>
             <tbody>
-              {trashItems.map((item) => {
+              {trashRows.map((item) => {
                 const id = String(item.project_id ?? "");
                 const filesHeld =
                   typeof item.file_count === "number" ? String(item.file_count) : "—";
@@ -2149,6 +2168,32 @@ export const Projects = ({
               })}
             </tbody>
           </table>
+          {/* A bounded view, not a hidden one: the heading keeps the real count, this
+              line states how much of it is drawn, and «Показать ещё» reveals the next
+              page. The whole listing is still what the backend answered. */}
+          {trashCount > trashRows.length ? (
+            <div
+              className="row"
+              data-testid="projects-trash-more"
+              style={{ gap: 8, flexWrap: "wrap", marginTop: 8, alignItems: "center" }}
+            >
+              <Button
+                size="small"
+                tone="ghost"
+                onClick={() => setTrashShown(trashRows.length + TRASH_PAGE_SIZE)}
+              >
+                {t(lang, "projects.trash.more")
+                  .replace("{shown}", String(trashRows.length))
+                  .replace("{total}", String(trashCount))}
+              </Button>
+              <span className="small muted" data-testid="projects-trash-bounded">
+                {t(lang, "projects.trash.bounded")
+                  .replace("{shown}", String(trashRows.length))
+                  .replace("{total}", String(trashCount))}
+              </span>
+            </div>
+          ) : null}
+          </>
         )}
 
         {/* The confirmation says exactly what the backend will do: move the folder back

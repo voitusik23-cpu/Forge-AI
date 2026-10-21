@@ -599,7 +599,9 @@ class ProjectStore:
         }
         self._write_index(index)
 
-    def list_deleted(self) -> List[Dict[str, Any]]:
+    def list_deleted(
+        self, *, limit: Optional[int] = None, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         """Every trash entry, newest deletion first. Read-only, names and record facts.
 
         Beyond the names, the answer carries what the «Удалённые проекты» section has
@@ -607,6 +609,13 @@ class ProjectStore:
         held and what status it had. The record travelled with the folder, so those
         two facts are read from it rather than guessed; an unreadable record is
         reported empty instead of claiming zero files.
+
+        ``limit``/``offset`` are **additive and optional**: called with neither (the
+        default, and what every existing caller does) the whole trash is returned in
+        exactly the order it always was. Given, they window that same ordered list, so
+        a caller paging through dozens of entries sees each one once and in one order.
+        Out-of-range values are the caller's to reject; here they simply select
+        nothing.
         """
 
         root = self.deleted_root()
@@ -659,7 +668,10 @@ class ProjectStore:
             key=lambda item: (str(item.get("deleted_at") or ""), item["trash_name"]),
             reverse=True,
         )
-        return found
+        start = max(0, int(offset))
+        if limit is None:
+            return found[start:]
+        return found[start : start + max(0, int(limit))]
 
     def restore_deleted(self, project_id: object) -> Dict[str, Any]:
         """Move the newest trash entry for ``project_id`` back into the store.

@@ -371,14 +371,30 @@ def register_project_routes(
         ]
 
     @app.get("/api/projects/deleted")
-    def list_deleted_projects() -> List[Dict[str, Any]]:
+    def list_deleted_projects(
+        limit: Optional[int] = None, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         """What is in ``projects-deleted`` right now: names and what each holds.
 
         Registered before ``/api/projects/{project_id}`` for the same reason
         ``/api/projects/lifecycle`` is: a literal segment must not be captured as an id.
+
+        ``limit``/``offset`` are **additive**: omitted (both defaults) the answer is the
+        whole trash, one flat list of the same rows in the same newest-first order it
+        has always been -- no caller that exists today has to change. Given, they window
+        that ordering, so a client can page through a trash of dozens of entries without
+        rendering them all. A non-positive ``limit`` or a negative ``offset`` is refused
+        with the surface's own 400 instead of being silently reinterpreted.
         """
 
-        return [dict(item) for item in projects.deleted_projects()]
+        if limit is not None and limit <= 0:
+            raise body_error_exception("'limit' must be a positive integer when given")
+        if offset < 0:
+            raise body_error_exception("'offset' must be zero or a positive integer")
+        return [
+            dict(item)
+            for item in projects.deleted_projects(limit=limit, offset=offset)
+        ]
 
     @app.get("/api/projects/{project_id}")
     def get_project(project_id: str) -> Dict[str, Any]:

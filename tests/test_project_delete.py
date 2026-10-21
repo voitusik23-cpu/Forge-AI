@@ -719,5 +719,141 @@ class DeleteEdgeTests(_DeleteTestCase):
         )
 
 
+class TrashListingTests(_DeleteTestCase):
+    """The trash listing: its fields, its newest-first order, and a bounded page.
+
+    A real trash on this machine held 42 entries and the «Удалённые проекты» section
+    drew every one of them in one table. The fix is a bound, and a bound is only safe
+    if the listing it bounds keeps its meaning: the same rows, the same newest-first
+    order, the same fields, and the defaults unchanged for every caller that does not
+    page. These tests pin exactly that.
+    """
+
+    #: Deletion moments the store will accept, oldest first: ``<id>-<YYYYmmddTHHMMSS>``.
+    MOMENTS = tuple(f"202601{days:02d}T120000" for days in range(1, 10))
+
+    def _trashed(self, count: int) -> list[str]:
+        """Create ``count`` projects and move each into the trash at a known moment."""
+
+        identifiers: list[str] = []
+        for index in range(count):
+            project = self._empty_project(f"Trashed project {index}")
+            self.store.delete(project.project_id, stamp=self.MOMENTS[index])
+            identifiers.append(project.project_id)
+        return identifiers
+
+    def test_14_the_trash_listing_can_be_read_in_bounded_pages(self) -> None:
+        identifiers = self._trashed(7)
+        newest_first = list(reversed(identifiers))
+        client = self._client()
+
+        # The default answer is what it always was: every row, newest first.
+        whole = client.get("/api/projects/deleted")
+        self.assertEqual(whole.status_code, 200, whole.text)
+        self.assertEqual([row["project_id"] for row in whole.json()], newest_first)
+
+        # A page is a window on that list, not a second list.
+        first = client.get("/api/projects/deleted", params={"limit": 3}).json()
+        self.assertEqual([row["project_id"] for row in first], newest_first[:3])
+        self.assertEqual(first[0], whole.json()[0])
+        second = client.get("/api/projects/deleted", params={"limit": 3, "offset": 3}).json()
+        self.assertEqual([row["project_id"] for row in second], newest_first[3:6])
+        tail = client.get("/api/projects/deleted", params={"offset": 5}).json()
+        self.assertEqual([row["project_id"] for row in tail], newest_first[5:])
+        last = client.get("/api/projects/deleted", params={"limit": 1, "offset": 6}).json()
+        self.assertEqual([row["project_id"] for row in last], newest_first[6:])
+        # Paging cannot invent a row, and the pages do not overlap or drop one.
+        self.assertEqual(client.get("/api/projects/deleted", params={"offset": 99}).json(), [])
+        self.assertEqual(
+            [row["project_id"] for row in first + second + last],
+            newest_first,
+        )
+        # Additive only: a limit that covers everything answers exactly the default.
+        self.assertEqual(
+            client.get(
+                "/api/projects/deleted", params={"limit": len(identifiers)}
+            ).json(),
+            whole.json(),
+        )
+        # Out-of-range paging is a controlled 400, never a silently reinterpreted page.
+        for params in ({"limit": 0}, {"limit": -1}, {"offset": -1}):
+            refused = client.get("/api/projects/deleted", params=params)
+            self.assertEqual(refused.status_code, 400, refused.text)
+            self.assertEqual(
+                refused.json()["detail"]["code"], "invalid_request_schema", refused.text
+            )
+
+        # A row read from the second page restores to exactly that project: a window
+        # does not change what an id means.
+        target = second[0]["project_id"]
+        restored = client.post(f"/api/projects/{target}/restore-deleted")
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.json()["project_id"], target)
+        self.assertTrue((self.root / target).is_dir())
+        self.assertNotIn(
+            target,
+            [row["project_id"] for row in client.get("/api/projects/deleted").json()],
+        )
+
+    def test_15_each_row_carries_the_date_the_original_status_and_the_file_count(
+        self,
+    ) -> None:
+        with_files = self._project_with_files(goal="A trashed project that held a file")
+        self.store.delete(with_files.project_id, stamp=self.MOMENTS[7])
+        archived = self._empty_project("A trashed project that was archived")
+        self.projects.archive(archived.project_id)
+        self.store.delete(archived.project_id, stamp=self.MOMENTS[8])
+
+        client = self._client()
+        rows = client.get("/api/projects/deleted").json()
+        self.assertEqual(
+            [row["project_id"] for row in rows], [archived.project_id, with_files.project_id]
+        )
+        newest, oldest = rows
+
+        # When it was deleted, what status it had, how many files it held, and its name:
+        # the four facts a person needs to decide whether restoring it is worth doing.
+        self.assertEqual(newest["deleted_at"], "2026-01-09T12:00:00")
+        self.assertEqual(newest["status"], "ARCHIVED")
+        self.assertEqual(newest["file_count"], 0)
+        self.assertEqual(newest["name"], "A trashed project that was archived")
+        self.assertEqual(oldest["deleted_at"], "2026-01-08T12:00:00")
+        self.assertEqual(oldest["status"], "COMPLETED")
+        self.assertEqual(oldest["file_count"], 1)
+        self.assertEqual(oldest["name"], "A trashed project that held a file")
+        for row in rows:
+            self.assertTrue(row["record_present"])
+            self.assertTrue(row["folder_present"])
+            self.assertIn(DELETED_DIRECTORY_NAME, row["trash_path"])
+        # No row publishes a host path.
+        self.assertNotIn(str(self.base), json.dumps(rows))
+
+        # The newest-first order is by deletion moment, not by project id: the row the
+        # listing puts first is the one deleted latest.
+        self.assertGreater(newest["deleted_at"], oldest["deleted_at"])
+
+    def test_16_a_restore_conflict_names_the_code_and_the_reason(self) -> None:
+        project = self._empty_project("A project whose id is taken again")
+        identifier = project.project_id
+        client = self._client()
+
+        deleted = client.delete(f"/api/projects/{identifier}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        trash = self.deleted_root / deleted.json()["trash_name"]
+        # A live project takes the id while the trash copy still holds one.
+        shutil.copy2(trash / f"{identifier}.json", self.root / f"{identifier}.json")
+
+        collision = client.post(f"/api/projects/{identifier}/restore-deleted")
+        self.assertEqual(collision.status_code, 409, collision.text)
+        detail = collision.json()["detail"]
+        self.assertEqual(detail["code"], "project_already_exists")
+        self.assertIn(identifier, detail["error"])
+        self.assertIn("already exists", detail["error"])
+        self.assertNotIn(str(self.base), collision.text)
+        # Nothing was overwritten: the trash copy is still there, so the restore stays
+        # possible once the live id is out of the way.
+        self.assertTrue((trash / f"{identifier}.json").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
