@@ -668,6 +668,60 @@ class ProjectService:
         self._store.write(restored)
         return restored
 
+    # ------------------------------------------------------------- deletion
+    #
+    # Deletion is deliberately not a lifecycle transition: a deleted project has no
+    # status, it has a place in ``projects-deleted``. It is also not a hard delete --
+    # the store moves the folder and the record, so nothing this layer did is lost and
+    # a restore is a move back. The only refusal this layer itself makes is the one it
+    # can prove from the record; "is a process running for it" is runtime state and is
+    # checked by the HTTP composition, which owns the runner.
+
+    #: The statuses a *bulk* cleanup may remove. A project that is still being worked
+    #: on (PLANNED, RUNNING, WAITING_FOR_CONFIRMATION, ...) is never swept away, and a
+    #: project that produced files is never "empty" however it ended.
+    EMPTY_CLEANUP_STATUSES = frozenset(
+        {
+            ProjectStatus.NEEDS_CHANGES,
+            ProjectStatus.FAILED,
+            ProjectStatus.ARCHIVED,
+        }
+    )
+
+    def delete(self, project_id: object) -> Dict[str, Any]:
+        """Move one project into ``projects-deleted`` and out of the listing."""
+
+        return self._store.delete(_project_id(project_id))
+
+    def restore_deleted(self, project_id: object) -> Dict[str, Any]:
+        """Move the newest trash entry for ``project_id`` back into the store."""
+
+        return self._store.restore_deleted(_project_id(project_id))
+
+    def deleted_projects(self) -> Tuple[Dict[str, Any], ...]:
+        """The trash listing, newest first. Read-only."""
+
+        return tuple(self._store.list_deleted())
+
+    def empty_cleanup_candidates(self) -> Tuple[LifecycleProject, ...]:
+        """The projects a bulk cleanup is allowed to remove.
+
+        Two facts decide it, both read from the record: the current version holds no
+        file, and the status is one of :attr:`EMPTY_CLEANUP_STATUSES`. A running
+        process is *not* checked here (this layer has no runner); the caller that owns
+        the runner adds that condition and reports the projects it skipped.
+        """
+
+        candidates: List[LifecycleProject] = []
+        for project in self.list_projects(include_archived=True):
+            if project.status not in self.EMPTY_CLEANUP_STATUSES:
+                continue
+            current = project.current()
+            if current is not None and int(current.file_count) > 0:
+                continue
+            candidates.append(project)
+        return tuple(candidates)
+
     # --------------------------------------------------------------- re-verify
     def set_preview_not_required(
         self, project_id: object, value: bool = True

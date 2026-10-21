@@ -114,6 +114,11 @@
   transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease);
 }
 .search:focus-within { border-color: var(--focus-border-search); box-shadow: var(--glow-cyan); }
+/* A search field with no search behind it is off, and reads as off: dimmed, no focus
+   highlight, and a cursor that says it cannot be typed into. */
+.search.off { opacity: 0.55; }
+.search.off:focus-within { border-color: var(--border); box-shadow: none; }
+.search input:disabled { cursor: not-allowed; }
 .search input {
   flex: 1;
   background: none;

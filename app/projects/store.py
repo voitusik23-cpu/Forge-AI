@@ -34,17 +34,19 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from app.projects.models import LifecycleProject, ProjectError, utc_now
 
 __all__ = [
+    "DELETED_DIRECTORY_NAME",
     "INDEX_FILENAME",
     "INDEX_SCHEMA_VERSION",
     "PROJECTS_ROOT_ENV_VAR",
     "SCHEMA_VERSION",
     "WORKSPACE_DIRECTORY_NAME",
     "ProjectStore",
+    "ProjectAlreadyExists",
     "UnknownProject",
     "default_projects_root",
     "is_safe_project_id",
@@ -67,6 +69,12 @@ INDEX_FILENAME = "index.json"
 
 #: The workspace directory name inside one project directory.
 WORKSPACE_DIRECTORY_NAME = "workspace"
+
+#: Where a deleted project is *moved*, never erased. It is a sibling of the store
+#: root (``.forge/projects-deleted`` for the default ``.forge/projects``), so the
+#: listing walk can never mistake a trash folder for a live project and a restore
+#: is a rename away. Deletion in this layer is always this move.
+DELETED_DIRECTORY_NAME = "projects-deleted"
 
 #: Project ids become file *and* directory names, so the allow-list is the exact
 #: generated shape rather than a permissive charset. ``new_project_id`` is the only
@@ -117,6 +125,22 @@ class UnknownProject(ProjectError):
 
     def __init__(self, project_id: str) -> None:
         super().__init__(f"no project is recorded under '{project_id}'")
+        self.project_id = project_id
+
+
+class ProjectAlreadyExists(ProjectError):
+    """A live project already uses the id a restore was about to take.
+
+    A refusal, not a server fault: restoring must never overwrite a record the owner
+    can see, so the trash entry stays where it is and the answer says why. It carries
+    a machine code so the HTTP layer can answer 409 with the same sentence instead of
+    turning the condition into an unhandled ``ValueError``.
+    """
+
+    code = "project_already_exists"
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__(f"project '{project_id}' already exists in the store")
         self.project_id = project_id
 
 
@@ -451,3 +475,278 @@ class ProjectStore:
         if root not in target.parents:
             raise ValueError("workspace file escapes the project workspace")
         return target
+
+    # ------------------------------------------------------------------ deletion
+    #
+    # Deleting a project here is a *move* into ``projects-deleted`` and nothing else.
+    # The record JSON travels with the folder, so the record (and therefore a restore)
+    # survives the deletion; no file is unlinked and no directory is recursed into.
+    #
+    # Both paths are re-proved at the moment they are used: the source comes from the
+    # id allow-list and is checked to sit inside the store root, and the destination is
+    # composed inside ``deleted_root`` and checked the same way. An id that is not the
+    # generated shape is refused by ``require``/``path_for`` before any move can start,
+    # so a request can never name a directory outside this store.
+
+    def deleted_root(self) -> Path:
+        """The trash directory: a **sibling** of the store root, never inside it."""
+
+        return self.root.parent / DELETED_DIRECTORY_NAME
+
+    def _relative(self, path: Path) -> str:
+        """A repository-relative rendering of ``path``, for an API payload.
+
+        When the store is redirected outside the repository (tests do that), the
+        absolute path is never published: the folder name is returned instead, which
+        still identifies what moved.
+        """
+
+        resolved = path.resolve(strict=False)
+        try:
+            return resolved.relative_to(repository_root().resolve(strict=False)).as_posix()
+        except ValueError:
+            return resolved.name
+
+    def _live_paths(self, project_id: str) -> Tuple[Path, Path]:
+        """The project's folder and its record, both proved inside the store root."""
+
+        record = self.path_for(project_id)
+        folder = (self.root / project_id).resolve(strict=False)
+        root = self.root.resolve(strict=False)
+        if folder != root and root not in folder.parents:
+            raise ValueError("project folder escapes the store root")
+        return folder, record
+
+    def delete(
+        self, project_id: object, *, stamp: str = ""
+    ) -> Dict[str, Any]:
+        """Move one project's folder and record into ``projects-deleted``.
+
+        Returns what was moved. Raises :class:`UnknownProject` when no record exists
+        and ``ValueError`` when an id or a path fails the containment checks; a
+        failure while moving is rolled back so a half-moved project is never left
+        behind.
+        """
+
+        project = self.require(project_id)
+        identifier = str(project.project_id)
+        folder, record = self._live_paths(identifier)
+        if not folder.is_dir() and not record.is_file():
+            raise UnknownProject(identifier)
+
+        trash_root = self.deleted_root().resolve(strict=False)
+        token = stamp or time.strftime("%Y%m%dT%H%M%S")
+        name = f"{identifier}-{token}"
+        suffix = 2
+        while (trash_root / name).exists():
+            name = f"{identifier}-{token}-{suffix}"
+            suffix += 1
+        target = (trash_root / name).resolve(strict=False)
+        if trash_root not in target.parents:
+            raise ValueError("trash path escapes the trash root")
+
+        target.mkdir(parents=True, exist_ok=True)
+        moved: List[Dict[str, str]] = []
+        undo: List[Tuple[Path, Path]] = []
+        try:
+            if folder.is_dir():
+                destination = target / identifier
+                _move_path(folder, destination)
+                undo.append((folder, destination))
+                moved.append(
+                    {"from": self._relative(folder), "to": self._relative(destination)}
+                )
+            if record.is_file():
+                destination = target / record.name
+                _move_path(record, destination)
+                undo.append((record, destination))
+                moved.append(
+                    {"from": self._relative(record), "to": self._relative(destination)}
+                )
+        except BaseException:
+            # Put back whatever already moved, then let the caller see the failure.
+            for source, destination in reversed(undo):
+                try:
+                    _move_path(destination, source)
+                except OSError:
+                    pass
+            raise
+
+        self._forget_index(identifier)
+        return {
+            "project_id": identifier,
+            "deleted": True,
+            "trash_name": name,
+            "trash_path": self._relative(target),
+            "moved": moved,
+            "timestamp": token,
+            "project": project.to_dict(),
+        }
+
+    def _forget_index(self, project_id: str) -> None:
+        """Remove the project from the listing cache and from the session links."""
+
+        index = self.read_index()
+        index["projects"] = [
+            item
+            for item in index["projects"]
+            if str(item.get("project_id", "")) != project_id
+        ]
+        index["sessions"] = {
+            key: value
+            for key, value in index["sessions"].items()
+            if value != project_id
+        }
+        self._write_index(index)
+
+    def list_deleted(self) -> List[Dict[str, Any]]:
+        """Every trash entry, newest deletion first. Read-only, names and record facts.
+
+        Beyond the names, the answer carries what the «Удалённые проекты» section has
+        to show: when the project was deleted, how many files its current version
+        held and what status it had. The record travelled with the folder, so those
+        two facts are read from it rather than guessed; an unreadable record is
+        reported empty instead of claiming zero files.
+        """
+
+        root = self.deleted_root()
+        if not root.is_dir():
+            return []
+        found: List[Dict[str, Any]] = []
+        for entry in sorted(root.iterdir(), key=lambda item: item.name, reverse=True):
+            if not entry.is_dir():
+                continue
+            project_id = entry.name.split("-", 2)
+            identifier = "-".join(project_id[:2]) if len(project_id) >= 2 else ""
+            if not is_safe_project_id(identifier):
+                continue
+            record_path = entry / f"{identifier}.json"
+            status = ""
+            file_count: Optional[int] = None
+            name = ""
+            if record_path.is_file():
+                try:
+                    data = json.loads(record_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    data = None
+                if isinstance(data, dict):
+                    try:
+                        stored = LifecycleProject.from_dict(data)
+                    except (KeyError, TypeError, ValueError):
+                        stored = None
+                    if stored is not None:
+                        status = stored.status.value
+                        file_count = stored.file_count()
+                        name = stored.name
+            found.append(
+                {
+                    "trash_name": entry.name,
+                    "project_id": identifier,
+                    "trash_path": self._relative(entry),
+                    "record_present": record_path.is_file(),
+                    "folder_present": (entry / identifier).is_dir(),
+                    # The deletion moment is the timestamp token of the folder the
+                    # delete created; an unrecognisable name reports an empty date.
+                    "deleted_at": _deleted_at_from_name(entry.name),
+                    "name": name,
+                    "status": status,
+                    "file_count": file_count,
+                }
+            )
+        # Newest deletion first, as the docstring promises. The name alone sorts by
+        # project id; the deletion token is the fact the reader cares about.
+        found.sort(
+            key=lambda item: (str(item.get("deleted_at") or ""), item["trash_name"]),
+            reverse=True,
+        )
+        return found
+
+    def restore_deleted(self, project_id: object) -> Dict[str, Any]:
+        """Move the newest trash entry for ``project_id`` back into the store.
+
+        Refuses -- rather than overwriting -- when a live project already uses the
+        id, because a restore must never replace a record the owner can see.
+        """
+
+        if not is_safe_project_id(project_id):
+            raise UnknownProject(str(project_id))
+        identifier = str(project_id)
+        if self.exists(identifier):
+            raise ProjectAlreadyExists(identifier)
+        root = self.deleted_root()
+        candidates = (
+            [entry for entry in root.iterdir() if entry.is_dir() and entry.name.startswith(f"{identifier}-")]
+            if root.is_dir()
+            else []
+        )
+        if not candidates:
+            raise UnknownProject(identifier)
+        source = sorted(candidates, key=lambda item: item.name, reverse=True)[0]
+        record = source / f"{identifier}.json"
+        if not record.is_file():
+            raise UnknownProject(identifier)
+
+        folder = self.root / identifier
+        moved: List[Dict[str, str]] = []
+        trash_folder = source / identifier
+        if trash_folder.is_dir():
+            _move_path(trash_folder, folder)
+            moved.append(
+                {"from": self._relative(trash_folder), "to": self._relative(folder)}
+            )
+        _move_path(record, self.path_for(identifier))
+        moved.append(
+            {
+                "from": self._relative(record),
+                "to": self._relative(self.path_for(identifier)),
+            }
+        )
+        try:
+            source.rmdir()
+        except OSError:
+            pass
+        restored = self.read(identifier)
+        if restored is not None:
+            self._refresh_index(restored)
+        return {
+            "project_id": identifier,
+            "restored": restored is not None,
+            "trash_name": source.name,
+            "moved": moved,
+            "project": restored.to_dict() if restored is not None else None,
+        }
+
+
+def _deleted_at_from_name(name: str) -> str:
+    """The deletion moment encoded in a trash folder name, or ``""`` when absent.
+
+    ``delete`` names the folder ``<project-id>-<YYYYmmddTHHMMSS>`` (with at most a
+    ``-N`` collision suffix), so the token is the third dash-separated part. It is
+    rendered ISO-like for display; no timezone is claimed, because none was recorded.
+    """
+
+    parts = name.split("-", 2)
+    if len(parts) != 3:
+        return ""
+    token = parts[2].split("-", 1)[0]
+    try:
+        moment = time.strptime(token, "%Y%m%dT%H%M%S")
+    except ValueError:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", moment)
+
+
+def _move_path(source: Path, destination: Path) -> None:
+    """``shutil.move`` with the destination's parent created first.
+
+    Deliberately not ``os.replace``: the source may be a directory, and a directory
+    rename across the same volume is what ``shutil.move`` reduces to, while a target
+    on another volume still works (Windows makes that case real).
+    """
+
+    import shutil
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError(str(destination))
+    shutil.move(str(source), str(destination))

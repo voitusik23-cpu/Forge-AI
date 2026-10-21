@@ -17,6 +17,10 @@ POST /api/projects/{id}/run  {confirm, digest}   -> start it, only with an expli
 POST /api/projects/{id}/run/stop                 -> terminate the process tree
 POST /api/projects/{id}/run/restart              -> stop, then start again under a fresh approval
 GET  /api/projects/{id}/run/log                  -> the redacted, bounded log
+DELETE|POST /api/projects/{id}                   -> move the project into projects-deleted
+POST /api/projects/delete-empty                  -> the same move, for empty finished projects
+GET  /api/projects/deleted                       -> what the trash holds now
+POST /api/projects/{id}/restore-deleted          -> move the newest trashed copy back
 ```
 
 Four properties are deliberate:
@@ -120,7 +124,7 @@ def register_project_routes(
     from app.projects.lifecycle import IllegalTransition
     from app.projects.presentation import build_project_presentation
     from app.projects.service import InvalidChangeRequest, UnknownProjectVersion
-    from app.projects.store import UnknownProject
+    from app.projects.store import ProjectAlreadyExists, UnknownProject
 
     app.state.forge_projects = projects
     registry = preview_registry if preview_registry is not None else PreviewRegistry()
@@ -344,7 +348,13 @@ def register_project_routes(
     def _guard(call: Any) -> Any:
         try:
             return call()
-        except (UnknownProject, UnknownProjectVersion, InvalidChangeRequest, IllegalTransition) as exc:
+        except (
+            UnknownProject,
+            UnknownProjectVersion,
+            InvalidChangeRequest,
+            IllegalTransition,
+            ProjectAlreadyExists,
+        ) as exc:
             raise _refusal(exc) from exc
 
     # Registered BEFORE the ``{project_id}`` route below: FastAPI matches in
@@ -359,6 +369,16 @@ def register_project_routes(
             project.summary()
             for project in projects.list_projects(include_archived=include_archived)
         ]
+
+    @app.get("/api/projects/deleted")
+    def list_deleted_projects() -> List[Dict[str, Any]]:
+        """What is in ``projects-deleted`` right now: names and what each holds.
+
+        Registered before ``/api/projects/{project_id}`` for the same reason
+        ``/api/projects/lifecycle`` is: a literal segment must not be captured as an id.
+        """
+
+        return [dict(item) for item in projects.deleted_projects()]
 
     @app.get("/api/projects/{project_id}")
     def get_project(project_id: str) -> Dict[str, Any]:
@@ -426,6 +446,118 @@ def register_project_routes(
             "acceptance": current.acceptance if current is not None else "",
             "status": project.status.value,
         }
+
+    # --------------------------------------------------------------- deletion
+    #
+    # A delete never erases: the store moves the project's folder and its record into
+    # ``projects-deleted`` (see ``app.projects.store.ProjectStore.delete``), removes the
+    # entry from the listing, and answers with what was moved. The two conditions this
+    # layer can prove and the store cannot are enforced here:
+    #
+    # * a project with a **live process** is refused -- the caller is told to stop it
+    #   first, because moving a folder out from under a running child is how a launched
+    #   process ends up writing into the trash;
+    # * a **bulk** cleanup only touches projects that are empty *and* in a terminal
+    #   status, and it reports the ones it skipped with the reason.
+
+    def _process_state(project_id: str) -> str:
+        try:
+            return str(local_runner.state(project_id) or "")
+        except Exception:  # noqa: BLE001 - an unreadable runner is "no live process"
+            return ""
+
+    def _has_live_process(project_id: str) -> bool:
+        if _process_state(project_id) in ("STARTING", "RUNNING", "STOPPING"):
+            return True
+        try:
+            return registry.process_session(project_id) is not None
+        except Exception:  # noqa: BLE001 - an unreadable registry is "no live process"
+            return False
+
+    def _running_refusal(project_id: str) -> "HTTPException":
+        error = (
+            "the project has a running process: stop it first "
+            f"(POST /api/projects/{project_id}/run/stop), then delete"
+        )
+        return HTTPException(
+            status_code=409,
+            detail={
+                **error_body(error_code="project_is_running", code="project_is_running"),
+                "error": error,
+                "project_id": project_id,
+                "run_state": _process_state(project_id),
+            },
+        )
+
+    def _delete_one(project_id: str) -> Dict[str, Any]:
+        project = _guard(lambda: projects.open_project(_project_id(project_id)))
+        if _has_live_process(project.project_id):
+            raise _running_refusal(project.project_id)
+        # A static preview holds no child process but does hold a port serving the
+        # folder that is about to move; stopping it keeps the answer honest.
+        try:
+            registry.stop(project.project_id)
+        except Exception:  # noqa: BLE001 - a preview that is already gone is not a failure
+            pass
+        return _guard(lambda: projects.delete(project.project_id))
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str) -> Dict[str, Any]:
+        """Move one project into ``projects-deleted``; never a hard delete."""
+
+        return _delete_one(project_id)
+
+    @app.post("/api/projects/{project_id}/delete")
+    def delete_project_post(project_id: str) -> Dict[str, Any]:
+        """The same move, for a client that only sends POST."""
+
+        return _delete_one(project_id)
+
+    @app.post("/api/projects/delete-empty")
+    def delete_empty_projects() -> Dict[str, Any]:
+        """Remove every project that is empty **and** finished.
+
+        The rule is the store's record, not the client's opinion: the current version
+        holds no file and the status is ``NEEDS_CHANGES``, ``FAILED`` or ``ARCHIVED``.
+        A project with a live process is skipped and reported, never stopped
+        implicitly.
+        """
+
+        deleted: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        for candidate in projects.empty_cleanup_candidates():
+            if _has_live_process(candidate.project_id):
+                skipped.append(
+                    {
+                        "project_id": candidate.project_id,
+                        "status": candidate.status.value,
+                        "reason": "project_is_running",
+                    }
+                )
+                continue
+            try:
+                deleted.append(projects.delete(candidate.project_id))
+            except (UnknownProject, ValueError) as exc:
+                skipped.append(
+                    {
+                        "project_id": candidate.project_id,
+                        "status": candidate.status.value,
+                        "reason": str(exc),
+                    }
+                )
+        return {
+            "deleted": deleted,
+            "deleted_count": len(deleted),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+            "rule": "file_count == 0 and status in {NEEDS_CHANGES, FAILED, ARCHIVED}",
+        }
+
+    @app.post("/api/projects/{project_id}/restore-deleted")
+    def restore_deleted_project(project_id: str) -> Dict[str, Any]:
+        """Move the newest trashed copy of a project back into the store."""
+
+        return _guard(lambda: projects.restore_deleted(project_id))
 
     # -------------------------------------------------------- entry point/preview
     @app.get("/api/projects/{project_id}/entrypoint")

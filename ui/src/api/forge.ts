@@ -88,6 +88,14 @@ export type TaskRunResponse = {
   cost_tier?: string | null;
   /** The registry's own rate/estimate, or null when no estimate exists. */
   estimated_cost?: number | null;
+  /**
+   * The **lifecycle** project (`proj-…`) this run created or was attached to, or
+   * `null` when the run produced none. It is a different id from `project_id`
+   * above, which is the workspace/Core project this server was composed for
+   * (`ws-…`) and is not in the lifecycle list. Only this field may be handed to
+   * «Проекты», and only after the lifecycle list confirms it exists.
+   */
+  lifecycle_project_id?: string | null;
 };
 
 /**
@@ -698,9 +706,21 @@ export type DiscoverySpecificationPayload = {
  * `body` is omitted entirely when `undefined`, so the routes that take no body are called without
  * one instead of receiving an empty object they never declared.
  */
-const postJson = async <T>(path: string, body?: unknown): Promise<Result<T>> => {
+const postJson = async <T>(path: string, body?: unknown): Promise<Result<T>> =>
+  sendJson<T>("POST", path, body);
+
+/**
+ * Send one JSON request and read JSON back, with the same failure vocabulary as the rest of
+ * this file. `DELETE` exists here because deleting a project is a real route: the folder and the
+ * record are moved into `.forge/projects-deleted`, never unlinked.
+ */
+const sendJson = async <T>(
+  method: "POST" | "DELETE",
+  path: string,
+  body?: unknown
+): Promise<Result<T>> => {
   const headers: Record<string, string> = { accept: "application/json" };
-  const init: RequestInit = { method: "POST", headers };
+  const init: RequestInit = { method, headers };
   if (body !== undefined) {
     headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -1128,6 +1148,72 @@ export const archiveProject = (projectId: string): Promise<Result<{ project?: Li
 /** `POST /api/projects/{id}/restore` — return it to the status it had before archiving. */
 export const restoreProject = (projectId: string): Promise<Result<{ project?: LifecycleProject }>> =>
   postJson<{ project?: LifecycleProject }>(projectPath(projectId, "/restore"));
+
+/**
+ * One deletion, as the backend answers it: what moved, and into which trash folder.
+ *
+ * `moved` lists the folder and the record separately, because they are two moves: the
+ * project directory `projects/<id>/` and the record file `projects/<id>.json`. `trash_path`
+ * is repository-relative (`.forge/projects-deleted/<id>-<timestamp>`); no absolute path of
+ * the host appears here.
+ */
+export type LifecycleDeletion = {
+  project_id?: string;
+  deleted?: boolean;
+  trash_name?: string;
+  trash_path?: string;
+  moved?: Array<{ from?: string; to?: string }>;
+  timestamp?: string;
+  project?: LifecycleProject;
+};
+
+/** `DELETE /api/projects/{id}` — move one project into `projects-deleted` (never an erasure). */
+export const deleteProject = (projectId: string): Promise<Result<LifecycleDeletion>> =>
+  sendJson<LifecycleDeletion>("DELETE", projectPath(projectId, ""));
+
+/** One trash entry, as `GET /api/projects/deleted` reports it. */
+export type LifecycleDeletedProject = {
+  trash_name?: string;
+  project_id?: string;
+  trash_path?: string;
+  record_present?: boolean;
+  folder_present?: boolean;
+  /** When the deletion happened (ISO-like, no timezone claimed), or "" when unknown. */
+  deleted_at?: string;
+  /** The record's own project name, or "" when the record could not be read. */
+  name?: string;
+  /** The status the project had when it was deleted, or "" when unreadable. */
+  status?: string;
+  /** The current version's file count at deletion, or null when unreadable. */
+  file_count?: number | null;
+};
+
+/** `GET /api/projects/deleted` — what the trash holds right now. */
+export const loadDeletedProjects = (): Promise<Result<LifecycleDeletedProject[]>> =>
+  readJson<LifecycleDeletedProject[]>("/api/projects/deleted");
+
+/**
+ * `POST /api/projects/delete-empty` — the bulk cleanup.
+ *
+ * The rule is the backend's own: the current version holds no file and the status is
+ * `NEEDS_CHANGES`, `FAILED` or `ARCHIVED`. `skipped` names every project the rule excluded
+ * (with its reason) so the interface can print what was *not* removed.
+ */
+export const deleteEmptyProjects = (): Promise<
+  Result<{
+    deleted?: LifecycleDeletion[];
+    deleted_count?: number;
+    skipped?: Array<{ project_id?: string; status?: string; reason?: string }>;
+    skipped_count?: number;
+    rule?: string;
+  }>
+> => postJson("/api/projects/delete-empty");
+
+/** `POST /api/projects/{id}/restore-deleted` — move the newest trashed copy back. */
+export const restoreDeletedProject = (
+  projectId: string
+): Promise<Result<{ project_id?: string; restored?: boolean; trash_name?: string; project?: LifecycleProject }>> =>
+  postJson(projectPath(projectId, "/restore-deleted"));
 
 /** `GET /api/projects/{id}/history` — every version, newest first. */
 export const loadProjectHistory = (projectId: string): Promise<Result<LifecycleHistory>> =>

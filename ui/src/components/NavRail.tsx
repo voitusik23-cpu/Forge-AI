@@ -155,10 +155,17 @@ export const TopBar = ({
       </span>
     </button>
 
-    <div className="search">
+    {/* The search field is deliberately OFF: this shell has no search route, and a
+        field that accepts typing and does nothing is exactly the kind of dead zone
+        the owner stopped tolerating. It says so, instead of pretending. */}
+    <div className="search off" title={t(lang, "top.search.off")}>
       <IconSearch size={16} />
-      <input placeholder={t(lang, "top.search")} />
-      <span className="kbd">Ctrl K</span>
+      <input
+        placeholder={t(lang, "top.search")}
+        disabled
+        aria-disabled
+        title={t(lang, "top.search.off")}
+      />
     </div>
 
     <div className="row" style={{ marginLeft: "auto", gap: 14 }}>

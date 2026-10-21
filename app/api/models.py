@@ -150,6 +150,16 @@ class TaskRunResponse:
     #: written can accompany a completed project. The raw answer is not echoed here;
     #: the flag says it was preserved in the run's own record.
     model_intent: Dict[str, Any] = field(default_factory=dict)
+    #: The **lifecycle** project (``proj-…``, ``app.projects.models.LifecycleProject``)
+    #: this run created or was attached to, or ``None`` when the run produced no
+    #: lifecycle project. It is deliberately a *different* key from ``project_id``
+    #: above: that one is the stable workspace/Core project this server was composed
+    #: for (``ws-…``), and copying it here would send a client to a project the
+    #: lifecycle list does not have. The id is published from the attach step's own
+    #: record and is never synthesised, and the same value is written into the run's
+    #: durable ``project_state``. Additive and last so every existing key keeps its
+    #: position and an older client is unaffected.
+    lifecycle_project_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -177,6 +187,8 @@ class TaskRunResponse:
             "cost_tier": self.cost_tier,
             "estimated_cost": self.estimated_cost,
             "model_intent": dict(self.model_intent),
+            # Last, and additive: every key above keeps the position it had before.
+            "lifecycle_project_id": self.lifecycle_project_id,
         }
 
 

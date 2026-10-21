@@ -3599,6 +3599,7 @@ class ForgeApiService:
         self,
         run_id: str,
         *,
+        lifecycle_project_id: str = "",
         project_status: object = "",
         workspace_exists: bool = False,
         files: Sequence[object] = (),
@@ -3616,6 +3617,13 @@ class ForgeApiService:
         its workspace, its manifest, its verification and its acceptance -- and the
         response fields it changes are returned so the caller can publish them.
 
+        ``lifecycle_project_id`` is the ``proj-…`` id of the project the attach step
+        actually created or found. It is published as
+        ``TaskRunResponse.lifecycle_project_id`` and written into the run's durable
+        ``project_state`` under the same name, so the response and the stored record
+        cannot disagree. It is the attach step's value, never derived from the run's
+        ``project_id`` (which is the workspace bound at composition).
+
         The persisted run record is updated with the same facts, so the history and
         the response cannot disagree. Only the facts passed in are used; nothing is
         inferred from the project's *status* alone.
@@ -3626,6 +3634,7 @@ class ForgeApiService:
             getattr(project_status, "value", project_status) or ""
         ).strip().upper()
         project_exists = bool(project_status_word)
+        lifecycle_id = str(lifecycle_project_id or "").strip() or None
         outcome = derive_outcome(
             run_state=run_state,
             run_success=run_success,
@@ -3651,6 +3660,10 @@ class ForgeApiService:
             "project_files_created": bool(manifest),
             "artifact_manifest_saved": bool(manifest),
             "files_created": len(manifest),
+            # Published and persisted from the attach step's own id. ``None`` when the
+            # attach reported no lifecycle project, never a copy of the run's
+            # workspace ``project_id``.
+            "lifecycle_project_id": lifecycle_id,
         }
         store: Optional[RunStore] = None
         if run_id:
@@ -3669,6 +3682,8 @@ class ForgeApiService:
                 "artifact_manifest_saved": fields["artifact_manifest_saved"],
                 "files_created": fields["files_created"],
                 "project_status": project_status_word,
+                # The same id the response publishes, in the run's durable state.
+                "lifecycle_project_id": lifecycle_id,
             },
         )
         return fields

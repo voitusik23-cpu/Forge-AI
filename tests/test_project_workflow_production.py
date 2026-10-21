@@ -833,6 +833,10 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 # mapping means "no intent declared". Additive, like the fields
                 # above; nothing that existed before it changed.
                 "model_intent",
+                # The lifecycle project this run created or was attached to (the
+                # `proj-…` record), or None. Additive and last: `project_id` remains
+                # the workspace/Core project it always was.
+                "lifecycle_project_id",
             },
         )
 

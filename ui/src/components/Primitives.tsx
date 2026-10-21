@@ -48,6 +48,8 @@ export const Button = ({
   disabled = false,
   onClick,
   type = "button",
+  title,
+  disabledReason,
 }: {
   children: ReactNode;
   tone?: "default" | "primary" | "ghost" | "danger";
@@ -56,11 +58,24 @@ export const Button = ({
   disabled?: boolean;
   onClick?: () => void;
   type?: "button" | "submit";
+  /** A plain sentence a hover explains; it never replaces the visible label. */
+  title?: string;
+  /**
+   * The reason the button is off, printed as its native tooltip.
+   *
+   * A disabled control owes the reader two things: that it is off, and why. The
+   * `title` is the machine-readable half (it survives even when the surrounding
+   * layout is cramped); the caller is expected to print the same sentence in the
+   * visible note beside the row, which is the half a screenshot can prove.
+   */
+  disabledReason?: string;
 }) => (
   <button
     type={type}
     disabled={disabled}
     onClick={onClick}
+    title={disabled && disabledReason ? disabledReason : title}
+    aria-disabled={disabled ? true : undefined}
     className={`btn${tone === "default" ? "" : ` ${tone}`}${size === "small" ? " small" : ""}${
       wide ? " wide" : ""
     }`}

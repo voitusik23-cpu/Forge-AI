@@ -432,7 +432,12 @@ export const Models = ({
                         href={`#balance-${providerId}`}
                         className="small"
                         style={{ color: "var(--info-text)" }}
-                        onClick={() => setBalanceDetail(providerId)}
+                        onClick={(event) => {
+                          // The panel is state, not an anchor target: without this the link
+                          // would also change the URL hash and appear to navigate nowhere.
+                          event.preventDefault();
+                          setBalanceDetail(providerId);
+                        }}
                       >
                         {t(lang, "balance.detail.show")}
                       </a>

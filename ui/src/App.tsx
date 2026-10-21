@@ -88,6 +88,26 @@ export const App = () => {
     [nav]
   );
 
+  /**
+   * The project a click asked to see, carried from one screen to another.
+   *
+   * This is the fix for the measured dead click: «Открыть файлы», «Запустить локально»
+   * and «Повторить проверку» on the result card used to switch to «Проекты» and stop
+   * there, so the click looked like it did nothing -- the list appeared with no card
+   * selected. The id (or an empty string, when the record carries none) now travels
+   * with the click, and `nonce` makes a repeated click on the same project a fresh
+   * request instead of a no-op.
+   */
+  const [projectFocus, setProjectFocus] = useState<{ id: string; nonce: number }>({
+    id: "",
+    nonce: 0,
+  });
+
+  const openProjects = useCallback((projectId?: string) => {
+    setProjectFocus((previous) => ({ id: projectId ?? "", nonce: previous.nonce + 1 }));
+    setNav("projects");
+  }, []);
+
   const selectSection = useCallback((section: string) => {
     setNav(section);
     if (section === "help") setHelpTopic(CONTEXT_TOPIC.help);
@@ -137,7 +157,7 @@ export const App = () => {
             onLanguage={setLang}
             onHelp={() => openHelp(CONTEXT_TOPIC.forge)}
             onOpenProviders={() => selectSection("providers")}
-            onOpenProjects={() => selectSection("projects")}
+            onOpenProjects={openProjects}
           />
         ) : null}
         {nav === "overview" ? <Overview lang={lang} backend={backend} /> : null}
@@ -158,6 +178,8 @@ export const App = () => {
             backend={backend}
             onRefresh={() => void reload()}
             onHelp={() => openHelp(CONTEXT_TOPIC.projects)}
+            focusProjectId={projectFocus.id}
+            focusNonce={projectFocus.nonce}
           />
         ) : null}
         {nav === "models" ? (

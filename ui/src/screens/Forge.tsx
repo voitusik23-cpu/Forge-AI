@@ -33,6 +33,7 @@ import {
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { RunProgress } from "../components/RunProgress";
 import { t, type Lang } from "../i18n";
+import { selectRunProject } from "../project-selection.js";
 import { deriveRunHeadline, answerAskedQuestions, type ResultActionId, type ResultHeadline } from "../forge-result";
 import type { BackendState } from "../api/client";
 import {
@@ -45,6 +46,7 @@ import {
   dispatchTask,
   isTerminalRecord,
   loadDiscoverySpecification,
+  loadProjectLifecycle,
   loadProjects,
   loadRunRecord,
   loadUiDefaults,
@@ -416,8 +418,14 @@ export const Forge = ({
   onHelp: () => void;
   /** Opens «Провайдеры»: the agent list is the hub's job, not the workspace's. */
   onOpenProviders: () => void;
-  /** Opens «Проекты», where the project's files, its check and the local run really live. */
-  onOpenProjects: () => void;
+  /**
+   * Opens «Проекты» **on one project**.
+   *
+   * The id is the only thing that makes the click do its job: switching screens without
+   * it left the owner on a list with no card selected, which reads as "nothing happened".
+   * An empty argument means "the list, with nothing selected".
+   */
+  onOpenProjects: (projectId?: string) => void;
 }) => {
   const live = backend.status === "live";
   const status = live ? backend.core : null;
@@ -438,6 +446,34 @@ export const Forge = ({
   }, [loadProjectList]);
 
   const activeProject = String(status?.active_project ?? "");
+
+  /**
+   * The ids `GET /api/projects/lifecycle` lists, so a result action can name a project
+   * that really exists in «Проекты».
+   *
+   * The run response publishes two ids: `project_id` is the *workspace* project the
+   * Core was bound to (`ws-…`, not in this list), and `lifecycle_project_id` is the
+   * `proj-…` record the run created or was attached to. Only the latter may open
+   * anything, and only when this list confirms it -- the check lives in
+   * `project-selection.js`, which the regression test executes directly.
+   */
+  const [lifecycleIds, setLifecycleIds] = useState<string[]>([]);
+  const loadLifecycleIds = useCallback(async () => {
+    const outcome = await loadProjectLifecycle();
+    if (!outcome.ok) {
+      setLifecycleIds([]);
+      return;
+    }
+    setLifecycleIds(
+      outcome.value
+        .map((row) => String(row.project_id ?? ""))
+        .filter((id) => id !== "")
+    );
+  }, []);
+
+  useEffect(() => {
+    void loadLifecycleIds();
+  }, [loadLifecycleIds]);
 
   useEffect(() => {
     if (projects.status !== "ready") return;
@@ -876,7 +912,37 @@ export const Forge = ({
   /** True only when the answer really asked (a plan ending in "?" is not a question list). */
   const askedQuestions = answerAskedQuestions(resultFacts);
 
-  /** What each headline action does. Files, the check and the local run live in «Проекты». */
+  /**
+   * The one project id the result actions may open: the run's own
+   * `lifecycle_project_id` **only** when the lifecycle list confirms it.
+   *
+   * `project_id` is deliberately not read here: it is the workspace/Core project
+   * (`ws-…`), which is not a lifecycle record. An absent id means "this run has no
+   * project" and an id the list does not name means "project not found"; both are a
+   * disabled button with the matching reason, never a click that lands on something
+   * else. `selectRunProject` is the whole rule and is executed by the regression test.
+   */
+  const runProject = selectRunProject(dispatched?.response.lifecycle_project_id, lifecycleIds);
+  const resultProjectId = runProject.projectId;
+  const resultProjectBlockedReason =
+    runProject.reason === "no_project"
+      ? t(lang, "forge.result.action.no_project")
+      : runProject.reason === "unknown_project"
+        ? t(lang, "forge.result.action.unknown_project")
+        : "";
+
+  // A run can create a project, so the list is re-read once the run has an id: the id this
+  // card could open must be one that exists in «Проекты» *now*, not one that existed before.
+  useEffect(() => {
+    if (runId === "") return;
+    void loadLifecycleIds();
+  }, [runId, loadLifecycleIds]);
+
+  /**
+   * What each headline action does. Files, the check and the local run live in «Проекты»,
+   * so those three hand that screen a **concrete project id**; with no id the button is
+   * disabled and the reason is printed instead of pretending to open something.
+   */
   const runResultAction = (action: ResultActionId) => {
     if (action === "answer") {
       void answerClarification();
@@ -886,7 +952,8 @@ export const Forge = ({
       void submit();
       return;
     }
-    onOpenProjects();
+    if (resultProjectId === "") return;
+    onOpenProjects(resultProjectId);
   };
 
   /**
@@ -951,14 +1018,15 @@ export const Forge = ({
 
   const polling = runId !== "" && recordFailure === null && !terminal;
 
-  // The offline executor is the one provider the Core's own composition names as "no files":
-  // it answers with a deterministic report and writes nothing. The write switch is therefore
-  // disabled there, and equally disabled when the run *cannot* write at all — a category other than
-  // `code` (`_write_mode_enabled` ignores write_mode for it) or no routable provider.
+  // The write switch is available whenever the run can write at all: a `code`
+  // category and a routable provider. `mock` is included on purpose -- the Core's
+  // `MOCK_DETERMINISTIC` mode writes the deterministic scaffold when the run belongs
+  // to a lifecycle project, and honestly reports `no_changes` when it does not; the
+  // old blanket "mock cannot write" disabled the only free path that creates a
+  // project at all. A non-code category or no provider still disables it.
   const mockSelected = provider === "mock";
-  const writeUnavailable = mockSelected
-    ? t(lang, "forge.task.write.offline")
-    : category !== "code"
+  const writeUnavailable =
+    category !== "code"
       ? t(lang, "forge.task.write.noncode")
       : !providerChoice.list.includes(provider)
         ? t(lang, "forge.task.write.noprovider")
@@ -1683,18 +1751,35 @@ export const Forge = ({
                     <div className="result-headline-text">{headlineText(lang, headline)}</div>
                     {headline.actions.length > 0 ? (
                       <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                        {headline.actions.map((action) => (
-                          <Button
-                            key={action}
-                            size="small"
-                            tone={action === "retry" || action === "answer" ? "primary" : "ghost"}
-                            disabled={action === "retry" && dispatch.status === "pending"}
-                            onClick={() => runResultAction(action)}
-                          >
-                            {t(lang, RESULT_ACTION_LABELS[action])}
-                          </Button>
-                        ))}
+                        {headline.actions.map((action) => {
+                          // The three project actions need a real lifecycle project id.
+                          // Without one the button is visibly off and the sentence below
+                          // says whether the run has no project at all or the project it
+                          // names is not in the list -- never a click that lands elsewhere.
+                          const needsProject =
+                            action === "open_files" || action === "launch_local" || action === "verify";
+                          const blocked = needsProject && resultProjectId === "";
+                          return (
+                            <Button
+                              key={action}
+                              size="small"
+                              tone={action === "retry" || action === "answer" ? "primary" : "ghost"}
+                              disabled={blocked || (action === "retry" && dispatch.status === "pending")}
+                              disabledReason={blocked ? resultProjectBlockedReason : undefined}
+                              onClick={() => runResultAction(action)}
+                            >
+                              {t(lang, RESULT_ACTION_LABELS[action])}
+                            </Button>
+                          );
+                        })}
                       </div>
+                    ) : null}
+                    {headline.actions.some(
+                      (action) =>
+                        (action === "open_files" || action === "launch_local" || action === "verify") &&
+                        resultProjectId === ""
+                    ) ? (
+                      <div className="small muted">{resultProjectBlockedReason}</div>
                     ) : null}
                     {headline.kind === "ready" || headline.kind === "unverified" ? (
                       <div className="small muted">{t(lang, "forge.result.action.note")}</div>

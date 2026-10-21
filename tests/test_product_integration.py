@@ -3576,6 +3576,10 @@ class CompatibilityTests(Block8Case):
                 # an empty mapping means "no intent declared", and no field that
                 # existed before it changed.
                 "model_intent",
+                # The lifecycle project (`proj-…`) this run created or was attached
+                # to, or None. Additive and last: `project_id` above is still the
+                # workspace/Core project, and it is not copied here.
+                "lifecycle_project_id",
             },
         )
         status = SystemStatusResponse("c", "a", "READY", 1, 1).to_dict()

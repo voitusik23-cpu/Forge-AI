@@ -460,12 +460,12 @@ def create_api_app(
 
     def _attach_project(
         session_id: Optional[str], outcome: Any
-    ) -> tuple[str, Optional[dict[str, Any]]]:
+    ) -> tuple[str, Optional[dict[str, Any]], str]:
         """Attach one finished run to the project its discovery session produced.
 
-        Returns ``(status, facts)``. ``status`` is the fact for the
-        ``X-Forge-Project-Attach`` header: ``none`` when no session was named or no
-        project is linked, ``ok`` when the run was recorded, ``already_attached``
+        Returns ``(status, facts, lifecycle_project_id)``. ``status`` is the fact for
+        the ``X-Forge-Project-Attach`` header: ``none`` when no session was named or
+        no project is linked, ``ok`` when the run was recorded, ``already_attached``
         when that very run id is already a version (an idempotent replay must not
         produce a second version), and ``error:<Type>`` when the attachment failed --
         in which case the failure is logged here and the run's own response is left
@@ -476,18 +476,24 @@ def create_api_app(
         and the version's verification and acceptance. It is ``None`` when nothing
         was attached, so the caller publishes the outcome it already has rather than
         inventing a project.
+
+        ``lifecycle_project_id`` is the ``proj-…`` id of the project the attach step
+        actually found. It is returned separately from ``facts`` so a replay -- which
+        adds no version and therefore has no facts to re-derive the outcome from --
+        still publishes the id of the project the run already belongs to. It is the
+        record's own identifier, never the workspace id and never synthesised.
         """
 
         if not isinstance(session_id, str) or not session_id.strip():
-            return "none", None
+            return "none", None, ""
         try:
             project_id = projects.project_for_session(session_id)
             if not project_id:
-                return "none", None
+                return "none", None, ""
             run_id = str(getattr(outcome.response, "run_id", "") or "")
             project = projects.open_project(project_id)
             if any(item.run_id == run_id for item in project.versions):
-                return "already_attached", None
+                return "already_attached", None, project_id
             # The durable record is the evidence: it carries the classification the
             # run store derived from the persisted snapshot and the writer's own
             # outcome. ``provider_used``/``model_used`` are fields of the response,
@@ -541,12 +547,12 @@ def create_api_app(
                 "run_success": bool(getattr(outcome.response, "success", False)),
                 "error": str(getattr(outcome.response, "error", "") or ""),
             }
-            return "ok", facts
+            return "ok", facts, project_id
         except Exception as exc:  # noqa: BLE001 - the run's own result stands
             logger.exception(
                 "project attach failed for discovery session %s", session_id
             )
-            return f"error:{type(exc).__name__}", None
+            return f"error:{type(exc).__name__}", None, ""
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -781,12 +787,21 @@ def create_api_app(
         # to the project's own facts and the response is updated with them. Without
         # this the response would say "specification ready" for a project that was
         # in fact created and completed a moment later.
-        attach_status, attach_facts = _attach_project(discovery_session_id, outcome)
+        attach_status, attach_facts, lifecycle_project_id = _attach_project(
+            discovery_session_id, outcome
+        )
         body = outcome.response.to_dict()
+        # The lifecycle id is published whenever the attach step found the project,
+        # including an idempotent replay: the run really does belong to it even though
+        # no second version was added. ``None`` when no lifecycle project exists.
+        if lifecycle_project_id:
+            body["lifecycle_project_id"] = lifecycle_project_id
         if attach_facts:
             body.update(
                 api_service.record_project_attach(
-                    outcome.response.run_id, **attach_facts
+                    outcome.response.run_id,
+                    lifecycle_project_id=lifecycle_project_id,
+                    **attach_facts,
                 )
             )
         response = JSONResponse(body)

@@ -33,7 +33,10 @@ import {
   catalogueModelsFor,
   changeProjectPreview,
   createProjectVersion,
+  deleteEmptyProjects,
+  deleteProject,
   dispatchTask,
+  loadDeletedProjects,
   loadProjectDetail,
   loadProjectFiles,
   loadProjectHistory,
@@ -41,6 +44,7 @@ import {
   loadProjectRun,
   loadRunRecord,
   restartProjectRun,
+  restoreDeletedProject,
   restoreProject,
   startProjectRun,
   stopProjectRun,
@@ -49,6 +53,7 @@ import {
   type DispatchResult,
   type Failure,
   type LifecycleArtifact,
+  type LifecycleDeletedProject,
   type LifecycleDetail,
   type LifecycleEntryPoint,
   type LifecycleHistory,
@@ -92,6 +97,38 @@ const statusTone = (status: unknown): "ok" | "warn" | "danger" | "info" | "neutr
 };
 
 type Load<T> = { status: "loading" } | { status: "ready"; value: T } | { status: "failed"; failure: Failure };
+
+/**
+ * Bring the project card to the top of the shell's scrolling region.
+ *
+ * The shell has exactly one scrolling element (`.content`, see base.css) and the card
+ * renders below the list, so without this a click on «Открыть» changed a row's highlight
+ * and nothing else -- the measured "does nothing". The offset is computed explicitly
+ * rather than with `scrollIntoView`, whose ancestor resolution inside a grid/flex child of
+ * an `overflow: auto` container is exactly the kind of thing that silently scrolls a little
+ * and leaves the card off screen.
+ *
+ * The last attempt is recorded on `window.__forgeScroll` so a CDP check can read what the
+ * code actually did instead of inferring it from a picture.
+ */
+const revealProjectCard = (): void => {
+  const card = document.getElementById("project-card");
+  if (card === null) return;
+  const content = card.closest(".content") as HTMLElement | null;
+  if (content === null) return;
+  const target =
+    card.getBoundingClientRect().top -
+    content.getBoundingClientRect().top +
+    content.scrollTop -
+    8;
+  content.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+  (window as unknown as Record<string, unknown>).__forgeScroll = {
+    target: Math.round(target),
+    scrollTopBefore: Math.round(content.scrollTop),
+    cardHeight: Math.round(card.getBoundingClientRect().height),
+  };
+};
+
 
 /** The four facts of a refused call, printed as they arrived. A 409 is never softened. */
 const Refusal = ({ lang, failure, onRetry }: { lang: Lang; failure: Failure; onRetry?: () => void }) => {
@@ -453,6 +490,7 @@ const ProjectCard = ({
   onRunStart,
   onRunStop,
   onRunRestart,
+  onDelete,
 }: {
   lang: Lang;
   backend: BackendState;
@@ -508,6 +546,12 @@ const ProjectCard = ({
   onRunStart: (digest: string) => void;
   onRunStop: () => void;
   onRunRestart: (digest: string) => void;
+  /**
+   * Delete this project: the parent asks the backend, which *moves* the folder into
+   * `.forge/projects-deleted`. The click is refused until it is confirmed inside the card,
+   * so a single accidental press cannot move anything.
+   */
+  onDelete: () => void;
 }) => {
   const archived = project.archived === true;
   const currentVersion = typeof project.current_version === "number" ? project.current_version : 0;
@@ -601,6 +645,11 @@ const ProjectCard = ({
           : t(lang, "projects.preview.not_wired");
 
   const [launchNote, setLaunchNote] = useState("");
+  // Deleting is a two-step decision: the first click only opens the confirmation, so the
+  // sentence that says what will happen is on screen before anything moves.
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const projectId = String(project.project_id ?? "");
+  const canDelete = projectId !== "";
   const changeRef = useRef<HTMLTextAreaElement | null>(null);
 
   // One handler for the whole action vocabulary: the card offers what the backend
@@ -1049,7 +1098,47 @@ const ProjectCard = ({
           <Button size="small" tone="ghost" onClick={onHistory}>
             {t(lang, "projects.action.history")}
           </Button>
+          {/* Deleting is a *move* into `.forge/projects-deleted`, so the confirmation says
+              exactly that before the second click. A record without an id gets a visibly
+              disabled button and the reason, never a click that does nothing. */}
+          <Button
+            size="small"
+            tone="danger"
+            disabled={!canDelete || busy === "delete"}
+            disabledReason={canDelete ? undefined : t(lang, "projects.delete.no_id")}
+            onClick={() => setConfirmDelete(true)}
+          >
+            {busy === "delete" ? t(lang, "projects.delete.running") : t(lang, "projects.action.delete")}
+          </Button>
+          {!canDelete ? <span className="small muted">{t(lang, "projects.delete.no_id")}</span> : null}
         </div>
+
+        {confirmDelete ? (
+          <div className="notice danger" data-testid="project-delete-confirm">
+            <div className="label">
+              {t(lang, "projects.delete.confirm.title").replace("{id}", text(projectId))}
+            </div>
+            <div className="small" style={{ marginTop: 6 }}>
+              {t(lang, "projects.delete.confirm.body")}
+            </div>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+              <Button
+                size="small"
+                tone="danger"
+                disabled={busy === "delete"}
+                onClick={() => {
+                  setConfirmDelete(false);
+                  onDelete();
+                }}
+              >
+                {t(lang, "projects.delete.confirm.yes")}
+              </Button>
+              <Button size="small" tone="ghost" onClick={() => setConfirmDelete(false)}>
+                {t(lang, "projects.delete.confirm.cancel")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
 
         {/* ----------------------------------------------------------- new version */}
         <div>
@@ -1259,11 +1348,22 @@ export const Projects = ({
   backend,
   onRefresh,
   onHelp,
+  focusProjectId = "",
+  focusNonce = 0,
 }: {
   lang: Lang;
   backend: BackendState;
   onRefresh: () => void;
   onHelp: () => void;
+  /**
+   * A project another screen asked to open (the result card's «Открыть файлы»).
+   *
+   * Without it that click only switched screens: the list appeared with no card selected,
+   * which is exactly the "nothing happens" the owner reported. `focusNonce` makes a second
+   * click on the same project a fresh request.
+   */
+  focusProjectId?: string;
+  focusNonce?: number;
 }) => {
   const live = backend.status === "live";
 
@@ -1288,6 +1388,38 @@ export const Projects = ({
     [summaries, filter]
   );
 
+  /**
+   * Open one project: select it, then bring its card into view once the card exists.
+   *
+   * The card renders below the list, so selecting alone looked like nothing happened on a
+   * screen with more rows than fit: the measured complaint. The scroll is therefore tied to
+   * the card's *content* arriving (`detail`), not to the click: at click time the card is
+   * still the «выберите проект» placeholder, and scrolling to that would stop short.
+   */
+  const scrollToCard = useRef(false);
+  const openProject = useCallback((projectId: string) => {
+    if (projectId === "") return;
+    scrollToCard.current = true;
+    setSelectedId(projectId);
+  }, []);
+
+  // A click on another screen's «Открыть файлы»/«Запустить локально» arrives here as
+  // `focusProjectId`. It selects that project and scrolls to its card once the list is
+  // readable; the detail route is fetched by the existing effect on `selectedId`.
+  useEffect(() => {
+    if (focusProjectId === "") return;
+    openProject(focusProjectId);
+  }, [focusProjectId, focusNonce, openProject]);
+
+  // An archived project lives under «Архив»: switch the tab so the row the click asked for
+  // is actually in the table that is shown.
+  useEffect(() => {
+    if (focusProjectId === "" || list.status !== "ready") return;
+    const found = summaries.find((project) => project.project_id === focusProjectId);
+    if (found === undefined) return;
+    setFilter(found.archived === true ? "archive" : "active");
+  }, [focusProjectId, focusNonce, list, summaries]);
+
   // Keep the selection valid across a refresh: a project that vanished must not leave a card
   // describing a record nobody can fetch any more.
   useEffect(() => {
@@ -1311,6 +1443,13 @@ export const Projects = ({
     setDetail({ status: "loading" });
     const outcome = await loadProjectDetail(projectId);
     setDetail(outcome.ok ? { status: "ready", value: outcome.value } : { status: "failed", failure: outcome.failure });
+    if (!scrollToCard.current) return;
+    scrollToCard.current = false;
+    // Two frames: one for React to commit the card, one for the browser to lay it out.
+    // Smooth scrolling is then a real animation from the list the user was looking at.
+    window.requestAnimationFrame(() =>
+      window.requestAnimationFrame(() => revealProjectCard())
+    );
   }, []);
 
   const project = detail?.status === "ready" ? detail.value.project ?? null : null;
@@ -1502,6 +1641,150 @@ export const Projects = ({
     setHistory(outcome.ok ? { status: "ready", value: outcome.value } : { status: "failed", failure: outcome.failure });
   };
 
+  // ------------------------------------------------------------------- deletion
+  //
+  // Deleting a project moves its folder into `.forge/projects-deleted`; the backend
+  // refuses while a process is running and says so with a 409 the Refusal block prints.
+  // Two clicks are required, and the first one only reveals the sentence that says what
+  // will happen -- nothing moves on an accidental press.
+  const deleteSelected = async () => {
+    if (selectedId === "") return;
+    const identifier = selectedId;
+    setBusy("delete");
+    setActionFailure(null);
+    setActionNotice("");
+    setDeleteNotice("");
+    const outcome = await deleteProject(identifier);
+    setBusy("");
+    if (!outcome.ok) {
+      setActionFailure(outcome.failure);
+      return;
+    }
+    const moved = String(outcome.value.trash_path ?? outcome.value.trash_name ?? "");
+    // The confirmation card is gone once the project is gone, so the result is printed
+    // beside the list -- otherwise the click's outcome would vanish with the card.
+    setDeleteNotice(
+      t(lang, "projects.delete.done")
+        .replace("{id}", identifier)
+        .replace("{path}", moved)
+    );
+    setSelectedId("");
+    setDetail(null);
+    await loadList();
+    await loadTrash();
+    onRefresh();
+  };
+
+  // -------------------------------------------------------------------- the trash
+  //
+  // «Удалённые проекты» is not a second project list: it is the answer of
+  // `GET /api/projects/deleted`, which reads `.forge/projects-deleted` directly. Every
+  // row says when the project was deleted, how many files it held and what status it
+  // had, because those three facts decide whether restoring it is worth doing. There
+  // is no permanent-delete control here or anywhere in this screen: restore is the
+  // only action the trash offers.
+  const [trash, setTrash] = useState<Load<LifecycleDeletedProject[]>>({ status: "loading" });
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [trashTarget, setTrashTarget] = useState("");
+  const [trashBusy, setTrashBusy] = useState("");
+  const [trashNotice, setTrashNotice] = useState("");
+  const [trashFailure, setTrashFailure] = useState<Failure | null>(null);
+
+  const loadTrash = useCallback(async () => {
+    const outcome = await loadDeletedProjects();
+    setTrash(outcome.ok ? { status: "ready", value: outcome.value } : { status: "failed", failure: outcome.failure });
+  }, []);
+
+  useEffect(() => {
+    void loadTrash();
+  }, [loadTrash]);
+
+  const trashItems = trash.status === "ready" ? trash.value : [];
+  const trashCount = trashItems.length;
+
+  const restoreFromTrash = async (identifier: string) => {
+    setTrashTarget("");
+    setTrashBusy(identifier);
+    setTrashFailure(null);
+    setTrashNotice("");
+    const outcome = await restoreDeletedProject(identifier);
+    setTrashBusy("");
+    if (!outcome.ok) {
+      // The backend's own sentence (a name collision, an entry already restored) is
+      // printed verbatim by `Refusal`: this screen never rewords a refusal into a
+      // success or guesses which one happened.
+      setTrashFailure(outcome.failure);
+      return;
+    }
+    setTrashNotice(t(lang, "projects.trash.restored").replace("{id}", identifier));
+    await loadList();
+    await loadTrash();
+    // The card the click restored is selected, so its files and versions are one
+    // click away and the row is visibly back in the list.
+    setSelectedId(identifier);
+    onRefresh();
+  };
+
+  // ------------------------------------------------------------------ bulk cleanup
+  // The rule the backend applies is stated in the interface too: empty (0 files) and in
+  // NEEDS_CHANGES, FAILED or ARCHIVED. The button first lists what would be removed, so
+  // the owner sees the ribbon of junk disappear *after* approving it by name.
+  const EMPTY_CLEANUP_STATUSES = useMemo(() => ["NEEDS_CHANGES", "FAILED", "ARCHIVED"], []);
+  const emptyCandidates = useMemo(
+    () =>
+      summaries.filter(
+        (project) =>
+          String(project.project_id ?? "") !== "" &&
+          (typeof project.file_count !== "number" || project.file_count === 0) &&
+          EMPTY_CLEANUP_STATUSES.includes(String(project.status ?? "").toUpperCase())
+      ),
+    [summaries, EMPTY_CLEANUP_STATUSES]
+  );
+  const [bulkStep, setBulkStep] = useState<"idle" | "confirm">("idle");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkNotice, setBulkNotice] = useState("");
+  const [bulkFailure, setBulkFailure] = useState<Failure | null>(null);
+  // The result of one deletion, printed beside the list: the card it belonged to is gone
+  // by then, so the card cannot be the place that says what happened.
+  const [deleteNotice, setDeleteNotice] = useState("");
+
+  const runBulkCleanup = async () => {
+    setBulkStep("idle");
+    setBulkBusy(true);
+    setBulkFailure(null);
+    setBulkNotice("");
+    const outcome = await deleteEmptyProjects();
+    setBulkBusy(false);
+    if (!outcome.ok) {
+      setBulkFailure(outcome.failure);
+      return;
+    }
+    const removed = outcome.value.deleted_count ?? 0;
+    const skipped = outcome.value.skipped_count ?? 0;
+    const removedIds = (outcome.value.deleted ?? [])
+      .map((item) => String(item.project_id ?? ""))
+      .filter((item) => item !== "");
+    setBulkNotice(
+      `${t(lang, "projects.delete.bulk.done").replace("{n}", String(removed))}${
+        removedIds.length > 0 ? ` (${removedIds.join(", ")})` : ""
+      }`
+    );
+    if (skipped > 0) {
+      setBulkNotice(
+        `${t(lang, "projects.delete.bulk.done").replace("{n}", String(removed))} ` +
+          t(lang, "projects.delete.bulk.skipped").replace("{n}", String(skipped))
+      );
+    }
+    // A selection that was just removed must not leave a card describing a gone record.
+    if (selectedId !== "" && removedIds.includes(selectedId)) {
+      setSelectedId("");
+      setDetail(null);
+    }
+    await loadList();
+    await loadTrash();
+    onRefresh();
+  };
+
   // ------------------------------------------------------------------- actions
   const runAction = async (
     kind: "verify" | "archive" | "restore",
@@ -1651,13 +1934,28 @@ export const Projects = ({
           title={t(lang, "projects.list.title")}
           hint={`/api/projects/lifecycle · ${summaries.length}`}
           action={
-            <div className="segment">
-              <button className={filter === "active" ? "on" : ""} onClick={() => setFilter("active")}>
-                {t(lang, "projects.filter.active")}
-              </button>
-              <button className={filter === "archive" ? "on" : ""} onClick={() => setFilter("archive")}>
-                {t(lang, "projects.filter.archive")}
-              </button>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+              <Button
+                size="small"
+                tone="ghost"
+                disabled={bulkBusy}
+                onClick={() => {
+                  setBulkFailure(null);
+                  setBulkNotice("");
+                  setBulkStep(emptyCandidates.length === 0 ? "idle" : "confirm");
+                  if (emptyCandidates.length === 0) setBulkNotice(t(lang, "projects.delete.bulk.none"));
+                }}
+              >
+                {bulkBusy ? t(lang, "projects.delete.bulk.running") : t(lang, "projects.delete.bulk.button")}
+              </Button>
+              <div className="segment">
+                <button className={filter === "active" ? "on" : ""} onClick={() => setFilter("active")}>
+                  {t(lang, "projects.filter.active")}
+                </button>
+                <button className={filter === "archive" ? "on" : ""} onClick={() => setFilter("archive")}>
+                  {t(lang, "projects.filter.archive")}
+                </button>
+              </div>
             </div>
           }
         />
@@ -1691,7 +1989,7 @@ export const Projects = ({
                     key={id}
                     className={id === selectedId ? "selected" : ""}
                     style={{ cursor: "pointer" }}
-                    onClick={() => setSelectedId(id)}
+                    onClick={() => openProject(id)}
                   >
                     <td style={{ fontWeight: 600 }}>
                       {text(project.name, t(lang, "projects.card.untitled"))}
@@ -1715,7 +2013,7 @@ export const Projects = ({
                       {archived ? <div className="small muted">{t(lang, "projects.badge.archived")}</div> : null}
                     </td>
                     <td>
-                      <Button size="small" onClick={() => setSelectedId(id)}>
+                      <Button size="small" onClick={() => openProject(id)}>
                         {t(lang, "projects.action.open")}
                       </Button>
                     </td>
@@ -1725,12 +2023,177 @@ export const Projects = ({
             </tbody>
           </table>
         )}
+
+        {/* What the bulk cleanup would do, before it does it. The list is printed by id,
+            because "the ribbon of junk" is exactly the rows the owner recognises. */}
+        {bulkStep === "confirm" ? (
+          <div className="notice warn" data-testid="projects-bulk-confirm">
+            <div className="label">
+              {t(lang, "projects.delete.bulk.found")
+                .replace("{n}", String(emptyCandidates.length))
+                .replace("{ids}", emptyCandidates.map((item) => String(item.project_id ?? "")).join(", "))}
+            </div>
+            <div className="small" style={{ marginTop: 6 }}>
+              {t(lang, "projects.delete.bulk.hint")}
+            </div>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+              <Button size="small" tone="danger" disabled={bulkBusy} onClick={() => void runBulkCleanup()}>
+                {t(lang, "projects.delete.bulk.confirm").replace("{n}", String(emptyCandidates.length))}
+              </Button>
+              <Button size="small" tone="ghost" onClick={() => setBulkStep("idle")}>
+                {t(lang, "projects.delete.bulk.cancel")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+        {deleteNotice !== "" ? (
+          <div className="notice" style={{ marginTop: 8 }} data-testid="project-delete-notice">
+            {deleteNotice}
+          </div>
+        ) : null}
+        {bulkNotice !== "" ? (
+          <div className="notice" style={{ marginTop: 8 }} data-testid="projects-bulk-notice">
+            {bulkNotice}
+          </div>
+        ) : null}
+        {bulkFailure !== null ? (
+          <div style={{ marginTop: 8 }}>
+            <Refusal lang={lang} failure={bulkFailure} />
+          </div>
+        ) : null}
+
         <div className="small muted" style={{ marginTop: 8 }}>
           {t(lang, "projects.list.hint")}
         </div>
       </Card>
 
+      {/* ---------------------------------------------------------- deleted projects */}
+      {/* Collapsed by default: the trash is where a mistake can be undone, not a second
+          list to read every time. The heading states the real location and the count,
+          and the only action is «Восстановить» -- there is no permanent delete. */}
+      <div data-testid="projects-trash">
+      <Card className="rise d1">
+        <CardHead
+          title={t(lang, "projects.trash.title")}
+          hint={`/api/projects/deleted · ${trashCount}`}
+          action={
+            <Button
+              size="small"
+              tone="ghost"
+              onClick={() => {
+                const next = !trashOpen;
+                setTrashOpen(next);
+                if (next) void loadTrash();
+              }}
+            >
+              {trashOpen ? t(lang, "projects.trash.hide") : t(lang, "projects.trash.show")}
+            </Button>
+          }
+        />
+        {!trashOpen ? (
+          <div className="small muted">{t(lang, "projects.trash.closed")}</div>
+        ) : trash.status === "loading" ? (
+          <div className="small muted">{t(lang, "state.loading")}</div>
+        ) : trash.status === "failed" ? (
+          <Refusal lang={lang} failure={trash.failure} onRetry={() => void loadTrash()} />
+        ) : trashItems.length === 0 ? (
+          <div className="small muted">{t(lang, "projects.trash.empty")}</div>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t(lang, "projects.col.name")}</th>
+                <th>{t(lang, "projects.trash.deleted_at")}</th>
+                <th>{t(lang, "projects.col.files")}</th>
+                <th>{t(lang, "projects.trash.status")}</th>
+                <th>{t(lang, "projects.col.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trashItems.map((item) => {
+                const id = String(item.project_id ?? "");
+                const filesHeld =
+                  typeof item.file_count === "number" ? String(item.file_count) : "—";
+                return (
+                  <tr key={String(item.trash_name ?? id)} data-testid="projects-trash-row">
+                    <td style={{ fontWeight: 600 }}>
+                      {text(item.name, t(lang, "projects.card.untitled"))}
+                      <div className="mono small muted">{text(item.project_id)}</div>
+                      <div className="mono small muted" style={{ overflowWrap: "anywhere" }}>
+                        {text(item.trash_path)}
+                      </div>
+                    </td>
+                    <td className="mono small">{text(item.deleted_at, t(lang, "projects.trash.unknown_date"))}</td>
+                    <td className="mono small">{filesHeld}</td>
+                    <td>
+                      <Badge tone={statusTone(item.status)}>
+                        {text(item.status, t(lang, "runs.unknown"))}
+                      </Badge>
+                    </td>
+                    <td>
+                      <Button
+                        size="small"
+                        disabled={id === "" || trashBusy === id}
+                        disabledReason={id === "" ? t(lang, "projects.delete.no_id") : undefined}
+                        onClick={() => {
+                          setTrashFailure(null);
+                          setTrashNotice("");
+                          setTrashTarget(id);
+                        }}
+                      >
+                        {trashBusy === id ? t(lang, "projects.trash.restoring") : t(lang, "projects.action.restore")}
+                      </Button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+
+        {/* The confirmation says exactly what the backend will do: move the folder back
+            out of `.forge/projects-deleted`, not "delete" or "undo" in the abstract. */}
+        {trashTarget !== "" ? (
+          <div className="notice warn" data-testid="project-restore-confirm" style={{ marginTop: 10 }}>
+            <div className="label">
+              {t(lang, "projects.trash.confirm.title").replace("{id}", trashTarget)}
+            </div>
+            <div className="small" style={{ marginTop: 6 }}>
+              {t(lang, "projects.trash.confirm.body")}
+            </div>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+              <Button
+                size="small"
+                tone="primary"
+                disabled={trashBusy !== ""}
+                onClick={() => void restoreFromTrash(trashTarget)}
+              >
+                {t(lang, "projects.trash.confirm.yes")}
+              </Button>
+              <Button size="small" tone="ghost" onClick={() => setTrashTarget("")}>
+                {t(lang, "projects.trash.confirm.cancel")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+        {trashNotice !== "" ? (
+          <div className="notice" style={{ marginTop: 8 }} data-testid="project-restore-notice">
+            {trashNotice}
+          </div>
+        ) : null}
+        {trashFailure !== null ? (
+          <div style={{ marginTop: 8 }} data-testid="project-restore-failure">
+            <Refusal lang={lang} failure={trashFailure} />
+          </div>
+        ) : null}
+        <div className="small muted" style={{ marginTop: 8 }}>
+          {t(lang, "projects.trash.note")}
+        </div>
+      </Card>
+      </div>
+
       {/* ------------------------------------------------------------- the card */}
+      <div id="project-card">
       {selectedId === "" ? (
         <Card className="rise d1">
           <CardHead title={t(lang, "projects.card.title")} />
@@ -1803,8 +2266,10 @@ export const Projects = ({
           onRunStart={(digest) => void runStart(digest)}
           onRunStop={() => void runStop()}
           onRunRestart={(digest) => void runRestart(digest)}
+          onDelete={() => void deleteSelected()}
         />
       ) : null}
+      </div>
 
       {/* --------------------------------------------------------------- history */}
       {history !== null ? (
