@@ -15,6 +15,8 @@
 // "no answer at all", "401/403" and "HTTP 500 with a detail" are three different things to a
 // user and the interface must not merge them into one message.
 
+import { taskRunBody } from "../task-run-body";
+
 export type ProjectInfo = {
   project_id?: string;
   name?: string;
@@ -486,6 +488,19 @@ export const dispatchTask = async (input: {
    */
   discoverySessionId?: string;
   /**
+   * The lifecycle project (`proj-…`) this run belongs to.
+   *
+   * Sent as `lifecycle_project_id`, which `POST /api/tasks/run` reads at the HTTP
+   * boundary (it is deliberately not a field of `TaskRunRequest`) and uses for two
+   * things: the tree a write-mode answer may touch is that project's own workspace,
+   * and after the run finishes the run is attached to that project as its next
+   * version through the existing `attach_run` path. An unknown, archived or deleted
+   * id is refused with 404/409 *before* anything is dispatched, so a change request
+   * can never write files that no record will name. It grants no execution
+   * authority: no command, workspace, profile, environment or timeout travels here.
+   */
+  lifecycleProjectId?: string;
+  /**
    * The owner's answers to the questions the previous run asked.
    *
    * `POST /api/tasks/run` reads them at the HTTP boundary (they are not fields of the
@@ -505,28 +520,20 @@ export const dispatchTask = async (input: {
   signal?: AbortSignal;
 }): Promise<Result<DispatchResult>> => {
   const path = "/api/tasks/run";
-  const body: Record<string, unknown> = {
+  // The body is composed by `ui/src/task-run-body.ts`, the module a test executes to
+  // post the same payload a screen posts. Nothing is added to it here.
+  const body = taskRunBody({
     description: input.description,
     category: input.category,
-  };
-  if (input.providerName) body.provider_name = input.providerName;
-  const modelName = (input.modelName ?? "").trim();
-  if (modelName !== "") body.model_name = modelName;
-  if (input.projectId) body.project_id = input.projectId;
-  if (input.writeMode === true) body.write_mode = true;
-  const discoverySessionId = (input.discoverySessionId ?? "").trim();
-  if (discoverySessionId !== "") body.discovery_session_id = discoverySessionId;
-  const clarificationRunId = (input.clarificationRunId ?? "").trim();
-  if (clarificationRunId !== "") body.clarification_run_id = clarificationRunId;
-  const clarificationAnswers = (input.clarificationAnswers ?? [])
-    .map((item) => ({
-      question: String(item?.question ?? "").trim(),
-      answer: String(item?.answer ?? "").trim(),
-    }))
-    .filter((item) => item.question !== "" && item.answer !== "");
-  if (clarificationAnswers.length > 0) {
-    body.clarification_answers = clarificationAnswers;
-  }
+    providerName: input.providerName,
+    modelName: input.modelName,
+    projectId: input.projectId,
+    writeMode: input.writeMode,
+    discoverySessionId: input.discoverySessionId,
+    lifecycleProjectId: input.lifecycleProjectId,
+    clarificationAnswers: input.clarificationAnswers,
+    clarificationRunId: input.clarificationRunId,
+  });
 
   const headers: Record<string, string> = {
     "content-type": "application/json",

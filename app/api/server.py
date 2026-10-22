@@ -238,6 +238,7 @@ def create_api_app(
     )
     from app.discovery.service import DiscoveryService, apply_specification
     from app.projects.service import ProjectService
+    from app.projects.store import ProjectDeleted, UnknownProject
     from app.tools.approval import ApprovalPolicy
 
     api_service = service or ForgeApiService(
@@ -458,18 +459,71 @@ def create_api_app(
     )
     register_discovery_routes(app, discovery, projects)
 
+    def _require_run_target(project_id: str) -> str:
+        """The id of a **live, active** project this run may be attached to.
+
+        The same three refusals the project routes make, applied *before* anything is
+        dispatched -- so a run for an id no record names writes nothing at all:
+
+        * ``404 unknown_project`` when no record exists (a malformed id included);
+        * ``409 project_deleted`` when the id is in ``projects-deleted``;
+        * ``409 illegal_project_transition`` when the record is archived.
+
+        The guard is the project service's own (``require_active``: deletion marker
+        first, then the record), never a re-implementation of it here.
+        """
+
+        try:
+            project = projects.require_active(project_id)
+        except UnknownProject as unknown:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    **error_body(error_code=unknown.code, code=unknown.code),
+                    "error": str(unknown),
+                },
+            ) from unknown
+        except ProjectDeleted as deleted:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **error_body(error_code=deleted.code, code=deleted.code),
+                    "error": str(deleted),
+                },
+            ) from deleted
+        if bool(getattr(project, "archived", False)):
+            message = (
+                f"an archived project cannot receive a run: restore '{project.project_id}' "
+                "first"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **error_body(
+                        error_code="illegal_project_transition",
+                        code="illegal_project_transition",
+                    ),
+                    "error": message,
+                },
+            )
+        return str(project.project_id)
+
     def _attach_project(
-        session_id: Optional[str], outcome: Any
+        project_id: str, outcome: Any
     ) -> tuple[str, Optional[dict[str, Any]], str]:
-        """Attach one finished run to the project its discovery session produced.
+        """Attach one finished run to the project it belongs to.
+
+        ``project_id`` is the project the **composition** resolved before the run was
+        dispatched -- from the linked discovery session or from the ``proj-…`` id the
+        caller named. It is never taken from the answer, the plan or the task text.
 
         Returns ``(status, facts, lifecycle_project_id)``. ``status`` is the fact for
-        the ``X-Forge-Project-Attach`` header: ``none`` when no session was named or
-        no project is linked, ``ok`` when the run was recorded, ``already_attached``
-        when that very run id is already a version (an idempotent replay must not
-        produce a second version), and ``error:<Type>`` when the attachment failed --
-        in which case the failure is logged here and the run's own response is left
-        exactly as it was.
+        the ``X-Forge-Project-Attach`` header: ``none`` when no project is known,
+        ``ok`` when the run was recorded, ``already_attached`` when that very run id
+        is already a version (an idempotent replay must not produce a second
+        version), and ``error:<Type>`` when the attachment failed -- in which case
+        the failure is logged here and the run's own response is left exactly as it
+        was.
 
         ``facts`` is the project evidence the outcome gate needs *after* the attach:
         the project's status, whether its workspace exists, its artifact manifest,
@@ -484,12 +538,9 @@ def create_api_app(
         record's own identifier, never the workspace id and never synthesised.
         """
 
-        if not isinstance(session_id, str) or not session_id.strip():
+        if not isinstance(project_id, str) or not project_id.strip():
             return "none", None, ""
         try:
-            project_id = projects.project_for_session(session_id)
-            if not project_id:
-                return "none", None, ""
             run_id = str(getattr(outcome.response, "run_id", "") or "")
             project = projects.open_project(project_id)
             if any(item.run_id == run_id for item in project.versions):
@@ -525,7 +576,17 @@ def create_api_app(
             attached = projects.attach_run(
                 project_id, source, source_root=source_root
             )
-            version = attached.current() or attached.latest_version
+            # The version THIS RUN produced, not whatever happens to be current. A
+            # change that wrote nothing records its attempt but leaves the previous
+            # version current; reporting the previous version's manifest, file count
+            # and verdicts as this run's result would be the "a finished run is a new
+            # version" lie this whole path exists to prevent.
+            version = None
+            if run_id:
+                version = next(
+                    (item for item in attached.versions if item.run_id == run_id), None
+                )
+            version = version or attached.current() or attached.latest_version
             files = tuple(getattr(version, "files", ()) or ())
             facts = {
                 "project_status": getattr(
@@ -550,7 +611,7 @@ def create_api_app(
             return "ok", facts, project_id
         except Exception as exc:  # noqa: BLE001 - the run's own result stands
             logger.exception(
-                "project attach failed for discovery session %s", session_id
+                "project attach failed for lifecycle project %s", project_id
             )
             return f"error:{type(exc).__name__}", None, ""
 
@@ -750,26 +811,69 @@ def create_api_app(
                     "'clarification_run_id' is not a usable run id"
                 )
 
+        # THE LIFECYCLE PROJECT. A caller that already knows *which* project this run
+        # belongs to names that ``proj-…`` id here -- «Проекты» does it for a change
+        # request, whose staged version is waiting for exactly one run. Like the
+        # discovery session id above it is read at the HTTP boundary and is
+        # deliberately NOT a field of `TaskRunRequest`: it grants nothing (no
+        # command, workspace, profile, environment or timeout), it only says where
+        # the result belongs.
+        #
+        # It is validated HERE, before anything is dispatched: a run for an unknown,
+        # archived or deleted project is refused with 404/409 instead of writing
+        # files into a workspace that no record will ever name. When the caller also
+        # names a discovery session, both must point at the same project -- a run
+        # whose specification and whose target disagree is refused rather than
+        # attached to the one the caller did not ask for.
+        requested_project_id = payload.get("lifecycle_project_id")
+        attach_project_id = ""
+        if requested_project_id is not None:
+            if not isinstance(requested_project_id, str) or not requested_project_id.strip():
+                raise body_error_exception(
+                    "'lifecycle_project_id' must be a non-empty string when supplied"
+                )
+            attach_project_id = _require_run_target(requested_project_id.strip())
+        if attach_project_id and discovery_session_id is not None:
+            linked_by_session = projects.project_for_session(discovery_session_id)
+            if linked_by_session and linked_by_session != attach_project_id:
+                message = (
+                    "the named discovery session belongs to project "
+                    f"'{linked_by_session}', not to '{attach_project_id}'"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        **error_body(
+                            error_code="project_mismatch", code="project_mismatch"
+                        ),
+                        "error": message,
+                    },
+                )
+
         # THE PROJECT WRITE TARGET. When this run belongs to a lifecycle project, the
         # tree a write-mode answer may touch is that project's own controlled folder
         # (``.forge/projects/<id>/workspace``), resolved here from the project store.
-        # No request value can name it: the only input is the confirmed discovery
-        # session this route already validated. When no project is linked, the target
-        # is absent and the guarded writer keeps the run's own workspace -- which is
-        # the read-only-per-project behaviour this route always had.
+        # No request value can name it: the input is the confirmed discovery session
+        # this route already validated and/or the ``proj-…`` id it just proved names
+        # a live, active record. When no project is linked, the target is absent and
+        # the guarded writer keeps the run's own workspace -- which is the
+        # read-only-per-project behaviour this route always had.
+        target_project = attach_project_id or (
+            projects.project_for_session(discovery_session_id)
+            if isinstance(discovery_session_id, str) and discovery_session_id.strip()
+            else ""
+        )
         project_workspace: Optional[Path] = None
         lifecycle_project_id = ""
         lifecycle_project_path = ""
-        if discovery_session_id is not None and bool(payload.get("write_mode", False)):
-            linked_project = projects.project_for_session(discovery_session_id)
-            if linked_project:
-                lifecycle_project_id = linked_project
-                project_workspace = projects.store.workspace_path(
-                    linked_project, create=True
-                )
-                lifecycle_project_path = projects.store.project_path_relative(
-                    linked_project
-                )
+        if target_project and bool(payload.get("write_mode", False)):
+            lifecycle_project_id = target_project
+            project_workspace = projects.store.workspace_path(
+                target_project, create=True
+            )
+            lifecycle_project_path = projects.store.project_path_relative(
+                target_project
+            )
 
         req = TaskRunRequest(
             description=description,
@@ -816,12 +920,14 @@ def create_api_app(
         except IdempotencyUnavailable as unavailable:
             # Fail closed: nothing was executed, and the caller is told why.
             raise HTTPException(status_code=503, detail=str(unavailable)) from unavailable
-        # THE PROJECT ATTACH. When the caller named a confirmed discovery session,
-        # the run that just finished belongs to that session's project: its written
-        # files are copied into the project workspace, a version is recorded, and
-        # the lifecycle advances. This runs AFTER the existing run path returned and
-        # reads the run's durable record, so nothing above it changes and a failure
-        # here can never reinterpret the run's own result.
+        # THE PROJECT ATTACH. When the caller named a confirmed discovery session or a
+        # ``proj-…`` id, the run that just finished belongs to that project: its
+        # written files are copied into the project workspace, a version is recorded,
+        # and the lifecycle advances. This runs AFTER the existing run path returned
+        # and reads the run's durable record, so nothing above it changes and a
+        # failure here can never reinterpret the run's own result. A change request
+        # fills the version it staged; a run that wrote no file leaves the previous
+        # version current (``attach_run``'s own rule).
         #
         # It runs BEFORE the body is serialized so that the one outcome the caller
         # sees is the truthful one: while the response was assembled no project
@@ -830,7 +936,7 @@ def create_api_app(
         # this the response would say "specification ready" for a project that was
         # in fact created and completed a moment later.
         attach_status, attach_facts, lifecycle_project_id = _attach_project(
-            discovery_session_id, outcome
+            target_project, outcome
         )
         body = outcome.response.to_dict()
         # The lifecycle id is published whenever the attach step found the project,

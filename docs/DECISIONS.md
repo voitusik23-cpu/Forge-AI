@@ -6080,16 +6080,32 @@ without reading a run. The owner needed one answer per project, and needed it to
   pass, would be reported as a finished project. The gate exists precisely to refuse that.
 - **Publish the discovery session id on the project record.** It was rejected to keep the record's
   field set exactly as documented; the cost is that a version submitted from the project screen
-  carries no `discovery_session_id`, which the UI states rather than hides.
+  carries no `discovery_session_id`, which the UI states rather than hides. (Superseded in part by
+  the decision below: the screen carries the project's own id instead, so no record field is added.)
 - **Show a percentage or an ETA while a run is in flight.** The backend publishes neither a per-step
   document nor a rate, so any percentage would be invented.
 
+### The change-run association (2026-10)
+
+A change requested from «Проекты» ran, wrote its files, and the card promised a version that never
+appeared: the screen had no association to send, so `attach_run` was never called. The smallest
+deterministic addition is a second **run-route** field, `lifecycle_project_id`, read at the HTTP
+boundary exactly like `discovery_session_id` and likewise not a field of `TaskRunRequest`.
+
+- It names the project by its own id, so nothing has to be published on the record and no reverse
+  lookup of the session index is needed.
+- The composition validates it *before* dispatch with `require_active` (404 unknown, 409 deleted,
+  409 archived) and refuses a session/project pair that disagrees (409 `project_mismatch`).
+- After the run, the existing `attach_run` path records the version **that run id** produced and
+  advances only on its own gate; a change run that wrote no file leaves the previous version current.
+- The response's `files_created`/verdicts now come from that attempt, not from whatever version
+  happens to be current, so a zero-file change cannot borrow the previous version's evidence.
+
 ### Consequences and open items
 
-The consequence of the session-link decision is visible and documented: attaching a version happens
-through a run that carries the confirmed session (the Кузница flow). A future revision may expose the
-link read-only, which would close that gap without changing the record's contract. `docs/USER_MANUAL.md`
-describes the flow for the owner; `docs/ARCHITECTURE.md` describes the implementation.
+The session link is still the creation path, and the project id is the change path; both end in the
+same `attach_run`. `docs/USER_MANUAL.md` describes the flow for the owner; `docs/ARCHITECTURE.md`
+describes the implementation.
 
 ## Project lifecycle v0.1 — русская версия
 
@@ -6153,16 +6169,35 @@ describes the flow for the owner; `docs/ARCHITECTURE.md` describes the implement
   прошёл проверку, был бы показан как завершённый проект. Гейт существует именно чтобы это отклонить.
 - **Публиковать идентификатор сессии уточнения в записи проекта.** Отклонено, чтобы набор полей
   записи оставался ровно задокументированным; цена — версия, отправленная с экрана проекта, не несёт
-  `discovery_session_id`, и интерфейс это сообщает, а не скрывает.
+  `discovery_session_id`, и интерфейс это сообщает, а не скрывает. (Частично снято решением ниже:
+  экран несёт собственный id проекта, поэтому поле записи не добавляется.)
 - **Показывать процент или оценку времени, пока запуск идёт.** Backend не публикует ни пошаговый
   документ, ни темп, поэтому любой процент был бы выдумкой.
 
+### Привязка запуска изменения (2026-10)
+
+Изменение, запрошенное из «Проектов», выполнялось, записывало файлы, а карточка обещала версию,
+которая не появлялась: экрану нечего было отправить для привязки, поэтому `attach_run` не
+вызывался. Минимальное детерминированное добавление — второе поле **маршрута запуска**,
+`lifecycle_project_id`, читаемое на границе HTTP так же, как `discovery_session_id`, и так же не
+являющееся полем `TaskRunRequest`.
+
+- Оно называет проект его собственным id, поэтому в записи ничего публиковать не нужно и обратный
+  поиск по индексу сессий не требуется.
+- Композиция проверяет его **до** диспетчеризации через `require_active` (404 неизвестен, 409
+  удалён, 409 архив) и отклоняет пару «сессия/проект», которая не совпадает (409 `project_mismatch`).
+- После запуска существующий путь `attach_run` записывает версию, которую произвёл **этот run id**,
+  и двигает жизненный цикл только по своему условию; запуск изменения, не записавший файлов,
+  оставляет текущей предыдущую версию.
+- `files_created`/вердикты ответа теперь относятся к этой попытке, а не к той версии, что случайно
+  оказалась текущей, поэтому изменение без файлов не может «одолжить» доказательства предыдущей
+  версии.
+
 ### Следствия и открытые пункты
 
-Следствие решения о связи сессии видно и задокументировано: привязка версии происходит через запуск,
-несущий подтверждённую сессию (поток «Кузницы»). Будущая ревизия может опубликовать связь только для
-чтения, что закрыло бы этот разрыв без изменения контракта записи. `docs/USER_MANUAL.md` описывает
-поток для владельца; `docs/ARCHITECTURE.md` описывает реализацию.
+Связь сессии остаётся путём создания, а id проекта — путём изменения; оба заканчиваются одним и тем
+же `attach_run`. `docs/USER_MANUAL.md` описывает поток для владельца; `docs/ARCHITECTURE.md`
+описывает реализацию.
 
 ## Run Outcome Gate and Paid-Model Policy v0.1
 

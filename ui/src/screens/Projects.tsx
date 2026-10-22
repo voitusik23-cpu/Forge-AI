@@ -110,6 +110,22 @@ const statusTone = (status: unknown): "ok" | "warn" | "danger" | "info" | "neutr
 type Load<T> = { status: "loading" } | { status: "ready"; value: T } | { status: "failed"; failure: Failure };
 
 /**
+ * What one change run did to the project, read from the record *after* the run.
+ *
+ * The honest rule the card applies: a version exists only when `toVersion` is
+ * greater than `fromVersion`. `filesCreated` explains why it is not (a run that
+ * wrote no file does not advance the project), and `attached` says whether the Core
+ * recorded the run against this project at all.
+ */
+type ChangeOutcome = {
+  runId: string;
+  filesCreated: number;
+  attached: boolean;
+  fromVersion: number;
+  toVersion: number;
+};
+
+/**
  * Bring the project card to the top of the shell's scrolling region.
  *
  * The shell has exactly one scrolling element (`.content`, see base.css) and the card
@@ -477,6 +493,7 @@ const ProjectCard = ({
   onDispatch,
   dispatching,
   dispatched,
+  changeOutcome,
   dispatchFailure,
   provider,
   onProvider,
@@ -529,6 +546,15 @@ const ProjectCard = ({
   onDispatch: () => void;
   dispatching: boolean;
   dispatched: DispatchResult | null;
+  /**
+   * What the change run did to the project, read back from the refreshed record.
+   *
+   * It exists because the response alone cannot answer the question the card is
+   * asked: a run that finished is not a new version. `fromVersion`/`toVersion` come
+   * from the project record itself, so «новая версия v3» can only be printed when
+   * `current_version` really moved.
+   */
+  changeOutcome: ChangeOutcome | null;
   dispatchFailure: Failure | null;
   provider: string;
   onProvider: (value: string) => void;
@@ -1211,15 +1237,18 @@ const ProjectCard = ({
               <Button size="small" disabled={busy === "version"} onClick={onNewVersion}>
                 {busy === "version" ? t(lang, "projects.newversion.running") : t(lang, "projects.newversion.create")}
               </Button>
-              <label className={`forge-toggle${mockSelected ? " disabled" : ""}`}>
+              {/* The switch is available for every routable provider, `mock` included:
+                  the Core's MOCK_DETERMINISTIC mode writes the deterministic scaffold
+                  when the run belongs to a lifecycle project, and honestly reports
+                  `no_changes` when it does not. That is the only free path that can
+                  create (or extend) a project at all, and it calls no model. */}
+              <label className="forge-toggle">
                 <input
                   type="checkbox"
-                  checked={writeMode && !mockSelected}
-                  disabled={mockSelected}
+                  checked={writeMode}
                   onChange={(event) => onWriteMode(event.target.checked)}
                 />
                 <span>{t(lang, "projects.newversion.write")}</span>
-                {mockSelected ? <span className="small muted">· {t(lang, "forge.discovery.mock.write")}</span> : null}
               </label>
             </div>
             {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
@@ -1241,6 +1270,33 @@ const ProjectCard = ({
             ) : null}
 
             {dispatchFailure !== null ? <Refusal lang={lang} failure={dispatchFailure} /> : null}
+
+            {/* THE HONEST RESULT OF A CHANGE. A finished run is not a new version: the
+                card says a new version exists only when the refreshed record's
+                `current_version` really moved, and otherwise prints the same sentence
+                the backend's own presentation uses. The run id is always named, so the
+                owner can open exactly that run. */}
+            {changeOutcome !== null ? (
+              <div
+                className={`notice ${changeOutcome.toVersion > changeOutcome.fromVersion ? "" : "warn"}`}
+                data-testid="change-outcome"
+              >
+                <div className="label">{t(lang, "projects.newversion.outcome.title")}</div>
+                <div style={{ marginTop: 6 }}>
+                  {!changeOutcome.attached
+                    ? t(lang, "projects.newversion.outcome.unattached")
+                    : changeOutcome.toVersion > changeOutcome.fromVersion
+                      ? t(lang, "projects.newversion.outcome.advanced")
+                          .replace("{version}", `v${changeOutcome.toVersion}`)
+                          .replace("{run}", changeOutcome.runId)
+                      : t(lang, "projects.newversion.outcome.not_written")}
+                </div>
+                <div className="small mono" style={{ marginTop: 6, wordBreak: "break-word" }}>
+                  {`${changeOutcome.attached ? "v" + changeOutcome.toVersion : "—"} · run ${changeOutcome.runId} · ${t(lang, "projects.col.files")}: ${changeOutcome.filesCreated}`}
+                </div>
+              </div>
+            ) : null}
+
             {dispatched !== null ? (
               <Facts
                 items={[
@@ -1446,21 +1502,25 @@ export const Projects = ({
   const [actionFailure, setActionFailure] = useState<Failure | null>(null);
   const [actionNotice, setActionNotice] = useState("");
 
-  const loadDetail = useCallback(async (projectId: string) => {
+  const loadDetail = useCallback(async (projectId: string): Promise<LifecycleDetail | null> => {
     if (projectId === "") {
       setDetail(null);
-      return;
+      return null;
     }
     setDetail({ status: "loading" });
     const outcome = await loadProjectDetail(projectId);
     setDetail(outcome.ok ? { status: "ready", value: outcome.value } : { status: "failed", failure: outcome.failure });
-    if (!scrollToCard.current) return;
+    if (!scrollToCard.current) return outcome.ok ? outcome.value : null;
     scrollToCard.current = false;
     // Two frames: one for React to commit the card, one for the browser to lay it out.
     // Smooth scrolling is then a real animation from the list the user was looking at.
     window.requestAnimationFrame(() =>
       window.requestAnimationFrame(() => revealProjectCard())
     );
+    // The loaded record is returned as well: a caller that has just changed the
+    // project (a dispatched change run) reads the new `current_version` from it
+    // instead of guessing it from the run's own response.
+    return outcome.ok ? outcome.value : null;
   }, []);
 
   const project = detail?.status === "ready" ? detail.value.project ?? null : null;
@@ -1829,6 +1889,7 @@ export const Projects = ({
   const [staged, setStaged] = useState<LifecycleNewVersion | null>(null);
   const [dispatching, setDispatching] = useState(false);
   const [dispatched, setDispatched] = useState<DispatchResult | null>(null);
+  const [changeOutcome, setChangeOutcome] = useState<ChangeOutcome | null>(null);
   const [dispatchFailure, setDispatchFailure] = useState<Failure | null>(null);
 
   const [provider, setProvider] = useState("");
@@ -1843,6 +1904,7 @@ export const Projects = ({
     setActionNotice("");
     setStaged(null);
     setDispatched(null);
+    setChangeOutcome(null);
     setDispatchFailure(null);
     setFiles(null);
     setHistory(null);
@@ -1886,6 +1948,7 @@ export const Projects = ({
     setActionFailure(null);
     setActionNotice("");
     setDispatched(null);
+    setChangeOutcome(null);
     setDispatchFailure(null);
     const outcome = await createProjectVersion(selectedId, trimmed);
     setBusy("");
@@ -1901,14 +1964,24 @@ export const Projects = ({
 
   const submitTask = async () => {
     if (staged === null || typeof staged.task_text !== "string" || staged.task_text === "") return;
+    if (selectedId === "") return;
+    const fromVersion = currentVersionNumber;
     setDispatching(true);
     setDispatchFailure(null);
+    setChangeOutcome(null);
     const outcome = await dispatchTask({
       description: staged.task_text,
       category: "code",
       providerName: options.includes(provider) ? provider : undefined,
       modelName: model !== "" ? model : undefined,
-      writeMode: writeMode && !mockSelected,
+      writeMode,
+      // THE ASSOCIATION. The run that executes this staged change text belongs to the
+      // project the card is showing, so the project's own `proj-…` id travels with it.
+      // The Core then (a) targets the project's controlled workspace with a write-mode
+      // answer and (b) records the run as the project's next version through the
+      // existing `attach_run` path. Without it the run finished into a workspace no
+      // record named and the card promised a version that never appeared.
+      lifecycleProjectId: selectedId,
     });
     setDispatching(false);
     if (!outcome.ok) {
@@ -1916,6 +1989,21 @@ export const Projects = ({
       return;
     }
     setDispatched(outcome.value);
+    // Read the record *after* the run: a new version exists only if `current_version`
+    // really moved. The response alone cannot answer that question.
+    const refreshed = await loadDetail(selectedId);
+    const toVersion =
+      refreshed !== null && typeof refreshed.project?.current_version === "number"
+        ? refreshed.project.current_version
+        : fromVersion;
+    setChangeOutcome({
+      runId: String(outcome.value.response.run_id ?? ""),
+      filesCreated: Number(outcome.value.response.files_created ?? 0),
+      attached: String(outcome.value.response.lifecycle_project_id ?? "") === selectedId,
+      fromVersion,
+      toVersion,
+    });
+    await loadList();
     onRefresh();
   };
 
@@ -2287,6 +2375,7 @@ export const Projects = ({
           onDispatch={() => void submitTask()}
           dispatching={dispatching}
           dispatched={dispatched}
+          changeOutcome={changeOutcome}
           dispatchFailure={dispatchFailure}
           provider={provider}
           onProvider={setProvider}

@@ -86,6 +86,11 @@ APP_TSX = UI_SOURCE / "App.tsx"
 FORGE_TSX = UI_SOURCE / "screens" / "Forge.tsx"
 PROJECTS_TSX = UI_SOURCE / "screens" / "Projects.tsx"
 FORGE_CLIENT = UI_SOURCE / "api" / "forge.ts"
+#: The `POST /api/tasks/run` body is composed here and `dispatchTask` calls it, so a
+#: target the client "calls" may be named in either module. Both are searched, and the
+#: client is separately required to use the builder -- otherwise the builder could be
+#: dead code and the actions with it.
+TASK_RUN_BODY = UI_SOURCE / "task-run-body.ts"
 
 WORKSPACE_PROJECT_ID = "flow-invariants-workspace"
 GOAL = "Хочу небольшой локальный справочник сотрудников с поиском по имени."
@@ -656,13 +661,18 @@ class NoDeadActionTests(unittest.TestCase):
 
     def test_04_the_client_really_calls_each_action_target(self) -> None:
         client_source = FORGE_CLIENT.read_text(encoding="utf-8")
+        # The request body has one composer (`ui/src/task-run-body.ts`) and the client
+        # must really use it, or a field asserted below would be dead.
+        self.assertIn("taskRunBody(", client_source)
+        searched = client_source + TASK_RUN_BODY.read_text(encoding="utf-8")
         for action_id, target in ACTION_TARGETS.items():
             needle = str(target["ui_path"])
             self.assertIn(
                 needle,
-                client_source,
-                f"action {action_id!r} claims target {needle!r}, but ui/src/api/forge.ts "
-                "never calls it: the action is dead",
+                searched,
+                f"action {action_id!r} claims target {needle!r}, but neither "
+                "ui/src/api/forge.ts nor the task-run body it calls ever sends it: "
+                "the action is dead",
             )
 
     def test_05_the_open_files_action_carries_a_concrete_project_id(self) -> None:

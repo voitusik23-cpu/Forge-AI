@@ -4373,6 +4373,36 @@ timeout, or allowlist can be named through it).
   chain, cost-aware routing, the frozen `RunScope`, and every security boundary are
   untouched.
 
+### The project association a change run carries
+
+A run can belong to a lifecycle project in two ways, both read at the HTTP boundary
+and both deliberately **not** fields of `TaskRunRequest`:
+
+* `discovery_session_id` — the confirmed session the run executes (the Кузница
+  creation path). The project is resolved from the store's session link.
+* `lifecycle_project_id` — the `proj-…` id itself (the «Проекты» change path). The
+  screen stages the next version with `POST /api/projects/{id}/versions` and then
+  submits the staged task text with this field, so the attach no longer depends on a
+  session id the record does not publish.
+
+Before anything is dispatched the id is proved with the project service's own guard
+(`require_active`: deletion marker first, then the record): `404 unknown_project` for
+an id no record names (a malformed or traversal-shaped one included), `409
+project_deleted` for an id in `projects-deleted`, `409 illegal_project_transition`
+for an archived record. When both associations are sent they must name the same
+project, otherwise the run is refused with `409 project_mismatch`. A refused run
+writes no file and dispatches nothing.
+
+After the run finishes, the composition attaches it to that project:
+`ProjectService.attach_run` copies the files the run wrote (a write-mode answer is
+written straight into the project's own workspace, `materialize_into`), records the
+version that **this run id** produced, and advances the lifecycle only when the
+existing completion gate is satisfied. A change request whose run wrote zero files
+records its attempt but leaves the previous version current. The response then names
+`lifecycle_project_id`, its `files_created`/verdicts are the *attempt's* — never the
+previous version's — and `X-Forge-Project-Attach` reports `ok`,
+`already_attached` (an idempotent replay adds no second version) or `none`.
+
 ### Smoke and tests
 
 `python -m app.smoke_discovery` prints `INITIAL GOAL`, `QUESTIONS`, `ANSWERS`
@@ -4538,6 +4568,36 @@ LLM-хук формулировок за существующим интерфе
   fallback, cost-aware маршрутизация, замороженный `RunScope` и все границы
   безопасности не изменяются.
 
+### Привязка запуска к проекту
+
+Запуск может принадлежать проекту жизненного цикла двумя способами; оба читаются на
+границе HTTP и оба намеренно **не** являются полями `TaskRunRequest`:
+
+- `discovery_session_id` — подтверждённая сессия, которую запуск исполняет (путь
+  создания в «Кузнице»). Проект находится по ссылке сессии в хранилище.
+- `lifecycle_project_id` — сам id `proj-…` (путь изменения в «Проектах»). Экран
+  подготавливает следующую версию через `POST /api/projects/{id}/versions` и затем
+  отправляет подготовленный текст задачи с этим полем, поэтому привязка больше не
+  зависит от id сессии, который запись проекта не публикует.
+
+До любой диспетчеризации id проверяется собственной защитой сервиса проектов
+(`require_active`: сначала маркер удаления, затем запись): `404 unknown_project` для
+id, который не называет ни одна запись (включая некорректный и traversal-подобный),
+`409 project_deleted` для id в `projects-deleted`, `409 illegal_project_transition`
+для архивной записи. Если переданы обе привязки, они должны указывать на один проект,
+иначе запуск отклоняется с `409 project_mismatch`. Отклонённый запуск не пишет ни
+одного файла и ничего не диспетчеризует.
+
+После завершения запуска композиция привязывает его к этому проекту:
+`ProjectService.attach_run` копирует записанные запуском файлы (ответ в режиме записи
+пишется прямо в рабочую папку проекта, `materialize_into`), записывает версию,
+которую произвёл **именно этот run id**, и двигает жизненный цикл только если
+выполнено существующее условие завершения. Запрос изменения, чей запуск не записал ни
+одного файла, фиксирует попытку, но оставляет текущей предыдущую версию. В ответе
+публикуется `lifecycle_project_id`, его `files_created`/вердикты относятся к **этой
+попытке**, а не к предыдущей версии, а `X-Forge-Project-Attach` сообщает `ok`,
+`already_attached` (идемпотентный повтор не добавляет вторую версию) или `none`.
+
 ### Smoke и тесты
 
 `python -m app.smoke_discovery` печатает `INITIAL GOAL`, `QUESTIONS`, `ANSWERS`
@@ -4642,10 +4702,10 @@ size, a SHA-256, its change and its verification relevance. Refusals keep the su
 `illegal_project_transition`/`project_not_completable` with the layer's own sentence.
 
 `POST /api/discovery/sessions/{id}/confirm` additionally creates the record (additive `project`
-field in the response), and `POST /api/tasks/run` attaches a finished run to the project of the
-session it was given, then reports the outcome in the `X-Forge-Project-Attach` header
-(`none`, `ok`, `already_attached`, `error:<Type>`); an attachment failure never changes the run's own
-response.
+field in the response), and `POST /api/tasks/run` attaches a finished run to the project it belongs
+to — named by the confirmed session (creation) or by `lifecycle_project_id` (a change request from
+«Проекты») — then reports the outcome in the `X-Forge-Project-Attach` header (`none`, `ok`,
+`already_attached`, `error:<Type>`); an attachment failure never changes the run's own response.
 
 ### UI
 
@@ -4763,8 +4823,9 @@ the confirmation creating the record and the run attaching to it.
 `illegal_project_transition`/`project_not_completable` с собственной фразой слоя.
 
 `POST /api/discovery/sessions/{id}/confirm` дополнительно создаёт запись (аддитивное поле `project`
-в ответе), а `POST /api/tasks/run` привязывает завершённый запуск к проекту той сессии, которая была
-названа, и сообщает итог в заголовке `X-Forge-Project-Attach` (`none`, `ok`, `already_attached`,
+в ответе), а `POST /api/tasks/run` привязывает завершённый запуск к проекту, которому он принадлежит:
+названному подтверждённой сессией (создание) или полем `lifecycle_project_id` (запрос изменения из
+«Проектов»). Итог сообщается в заголовке `X-Forge-Project-Attach` (`none`, `ok`, `already_attached`,
 `error:<Type>`); сбой привязки никогда не меняет собственный ответ запуска.
 
 ### Интерфейс

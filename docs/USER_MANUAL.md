@@ -149,18 +149,28 @@ In the project card, section **«Добавить функцию / новая в
 1. Write what to change, in your own words: *"Add a CSV export of the monthly report."*
 2. Choose the **provider** and the **model** (the list is what the backend reported; an empty list
    means the backend decides).
-3. Decide about **Записать изменения в проект**. For the offline provider `mock` the switch is
-   disabled and the run is labelled **«ответ без изменения файлов»** — that provider answers without
-   touching a file, so promising a write would be a lie.
+3. Decide about **Записать изменения в проект**. The switch is available for every provider the
+   backend reports. For the offline provider `mock` a write-mode run produces Forge's own
+   deterministic scaffold (no model is called), and it honestly reports «no changes» when there is
+   nothing to write.
 4. Press **Создать версию**. The backend stages the next version and returns the exact **task text**
    it composed from your request and the project specification. The screen shows that text
    unchanged, then offers **Отправить задачу в Core**.
 
-**One honest limitation.** The task submitted from this screen carries no `discovery_session_id`:
-the backend keeps the session↔project link in `index.json` and does not publish it in the project
-record. A version is therefore *filled* by a run that carries the confirmed session — the run you
-start from «Кузница» after confirming a session. This is stated in the form itself, under the
-button, rather than hidden.
+**What happens on «Отправить задачу в Core».** The task travels with this project's own id
+(`lifecycle_project_id`), so the Core writes a write-mode answer into the project's controlled folder
+and, once the run finishes, records it as the project's **next version**. The card then reports the
+result honestly:
+
+* the version really advanced: «Новая версия v3 записана. Запуск: run-…», and the versions table
+  shows that run id on the new version;
+* the run wrote no file: «Изменения не записаны: новой версии нет» — the previous version stays
+  current and the attempt is still listed;
+* the project cannot receive the run (unknown, archived or deleted): the backend refuses with
+  `HTTP 404`/`HTTP 409` and the reason, and nothing is written.
+
+There is no limitation left here: the earlier note about a change request carrying no
+`discovery_session_id` described a real gap, and it is closed by naming the project itself.
 
 ## 8. Create a new version
 
@@ -482,17 +492,28 @@ Last version: v2
 1. Напишите, что изменить, своими словами: *«Добавить экспорт месячного отчёта в CSV»*.
 2. Выберите **провайдера** и **модель** (список — это то, что сообщил backend; пустой список значит,
    что провайдера выбирает он сам).
-3. Решите про **Записать изменения в проект**. Для offline-провайдера `mock` переключатель
-   заблокирован, а запуск помечен **«ответ без изменения файлов»** — этот провайдер отвечает, не
-   трогая файлы, и обещать запись было бы обманом.
+3. Решите про **Записать изменения в проект**. Переключатель доступен для любого провайдера, который
+   сообщил backend. Для offline-провайдера `mock` запуск в режиме записи создаёт собственный
+   детерминированный каркас Forge (модель не вызывается) и честно сообщает «нет изменений», когда
+   записывать нечего.
 4. Нажмите **Создать версию**. Backend подготавливает следующую версию и возвращает точный **текст
    задачи**, составленный из вашей просьбы и спецификации проекта. Экран показывает этот текст без
    изменений и предлагает **Отправить задачу в Core**.
 
-**Одно честное ограничение.** Задача, отправленная с этого экрана, не несёт `discovery_session_id`:
-backend хранит связь «сессия ↔ проект» в `index.json` и не публикует её в записи проекта. Поэтому
-версию *заполняет* запуск, который несёт подтверждённую сессию — тот, что вы запускаете из «Кузницы»
-после подтверждения сессии. Это написано в самой форме, под кнопкой, а не спрятано.
+**Что происходит по «Отправить задачу в Core».** Задача уходит с собственным id этого проекта
+(`lifecycle_project_id`), поэтому Core пишет ответ в режиме записи в контролируемую папку проекта и
+после завершения запуска записывает его как **следующую версию** проекта. Карточка сообщает результат
+честно:
+
+* версия действительно сдвинулась: «Новая версия v3 записана. Запуск: run-…», и таблица версий
+  показывает этот run id у новой версии;
+* запуск не записал ни одного файла: «Изменения не записаны: новой версии нет» — текущей остаётся
+  предыдущая версия, а попытка всё равно перечислена;
+* проект не может принять запуск (неизвестен, в архиве или удалён): backend отклоняет с
+  `HTTP 404`/`HTTP 409` и причиной, и ничего не записывается.
+
+Ограничения здесь больше нет: прежняя заметка о том, что запрос изменения не несёт
+`discovery_session_id`, описывала реальный разрыв, и он закрыт — задача называет сам проект.
 
 ## 8. Создать новую версию
 
