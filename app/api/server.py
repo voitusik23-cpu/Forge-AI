@@ -710,6 +710,46 @@ def create_api_app(
                 ) from refused
             description = apply_specification(specification, description)
 
+        # THE CLARIFICATION HAND-OFF. When the previous answer asked questions instead of
+        # writing files, the owner's answers travel with the next dispatch here. They are
+        # read at the HTTP boundary and are deliberately NOT fields of `TaskRunRequest`
+        # (that model's field set is the contract several tests pin, exactly like the
+        # discovery session id above): they are task text and durable context, never a
+        # source of execution authority -- no command, workspace, profile, environment,
+        # timeout or allowlist can be named through them.
+        #
+        # ``clarification_run_id`` names the run whose questions were answered. The
+        # service reads that run's own record, so a retry keeps the answers already
+        # given instead of asking for them again. An unknown id is not an error: it
+        # simply means a fresh clarification context (the confirmed-session case, where
+        # there is no earlier run to inherit from).
+        clarification_answers = payload.get("clarification_answers")
+        if clarification_answers is not None:
+            if not isinstance(clarification_answers, list):
+                raise body_error_exception(
+                    "'clarification_answers' must be a list of {question, answer} items"
+                )
+            for item in clarification_answers:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("question"), str)
+                    or not isinstance(item.get("answer"), str)
+                ):
+                    raise body_error_exception(
+                        "each clarification answer must be an object with string "
+                        "'question' and 'answer'"
+                    )
+        clarification_run_id = payload.get("clarification_run_id")
+        if clarification_run_id is not None:
+            if not isinstance(clarification_run_id, str) or not clarification_run_id.strip():
+                raise body_error_exception(
+                    "'clarification_run_id' must be a non-empty string when supplied"
+                )
+            if not is_safe_run_id(clarification_run_id):
+                raise body_error_exception(
+                    "'clarification_run_id' is not a usable run id"
+                )
+
         # THE PROJECT WRITE TARGET. When this run belongs to a lifecycle project, the
         # tree a write-mode answer may touch is that project's own controlled folder
         # (``.forge/projects/<id>/workspace``), resolved here from the project store.
@@ -753,6 +793,8 @@ def create_api_app(
                 project_workspace=project_workspace,
                 lifecycle_project_id=lifecycle_project_id,
                 lifecycle_project_path=lifecycle_project_path,
+                clarification_answers=clarification_answers,
+                clarification_run_id=clarification_run_id,
             )
         except PaidModelRequiresConfirmation as paid:
             # A refusal, not an error: the request was well-formed and the server

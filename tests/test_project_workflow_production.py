@@ -837,6 +837,10 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 # `proj-…` record), or None. Additive and last: `project_id` remains
                 # the workspace/Core project it always was.
                 "lifecycle_project_id",
+                # The clarification round (0 = no context, 1 = may ask, 2 = forced
+                # final). Additive: the backend's own count, so a client never
+                # infers a round from the words of an answer.
+                "clarification_round",
             },
         )
 

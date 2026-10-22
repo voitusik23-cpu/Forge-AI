@@ -96,6 +96,13 @@ export type TaskRunResponse = {
    * «Проекты», and only after the lifecycle list confirms it exists.
    */
   lifecycle_project_id?: string | null;
+  /**
+   * `clarification_round`: the backend's own count for this run's clarification context.
+   * 0 = no context at all, 1 = the run may still ask, 2 = the forced final round on which
+   * no further «Ответить» is possible. The card reads this number instead of inferring a
+   * round from the wording of an answer.
+   */
+  clarification_round?: number;
 };
 
 /**
@@ -478,6 +485,22 @@ export const dispatchTask = async (input: {
    * command, workspace, profile, environment or timeout can be named through it.
    */
   discoverySessionId?: string;
+  /**
+   * The owner's answers to the questions the previous run asked.
+   *
+   * `POST /api/tasks/run` reads them at the HTTP boundary (they are not fields of the
+   * request model) and appends the canonical `Уточнения от пользователя:` block to the
+   * task text, so the next attempt really is different. They carry no execution
+   * authority: no command, workspace, profile, environment or timeout can be named
+   * through them.
+   */
+  clarificationAnswers?: Array<{ question: string; answer: string }>;
+  /**
+   * The run whose questions were answered. The Core reads that run's own durable
+   * clarification context, so a retry keeps the answers already given instead of losing
+   * them; an unknown id simply starts a fresh context.
+   */
+  clarificationRunId?: string;
   /** Lets the interface cancel its own request; the backend keeps whatever it already did. */
   signal?: AbortSignal;
 }): Promise<Result<DispatchResult>> => {
@@ -493,6 +516,17 @@ export const dispatchTask = async (input: {
   if (input.writeMode === true) body.write_mode = true;
   const discoverySessionId = (input.discoverySessionId ?? "").trim();
   if (discoverySessionId !== "") body.discovery_session_id = discoverySessionId;
+  const clarificationRunId = (input.clarificationRunId ?? "").trim();
+  if (clarificationRunId !== "") body.clarification_run_id = clarificationRunId;
+  const clarificationAnswers = (input.clarificationAnswers ?? [])
+    .map((item) => ({
+      question: String(item?.question ?? "").trim(),
+      answer: String(item?.answer ?? "").trim(),
+    }))
+    .filter((item) => item.question !== "" && item.answer !== "");
+  if (clarificationAnswers.length > 0) {
+    body.clarification_answers = clarificationAnswers;
+  }
 
   const headers: Record<string, string> = {
     "content-type": "application/json",

@@ -66,6 +66,16 @@ from app.agent_runtime.output_contract import (
     append_output_contract,
     build_retry_prompt,
 )
+from app.agent_runtime.clarification import (
+    ClarificationAnswer,
+    MAX_CLARIFICATION_ROUNDS,
+    answers_block,
+    coerce_answers,
+    merge_answers,
+    next_round,
+    round_is_final,
+    unanswered_questions,
+)
 from app.agent_runtime.offline_task import (
     OfflineTaskDecisionProvider,
     OfflineWorkspaceVerifier,
@@ -348,6 +358,23 @@ MATERIALIZATION_PROJECT_STATE_KEY = "project_materialization"
 #: beside ``code_write`` -- the same rule ``PROVIDER_KEY_INDEX_PROJECT_STATE_KEY``
 #: follows.
 WRITE_RETRY_PROJECT_STATE_KEY = "write_retry"
+
+
+#: The ``project_state`` key of the clarification context: which questions the model
+#: asked, which answers the owner gave, and which round the run belongs to. It is the
+#: durable half of the loop fix -- a later retry names ``clarification_run_id``, the
+#: service reads this record and the answers travel again, so nothing has to be
+#: re-typed and no answer is lost with a browser refresh.
+CLARIFICATION_PROJECT_STATE_KEY = "clarification"
+
+#: The ``project_state`` key of the round number alone (an int), so an operator reading
+#: ``GET /api/runs/{id}`` sees ``clarification_round`` without opening the context.
+CLARIFICATION_ROUND_PROJECT_STATE_KEY = "clarification_round"
+
+#: The prefix of a clarification context id. A context is fresh unless the caller names
+#: the run that asked, which is what makes "the session was already CONFIRMED" unable
+#: to swallow an answer: there is no session in this path at all.
+CLARIFICATION_CONTEXT_PREFIX = "clr-"
 
 
 from pathlib import Path
@@ -2896,6 +2923,7 @@ class ForgeApiService:
                 specification_confirmed=False,
             )
         recorded_files = recorded_state.get("files_created")
+        recorded_round = recorded_state.get(CLARIFICATION_ROUND_PROJECT_STATE_KEY)
         return TaskRunResponse(
             run_id=run_id,
             task_id=req.task_id or "",
@@ -2925,6 +2953,15 @@ class ForgeApiService:
             files_created=(
                 int(recorded_files)
                 if isinstance(recorded_files, int) and not isinstance(recorded_files, bool)
+                else 0
+            ),
+            # A replay repeats the round the original run recorded; an older record
+            # without one reports 0, which the client reads as "no clarification
+            # context", never as "round one".
+            clarification_round=(
+                int(recorded_round)
+                if isinstance(recorded_round, int)
+                and not isinstance(recorded_round, bool)
                 else 0
             ),
         )
@@ -3270,6 +3307,93 @@ class ForgeApiService:
         target = workspace if workspace is not None else self._workspace
         return build_retry_prompt(build_workspace_context(target))
 
+    # ------------------------------------------------------------- clarification
+    def _clarification_context(
+        self, run_id: str
+    ) -> Dict[str, Any]:
+        """The clarification context of an earlier run, or ``{}`` when it has none.
+
+        This is the "reuse what exists" half of the fix: the context lives in the run's
+        own durable ``project_state`` (written by :meth:`_record_run_outcome`), so a
+        retry does not need a second store, a session, or a client that still remembers
+        anything. An unknown, unreadable or foreign record is an empty context -- never
+        an error, because a missing context only means "start fresh".
+        """
+
+        wanted = str(run_id or "").strip()
+        if not wanted:
+            return {}
+        try:
+            record = self.get_run_record(wanted)
+        except Exception:  # noqa: BLE001 - an unreadable record is an absent context
+            return {}
+        if not isinstance(record, Mapping):
+            return {}
+        project_state = record.get("project_state")
+        if not isinstance(project_state, Mapping):
+            return {}
+        context = project_state.get(CLARIFICATION_PROJECT_STATE_KEY)
+        return dict(context) if isinstance(context, Mapping) else {}
+
+    def _plan_clarification(
+        self,
+        *,
+        run_id: str,
+        answers: object,
+        clarification_run_id: object,
+    ) -> Dict[str, Any]:
+        """Decide the round, the context and the answers this run carries.
+
+        The rule is the requirement's own, in one place:
+
+        * no answers -> round 1: the run may ask;
+        * answers -> round 2: forced (``intent=GENERATE_PROJECT``), never a third;
+        * an earlier context supplies its answers as well, so a retry keeps them;
+        * an unknown context, or one that is already final, starts a **fresh**
+          context instead of silently dropping the answers (the confirmed-session
+          case the owner measured).
+
+        Returns a plain mapping so it can be recorded into ``project_state`` unchanged.
+        """
+
+        carried = coerce_answers(answers)
+        previous = self._clarification_context(clarification_run_id)
+        previous_answers = coerce_answers(previous.get("answered"))
+        merged = merge_answers(previous_answers, carried)
+        previous_round = previous.get("round") if previous else 0
+        round_number = next_round(previous_round, has_answers=bool(merged))
+        context_id = str(previous.get("context_id") or "").strip()
+        if not context_id or (not previous and merged):
+            # An unknown context -- or a context that no longer exists -- is a fresh
+            # one. Nothing is inherited from a run the caller could not name.
+            context_id = f"{CLARIFICATION_CONTEXT_PREFIX}{run_id}"
+        return {
+            "round": int(round_number),
+            "context_id": context_id,
+            "answered": [item.to_dict() for item in merged],
+            "forced": round_is_final(round_number),
+            "previous_round": int(previous_round or 0),
+        }
+
+    def _clarified_description(
+        self,
+        description: str,
+        clarification: Mapping[str, Any],
+        *,
+        answers: Sequence[ClarificationAnswer],
+    ) -> str:
+        """The description with the canonical answers block appended after it.
+
+        The block is a deterministic text (:mod:`app.agent_runtime.clarification`), the
+        owner's description is never rewritten, and the output contract is appended
+        later by :meth:`_write_task_description` -- so the order is exactly
+        "description, answers, contract".
+        """
+
+        if not answers:
+            return description
+        return f"{description}\n\n{answers_block(answers, round_number=int(clarification.get('round') or 1))}"
+
     @staticmethod
     def _offline_write_answer(plan: object) -> str:
         """The deterministic plan text used as the offline "model answer".
@@ -3571,6 +3695,7 @@ class ForgeApiService:
         outcome: RunOutcome,
         questions: tuple,
         saved: Mapping[str, Any],
+        clarification: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         """Record the outcome and the independent save facts beside the run.
 
@@ -3578,17 +3703,29 @@ class ForgeApiService:
         and the run record says the same thing, so an operator reading
         ``GET /api/runs/{id}`` cannot see a different story from the one the UI was
         given. Nothing is invented when the run has no snapshot.
+
+        ``clarification`` is the context of a run that asked or answered a
+        clarification request (``{round, context_id, questions, answered, forced}``).
+        It is what makes the answers survive: the next dispatch names this run and the
+        service reads them back from here, so no second store and no client memory is
+        required.
         """
 
         if store is None or not run_id:
             return False
-        clarification = outcome is RunOutcome.CLARIFICATION_REQUIRED
+        clarification_required = outcome is RunOutcome.CLARIFICATION_REQUIRED
         entries: Dict[str, Any] = {
             "outcome": outcome.value,
             "state": state_for_outcome(outcome),
-            "needs_clarification": clarification,
+            "needs_clarification": clarification_required,
             "clarification_questions": list(questions),
         }
+        if clarification:
+            context = dict(clarification)
+            entries[CLARIFICATION_PROJECT_STATE_KEY] = context
+            entries[CLARIFICATION_ROUND_PROJECT_STATE_KEY] = int(
+                context.get("round") or 0
+            )
         entries.update(dict(saved))
         try:
             return self._write_project_state_entries(store, run_id, entries)
@@ -3772,6 +3909,8 @@ class ForgeApiService:
         cost_facts: Optional[Mapping[str, Any]] = None,
         project_workspace: object = None,
         project_path: str = "",
+        clarification: Optional[Mapping[str, Any]] = None,
+        clarification_answers: Sequence[ClarificationAnswer] = (),
     ) -> "RunDispatchResult":
         """Execute one submitted task with the deterministic offline run loop.
 
@@ -4032,8 +4171,31 @@ class ForgeApiService:
             "artifact_manifest_saved": False,
             "files_created": files_created,
         }
+        # THE CLARIFICATION CONTEXT on the offline path. It produces no questions of
+        # its own (its answer is a deterministic report, not a model's prose), so a
+        # run that carries the owner's answers is the forced round -- and the round is
+        # recorded the same way the provider path records it, so the card and the
+        # history cannot disagree about which round this was.
+        offline_round = (
+            MAX_CLARIFICATION_ROUNDS if clarification_answers else 0
+        )
         self._record_run_outcome(
-            run_store, run_id, outcome=outcome, questions=(), saved=saved
+            run_store,
+            run_id,
+            outcome=outcome,
+            questions=(),
+            saved=saved,
+            clarification=(
+                {
+                    "round": int(offline_round),
+                    "context_id": str((clarification or {}).get("context_id") or ""),
+                    "questions": [],
+                    "answered": [item.to_dict() for item in clarification_answers],
+                    "forced": round_is_final(offline_round),
+                }
+                if offline_round
+                else None
+            ),
         )
         return RunDispatchResult(
             response=TaskRunResponse(
@@ -4071,6 +4233,7 @@ class ForgeApiService:
                 # No provider ran, so no cost was estimated: a measured 0.0, not an
                 # unknown. Unknown is reported as None elsewhere.
                 estimated_cost=0.0,
+                clarification_round=int(offline_round),
             ),
             idempotent_replay=False,
             history_recorded=history_recorded,
@@ -4114,6 +4277,8 @@ class ForgeApiService:
         project_workspace: Optional[object] = None,
         lifecycle_project_id: str = "",
         lifecycle_project_path: str = "",
+        clarification_answers: object = None,
+        clarification_run_id: object = "",
     ) -> "RunDispatchResult":
         """Execute a task and return the response with its dispatch facts.
 
@@ -4125,6 +4290,14 @@ class ForgeApiService:
         workspace while a project is being created. ``lifecycle_project_id`` and
         ``lifecycle_project_path`` are the same fact for the manifest and for the
         event, and neither grants anything.
+
+        ``clarification_answers``/``clarification_run_id`` are the owner's answers to
+        the questions an earlier run asked, read at the HTTP boundary exactly like the
+        discovery session id. They carry no authority: they become part of the *task
+        text* and of the run's durable ``project_state``, nothing else. Answers make
+        the next attempt different (round 2, forced to generate files), and
+        ``clarification_run_id`` lets a retry inherit the answers already recorded
+        instead of losing them.
         """
         run_id = f"run-api-{uuid.uuid4().hex[:8]}"
         task_id = req.task_id or f"task-{uuid.uuid4().hex[:6]}"
@@ -4134,6 +4307,18 @@ class ForgeApiService:
                 "this execution has no authorized project: bind one at composition time "
                 "before creating any run"
             )
+
+        # THE CLARIFICATION STEP. It is decided before the prompt is built, because the
+        # answers change the prompt: round 1 may ask, round 2 is forced, and a third
+        # round cannot exist (``MAX_CLARIFICATION_ROUNDS``). The context is read from
+        # the run the caller named, so the answers survive a retry.
+        clarification = self._plan_clarification(
+            run_id=run_id,
+            answers=clarification_answers,
+            clarification_run_id=clarification_run_id,
+        )
+        clarification_answers_tuple = coerce_answers(clarification.get("answered"))
+        clarification_round = int(clarification.get("round") or 0)
 
         category = TaskCategory.CODE
         try:
@@ -4206,11 +4391,19 @@ class ForgeApiService:
         # the task text plus a bounded list of the target workspace's file names
         # (never their contents), so an answer can name a real path. When it is off,
         # the task is exactly the description it always was.
+        #
+        # THE ANSWERS COME AFTER THE DESCRIPTION AND BEFORE THE CONTRACT. When the
+        # owner answered a clarification request, the canonical block is appended to
+        # the description here -- one place, both modes -- and
+        # ``_write_task_description`` still appends the output contract last.
         write_mode = self._resolve_write_mode(req, category)
+        described = self._clarified_description(
+            req.description, clarification, answers=clarification_answers_tuple
+        )
         task_description = (
-            self._write_task_description(req.description, project_workspace)
+            self._write_task_description(described, project_workspace)
             if write_mode
-            else req.description
+            else described
         )
 
         task = Task(
@@ -4256,6 +4449,8 @@ class ForgeApiService:
                 cost_facts=cost_facts,
                 project_workspace=project_workspace,
                 project_path=lifecycle_project_path,
+                clarification=clarification,
+                clarification_answers=clarification_answers_tuple,
             )
 
         # A model named in the request selects the provider model for THIS run. The dispatcher
@@ -4347,8 +4542,20 @@ class ForgeApiService:
             and not carries_file_changes(first_answer)
         ):
             write_retry_attempted = True
+            retry_text = self._write_retry_description(project_workspace)
+            if clarification_answers_tuple:
+                # The retry is a second attempt at the SAME task, so it keeps the
+                # owner's answers: dropping them here would ask a model to write files
+                # while withholding exactly the information it said it was missing.
+                retry_text = (
+                    f"{retry_text}\n\n"
+                    + answers_block(
+                        clarification_answers_tuple,
+                        round_number=clarification_round or 1,
+                    )
+                )
             retry_run = dispatch_once(
-                replace(task, description=self._write_retry_description(project_workspace)),
+                replace(task, description=retry_text),
                 reuse_run=run,
                 attempt_number=1,
             )
@@ -4542,6 +4749,14 @@ class ForgeApiService:
             and model_intent.questions
             else extract_clarifying_questions(provider_answer)
         )
+        # QUESTIONS THE OWNER ALREADY ANSWERED ARE DROPPED. A model that re-asks an
+        # answered question is told nothing new by showing it again, and surfacing it
+        # is what made the loop look alive while the owner's words had no effect. On
+        # the final round the list is the model's own leftover wording only: no
+        # further answer is possible, so nothing new is offered (the card says so).
+        questions = unanswered_questions(
+            questions, clarification_answers_tuple
+        )
         outcome = derive_outcome(
             run_state=run.state.value,
             run_success=success,
@@ -4573,8 +4788,30 @@ class ForgeApiService:
             "artifact_manifest_saved": False,
             "files_created": files_created,
         }
+        # THE ROUND THIS RUN REALLY BELONGS TO, as the response publishes it: 2 when the
+        # owner's answers were carried (the forced round), 1 when this run asked
+        # something new, 0 when no clarification is involved at all. It follows the
+        # *facts*, not the intent: an answer that wrote its files is still round 2 of
+        # the same context, and the card reads that honestly.
+        published_round = (
+            MAX_CLARIFICATION_ROUNDS
+            if clarification_answers_tuple
+            else (1 if questions else 0)
+        )
+        clarification_record = {
+            "round": int(published_round),
+            "context_id": str(clarification.get("context_id") or ""),
+            "questions": list(questions),
+            "answered": [item.to_dict() for item in clarification_answers_tuple],
+            "forced": round_is_final(published_round),
+        }
         self._record_run_outcome(
-            api_run_store, run_id, outcome=outcome, questions=questions, saved=saved
+            api_run_store,
+            run_id,
+            outcome=outcome,
+            questions=questions,
+            saved=saved,
+            clarification=clarification_record if published_round else None,
         )
 
         response = TaskRunResponse(
@@ -4604,6 +4841,7 @@ class ForgeApiService:
             cost_tier=actual_tier or cost_facts.get("cost_tier"),
             estimated_cost=estimated_cost,
             model_intent=model_intent.response_payload(),
+            clarification_round=int(published_round),
         )
         return RunDispatchResult(
             response=response,

@@ -160,6 +160,13 @@ class TaskRunResponse:
     #: durable ``project_state``. Additive and last so every existing key keeps its
     #: position and an older client is unaffected.
     lifecycle_project_id: Optional[str] = None
+    #: The clarification round this run belongs to: ``0`` when the run has no
+    #: clarification context at all, ``1`` for a run that may still ask, ``2`` for the
+    #: forced final round. It is the *backend's* count (the same number the run's
+    #: durable ``project_state`` carries), so a client reads it instead of inferring a
+    #: round from the words of an answer. Additive and last: ``2`` means "no further
+    #: «Ответить» is possible for this context" and nothing else.
+    clarification_round: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -189,6 +196,8 @@ class TaskRunResponse:
             "model_intent": dict(self.model_intent),
             # Last, and additive: every key above keeps the position it had before.
             "lifecycle_project_id": self.lifecycle_project_id,
+            # The clarification round (0 = no context, 1 = may ask, 2 = forced final).
+            "clarification_round": int(self.clarification_round or 0),
         }
 
 

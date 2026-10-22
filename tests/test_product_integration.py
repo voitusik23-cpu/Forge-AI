@@ -3580,6 +3580,10 @@ class CompatibilityTests(Block8Case):
                 # to, or None. Additive and last: `project_id` above is still the
                 # workspace/Core project, and it is not copied here.
                 "lifecycle_project_id",
+                # The clarification round (0 = no context, 1 = may ask, 2 = forced
+                # final). Additive: the backend's own count, published so a client
+                # never infers a round from the wording of an answer.
+                "clarification_round",
             },
         )
         status = SystemStatusResponse("c", "a", "READY", 1, 1).to_dict()

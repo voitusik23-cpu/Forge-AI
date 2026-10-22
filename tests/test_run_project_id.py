@@ -75,7 +75,14 @@ EXISTING_KEYS = [
     "estimated_cost",
     "model_intent",
 ]
-CONTRACT_KEYS = [*EXISTING_KEYS, "lifecycle_project_id"]
+CONTRACT_KEYS = [
+    *EXISTING_KEYS,
+    "lifecycle_project_id",
+    # The clarification round of this run (0 = no context, 1 = may ask, 2 = forced
+    # final). Additive and last, exactly like the lifecycle id above: it states the
+    # backend's own count, so a client never infers a round from prose.
+    "clarification_round",
+]
 
 #: The workspace/Core project this test server is composed for. It is deliberately
 #: not the `proj-…` shape: if the response ever copies it into the lifecycle field,

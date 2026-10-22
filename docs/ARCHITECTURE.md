@@ -5258,3 +5258,103 @@ keyword-аргумент `intent_type` (`""` = вызывающий не зая�
 уточнения, плана, генерации с фейковыми файлами и сломанного конверта: исходную задачу,
 распознанное намерение, summary, следующее действие и отсутствие ложного `COMPLETED`; завершается
 кодом 0 и не открывает сокет.
+
+## Clarification answers and the two-round limit v0.1
+
+**The measured loop.** A run answered with questions, the result card said «Forge задал вопросы —
+ответьте, и он продолжит», and the owner pressed «Ответить». That action opened the *discovery* card
+(`ui/src/screens/Forge.tsx`, `answerClarification`): its questions are derived from the goal text by
+`app/discovery/questions.py`, so he answered questions the model never asked; the answers were stored
+in a discovery session that was already `CONFIRMED` (`DiscoveryService.answer` raises
+`DiscoveryStateConflict` there), and the UI sidestepped that by opening yet another session from the
+same idea. The next dispatch then carried the **same description**
+(`POST /api/tasks/run` had no clarification input at all), so the model asked the same questions
+again — indefinitely.
+
+**One deterministic text.** `app/agent_runtime/clarification.py` owns the words and the rules that
+decide them: the heading `Уточнения от пользователя:`, one `- <question> → <answer>` line per
+answered question, and the closing sentence `Продолжай и СЕЙЧАС создай файлы. Больше вопросов не
+задавай.` The block is appended **after** the description and **before** the output contract
+(`_clarified_description` in `app/api/service.py`), in read-only and write mode alike, and the single
+write-mode retry repeats it — a retry that withheld the answers would ask the model to write files
+while hiding what it said it was missing.
+
+**Two rounds, then stop.** `clarification_round` is 1 for a run that may still ask and 2 for a run
+that carries answers; the final round appends `intent=GENERATE_PROJECT` and «Do not ask further
+questions — write the files with the information you have», and `MAX_CLARIFICATION_ROUNDS = 2` makes
+a third round impossible by construction (`next_round` clamps a retry of the final round back to 2).
+A question the owner already answered is dropped from the surfaced list by normalised comparison; if
+nothing new remains, the run is escalated to the final round instead of offering the same list again.
+
+**Where the answers live.** The run's own durable `project_state` carries
+`clarification {round, context_id, questions, answered[]}` and `clarification_round`; the request names
+`clarification_run_id` and the service reads that record back, so a later retry keeps the answers
+without the client re-sending them. `clarification_answers`/`clarification_run_id` are read at the
+HTTP boundary exactly like `discovery_session_id` and are deliberately **not** fields of
+`TaskRunRequest`: they are task text and durable context, never execution authority. The clarification
+context belongs to the run, not to a discovery session, so a `CONFIRMED`, open or absent session makes
+no difference to whether an answer is used.
+
+**What the card does.** `TaskRunResponse.clarification_round` (additive, last) is published so the
+card reads the backend's own count instead of inferring a round from prose.
+`ui/src/forge-result.ts` gives round 2 its own headline (`forge.headline.questions.exhausted`,
+«Больше Forge вопросов не задаст: модель не смогла создать файлы») with «Повторить» and **no**
+«Ответить». «Ответить» now dispatches exactly one new run with
+`clarification_answers` + `clarification_run_id`, the same provider/model/approval rules and the same
+write decision, and the card names the new run id.
+
+**Evidence.** `tests/test_clarification_loop.py` (18 tests, offline) pins the canonical text, the
+order (description → answers → contract), the two-round limit, the filter, the durable answers, the
+unchanged provider/model/approval facts, the still-refused paid pair, one dispatch per «Ответить»
+(through the real route with `TestClient`), and the terminal card executed from the shipped
+TypeScript with Node.
+
+## Уточнения пользователя и предел в два раунда v0.1
+
+**Измеренный цикл.** Запуск ответил вопросами, карточка сказала «Forge задал вопросы — ответьте, и
+он продолжит», владелец нажал «Ответить». Это действие открывало карточку *уточнения*
+(`ui/src/screens/Forge.tsx`, `answerClarification`): её вопросы выводятся из текста цели в
+`app/discovery/questions.py`, поэтому он отвечал на вопросы, которых модель не задавала; ответы
+ложились в сессию уточнения, которая уже была `CONFIRMED` (там `DiscoveryService.answer` поднимает
+`DiscoveryStateConflict`), а интерфейс обходил это, открывая ещё одну сессию из той же идеи.
+Следующий запуск нёс **то же описание** (`POST /api/tasks/run` вообще не имел входа для уточнений),
+поэтому модель спрашивала то же снова — бесконечно.
+
+**Один детерминированный текст.** `app/agent_runtime/clarification.py` владеет словами и правилами
+их выбора: заголовок `Уточнения от пользователя:`, по строке `- <вопрос> → <ответ>` на каждый
+отвеченный вопрос и закрывающая фраза `Продолжай и СЕЙЧАС создай файлы. Больше вопросов не
+задавай.` Блок добавляется **после** описания и **до** выходного контракта (`_clarified_description`
+в `app/api/service.py`) и в режиме чтения, и в режиме записи, а единственный повторный запрос в
+режиме записи повторяет его: повтор, скрывающий ответы, просил бы модель писать файлы, утаивая то,
+чего ей не хватало.
+
+**Два раунда, затем стоп.** `clarification_round` равен 1 для запуска, который ещё может спрашивать,
+и 2 для запуска, несущего ответы; последний раунд добавляет `intent=GENERATE_PROJECT` и «Do not ask
+further questions — write the files with the information you have», а `MAX_CLARIFICATION_ROUNDS = 2`
+делает третий раунд невозможным по построению (`next_round` возвращает повтор последнего раунда
+обратно в 2). Вопрос, на который владелец уже ответил, выбрасывается из показываемого списка
+нормализованным сравнением; если нового не осталось, запуск эскалируется в последний раунд, а не
+предлагает тот же список снова.
+
+**Где живут ответы.** Долговечный `project_state` самого запуска несёт
+`clarification {round, context_id, questions, answered[]}` и `clarification_round`; запрос называет
+`clarification_run_id`, и сервис читает эту запись обратно, поэтому поздний повтор сохраняет ответы
+без повторной отправки клиентом. `clarification_answers`/`clarification_run_id` читаются на границе
+HTTP точно так же, как `discovery_session_id`, и намеренно **не** являются полями `TaskRunRequest`:
+это текст задачи и долговечный контекст, а не полномочия на выполнение. Контекст уточнения
+принадлежит запуску, а не сессии уточнения, поэтому состояние сессии (`CONFIRMED`, открыта или её
+нет) не влияет на то, будет ли ответ использован.
+
+**Что делает карточка.** `TaskRunResponse.clarification_round` (аддитивное, последнее) публикуется,
+чтобы карточка читала собственный счётчик бэкенда, а не выводила раунд из прозы.
+`ui/src/forge-result.ts` даёт раунду 2 собственный заголовок (`forge.headline.questions.exhausted`,
+«Больше Forge вопросов не задаст: модель не смогла создать файлы») с «Повторить» и **без**
+«Ответить». «Ответить» теперь запускает ровно один новый запуск с `clarification_answers` +
+`clarification_run_id`, теми же правилами провайдера/модели/подтверждений и тем же решением о
+записи, а карточка называет id нового запуска.
+
+**Доказательства.** `tests/test_clarification_loop.py` (18 тестов, офлайн) закрепляет канонический
+текст, порядок (описание → ответы → контракт), предел в два раунда, фильтр, долговечность ответов,
+неизменность фактов провайдера/модели/подтверждений, по-прежнему отказанную платную пару, один
+диспатч на «Ответить» (через настоящий маршрут с `TestClient`) и терминальную карточку, исполняемую
+из поставляемого TypeScript через Node.

@@ -110,6 +110,19 @@ const newIdempotencyKey = (): string =>
     ? crypto.randomUUID()
     : `forge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+/**
+ * What a clarification dispatch carries: a run id and the answers.
+ *
+ * Two runs are involved and they are never the same one. «Ответить» sends the run whose card asked
+ * (the backend reads *that* run's context and adds the answers to it); the answers kept for
+ * «Повторить» are named by the run that was just dispatched (the one whose card offers the retry),
+ * because that is the record the backend can read the answers back from.
+ */
+type ClarificationDispatch = {
+  runId: string;
+  answers: Array<{ question: string; answer: string }>;
+};
+
 type ProjectsState =
   | { status: "loading" }
   | { status: "ready"; items: ProjectInfo[] }
@@ -579,6 +592,15 @@ export const Forge = ({
   const [notice, setNotice] = useState("");
   const inFlight = useRef<AbortController | null>(null);
 
+  // ------------------------------------------------------------------ clarification
+  // The answers of a run that asked, one draft per question the card shows. `lastClarification`
+  // is what «Повторить» re-sends, and `clarificationSentTo` is the id of the run those answers
+  // started -- the card uses it to state that a NEW run began instead of leaving the owner to
+  // guess. The drafts are dropped whenever the run changes: new run, new questions.
+  const [clarificationDrafts, setClarificationDrafts] = useState<Record<string, string>>({});
+  const [lastClarification, setLastClarification] = useState<ClarificationDispatch | null>(null);
+  const [clarificationSentTo, setClarificationSentTo] = useState("");
+
   // ------------------------------------------------------------------ discovery
   // The session is the Core's own record: `session.state` decides which step is reachable, and
   // only a CONFIRMED session can be run (the backend enforces it with 409). Nothing below sets a
@@ -848,20 +870,36 @@ export const Forge = ({
   };
 
   /**
-   * The result's «Ответить на вопросы» button.
+   * The result's «Ответить» button.
    *
-   * A run whose outcome is `CLARIFICATION_REQUIRED` stopped because its answer asked questions, so
-   * the honest next step is the clarification card, not a second run. An open session is reopened
-   * as it is; a confirmed or cancelled one cannot accept answers any more (the Core refuses with
-   * 409 `discovery_state_conflict`), so a fresh session is opened from the same idea.
+   * A run stopped because its answer asked questions instead of writing files, so the honest next
+   * step is a **new run that carries the answers** — not the discovery card.
+   *
+   * That card was the measured bug: its questions are derived from the goal text
+   * (`app/discovery/questions.py`), so the owner answered questions the model never asked; they
+   * were stored in a discovery session that was already CONFIRMED (where `answer` refuses with
+   * 409 and the UI sidestepped it by opening yet another session from the same idea), and then
+   * «приступить» re-dispatched the SAME description. The model asked the same questions again —
+   * forever. Now the answers travel with the dispatch (`clarification_answers` plus the id of the
+   * run that asked, `clarification_run_id`), the backend appends the canonical block to the task
+   * text, and the clarification context belongs to the run, not to a discovery session — so a
+   * CONFIRMED, open or absent session makes no difference to whether the answers are used.
    */
   const answerClarification = async () => {
-    if (sessionId !== "" && !confirmed && sessionState !== "CANCELLED") {
-      setDiscoveryNotice("");
-      setPhase("clarify");
+    if (dispatch.status === "pending") return;
+    // The exact questions the card shows, in its order, with what the owner typed next to each.
+    // An untouched question is simply not sent: the block carries answers, never guesses.
+    const answers = responseQuestions
+      .map((question) => ({
+        question,
+        answer: String(clarificationDrafts[question] ?? "").trim(),
+      }))
+      .filter((item) => item.answer !== "");
+    if (answers.length === 0) {
+      setNotice(t(lang, "forge.result.clarification.answers.empty"));
       return;
     }
-    await continueFromIdea();
+    await submit({ runId, answers });
   };
 
   // ------------------------------------------------------------------ run record
@@ -889,6 +927,15 @@ export const Forge = ({
         .map((item) => String(item ?? ""))
         .filter((item) => item.trim() !== "")
     : [];
+  /**
+   * `clarification_round` as the backend published it. It is the run's own count (0 = no
+   * clarification context, 1 = may still ask, 2 = the forced final round), read from the
+   * response and never inferred from the wording of an answer.
+   */
+  const clarificationRound =
+    typeof dispatched?.response.clarification_round === "number"
+      ? dispatched.response.clarification_round
+      : 0;
   const resultFacts = {
     filesCreated,
     writeStatus: String(codeWrite?.status ?? ""),
@@ -896,6 +943,7 @@ export const Forge = ({
     writeReason: String(codeWrite?.reason ?? ""),
     questions: responseQuestions,
     needsClarification: dispatched?.response.needs_clarification === true,
+    clarificationRound,
     error: String(dispatched?.response.error ?? ""),
     writeRequested: requestedWriteMode,
   };
@@ -938,6 +986,12 @@ export const Forge = ({
     void loadLifecycleIds();
   }, [runId, loadLifecycleIds]);
 
+  // A new run carries its own questions, so the drafts of the previous card are dropped: an
+  // answer typed for one question must never be attached to a different one.
+  useEffect(() => {
+    setClarificationDrafts({});
+  }, [runId]);
+
   /**
    * What each headline action does. Files, the check and the local run live in «Проекты»,
    * so those three hand that screen a **concrete project id**; with no id the button is
@@ -949,7 +1003,10 @@ export const Forge = ({
       return;
     }
     if (action === "retry") {
-      void submit();
+      // A retry of a clarification round re-sends the answers that round carried: the backend
+      // keeps them in the run's own context, and dropping them here would ask the model the same
+      // question again with LESS information than the attempt it is retrying.
+      void submit(clarificationRound > 0 && lastClarification !== null ? lastClarification : undefined);
       return;
     }
     if (resultProjectId === "") return;
@@ -1061,7 +1118,7 @@ export const Forge = ({
       : t(lang, "forge.launch.cost.notlisted"),
   ].join(" · ");
 
-  const submit = async () => {
+  const submit = async (clarification?: ClarificationDispatch) => {
     // The button stays live for every honest reason a run cannot start (a disabled button with no
     // explanation is what made "Запустить задачу" look dead). The single exception is the paid
     // confirmation below: there the button is disabled *and* the reason is printed beside it.
@@ -1085,6 +1142,10 @@ export const Forge = ({
     setRecordFailure(null);
     setDispatch({ status: "pending" });
     setRequestedWriteMode(effectiveWriteMode);
+    // The same form, the same provider/model/approval rules and the same write decision; only the
+    // answers (and the run that asked) are added. A dispatch that carries no answers is a plain
+    // run, so the "answers started this run" line is cleared rather than left from an earlier one.
+    if (clarification === undefined) setClarificationSentTo("");
     const controller = new AbortController();
     inFlight.current = controller;
     // Only a provider the Core itself reported is sent; an empty or stale selection leaves the
@@ -1104,7 +1165,15 @@ export const Forge = ({
         // The session travels with the run so the Core can apply its own confirmation guard: an
         // unconfirmed session is refused with 409 discovery_not_confirmed, and that refusal is
         // shown as it arrived instead of being hidden by the interface.
-        discoverySessionId: sessionId,
+        //
+        // A clarification dispatch is the exception, deliberately: its answers belong to the RUN,
+        // not to a discovery session, so an open (unconfirmed) session must not refuse a click
+        // that has nothing to do with it. A CONFIRMED session still travels, so the run keeps its
+        // specification and its project write target.
+        discoverySessionId:
+          clarification === undefined ? sessionId : confirmed ? sessionId : undefined,
+        clarificationAnswers: clarification?.answers,
+        clarificationRunId: clarification?.runId,
         idempotencyKey,
         signal: controller.signal,
       });
@@ -1114,6 +1183,15 @@ export const Forge = ({
         setNotice(t(lang, "forge.task.cancelled"));
       } else if (outcome.ok) {
         setDispatch({ status: "sent", result: outcome.value });
+        if (clarification !== undefined) {
+          // Keep the answers for «Повторить» and name the NEW run: the owner must see that the
+          // click started another run, not the same card again. The saved `runId` is the run that
+          // just ran (the one whose card offers «Повторить»), because the backend reads the
+          // answers from the named run's own record.
+          const newRunId = String(outcome.value.response.run_id ?? "");
+          setLastClarification({ runId: newRunId, answers: clarification.answers });
+          setClarificationSentTo(newRunId);
+        }
         // A replayed answer must not silently become a new logical operation.
         if (outcome.value.facts.idempotent_replay !== true) setIdempotencyKey(newIdempotencyKey());
       } else {
@@ -1790,9 +1868,20 @@ export const Forge = ({
                   </div>
                 </div>
 
+                {/* The new run the answers started. Naming its id is the proof the click moved the
+                    flow forward instead of re-opening the same card: the record card below then
+                    polls THIS id, so its progress is the new run's progress. */}
+                {clarificationSentTo !== "" && clarificationSentTo === runId ? (
+                  <div className="notice">
+                    {t(lang, "forge.result.clarification.new_run").replace("{run}", runId)}
+                  </div>
+                ) : null}
+
                 {/* The questions the final answer asked, when it really asked any — listed as
                     they arrived, never re-worded. A plan that merely ends in "?" is not a
-                    question list: that case is the «plan instead of files» headline above. */}
+                    question list: that case is the «plan instead of files» headline above.
+                    On the final round there is nothing to answer into, so the list is shown
+                    without inputs: the card above already says the loop is over. */}
                 {askedQuestions ? (
                   <div className="notice warn">
                     <div className="label">{t(lang, "forge.result.questions")}</div>
@@ -1803,8 +1892,33 @@ export const Forge = ({
                         </li>
                       ))}
                     </ol>
+                    {headline.kind === "questions" ? (
+                      // One input per question, in the card's own order. «Ответить» above sends
+                      // them as `clarification_answers`, so the next run's task text carries
+                      // `- question → answer` for each one the owner filled in.
+                      <div className="stack" style={{ gap: 10, marginTop: 10 }}>
+                        {responseQuestions.map((question) => (
+                          <Field key={question} label={question}>
+                            <textarea
+                              className="input"
+                              rows={2}
+                              value={clarificationDrafts[question] ?? ""}
+                              placeholder={t(lang, "forge.result.clarification.answer_placeholder")}
+                              onChange={(event) =>
+                                setClarificationDrafts((previous) => ({
+                                  ...previous,
+                                  [question]: event.target.value,
+                                }))
+                              }
+                            />
+                          </Field>
+                        ))}
+                      </div>
+                    ) : null}
                     <div className="small" style={{ marginTop: 6 }}>
-                      {t(lang, "forge.result.clarification.hint")}
+                      {headline.kind === "questions"
+                        ? t(lang, "forge.result.clarification.hint")
+                        : t(lang, "forge.result.clarification.final_hint")}
                     </div>
                   </div>
                 ) : null}

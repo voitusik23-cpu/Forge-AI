@@ -10,6 +10,7 @@
 //   * `files_created` — how many files the guarded writer really applied;
 //   * `project_state.code_write.status` / `.verification` / `.reason` — what the writer did;
 //   * `clarification_questions` — what the model asked instead of writing;
+//   * `clarification_round` — the backend's own round count (2 = the final one, no «Ответить»);
 //   * `error` — the dispatch's own failure, when it had one;
 //   * `writeRequested` — whether files were even asked for (a read-only run owes none).
 //
@@ -22,6 +23,15 @@ import type { Lang } from "./i18n";
 /** The one action a headline offers. Each id maps to a button in the result card. */
 export type ResultActionId = "open_files" | "launch_local" | "verify" | "answer" | "retry";
 
+/**
+ * The number of clarification rounds the backend allows (`app/agent_runtime/clarification.py`).
+ *
+ * Round 1 may ask; round 2 is forced to generate and is the **last** one. It is mirrored here as
+ * a constant so the card's rule is one comparison a test can execute, not a number written into
+ * JSX.
+ */
+export const MAX_CLARIFICATION_ROUNDS = 2;
+
 /** The shape of the headline, which also decides its colour and the last stage chip. */
 export type ResultKind =
   /** Files were applied and the writer's own post-write check passed (or did not apply). */
@@ -30,6 +40,8 @@ export type ResultKind =
   | "unverified"
   /** Nothing was written and the model asked questions instead. */
   | "questions"
+  /** The final clarification round still produced no file: the loop is over. */
+  | "questions_exhausted"
   /** Nothing was written and the model answered with a plan or a report. */
   | "plan"
   /** Nothing was written and nothing was asked for: a plain read-only answer. */
@@ -63,6 +75,11 @@ export type RunResultFacts = {
   questions: string[];
   /** `needs_clarification`: the backend's own verdict that the work stopped to ask. */
   needsClarification: boolean;
+  /**
+   * `clarification_round` as the backend published it: 0 = this run has no clarification
+   * context, 1 = it may still ask, 2 = the forced final round (no further «Ответить»).
+   */
+  clarificationRound: number;
   /** The dispatch's own error text, when it reported one. */
   error: string;
   /** Whether the run asked for files (`write_mode`), captured at submit time. */
@@ -166,6 +183,9 @@ export const deriveRunHeadline = (lang: Lang, facts: RunResultFacts): ResultHead
   const files = Number.isFinite(facts.filesCreated) ? Math.max(0, Math.trunc(facts.filesCreated)) : 0;
   const verification = String(facts.verification ?? "").trim();
   const writeStatus = String(facts.writeStatus ?? "").trim();
+  const round = Number.isFinite(facts.clarificationRound)
+    ? Math.max(0, Math.trunc(facts.clarificationRound))
+    : 0;
 
   if (files > 0) {
     if (verification === "failed") {
@@ -198,6 +218,18 @@ export const deriveRunHeadline = (lang: Lang, facts: RunResultFacts): ResultHead
   }
 
   // Nothing on disk, so the question is *why*, and the answer is never "COMPLETED".
+  if (round >= MAX_CLARIFICATION_ROUNDS) {
+    // The last round already happened and it still produced no file. Offering another
+    // «Ответить» here is exactly the loop the owner measured, so the card states the end of
+    // the loop and offers the one honest next step: a retry that carries the same answers.
+    return {
+      kind: "questions_exhausted",
+      key: "forge.headline.questions.exhausted",
+      params: {},
+      state: "НЕ СОЗДАН",
+      actions: ["retry"],
+    };
+  }
   if (answerAskedQuestions(facts)) {
     return {
       kind: "questions",
