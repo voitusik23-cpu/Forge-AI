@@ -1516,6 +1516,173 @@ def registered_window_state(entry) -> str:
     return WINDOW_OPEN if window_is_visible(handle) else WINDOW_HIDDEN
 
 
+def build_stamp(repo: pathlib.Path = REPO) -> str:
+    """The content hash of the built shell, or ``""`` when nothing was built.
+
+    The launcher records it in the journal so a launch names the build it is about to
+    show. It is a *fact about the files on disk*, not a version number, so it cannot
+    claim a build the server is not serving.
+    """
+
+    try:
+        return hashlib.sha256((repo / "ui" / "dist" / "index.html").read_bytes()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+#: The loopback port the app window's DevTools endpoint listens on. It is used for one
+#: thing only: reloading an already-open window after a rebuild. The endpoint binds to
+#: loopback by Chrome itself and the Forge API on 8011 has no authentication either, so
+#: this opens no new trust boundary -- it is a second loopback listener, not a wider one.
+DEVTOOLS_PORT = 9340
+
+#: Windows virtual-key codes for the keyboard fallback (Ctrl+Shift+R).
+_VK_CONTROL = 0x11
+_VK_SHIFT = 0x10
+_VK_R = 0x52
+_KEYEVENTF_KEYUP = 0x0002
+
+
+def _websocket_reload(port: int = DEVTOOLS_PORT, timeout: float = 5.0) -> bool:
+    """Ask the browser to hard-reload its page, over the DevTools protocol.
+
+    A minimal RFC 6455 client: only the two frames this needs are implemented (one
+    masked text frame out, one header in). It talks to ``127.0.0.1`` only, and only
+    when the app window was started with :data:`DEVTOOLS_PORT` open. ``Page.reload``
+    with ``ignoreCache`` is a real reload of the *document* the window runs.
+    """
+
+    import base64
+    import socket
+    import struct
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{int(port)}/json/list", timeout=timeout
+        ) as response:
+            targets = json.loads(response.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - no endpoint is a normal, non-fatal state
+        return False
+    page = next(
+        (
+            item
+            for item in targets
+            if item.get("type") == "page"
+            and str(item.get("webSocketDebuggerUrl", "")).startswith("ws://")
+        ),
+        None,
+    )
+    if page is None:
+        return False
+    url = str(page["webSocketDebuggerUrl"])
+    hostport = url.split("//", 1)[1].split("/", 1)[0]
+    host, _, raw_port = hostport.partition(":")
+    path = "/" + url.split("//", 1)[1].split("/", 1)[1]
+    try:
+        with socket.create_connection((host or "127.0.0.1", int(raw_port or 80)), timeout=timeout) as sock:
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            handshake = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {hostport}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            sock.sendall(handshake.encode("ascii"))
+            answer = b""
+            while b"\r\n\r\n" not in answer:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return False
+                answer += chunk
+            if b" 101 " not in answer.split(b"\r\n", 1)[0]:
+                return False
+            payload = json.dumps(
+                {"id": 1, "method": "Page.reload", "params": {"ignoreCache": True}}
+            ).encode("utf-8")
+            mask = os.urandom(4)
+            length = len(payload)
+            header = bytearray([0x81])
+            if length < 126:
+                header.append(0x80 | length)
+            elif length < 65536:
+                header.append(0x80 | 126)
+                header.extend(struct.pack("!H", length))
+            else:  # pragma: no cover - this payload is tiny
+                header.append(0x80 | 127)
+                header.extend(struct.pack("!Q", length))
+            header.extend(mask)
+            masked = bytes(
+                byte ^ mask[index % 4] for index, byte in enumerate(payload)
+            )
+            sock.sendall(bytes(header) + masked)
+            return True
+    except Exception:  # noqa: BLE001 - a reload helper must never break a launch
+        return False
+
+
+def _hard_reload_keys(handle: int) -> bool:
+    """Send Ctrl+Shift+R to ``handle`` -- only while it really is the foreground window.
+
+    This is the fallback for a browser started without a DevTools port. The foreground
+    check is deliberate: a keystroke sent to a window that is *not* ours would type
+    into whatever the owner has in front of him, so it is sent only when the OS reports
+    the application window as the foreground one.
+    """
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    if int(user32.GetForegroundWindow()) != int(handle):
+        return False
+    for vk in (_VK_CONTROL, _VK_SHIFT, _VK_R):
+        user32.keybd_event(vk, 0, 0, 0)
+        time.sleep(0.02)
+    for vk in (_VK_R, _VK_SHIFT, _VK_CONTROL):
+        user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+        time.sleep(0.02)
+    return True
+
+
+def hard_reload_window(title_fragment: str, journal: "Journal", timeout: float = 20.0) -> bool:
+    """Restore the application window and make it load the current build.
+
+    The measured failure this exists for: the launcher only brought an already-open
+    window to the front, so a window opened before ``vite build`` kept running the
+    previous bundle, and the owner saw the old interface after a rebuild while the
+    server was already serving the new one.
+
+    Two paths, in order: the DevTools endpoint (a real ``Page.reload`` with the cache
+    ignored), then Ctrl+Shift+R while the window is provably in front. Either way the
+    window loads a **new document**, so ``index.html`` and the content-hashed assets
+    are fetched again.
+    """
+
+    handles = window_handles(title_fragment)
+    usable = [handle for handle in handles if not window_is_another_browser(handle)]
+    if not usable:
+        return False
+    if not bring_to_front(title_fragment, journal):
+        return False
+    if _websocket_reload():
+        journal.write(
+            f"window hard-reloaded over the DevTools endpoint (build {build_stamp() or 'unbuilt'})"
+        )
+        return True
+    if _hard_reload_keys(int(usable[0])):
+        journal.write(
+            f"window hard-reloaded with Ctrl+Shift+R (build {build_stamp() or 'unbuilt'})"
+        )
+        return True
+    journal.write(
+        "the window could not be reloaded automatically (no DevTools endpoint, and the "
+        "window is not in front); the «Обновить» button loads the current build"
+    )
+    return True
+
+
 def bring_to_front(title_fragment: str, journal: "Journal", timeout: float = 20.0) -> bool:
     """Restore and foreground the application window, whatever state it opened in.
 
@@ -2151,7 +2318,7 @@ class Supervisor:
                     f"skipping a window belonging to another browser: {window_title(handle)!r}"
                 )
             own = [handle for handle in existing if handle not in foreign]
-            if own and bring_to_front("FORGE AI", self.journal):
+            if own and hard_reload_window("FORGE AI", self.journal):
                 self.register_windows(own)
                 self.await_windows_closed()
                 self.unregister_windows()
@@ -2237,6 +2404,9 @@ class Supervisor:
                 f"--app={self.url}",
                 "--window-size=1600,1000",
                 f"--user-data-dir={profile}",
+                # A loopback DevTools endpoint, so an already-open window can be
+                # reloaded after a rebuild instead of silently running the old bundle.
+                f"--remote-debugging-port={DEVTOOLS_PORT}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 *flags,

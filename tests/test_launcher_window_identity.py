@@ -462,5 +462,81 @@ class WindowIdentityTests(unittest.TestCase):
         self.assertEqual(script.scans_seen, 7)
 
 
+class WindowReloadTests(unittest.TestCase):
+    """A window opened before a rebuild must load the new bundle, not keep the old one.
+
+    Measured failure: the launcher only brought an already-open window forward, so after
+    ``vite build`` the owner kept seeing the previous interface while the server on
+    ``ui/dist`` was already serving the new, content-hashed assets. The fix is a reload
+    step on the reuse path; these tests pin it without starting a browser.
+    """
+
+    def test_01_reusing_a_window_reloads_it_instead_of_only_bringing_it_forward(self) -> None:
+        journal = FakeJournal()
+        supervisor = mock.Mock()
+        supervisor.journal = journal
+        supervisor.register_windows = mock.Mock()
+        supervisor.await_windows_closed = mock.Mock()
+        supervisor.unregister_windows = mock.Mock()
+        with mock.patch.object(launcher, "window_handles", return_value=[HWND]), \
+                mock.patch.object(launcher, "window_is_another_browser", return_value=False), \
+                mock.patch.object(launcher, "bring_to_front", return_value=True), \
+                mock.patch.object(launcher, "window_title", return_value="FORGE AI"), \
+                mock.patch.object(launcher, "_websocket_reload", return_value=True) as reloaded, \
+                mock.patch.object(launcher.time, "sleep", return_value=None):
+            code = launcher.Supervisor.close_window(supervisor)
+        self.assertEqual(code, 0)
+        reloaded.assert_called_once()
+        supervisor.register_windows.assert_called_once()
+        self.assertIn("hard-reloaded", journal.text())
+        self.assertIn("already open", journal.text())
+
+    def test_02_the_devtools_reload_is_preferred_and_names_the_build(self) -> None:
+        journal = FakeJournal()
+        with mock.patch.object(launcher, "window_handles", return_value=[HWND]), \
+                mock.patch.object(launcher, "window_is_another_browser", return_value=False), \
+                mock.patch.object(launcher, "bring_to_front", return_value=True), \
+                mock.patch.object(launcher, "_websocket_reload", return_value=True), \
+                mock.patch.object(launcher, "build_stamp", return_value="abc123abc123"):
+            reloaded = launcher.hard_reload_window("FORGE AI", journal)
+        self.assertTrue(reloaded)
+        self.assertIn("DevTools endpoint", journal.text())
+        self.assertIn("abc123abc123", journal.text())
+
+    def test_03_without_devtools_the_keyboard_fallback_is_used_only_in_front(self) -> None:
+        journal = FakeJournal()
+        with mock.patch.object(launcher, "window_handles", return_value=[HWND]), \
+                mock.patch.object(launcher, "window_is_another_browser", return_value=False), \
+                mock.patch.object(launcher, "bring_to_front", return_value=True), \
+                mock.patch.object(launcher, "_websocket_reload", return_value=False), \
+                mock.patch.object(launcher, "_hard_reload_keys", return_value=True) as keys, \
+                mock.patch.object(launcher, "build_stamp", return_value="deadbeefdead"):
+            self.assertTrue(launcher.hard_reload_window("FORGE AI", journal))
+            keys.assert_called_once_with(HWND)
+
+        # When the window cannot be proven to be in front, no keystroke is sent: a
+        # Ctrl+Shift+R typed into another application would be worse than a stale page.
+        journal = FakeJournal()
+        with mock.patch.object(launcher, "window_handles", return_value=[HWND]), \
+                mock.patch.object(launcher, "window_is_another_browser", return_value=False), \
+                mock.patch.object(launcher, "bring_to_front", return_value=True), \
+                mock.patch.object(launcher, "_websocket_reload", return_value=False), \
+                mock.patch.object(launcher, "_hard_reload_keys", return_value=False) as keys, \
+                mock.patch.object(launcher, "build_stamp", return_value="deadbeefdead"):
+            self.assertTrue(launcher.hard_reload_window("FORGE AI", journal))
+            keys.assert_called_once_with(HWND)
+        self.assertIn("could not be reloaded automatically", journal.text())
+        self.assertIn("«Обновить»", journal.text())
+
+    def test_04_the_open_window_gets_a_devtools_endpoint_to_reload_through(self) -> None:
+        # The endpoint is loopback-only and exists for the reload step; without it the
+        # reuse path could only send keystrokes to a window it does not own.
+        source = (ROOT / "tools" / "forge_launch.py").read_text(encoding="utf-8")
+        self.assertIn("--remote-debugging-port=", source)
+        self.assertIn("DEVTOOLS_PORT", source)
+        self.assertIn('"Page.reload"', source)
+        self.assertIn("ignoreCache", source)
+
+
 if __name__ == "__main__":
     unittest.main()

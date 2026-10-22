@@ -15,6 +15,7 @@ import {
 import { t, type Lang } from "../i18n";
 import { StatusDot } from "./Primitives";
 import type { ThemeMode } from "../appearance";
+import { hardReload } from "../reload";
 
 // Seven primary sections. Агенты, Модели, Расходы and Инструменты are one area now: their
 // screens, routes and endpoints are untouched, they simply live under «Провайдеры» instead of
@@ -175,6 +176,17 @@ export const TopBar = ({
       </span>
       <button className="btn small" onClick={onCycleTheme} title={t(lang, "appearance.cycle")}>
         {t(lang, `appearance.theme.${themeMode}`)}
+      </button>
+      {/* A rebuilt bundle must never be shadowed by the document already on screen.
+          This is the documented one-click equivalent of the launcher's own reload
+          step: a new document, so index.html and the hashed assets are refetched. */}
+      <button
+        className="btn small"
+        data-testid="app-reload"
+        onClick={() => hardReload()}
+        title={t(lang, "top.reload.hint")}
+      >
+        {t(lang, "top.reload")}
       </button>
       <button className="btn small" onClick={onHelp} title={t(lang, "help.how")}>
         ?
