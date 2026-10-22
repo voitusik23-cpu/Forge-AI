@@ -32,6 +32,7 @@ standard library only.
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -68,6 +69,7 @@ from app.projects.models import (
     verification_relevance_for_path,
 )
 from app.projects.store import (
+    ProjectDeleted,
     ProjectStore,
     UnknownProject,
     is_safe_project_id,
@@ -108,6 +110,39 @@ _TERMINAL_FAILURES = frozenset(
         "TERMINAL_REFUSED",
     }
 )
+
+
+# --------------------------------------------------------------------------- #
+# the per-project critical section
+# --------------------------------------------------------------------------- #
+
+#: One lock per (store root, project id), shared by every ``ProjectService`` instance
+#: in this process that uses the same store. A mutating operation holds it across
+#: *read -> marker check -> write*, so a delete and a verification can never
+#: interleave their two halves: whichever arrives second waits for the first.
+#:
+#: The ordering this buys is the one the owner allowed: DELETE waits for an in-flight
+#: verification to finish and then moves the project. The ordering is not the only
+#: defence -- another *process* holds no such lock, so the durable marker (the trash
+#: entry, ``ProjectStore.is_deleted``) is re-checked by ``ProjectStore.write`` on the
+#: exact write path. Locks are kept for the process lifetime: there is one per
+#: project id this process ever touched, which is a handful, and dropping one while
+#: a second caller waits on it would let a third caller create a different lock and
+#: run concurrently with the waiter.
+_PROJECT_LOCKS: Dict[str, threading.Lock] = {}
+_PROJECT_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_project(store_root: object, project_id: str) -> threading.Lock:
+    """The lock a read-then-write of ``project_id`` in this process must hold."""
+
+    key = f"{Path(store_root).resolve(strict=False)}|{project_id}"
+    with _PROJECT_LOCKS_GUARD:
+        lock = _PROJECT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROJECT_LOCKS[key] = lock
+        return lock
 
 
 class InvalidChangeRequest(ProjectError):
@@ -331,11 +366,34 @@ class ProjectService:
         return self._store
 
     def open_project(self, project_id: object) -> LifecycleProject:
-        """The stored record, or :class:`UnknownProject`."""
+        """The stored record, or :class:`UnknownProject`. A **read**, never a write."""
 
         if not is_safe_project_id(project_id):
             raise UnknownProject(str(project_id))
         return self._store.require(project_id)
+
+    def require_active(self, project_id: object) -> LifecycleProject:
+        """The record of an **active** project, or a typed refusal.
+
+        Called at the top of every mutating operation, inside that operation's
+        per-project lock, immediately before the operation reads what it needs. The
+        deletion marker is checked *before* the record: a record that a late writer
+        already put back is still a deleted project, and that resurrected shape is
+        precisely what this guard exists to refuse.
+
+        ``ProjectDeleted`` (``409 project_deleted``) when the id is in the trash,
+        ``UnknownProject`` (``404``) when no record exists at all.
+        """
+
+        identifier = _project_id(project_id)
+        if self._store.is_deleted(identifier):
+            raise ProjectDeleted(identifier)
+        return self._store.require(identifier)
+
+    def _project_lock(self, project_id: str) -> threading.Lock:
+        """The per-project lock this service uses for ``project_id``."""
+
+        return _lock_for_project(self._store.root, project_id)
 
     def list_projects(self, *, include_archived: bool = True) -> Tuple[LifecycleProject, ...]:
         return tuple(
@@ -442,14 +500,16 @@ class ProjectService:
         lifecycle's own typed refusal.
         """
 
-        project = self.open_project(project_id)
-        if plan_ref:
-            project = replace(project, plan_ref=str(plan_ref))
-        if project.status is ProjectStatus.PLANNED:
-            return project
-        advanced = advance(project, LifecycleEvent(name="confirmed"))
-        self._store.write(advanced)
-        return advanced
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            project = self.require_active(identifier)
+            if plan_ref:
+                project = replace(project, plan_ref=str(plan_ref))
+            if project.status is ProjectStatus.PLANNED:
+                return project
+            advanced = advance(project, LifecycleEvent(name="confirmed"))
+            self._store.write(advanced)
+            return advanced
 
     # --------------------------------------------------------------- attach
     def attach_run(
@@ -480,7 +540,23 @@ class ProjectService:
         not hide it.
         """
 
-        project = self._store.require(_project_id(project_id))
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            return self._attach_run_locked(
+                identifier, run, source_root=source_root, now=now
+            )
+
+    def _attach_run_locked(
+        self,
+        project_id: str,
+        run: object,
+        *,
+        source_root: Optional[object],
+        now: str,
+    ) -> LifecycleProject:
+        """``attach_run`` under the per-project lock, on an active project."""
+
+        project = self.require_active(project_id)
         facts = run_facts(run)
         timestamp = now or utc_now()
 
@@ -582,7 +658,16 @@ class ProjectService:
         the previous version stays current and the project becomes ``FAILED``.
         """
 
-        project = self._store.require(_project_id(project_id))
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            return self._new_version_locked(identifier, change_request_text)
+
+    def _new_version_locked(
+        self, project_id: str, change_request_text: object
+    ) -> NewVersionTask:
+        """``new_version`` under the per-project lock, on an active project."""
+
+        project = self.require_active(project_id)
         text, _redacted = self._screen(change_request_text)
         text = str(text or "").strip()
         if not text:
@@ -655,18 +740,22 @@ class ProjectService:
         the status ``restore`` returns it to.
         """
 
-        project = self.open_project(project_id)
-        archived = advance(project, LifecycleEvent(name="archived"))
-        self._store.write(archived)
-        return archived
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            project = self.require_active(identifier)
+            archived = advance(project, LifecycleEvent(name="archived"))
+            self._store.write(archived)
+            return archived
 
     def restore(self, project_id: object) -> LifecycleProject:
         """Return an archived project to the status it had before archiving."""
 
-        project = self.open_project(project_id)
-        restored = advance(project, LifecycleEvent(name="restore"))
-        self._store.write(restored)
-        return restored
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            project = self.require_active(identifier)
+            restored = advance(project, LifecycleEvent(name="restore"))
+            self._store.write(restored)
+            return restored
 
     # ------------------------------------------------------------- deletion
     #
@@ -676,6 +765,14 @@ class ProjectService:
     # a restore is a move back. The only refusal this layer itself makes is the one it
     # can prove from the record; "is a process running for it" is runtime state and is
     # checked by the HTTP composition, which owns the runner.
+    #
+    # The move is also the durable deletion marker: the trash entry is created before
+    # anything moves and is removed only by a successful restore, so "this id is
+    # deleted" is a fact on disk rather than a flag in memory. Every mutating method
+    # above holds the per-project lock across read -> marker check -> write, and
+    # ``ProjectStore.write`` re-checks the marker at the write itself; that combination
+    # makes a resurrected record impossible in this process and refused across
+    # processes.
 
     #: The statuses a *bulk* cleanup may remove. A project that is still being worked
     #: on (PLANNED, RUNNING, WAITING_FOR_CONFIRMATION, ...) is never swept away, and a
@@ -689,14 +786,31 @@ class ProjectService:
     )
 
     def delete(self, project_id: object) -> Dict[str, Any]:
-        """Move one project into ``projects-deleted`` and out of the listing."""
+        """Move one project into ``projects-deleted`` and out of the listing.
 
-        return self._store.delete(_project_id(project_id))
+        Under the per-project lock, so an in-flight verification either finishes
+        first (and is then moved by this call) or is refused by the marker this call
+        leaves behind. The record is read here rather than through
+        :meth:`require_active`: deleting an already deleted id stays the ``404`` it
+        has always been, and this operation is the one *making* the marker.
+        """
+
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            self._store.require(identifier)
+            return self._store.delete(identifier)
 
     def restore_deleted(self, project_id: object) -> Dict[str, Any]:
-        """Move the newest trash entry for ``project_id`` back into the store."""
+        """Move the newest trash entry for ``project_id`` back into the store.
 
-        return self._store.restore_deleted(_project_id(project_id))
+        The store moves the folder and the record back and clears the marker, all
+        inside this lock, so no concurrent mutation can observe the project as
+        active before its record is back or as deleted after it is.
+        """
+
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            return self._store.restore_deleted(identifier)
 
     def deleted_projects(
         self, *, limit: Optional[int] = None, offset: int = 0
@@ -741,21 +855,23 @@ class ProjectService:
         (``app.projects.stage.project_stage``).
         """
 
-        project = self._store.require(_project_id(project_id))
-        version = project.current() or project.latest_version
-        if version is None:
-            raise UnknownProjectVersion(
-                f"project '{project.project_id}' has no version to annotate"
-            )
-        versions = [
-            replace(item, preview_not_required=bool(value))
-            if item.version == version.version
-            else item
-            for item in project.versions
-        ]
-        updated = replace(project, versions=versions, updated_at=utc_now())
-        self._store.write(updated)
-        return updated
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            project = self.require_active(identifier)
+            version = project.current() or project.latest_version
+            if version is None:
+                raise UnknownProjectVersion(
+                    f"project '{project.project_id}' has no version to annotate"
+                )
+            versions = [
+                replace(item, preview_not_required=bool(value))
+                if item.version == version.version
+                else item
+                for item in project.versions
+            ]
+            updated = replace(project, versions=versions, updated_at=utc_now())
+            self._store.write(updated)
+            return updated
 
     def verify_again(self, project_id: object) -> LifecycleProject:
         """Re-judge the recorded artifacts, then advance the lifecycle.
@@ -765,9 +881,21 @@ class ProjectService:
         size and SHA-256, and every recorded Python artifact must still compile.
         The acceptance judgement is the one already recorded for the version, which
         is a statement about the run and is not re-derived here.
+
+        The read, the marker check and the write are one critical section: this is
+        the operation that was measured re-creating a deleted project's record, and
+        it now cannot read a live record and write it back after the id was moved to
+        ``projects-deleted``.
         """
 
-        project = self.open_project(project_id)
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            return self._verify_again_locked(identifier)
+
+    def _verify_again_locked(self, project_id: str) -> LifecycleProject:
+        """``verify_again`` under the per-project lock, on an active project."""
+
+        project = self.require_active(project_id)
         if project.status not in {
             ProjectStatus.COMPLETED,
             ProjectStatus.NEEDS_CHANGES,

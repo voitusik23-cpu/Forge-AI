@@ -7056,3 +7056,141 @@ collapsed block only, and the ninth chip reads «Завершено без фа�
 `run_id`, `event_count`, `classification.outcome`, английский `code_write.reason` и diff живут
 только в этом свёрнутом блоке, а девятый шаг читается как «Завершено без файлов», когда ни один
 файл не записан.
+
+## Deleted projects are tombstoned by the trash entry v0.1
+
+### Context
+
+MEASURED: `POST /api/projects/{id}/verify` was already in flight when
+`DELETE /api/projects/{id}` completed, and the project **came back**. The exact write path
+was `verify_again` -> `ProjectStore.read` (before the move) -> `ProjectStore.write` (after
+it): the record was re-created in the active store while its workspace sat in
+`.forge/projects-deleted/<id>-<ts>/`, so `GET /api/projects/lifecycle` listed it again and
+`POST /{id}/restore-deleted` answered `409 project_already_exists`. A real project on this
+machine (`proj-2e2fe4a64973`) still has that shape. Deletion was a move with no durable
+"this id is deleted" fact for a late writer to consult.
+
+### Accepted decisions
+
+- **The trash entry is the deletion marker.** `ProjectStore.delete` creates
+  `projects-deleted/<id>-<ts>/` before it moves anything, and only a successful
+  `restore_deleted` clears it. `trash_entries(id)` / `newest_trash_entry(id)` /
+  `is_deleted(id)` read that fact from disk on every call, so it is durable, needs no
+  in-memory state, and survives a restart. No second index file exists to drift from the
+  trash.
+- **The guard is on the write itself.** `ProjectStore.write` re-checks `is_deleted` and
+  raises `ProjectDeleted` (`409 project_deleted`) before writing, so the measured path
+  (read, delete, write) is refused at the exact point where the record would be
+  re-created, even when the writer is another process.
+- **One lock per project, held across read -> check -> write.** `ProjectService` keeps a
+  `threading.Lock` per (store root, project id); every mutating operation (`confirm`,
+  `attach_run`, `new_version`, `archive`, `restore`, `set_preview_not_required`,
+  `verify_again`, `delete`, `restore_deleted`) holds it and calls `require_active` inside
+  it. Chosen ordering: **DELETE waits for an in-flight verification to finish and then
+  moves the project**; a verification that finds the marker instead answers
+  `409 project_deleted`. Both outcomes are allowed by the product; a resurrected record is
+  not.
+- **`require_active` checks the marker before the record.** A record that a late writer
+  already put back is still a deleted project. An unknown id stays `404 unknown_project`;
+  a deleted id is `409 project_deleted` from every mutating route.
+- **Restore moves the folder and the record back and clears the marker in one critical
+  section.** If the trashed entry cannot be cleared, the move is rolled back: a restored
+  project that still answers "deleted" would be worse than a retryable refusal. `409
+  project_already_exists` is answered only when a genuinely active record holds the id.
+- **A failed delete rolls its trash entry back.** A delete that could not move the project
+  removes the empty entry it created, so a still-live project is never tombstoned.
+
+### Rejected alternatives
+
+- **An in-memory "deleted ids" set.** It dies with the process, so the first restart
+  resurrects exactly the projects this fix exists to keep deleted.
+- **A second marker file (`.deleted-index.json`) maintained by delete/restore.** It can
+  drift from the trash after a crash between the two writes, and the trash already records
+  the same fact; one source of truth is cheaper to keep correct.
+- **Relying only on the write-time check, without the lock.** The record would still be
+  re-created in the window between the check and `os.replace`, and the two halves of
+  read-then-write would interleave. The lock makes the in-process interleaving
+  deterministic; the marker is the cross-process backstop.
+- **Hard-deleting the record so a late write cannot find it.** That destroys the
+  reversible deletion the product promises (byte-identical restore).
+
+### Consequences and open items
+
+Within one process the interleaving is fully serialised; across processes the marker is
+re-read at the write, which narrows the window to the check-to-rename gap of a single
+write. A hard kill between creating the trash entry and moving the folder leaves a
+tombstoned but unmoved project (refused, not resurrected); a hard kill during the move
+leaves a partial trash entry that `restore_deleted` still refuses to guess about. Neither
+is repaired automatically, deliberately: guessing here would either resurrect a project or
+erase one. `tests/test_deleted_project_race.py` pins the fixed behaviour, including the
+deterministic read -> delete -> write interleaving.
+
+## Удалённые проекты помечаются записью в корзине v0.1
+
+### Контекст
+
+ИЗМЕРЕНО: `POST /api/projects/{id}/verify` уже выполнялся, когда
+`DELETE /api/projects/{id}` завершился, и проект **вернулся**. Точный путь записи:
+`verify_again` -> `ProjectStore.read` (до переноса) -> `ProjectStore.write` (после него):
+запись создавалась заново в активном хранилище, пока её рабочая папка лежала в
+`.forge/projects-deleted/<id>-<ts>/`, поэтому `GET /api/projects/lifecycle` снова показывал
+её, а `POST /{id}/restore-deleted` отвечал `409 project_already_exists`. Реальный проект на
+этой машине (`proj-2e2fe4a64973`) до сих пор имеет такую форму. Удаление было переносом без
+долговечного факта «этот id удалён», который мог бы прочитать поздний писатель.
+
+### Принятые решения
+
+- **Маркер удаления — запись в корзине.** `ProjectStore.delete` создаёт
+  `projects-deleted/<id>-<ts>/` до переноса чего-либо, и только успешный
+  `restore_deleted` её убирает. `trash_entries(id)` / `newest_trash_entry(id)` /
+  `is_deleted(id)` читают этот факт с диска при каждом вызове, поэтому он долговечен, не
+  требует состояния в памяти и переживает перезапуск. Второго индексного файла нет,
+  поэтому ему нечем разойтись с корзиной.
+- **Проверка стоит на самой записи.** `ProjectStore.write` повторно проверяет
+  `is_deleted` и до записи поднимает `ProjectDeleted` (`409 project_deleted`), поэтому
+  измеренный путь (чтение, удаление, запись) отклоняется ровно в точке, где запись была бы
+  создана заново, — даже если писатель находится в другом процессе.
+- **Один замок на проект, удерживаемый на всём пути чтение -> проверка -> запись.**
+  `ProjectService` держит `threading.Lock` на пару (корень хранилища, id проекта); каждая
+  изменяющая операция (`confirm`, `attach_run`, `new_version`, `archive`, `restore`,
+  `set_preview_not_required`, `verify_again`, `delete`, `restore_deleted`) удерживает его и
+  вызывает `require_active` внутри. Выбранный порядок: **DELETE ждёт завершения
+  выполняющейся проверки и затем переносит проект**; проверка, увидевшая маркер, отвечает
+  `409 project_deleted`. Оба исхода допустимы для продукта; воскрешённая запись — нет.
+- **`require_active` проверяет маркер раньше записи.** Запись, которую поздний писатель уже
+  вернул, всё равно относится к удалённому проекту. Неизвестный id остаётся
+  `404 unknown_project`; удалённый id даёт `409 project_deleted` на каждом изменяющем
+  маршруте.
+- **Восстановление возвращает папку и запись и очищает маркер в одной критической
+  секции.** Если запись корзины не удаётся очистить, перенос откатывается: восстановленный
+  проект, который всё ещё отвечает «удалён», был бы хуже, чем повторяемый отказ. `409
+  project_already_exists` отвечается только когда id действительно занят активной записью.
+- **Неудавшееся удаление убирает свою запись корзины.** Удаление, которое не смогло
+  перенести проект, удаляет созданную пустую запись, поэтому живой проект никогда не
+  помечается удалённым.
+
+### Отклонённые альтернативы
+
+- **Множество «удалённых id» в памяти.** Оно умирает вместе с процессом, и первый же
+  перезапуск воскрешает ровно те проекты, которые это исправление обязано удерживать
+  удалёнными.
+- **Второй файл-маркер (`.deleted-index.json`), который ведут delete/restore.** Он может
+  разойтись с корзиной после падения между двумя записями, а корзина уже хранит тот же
+  факт; один источник истины дешевле держать корректным.
+- **Полагаться только на проверку при записи, без замка.** Запись всё равно создавалась бы
+  заново в окне между проверкой и `os.replace`, а половины «чтение-запись» чередовались бы.
+  Замок делает чередование внутри процесса детерминированным; маркер — межпроцессная
+  подстраховка.
+- **Жёстко удалять запись, чтобы поздняя запись ничего не нашла.** Это уничтожает обратимое
+  удаление, которое обещает продукт (побайтовое восстановление).
+
+### Следствия и открытые вопросы
+
+Внутри одного процесса чередование полностью сериализовано; между процессами маркер
+перечитывается при записи, что сужает окно до промежутка между проверкой и переименованием
+одной записи. Жёсткое завершение между созданием записи корзины и переносом папки оставляет
+помеченный, но неперенесённый проект (отказ, не воскрешение); жёсткое завершение во время
+переноса оставляет частичную запись корзины, о которой `restore_deleted` отказывается
+догадываться. Ни то, ни другое не чинится автоматически — намеренно: догадка здесь либо
+воскресила бы проект, либо стёрла его. `tests/test_deleted_project_race.py` закрепляет
+исправленное поведение, включая детерминированное чередование чтение -> удаление -> запись.

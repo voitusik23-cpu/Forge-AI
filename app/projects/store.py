@@ -47,6 +47,7 @@ __all__ = [
     "WORKSPACE_DIRECTORY_NAME",
     "ProjectStore",
     "ProjectAlreadyExists",
+    "ProjectDeleted",
     "UnknownProject",
     "default_projects_root",
     "is_safe_project_id",
@@ -141,6 +142,24 @@ class ProjectAlreadyExists(ProjectError):
 
     def __init__(self, project_id: str) -> None:
         super().__init__(f"project '{project_id}' already exists in the store")
+        self.project_id = project_id
+
+
+class ProjectDeleted(ProjectError):
+    """The id names a project that is in ``projects-deleted``, not a live project.
+
+    A refusal, not a server fault, and the one code a *late* writer gets when it
+    tried to persist a record it had read before the deletion finished. It exists
+    because a resumed verification could otherwise re-create a deleted project's
+    record while its workspace sits in the trash (see ``ProjectStore.write``).
+    """
+
+    code = "project_deleted"
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__(
+            f"project '{project_id}' was deleted and can no longer be modified"
+        )
         self.project_id = project_id
 
 
@@ -276,8 +295,17 @@ class ProjectStore:
 
     # ------------------------------------------------------------------- I/O
     def write(self, project: LifecycleProject) -> Path:
-        """Atomically persist one project record and refresh its index entry."""
+        """Atomically persist one project record and refresh its index entry.
 
+        The deletion marker is re-checked here, at the write itself, and not only at
+        the caller: a verification (or an attach) that read the record *before* a
+        concurrent delete finished must not be able to put the record back. This is
+        the exact path the measured defect used -- read, delete, write -- so the
+        refusal lives on the path, not in a caller's convention.
+        """
+
+        if self.is_deleted(project.project_id):
+            raise ProjectDeleted(project.project_id)
         target = self.path_for(project.project_id)
         payload = json.dumps(
             {"schema": SCHEMA_VERSION, **project.to_dict()},
@@ -493,6 +521,91 @@ class ProjectStore:
 
         return self.root.parent / DELETED_DIRECTORY_NAME
 
+    #: The trash entry *is* the durable deletion marker. ``delete`` creates it before
+    #: it moves anything and only a successful ``restore_deleted`` clears it, so the
+    #: fact "this id is deleted" survives a restart, needs no in-memory state, and is
+    #: readable by a writer that read the record before the deletion finished. A
+    #: leftover entry is also how a half-finished delete stays visible instead of
+    #: silently resurrecting the project.
+
+    def trash_entries(self, project_id: object) -> List[Path]:
+        """Every trash entry for ``project_id``, the newest move first.
+
+        Names are ``<project-id>-<YYYYmmddTHHMMSS>`` (with a numeric collision
+        suffix), and project ids contain no ``-`` after their ``proj-`` prefix, so
+        the ``<id>-`` prefix cannot accidentally match another project.
+        """
+
+        if not is_safe_project_id(project_id):
+            return []
+        identifier = str(project_id)
+        root = self.deleted_root()
+        if not root.is_dir():
+            return []
+        prefix = f"{identifier}-"
+        try:
+            entries = [
+                entry
+                for entry in root.iterdir()
+                if entry.is_dir() and entry.name.startswith(prefix)
+            ]
+        except OSError:
+            return []
+        return sorted(entries, key=lambda item: item.name, reverse=True)
+
+    def newest_trash_entry(self, project_id: object) -> Optional[Path]:
+        """The newest move of ``project_id`` into the trash, or ``None``."""
+
+        entries = self.trash_entries(project_id)
+        return entries[0] if entries else None
+
+    def is_deleted(self, project_id: object) -> bool:
+        """True when the id is in the trash, i.e. must not be written any more.
+
+        Durable and cross-process: it is derived from the trash directory on every
+        call, so a late writer in another process sees the same answer a restart
+        would.
+        """
+
+        return self.newest_trash_entry(project_id) is not None
+
+    def _clear_trash_entry(self, entry: Path) -> bool:
+        """Remove the now-empty trash entry, so the id stops being deleted.
+
+        ``rmdir`` is retried for the same measured Windows reason
+        :func:`_replace_with_retry` exists (a transient sharing violation). When the
+        directory is not empty -- something this layer did not put there -- it is
+        renamed instead, so the marker is cleared without erasing anything. ``False``
+        means the marker survived both attempts and the caller must not report a
+        completed restore.
+        """
+
+        delay = 0.02
+        for attempt in range(5):
+            try:
+                entry.rmdir()
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError:
+                if attempt == 4:
+                    break
+                time.sleep(delay)
+        aside = entry.parent / f"restored-{entry.name}"
+        if aside.exists():
+            return False
+        for attempt in range(5):
+            try:
+                entry.rename(aside)
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError:
+                if attempt == 4:
+                    return False
+                time.sleep(delay)
+        return False
+
     def _relative(self, path: Path) -> str:
         """A repository-relative rendering of ``path``, for an API payload.
 
@@ -570,6 +683,13 @@ class ProjectStore:
                     _move_path(destination, source)
                 except OSError:
                     pass
+            # An entry that holds nothing is not a deletion: leaving it would
+            # tombstone a project that is still live, because the entry is the
+            # marker every later write consults.
+            try:
+                target.rmdir()
+            except OSError:
+                pass
             raise
 
         self._forget_index(identifier)
@@ -676,8 +796,13 @@ class ProjectStore:
     def restore_deleted(self, project_id: object) -> Dict[str, Any]:
         """Move the newest trash entry for ``project_id`` back into the store.
 
-        Refuses -- rather than overwriting -- when a live project already uses the
-        id, because a restore must never replace a record the owner can see.
+        Refuses -- rather than overwriting -- when a genuinely *active* project
+        already uses the id, because a restore must never replace a record the owner
+        can see. The move and the clearing of the entry (the deletion marker) happen
+        together: callers that mutate a project hold the same per-project lock, so no
+        reader observes the folder back while the id still answers "deleted". If the
+        entry cannot be cleared the move is rolled back, because a restored project
+        that is still tombstoned would be a worse answer than a retryable refusal.
         """
 
         if not is_safe_project_id(project_id):
@@ -685,38 +810,52 @@ class ProjectStore:
         identifier = str(project_id)
         if self.exists(identifier):
             raise ProjectAlreadyExists(identifier)
-        root = self.deleted_root()
-        candidates = (
-            [entry for entry in root.iterdir() if entry.is_dir() and entry.name.startswith(f"{identifier}-")]
-            if root.is_dir()
-            else []
-        )
-        if not candidates:
+        source = self.newest_trash_entry(identifier)
+        if source is None:
             raise UnknownProject(identifier)
-        source = sorted(candidates, key=lambda item: item.name, reverse=True)[0]
         record = source / f"{identifier}.json"
         if not record.is_file():
             raise UnknownProject(identifier)
 
         folder = self.root / identifier
+        record_target = self.path_for(identifier)
         moved: List[Dict[str, str]] = []
+        undo: List[Tuple[Path, Path]] = []
         trash_folder = source / identifier
-        if trash_folder.is_dir():
-            _move_path(trash_folder, folder)
-            moved.append(
-                {"from": self._relative(trash_folder), "to": self._relative(folder)}
-            )
-        _move_path(record, self.path_for(identifier))
-        moved.append(
-            {
-                "from": self._relative(record),
-                "to": self._relative(self.path_for(identifier)),
-            }
-        )
         try:
-            source.rmdir()
-        except OSError:
-            pass
+            if trash_folder.is_dir():
+                _move_path(trash_folder, folder)
+                undo.append((folder, trash_folder))
+                moved.append(
+                    {"from": self._relative(trash_folder), "to": self._relative(folder)}
+                )
+            _move_path(record, record_target)
+            undo.append((record_target, record))
+            moved.append(
+                {
+                    "from": self._relative(record),
+                    "to": self._relative(record_target),
+                }
+            )
+        except BaseException:
+            for live, trashed in reversed(undo):
+                try:
+                    _move_path(live, trashed)
+                except OSError:
+                    pass
+            raise
+
+        if not self._clear_trash_entry(source):
+            for live, trashed in reversed(undo):
+                try:
+                    _move_path(live, trashed)
+                except OSError:
+                    pass
+            raise ProjectError(
+                f"project '{identifier}' could not be restored: its trash entry is "
+                "still there and nothing was moved"
+            )
+
         restored = self.read(identifier)
         if restored is not None:
             self._refresh_index(restored)

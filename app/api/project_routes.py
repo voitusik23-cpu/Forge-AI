@@ -43,6 +43,8 @@ Four properties are deliberate:
 * **Failures use the surface's existing error contract.** An unknown project is
   ``404``, a malformed body is ``400``, and an impossible lifecycle move (including
   starting a preview of an archived project) is ``409`` with the layer's own code.
+  A mutating call against an id that is in ``projects-deleted`` is
+  ``409 project_deleted``: the record is not written and the trash is not touched.
 """
 
 from __future__ import annotations
@@ -122,9 +124,10 @@ def register_project_routes(
 
     from app.api.routes import body_error_exception, error_body
     from app.projects.lifecycle import IllegalTransition
+    from app.projects.models import ProjectError
     from app.projects.presentation import build_project_presentation
     from app.projects.service import InvalidChangeRequest, UnknownProjectVersion
-    from app.projects.store import ProjectAlreadyExists, UnknownProject
+    from app.projects.store import ProjectAlreadyExists, ProjectDeleted, UnknownProject
 
     app.state.forge_projects = projects
     registry = preview_registry if preview_registry is not None else PreviewRegistry()
@@ -141,7 +144,11 @@ def register_project_routes(
             status = 404
         elif isinstance(exc, InvalidChangeRequest):
             status = 400
-        elif isinstance(exc, IllegalTransition):
+        elif isinstance(exc, (IllegalTransition, ProjectAlreadyExists, ProjectDeleted)):
+            status = 409
+        elif isinstance(exc, ProjectError):
+            # A typed refusal of this layer that has no more specific status: still a
+            # conflict with recorded state, never a 500 and never an untyped crash.
             status = 409
         else:
             status = 409
@@ -354,6 +361,8 @@ def register_project_routes(
             InvalidChangeRequest,
             IllegalTransition,
             ProjectAlreadyExists,
+            ProjectDeleted,
+            ProjectError,
         ) as exc:
             raise _refusal(exc) from exc
 
