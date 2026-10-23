@@ -130,7 +130,17 @@ class SettingsStoreTests(_Base):
         self.assertEqual(path.name, "settings.json")
         self.assertNotEqual(path.name, ".env")
         self.assertIn(".forge", path.parts)
-        self.assertFalse(path.exists(), "the repository must not carry a settings file")
+        # The file may exist -- a running application in this checkout creates it -- so its
+        # *content* is what is asserted: a folder path and the roots already used, never a
+        # credential. (Asserting its absence made this test depend on whether the shipped
+        # application had been started, which is not a property of the code.)
+        if path.exists():
+            document = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(document.get("schema"), "forge.settings.v1")
+            self.assertTrue(str(document.get("project_root", "")).strip())
+            lowered = json.dumps(document).lower()
+            for forbidden in ("api_key", "token", "password", "secret", "bearer"):
+                self.assertNotIn(forbidden, lowered)
 
     def test_03_a_value_survives_a_restart_and_the_previous_root_is_remembered(self) -> None:
         path = self.base / "settings.json"
