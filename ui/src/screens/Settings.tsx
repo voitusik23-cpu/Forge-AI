@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useState } from "react";
 import { Badge, Button, Card, CardHead } from "../components/Primitives";
 import { VersionLine } from "../components/VersionLine";
 import {
@@ -12,6 +13,12 @@ import {
 } from "../appearance";
 import { t, type Lang } from "../i18n";
 import type { Status } from "../api/client";
+import {
+  loadSettings,
+  saveProjectRoot,
+  type Failure,
+  type ForgeSettings,
+} from "../api/forge";
 
 const THEME_LABEL: Record<Lang, Record<ThemeMode, string>> = {
   ru: { dark: "Тёмная", light: "Светлая", system: "Как в системе" },
@@ -26,6 +33,134 @@ const ACCENT_LABEL: Record<Lang, Record<Accent, string>> = {
 const DENSITY_LABEL: Record<Lang, Record<Density, string>> = {
   ru: { comfortable: "Свободная", compact: "Плотная" },
   en: { comfortable: "Comfortable", compact: "Compact" },
+};
+
+/**
+ * The one setting the product itself owns: where a delivered project lives.
+ *
+ * It is *not* `.env` and not deployment configuration: it is a folder the owner picks,
+ * it is stored in the application's own settings file, and it decides where the **next**
+ * project's files appear. The screen therefore prints the stored value, the documented
+ * default, and whether the folder exists right now -- three facts, never one summary.
+ *
+ * The absolute path is printed here on purpose. Every other payload publishes a
+ * relative folder; this screen exists so the owner can see and paste the real one.
+ */
+const ProjectRootCard = ({ lang }: { lang: Lang }) => {
+  const [settings, setSettings] = useState<ForgeSettings | null>(null);
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState("");
+  const [notice, setNotice] = useState("");
+  const [failure, setFailure] = useState<Failure | null>(null);
+
+  const load = useCallback(async () => {
+    const outcome = await loadSettings();
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    setFailure(null);
+    setSettings(outcome.value);
+    setValue(String(outcome.value.project_root ?? ""));
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const save = async (body: { project_root: string } | { use_desktop: true }) => {
+    setBusy("save");
+    setNotice("");
+    setFailure(null);
+    const outcome = await saveProjectRoot(body);
+    setBusy("");
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    setSettings(outcome.value);
+    setValue(String(outcome.value.project_root ?? ""));
+    setNotice(
+      t(lang, "projects.settings.saved").replace(
+        "{path}",
+        String(outcome.value.project_root ?? "")
+      )
+    );
+  };
+
+  const current = String(settings?.project_root ?? "");
+  const fallback = String(settings?.default_project_root ?? "");
+  const exists = settings?.project_root_exists === true;
+
+  return (
+    <Card className="rise d2">
+      <CardHead
+        title={t(lang, "projects.settings.title")}
+        hint={t(lang, "projects.settings.hint")}
+        action={<Badge tone={exists ? "ok" : "warn"}>.forge/settings.json</Badge>}
+      />
+      <div className="stack" style={{ gap: 12 }}>
+        <label className="field">
+          <span className="label">{t(lang, "projects.settings.root")}</span>
+          <input
+            className="input"
+            type="text"
+            value={value}
+            spellCheck={false}
+            onChange={(event) => setValue(event.target.value)}
+            placeholder={fallback}
+            data-testid="settings-project-root"
+          />
+        </label>
+        <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <span data-testid="settings-project-root-save">
+            <Button
+              size="small"
+              disabled={busy === "save" || value.trim() === ""}
+              onClick={() => void save({ project_root: value })}
+            >
+              {busy === "save" ? t(lang, "state.loading") : t(lang, "projects.settings.save")}
+            </Button>
+          </span>
+          <span data-testid="settings-project-root-desktop">
+            <Button
+              size="small"
+              tone="ghost"
+              disabled={busy === "save"}
+              onClick={() => void save({ use_desktop: true })}
+            >
+              {t(lang, "projects.settings.desktop")}
+            </Button>
+          </span>
+        </div>
+        {current !== "" ? (
+          <div className="small mono" style={{ overflowWrap: "anywhere" }}>
+            {current} {exists ? "" : `· ${t(lang, "projects.save.unknown")}`}
+          </div>
+        ) : null}
+        {fallback !== "" ? (
+          <div className="small muted">
+            {t(lang, "projects.settings.default").replace("{path}", fallback)}
+          </div>
+        ) : null}
+        {notice !== "" ? (
+          <div className="notice" data-testid="settings-project-root-notice">
+            {notice}
+          </div>
+        ) : null}
+        {failure !== null ? (
+          <div className="notice warn" data-testid="settings-project-root-failure">
+            <div>{`HTTP ${failure.status}${failure.code ? ` · ${failure.code}` : ""}`}</div>
+            {failure.detail ? (
+              <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+                {failure.detail}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </Card>
+  );
 };
 
 export const Settings = ({
@@ -50,8 +185,8 @@ export const Settings = ({
         <h1 style={{ margin: 0, fontSize: "var(--t-title)" }}>{t(lang, "nav.settings")}</h1>
         <div className="small muted" style={{ marginTop: 4 }}>
           {lang === "ru"
-            ? "Внешний вид и хранение настроек"
-            : "Appearance and where preferences are kept"}
+            ? "Внешний вид, папка проектов и хранение настроек"
+            : "Appearance, the projects folder, and where preferences are kept"}
         </div>
         {/* version · short commit: the compact line from Part 1.1 of the brief. */}
         <div style={{ marginTop: 6 }}>
@@ -151,6 +286,8 @@ export const Settings = ({
         </div>
       </Card>
 
+      <ProjectRootCard lang={lang} />
+
       <Card className="rise d1">
         <CardHead
           title={lang === "ru" ? "Где что лежит" : "Where things live"}
@@ -161,6 +298,7 @@ export const Settings = ({
             ["ui/dist", lang === "ru" ? "собранный интерфейс" : "the built interface"],
             [".forge/logs/launcher.log", lang === "ru" ? "журнал запуска" : "launcher journal"],
             [".forge/logs/api.log", lang === "ru" ? "журнал Core API" : "Core API log"],
+            [".forge/settings.json", lang === "ru" ? "папка проектов (настройка Forge)" : "the projects folder (a Forge setting)"],
             ["%LOCALAPPDATA%\\ForgeAI\\accounts.json", lang === "ru" ? "учётные записи (код — только хешем)" : "accounts (the code is stored as a hash)"],
             ["FORGE_RUN_STORE_ROOT", lang === "ru" ? "записи запусков" : "run records"],
           ].map(([path, note]) => (

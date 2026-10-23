@@ -432,7 +432,9 @@ def materialize(
         target = supplied
 
     if not project_path:
-        project_path = resolved_store.project_path_relative(project_id)
+        # The record's own published folder (visible-folder projects are root-relative,
+        # legacy ones repository-relative), never a recomputed guess.
+        project_path = resolved_store.published_project_path(project_id)
 
     return materialize_into(
         target,

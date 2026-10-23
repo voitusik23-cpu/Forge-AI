@@ -14,22 +14,38 @@ Layout (all under the store root, ``<repository>/.forge/projects`` by default):
 .forge/projects/
     index.json                  <- listing + discovery-session links
     <project_id>.json           <- one project record
-    <project_id>/workspace/     <- the project's controlled working tree
+    <project_id>/workspace/     <- the project's controlled working tree (legacy)
 ```
 
-The workspace is a *subdirectory of the store*, which is itself inside the
-repository, so no project can ever name a path outside the repository: the
-containment is re-proved on every resolution instead of being trusted from the id.
+**Where a project's files live.** The default layout above is kept for every project
+that already exists, and it is still what a store with no configured *project root*
+produces. A deployment that configures one (the desktop application does; see
+:mod:`app.config.app_settings`) delivers each **new** project into a visible folder
+instead:
 
-Nothing secret is stored here. A record holds user text that was already screened
-for credential shapes, plus identifiers, status words, repo-relative paths, sizes
-and SHA-256 digests.
+```
+<project root>/<project name> (proj-<id>)    <- the files the owner opens
+.forge/projects/<id>.json                    <- the record, unchanged
+```
+
+The record carries that folder's absolute location in ``workspace_dir`` (written here,
+never published) and its root-relative form in ``project_path``. Which one is in use is
+a property of the **record**, not of the store: a project keeps the folder it was
+delivered to even after the owner changes the root setting, and a project created
+before this existed keeps working in the legacy workspace. So the store resolves the
+workspace from the record first and falls back to the legacy layout.
+
+Every resolved path is re-proved against roots the *deployment* configured -- the
+current project root, the roots it used before, and this store's own root -- never
+against a value from a request or from the record being read. Nothing secret is
+written here.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import re
 import tempfile
@@ -37,6 +53,12 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from app.projects.models import LifecycleProject, ProjectError, utc_now
+from app.projects.folders import (
+    UnsafeProjectFolder,
+    prove_folder,
+    published_folder_path,
+    visible_folder,
+)
 
 __all__ = [
     "DELETED_DIRECTORY_NAME",
@@ -229,10 +251,74 @@ def _atomic_write_bytes(target: Path, data: bytes) -> Path:
 
 
 class ProjectStore:
-    """Read and write one JSON file per project, plus the listing file."""
+    """Read and write one JSON file per project, plus the listing file.
 
-    def __init__(self, root: Optional[object] = None) -> None:
+    ``visible_root`` is where **new** projects' files are delivered, or ``None`` to keep
+    the legacy hidden workspace. It may be a path or a zero-argument callable returning
+    one: the desktop application passes a callable over the owner's settings, so editing
+    the root in «Настройки» takes effect for the next project without a restart. It is
+    only ever consulted for a project that is being **created**; an existing project is
+    resolved from its own record.
+    """
+
+    def __init__(self, root: Optional[object] = None, *, visible_root: object = None) -> None:
         self.root = Path(root) if root is not None else default_projects_root()
+        self._visible_root = visible_root
+
+    # ------------------------------------------------------- the visible root
+    def visible_root(self) -> Optional[Path]:
+        """The configured project root, or ``None`` when none is configured.
+
+        An unusable value is ``None`` rather than an exception: a broken setting must
+        not make the project list unreadable, and a project created while it is broken
+        simply lands in the legacy workspace (which still works).
+        """
+
+        source = self._visible_root
+        if source is None:
+            return None
+        if callable(source):
+            try:
+                source = source()
+            except Exception:  # noqa: BLE001 - an unreadable setting is "not configured"
+                return None
+        if source is None:
+            return None
+        try:
+            path = Path(str(source)).expanduser()
+        except (TypeError, ValueError):
+            return None
+        if not path.is_absolute() or any(part == ".." for part in path.parts):
+            return None
+        return path
+
+    def allowed_workspace_roots(self) -> Tuple[Path, ...]:
+        """The roots a project folder may live under: the project root, then the store.
+
+        Both come from the deployment's configuration. Nothing here is derived from a
+        request, and the only record-derived value is *which* of these roots a project's
+        folder is proved against.
+        """
+
+        roots: List[Path] = []
+        visible = self.visible_root()
+        if visible is not None:
+            roots.append(visible)
+        roots.append(self.root)
+        return tuple(roots)
+
+    def _legacy_workspace_path(self, project_id: object) -> Path:
+        """``<store>/<id>/workspace``, re-proved to sit inside the store root."""
+
+        if not is_safe_project_id(project_id):
+            raise ValueError("unsafe project id")
+        target = (
+            self.root / str(project_id) / WORKSPACE_DIRECTORY_NAME
+        ).resolve(strict=False)
+        root = self.root.resolve(strict=False)
+        if target != root and root not in target.parents:
+            raise ValueError("project workspace escapes the store root")
+        return target
 
     # ------------------------------------------------------------------ paths
     def path_for(self, project_id: object) -> Path:
@@ -247,19 +333,82 @@ class ProjectStore:
         return target
 
     def workspace_path(self, project_id: object, *, create: bool = False) -> Path:
-        """The project's workspace directory, re-proved to sit inside the store root."""
+        """The project's workspace directory, proved to sit under an allowed root.
+
+        The record decides: a project delivered to a visible folder is resolved from
+        its own ``workspace_dir`` (and refused when that path no longer proves to be
+        inside a configured root), and a project that predates that keeps the legacy
+        ``<store>/<id>/workspace``. The containment is re-proved on every resolution
+        instead of being trusted from the id.
+        """
 
         if not is_safe_project_id(project_id):
             raise ValueError("unsafe project id")
-        target = (
-            self.root / str(project_id) / WORKSPACE_DIRECTORY_NAME
-        ).resolve(strict=False)
-        root = self.root.resolve(strict=False)
-        if target != root and root not in target.parents:
-            raise ValueError("project workspace escapes the store root")
+        record = self.read(project_id)
+        recorded = str(getattr(record, "workspace_dir", "") or "") if record is not None else ""
+        if recorded:
+            try:
+                target = prove_folder(
+                    recorded, allowed_roots=self.allowed_workspace_roots()
+                )
+            except UnsafeProjectFolder as exc:
+                raise ValueError(
+                    "project workspace is not inside a configured project root"
+                ) from exc
+            if create:
+                target.mkdir(parents=True, exist_ok=True)
+            return target
+        target = self._legacy_workspace_path(project_id)
         if create:
             target.mkdir(parents=True, exist_ok=True)
         return target
+
+    def allocate_workspace(
+        self, project_id: object, name: object = ""
+    ) -> Tuple[Path, str, str]:
+        """Create the workspace for a **new** project and describe it.
+
+        Returns ``(workspace, published_path, recorded_dir)``:
+
+        * a visible folder when a project root is configured --
+          ``<root>/<name> (proj-<id>)``, published as ``<root name>/<folder name>`` and
+          recorded as its absolute path;
+        * the legacy ``<store>/<id>/workspace`` otherwise, published repository-relative
+          and recorded as ``""`` (meaning "the legacy layout").
+
+        The folder is created here, before the record that names it is written: a record
+        pointing at a folder it does not have would be a lie the API would publish.
+        """
+
+        if not is_safe_project_id(project_id):
+            raise ValueError("unsafe project id")
+        identifier = str(project_id)
+        root = self.visible_root()
+        if root is None:
+            workspace = self._legacy_workspace_path(identifier)
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace, self.project_path_relative(identifier), ""
+        folder = visible_folder(root, identifier, name)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise UnsafeProjectFolder(
+                f"папку проекта не удалось создать: {folder} ({type(exc).__name__})"
+            ) from exc
+        proved = prove_folder(folder, allowed_roots=(root,), must_exist=True)
+        return proved, published_folder_path(root, proved), str(proved)
+
+    def published_project_path(self, project_id: object) -> str:
+        """The project's folder as a payload may print it: the record's own value.
+
+        Falls back to the legacy repository-relative form when a record is missing or
+        carries no path, so a caller that only knows the id still gets an honest answer.
+        """
+
+        record = self.read(project_id)
+        if record is not None and str(record.project_path or "").strip():
+            return str(record.project_path)
+        return self.project_path_relative(project_id)
 
     def project_path_relative(self, project_id: object) -> str:
         """The workspace path as a **repository-relative** string.
@@ -308,7 +457,14 @@ class ProjectStore:
             raise ProjectDeleted(project.project_id)
         target = self.path_for(project.project_id)
         payload = json.dumps(
-            {"schema": SCHEMA_VERSION, **project.to_dict()},
+            {
+                "schema": SCHEMA_VERSION,
+                **project.to_dict(),
+                # Written here and nowhere else: ``to_dict`` is the *published* shape and
+                # must never carry an absolute path of the host, while the store needs
+                # one to find the files again after a restart.
+                "workspace_dir": str(project.workspace_dir or ""),
+            },
             ensure_ascii=False,
             sort_keys=True,
             indent=2,
@@ -489,12 +645,27 @@ class ProjectStore:
         return _atomic_write_bytes(target, data)
 
     def workspace_file_path(self, project_id: object, relative_path: str) -> Path:
-        """Resolve one workspace-relative file, re-proving containment."""
+        """Resolve one workspace-relative file, re-proving containment.
 
+        Two refusals beyond containment, both from the repository's existing shared
+        recognizers rather than a second list: a path that enters a ``.git`` directory,
+        and a path the secret recognizer already knows (``.env``, a private key, a
+        credential file). A delivered project is a normal folder the owner can commit,
+        so a secret must never be written into it by Forge.
+        """
+
+        from app.execution.secret_files import is_secret_directory, is_secret_file
         from app.projects.models import is_safe_relative_path
 
         if not is_safe_relative_path(relative_path):
             raise ValueError("unsafe workspace-relative path")
+        parts = str(relative_path).split("/")
+        if any(part.lower() == ".git" for part in parts):
+            raise ValueError("a project file may not enter a .git directory")
+        if is_secret_file(relative_path) or any(
+            is_secret_directory(part) for part in parts[:-1]
+        ):
+            raise ValueError("a secret file is never written into a project workspace")
         workspace = self.workspace_path(project_id)
         target = workspace.joinpath(*str(relative_path).split("/")).resolve(
             strict=False
@@ -621,19 +792,40 @@ class ProjectStore:
             return resolved.name
 
     def _live_paths(self, project_id: str) -> Tuple[Path, Path]:
-        """The project's folder and its record, both proved inside the store root."""
+        """The project's folder and its record, both proved inside a configured root.
 
-        record = self.path_for(project_id)
+        For a project delivered to a visible folder the folder is that folder itself
+        (its contents are the project's files). For a legacy project it is
+        ``<store>/<id>``, which holds the ``workspace/`` directory -- exactly what it
+        always moved, so an existing trash entry and an existing restore keep working.
+        """
+
+        record = self.read(project_id)
+        recorded = str(getattr(record, "workspace_dir", "") or "") if record else ""
+        if recorded:
+            folder = prove_folder(recorded, allowed_roots=self.allowed_workspace_roots())
+            return folder, self.path_for(project_id)
+        record_path = self.path_for(project_id)
         folder = (self.root / project_id).resolve(strict=False)
         root = self.root.resolve(strict=False)
         if folder != root and root not in folder.parents:
             raise ValueError("project folder escapes the store root")
-        return folder, record
+        return folder, record_path
 
     def delete(
         self, project_id: object, *, stamp: str = ""
     ) -> Dict[str, Any]:
         """Move one project's folder and record into ``projects-deleted``.
+
+        **One trash root, and it is the existing one.** A deleted project -- whether its
+        files were in the legacy hidden workspace or in a visible folder on the desktop
+        -- is moved to ``<store parent>/projects-deleted/<id>-<timestamp>``, the directory
+        :meth:`deleted_root` names. That choice is deliberate: the listing
+        (:meth:`list_deleted`), the restore (:meth:`restore_deleted`) and the durable
+        "this id is deleted" marker all already work from that one directory, so deletion
+        stays a *move* and stays reversible. The visible folder is not copied and not
+        emptied: the same folder, with the same files, is renamed into the trash, and the
+        record travels beside it.
 
         Returns what was moved. Raises :class:`UnknownProject` when no record exists
         and ``ValueError`` when an id or a path fails the containment checks; a
@@ -794,7 +986,15 @@ class ProjectStore:
         return found[start : start + max(0, int(limit))]
 
     def restore_deleted(self, project_id: object) -> Dict[str, Any]:
-        """Move the newest trash entry for ``project_id`` back into the store.
+        """Move the newest trash entry for ``project_id`` back where the project lived.
+
+        The trashed **record** travels with the folder, so it -- not the current setting
+        -- says where the folder belongs: a project that was delivered to a visible
+        folder is put back into that exact folder, and a legacy project goes back to
+        ``<store>/<id>``. A recorded folder that no longer proves to be inside a
+        configured root is not trusted; the project is restored into the legacy location
+        instead and the record is rewritten to name it, so a restored project can never
+        point at a folder that is not there.
 
         Refuses -- rather than overwriting -- when a genuinely *active* project
         already uses the id, because a restore must never replace a record the owner
@@ -817,7 +1017,7 @@ class ProjectStore:
         if not record.is_file():
             raise UnknownProject(identifier)
 
-        folder = self.root / identifier
+        folder, rewrite_legacy = self._restore_destination(identifier, record)
         record_target = self.path_for(identifier)
         moved: List[Dict[str, str]] = []
         undo: List[Tuple[Path, Path]] = []
@@ -857,6 +1057,18 @@ class ProjectStore:
             )
 
         restored = self.read(identifier)
+        if restored is not None and rewrite_legacy:
+            # The record named a visible folder this deployment may no longer use; the
+            # files are back in the legacy workspace, so the record says so.
+            restored = replace(
+                restored,
+                workspace_dir="",
+                project_path=self.project_path_relative(identifier),
+            )
+            try:
+                self.write(restored)
+            except ProjectDeleted:  # pragma: no cover - the marker was just cleared
+                pass
         if restored is not None:
             self._refresh_index(restored)
         return {
@@ -866,6 +1078,43 @@ class ProjectStore:
             "moved": moved,
             "project": restored.to_dict() if restored is not None else None,
         }
+
+    def _restore_destination(
+        self, identifier: str, trashed_record: Path
+    ) -> Tuple[Path, bool]:
+        """Where a restore puts the folder back, and whether the record must be rewritten.
+
+        The answer comes from the trashed record, proved against the roots this
+        deployment configured. Three cases, and each one puts the folder where the files
+        will actually resolve:
+
+        * a recorded visible folder that still proves to sit inside an allowed root -- the
+          folder itself goes back there, and the record is left alone;
+        * a recorded visible folder that does **not** prove any more (the root setting
+          changed, the record was edited) -- the files go into the legacy workspace
+          ``<store>/<id>/workspace`` and the record is rewritten to say so, because a
+          restored project must never point at a folder that is not there;
+        * no recorded folder (a legacy project, or an unreadable record) -- the legacy
+          project directory ``<store>/<id>``, which is exactly what a legacy delete moved.
+        """
+
+        legacy_project = self.root / identifier
+        try:
+            data = json.loads(trashed_record.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return legacy_project, False
+        if not isinstance(data, dict):
+            return legacy_project, False
+        recorded = str(data.get("workspace_dir", "") or "")
+        if not recorded:
+            return legacy_project, False
+        try:
+            return (
+                prove_folder(recorded, allowed_roots=self.allowed_workspace_roots()),
+                False,
+            )
+        except UnsafeProjectFolder:
+            return self._legacy_workspace_path(identifier), True
 
 
 def _deleted_at_from_name(name: str) -> str:

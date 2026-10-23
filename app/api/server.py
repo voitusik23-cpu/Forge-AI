@@ -187,6 +187,8 @@ def create_api_app(
     discovery_service: Optional[object] = None,
     project_service: Optional[object] = None,
     project_runner: Optional[object] = None,
+    settings_store: Optional[object] = None,
+    project_opener: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -212,6 +214,14 @@ def create_api_app(
     executor either: a confirmed discovery session creates a project record, and the
     task route copies the *existing* run's written files into that project's
     workspace after the run finished.
+
+    ``settings_store`` is the owner's own settings file
+    (:class:`app.config.app_settings.AppSettingsStore`). It is registered here so the
+    «Настройки» screen can read and change the project root. It deliberately does **not**
+    decide where a project's files go by itself: that is the ``project_service``'s store,
+    composed by the launcher with the same settings. A caller that composes its own
+    service (a test, a laboratory script) therefore keeps the layout it asked for and
+    never writes into the owner's desktop.
     """
 
     from fastapi import FastAPI, HTTPException, Request, Header
@@ -222,6 +232,8 @@ def create_api_app(
     from app.api.operating_surface import build_operating_surface
     from app.api.discovery_routes import register_discovery_routes
     from app.api.project_routes import register_project_routes
+    from app.api.settings_routes import register_settings_routes
+    from app.config.app_settings import AppSettingsStore
     from app.projects.preview import PreviewRegistry
     from app.projects.runner import LocalRunner
     from app.api.routes import (
@@ -436,6 +448,7 @@ def create_api_app(
         run_record_loader=api_service.get_run_record,
         preview_registry=previews,
         runner=runner,
+        opener=project_opener,
         environment_facts=lambda: {
             "provider_registry_ids": _provider_registry_ids(api_service),
             "api_routes": sorted(
@@ -458,6 +471,14 @@ def create_api_app(
         else DiscoveryService()
     )
     register_discovery_routes(app, discovery, projects)
+
+    # The owner's settings, composed once for this process. The routes are read/write;
+    # the value they hold is consumed by the launcher (``app/api/main.py``), which builds
+    # the project store with it, so «Настройки» and where a project lands cannot disagree.
+    register_settings_routes(
+        app,
+        settings_store if settings_store is not None else AppSettingsStore(),
+    )
 
     def _require_run_target(project_id: str) -> str:
         """The id of a **live, active** project this run may be attached to.
@@ -871,7 +892,7 @@ def create_api_app(
             project_workspace = projects.store.workspace_path(
                 target_project, create=True
             )
-            lifecycle_project_path = projects.store.project_path_relative(
+            lifecycle_project_path = projects.store.published_project_path(
                 target_project
             )
 

@@ -90,10 +90,34 @@ def resolve_workspace_project_id(workspace_root: Optional[pathlib.Path] = None) 
     return project_run_store_root(root).name
 
 
+def compose_project_service(settings: Any) -> Any:
+    """The lifecycle service the desktop application delivers projects with.
+
+    This is the one place the *product* decision about a project's folder is made: the
+    store is built with a **visible root** read from the owner's own settings file, so a
+    new project's files appear in ``%USERPROFILE%\\Desktop\\Forge Projects`` (or whatever
+    he chose in «Настройки») instead of a hidden directory under the repository. The root
+    is supplied as a callable, so editing it takes effect for the next project without a
+    restart.
+
+    The record directory (``.forge/projects``) is untouched: versions, the artifact
+    manifest and run links stay there. ``create_api_app`` composes no such service by
+    itself -- a test or a laboratory script that builds its own app keeps the legacy
+    hidden workspace and never writes into the owner's desktop.
+    """
+
+    from app.projects.service import ProjectService
+    from app.projects.store import ProjectStore
+
+    return ProjectService(ProjectStore(visible_root=lambda: settings.project_root()))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Serve the Core API. Returns a process exit code."""
 
     import uvicorn
+
+    from app.config.app_settings import AppSettingsStore
 
     host, port = resolve_bind()
     warn_if_exposed(host)
@@ -105,7 +129,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # without that the service stays unbound and every task is refused (which is the correct
     # fail-closed behaviour, but it also means the application can never run anything).
     project_id = resolve_workspace_project_id()
-    app: Any = create_api_app(idempotency_guard=guard, authorized_project_id=project_id)
+    # The owner's settings are read once and shared: the settings routes write this file
+    # and the project store reads it through the same instance. The configured projects
+    # folder is created here, at startup, so it is visible on his desktop before the first
+    # project exists ("я вставляю промт и в конце получаю на рабочий стол готовый проект"
+    # -- the destination has to be there to be a destination). A folder that cannot be
+    # created is not fatal: the first project reports the refusal where it happens.
+    settings = AppSettingsStore()
+    try:
+        settings.ensure_root()
+    except Exception:  # noqa: BLE001 - an unusable root must not stop the API from serving
+        pass
+    app: Any = create_api_app(
+        idempotency_guard=guard,
+        authorized_project_id=project_id,
+        project_service=compose_project_service(settings),
+        settings_store=settings,
+    )
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
 

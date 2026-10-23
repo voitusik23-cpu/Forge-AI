@@ -43,6 +43,8 @@ import {
   loadProjectLifecycle,
   loadProjectRun,
   loadRunRecord,
+  moveProjectToVisibleFolder,
+  openProject as openProjectTarget,
   restartProjectRun,
   restoreDeletedProject,
   restoreProject,
@@ -56,8 +58,10 @@ import {
   type LifecycleDeletedProject,
   type LifecycleDetail,
   type LifecycleEntryPoint,
+  type LifecycleFolder,
   type LifecycleHistory,
   type LifecycleNewVersion,
+  type LifecycleOpen,
   type LifecyclePreview,
   type LifecycleProject,
   type LifecycleRun,
@@ -123,6 +127,23 @@ type ChangeOutcome = {
   attached: boolean;
   fromVersion: number;
   toVersion: number;
+  /**
+   * What the new version really changed, read from its own manifest after the run:
+   * a path, whether it was created or updated, and its size. Empty when the run wrote
+   * nothing, which is exactly the case the card must not dress up as a new version.
+   */
+  files: LifecycleArtifact[];
+};
+
+/**
+ * How a project file is named in «Что изменилось»: the backend's own `create`/`update`
+ * word, translated, so the card never invents a third vocabulary for the same fact.
+ */
+const changeWord = (lang: Lang, change: unknown): string => {
+  const word = String(change ?? "");
+  if (word === "create") return lang === "ru" ? "создан" : "created";
+  if (word === "update") return lang === "ru" ? "обновлён" : "updated";
+  return text(word);
 };
 
 /**
@@ -519,6 +540,14 @@ const ProjectCard = ({
   onRunStop,
   onRunRestart,
   onDelete,
+  open,
+  folder,
+  onOpenTarget,
+  openingTarget,
+  diskNotice,
+  diskFailure,
+  onMoveToVisible,
+  movingToVisible,
 }: {
   lang: Lang;
   backend: BackendState;
@@ -589,6 +618,18 @@ const ProjectCard = ({
    * so a single accidental press cannot move anything.
    */
   onDelete: () => void;
+  /** What can really be opened, per target, and why not when it cannot. */
+  open: LifecycleOpen;
+  /** The project's folder as the backend publishes it, plus whether it is there now. */
+  folder: LifecycleFolder;
+  /** Really open the project: folder, VS Code, or a terminal at it. */
+  onOpenTarget: (target: "folder" | "editor" | "terminal") => void;
+  openingTarget: string;
+  diskNotice: string;
+  diskFailure: Failure | null;
+  /** Deliver an existing project's files into the configured visible folder. */
+  onMoveToVisible: () => void;
+  movingToVisible: boolean;
 }) => {
   const archived = project.archived === true;
   const currentVersion = typeof project.current_version === "number" ? project.current_version : 0;
@@ -655,6 +696,15 @@ const ProjectCard = ({
   const hasRun = runIdValue !== "" && runIdValue !== "—";
   const notices = presentation.notices ?? [];
 
+  // ------------------------------------------------------------- the entrance
+  // Every word here is the backend's: which target is available, and the sentence that
+  // says why it is not. The interface computes nothing about the machine -- a folder
+  // that is gone or a project with no files is refused by the backend, and the buttons
+  // here only reflect that answer.
+  const openTargets = open.targets ?? {};
+  const folderPath = text(folder.path ?? project.project_path, t(lang, "projects.facts.none"));
+  const diskFiles = typeof folder.files === "number" ? folder.files : Number(open.files ?? 0);
+
   // ------------------------------------------------------------ the derived facts
   // `stage` is one of the eight words the backend derives from the facts
   // (`app/projects/stage.py`); it is shown beside the owner's word, never instead of it.
@@ -719,6 +769,179 @@ const ProjectCard = ({
       );
     }
   };
+
+  /* THE CORRECTION LOOP, as a value.
+   *
+   * It is defined here and rendered near the top of the card (right under the
+   * folder and its open buttons), because «Что поправить?» is the default way to
+   * edit a project: one textarea, one button, no terminal. Keeping the JSX in one
+   * place while moving where it appears is what lets the same handlers serve it.
+   */
+  const changeBlock = (
+    <>
+        {/* ----------------------------------------------------------- new version */}
+        <div>
+          <div className="label">{t(lang, "projects.newversion.title")}</div>
+          <div className="stack" style={{ gap: 10, marginTop: 8 }}>
+            <Field
+              label={t(lang, "projects.newversion.field")}
+              hint={t(lang, "projects.newversion.hint")}
+              error={changeError}
+            >
+              <textarea
+                className="input"
+                rows={3}
+                ref={changeRef}
+                value={change}
+                onChange={(event) => onChange(event.target.value)}
+                placeholder={t(lang, "projects.newversion.placeholder")}
+              />
+            </Field>
+            <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+              <label className="field" style={{ flex: "0 1 190px" }}>
+                <span className="label">{t(lang, "projects.col.provider")}</span>
+                <select
+                  className="input"
+                  value={provider}
+                  onChange={(event) => onProvider(event.target.value)}
+                  disabled={backend.status !== "live"}
+                >
+                  <option value="">{t(lang, "projects.newversion.provider.auto")}</option>
+                  {providerOptions(backend).map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field" style={{ flex: "0 1 240px" }}>
+                <span className="label">{t(lang, "projects.col.model")}</span>
+                {modelChoices.length > 0 ? (
+                  <select className="input" value={model} onChange={(event) => onModel(event.target.value)}>
+                    {modelChoices.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className="input"
+                    type="text"
+                    value={model}
+                    onChange={(event) => onModel(event.target.value)}
+                    placeholder={t(lang, "forge.task.model.placeholder")}
+                  />
+                )}
+              </label>
+            </div>
+            <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+              <Button size="small" disabled={busy === "version"} onClick={onNewVersion}>
+                {busy === "version" ? t(lang, "projects.newversion.running") : t(lang, "projects.newversion.create")}
+              </Button>
+              {/* The switch is available for every routable provider, `mock` included:
+                  the Core's MOCK_DETERMINISTIC mode writes the deterministic scaffold
+                  when the run belongs to a lifecycle project, and honestly reports
+                  `no_changes` when it does not. That is the only free path that can
+                  create (or extend) a project at all, and it calls no model. */}
+              <label className="forge-toggle">
+                <input
+                  type="checkbox"
+                  checked={writeMode}
+                  onChange={(event) => onWriteMode(event.target.checked)}
+                />
+                <span>{t(lang, "projects.newversion.write")}</span>
+              </label>
+            </div>
+            {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
+            <div className="small muted">{t(lang, "projects.newversion.session.note")}</div>
+
+            {staged !== null ? (
+              <div className="stack" style={{ gap: 8 }}>
+                <div className="label">
+                  {t(lang, "projects.newversion.staged").replace("{version}", `v${text(staged.version)}`)}
+                </div>
+                <pre className="forge-output mono small">{text(staged.task_text)}</pre>
+                <div className="row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <Button size="small" tone="primary" disabled={dispatching} onClick={onDispatch}>
+                    {dispatching ? t(lang, "projects.newversion.submitting") : t(lang, "projects.newversion.submit")}
+                  </Button>
+                  <span className="small muted">{t(lang, "projects.newversion.submit.hint")}</span>
+                </div>
+              </div>
+            ) : null}
+
+            {dispatchFailure !== null ? <Refusal lang={lang} failure={dispatchFailure} /> : null}
+
+            {/* THE HONEST RESULT OF A CHANGE. A finished run is not a new version: the
+                card says a new version exists only when the refreshed record's
+                `current_version` really moved, and otherwise prints the same sentence
+                the backend's own presentation uses. The run id is always named, so the
+                owner can open exactly that run. */}
+            {changeOutcome !== null ? (
+              <div
+                className={`notice ${changeOutcome.toVersion > changeOutcome.fromVersion ? "" : "warn"}`}
+                data-testid="change-outcome"
+              >
+                <div className="label">{t(lang, "projects.newversion.outcome.title")}</div>
+                <div style={{ marginTop: 6 }}>
+                  {!changeOutcome.attached
+                    ? t(lang, "projects.newversion.outcome.unattached")
+                    : changeOutcome.toVersion > changeOutcome.fromVersion
+                      ? t(lang, "projects.newversion.outcome.advanced")
+                          .replace("{version}", `v${changeOutcome.toVersion}`)
+                          .replace("{run}", changeOutcome.runId)
+                      : t(lang, "projects.newversion.outcome.not_written")}
+                </div>
+                <div className="small mono" style={{ marginTop: 6, wordBreak: "break-word" }}>
+                  {`${changeOutcome.attached ? "v" + changeOutcome.toVersion : "—"} · run ${changeOutcome.runId} · ${t(lang, "projects.col.files")}: ${changeOutcome.filesCreated}`}
+                </div>
+                {/* WHAT CHANGED, from the new version's own manifest. A run that wrote
+                    nothing has no entry here and the card says exactly that, instead of
+                    showing an empty list that would read as "nothing to report". */}
+                <div className="small" style={{ marginTop: 8 }} data-testid="change-files">
+                  <div className="label">{t(lang, "projects.newversion.changed")}</div>
+                  {changeOutcome.files.length === 0 ? (
+                    <div className="muted" style={{ marginTop: 4 }}>
+                      {t(lang, "projects.newversion.changed.none")}
+                    </div>
+                  ) : (
+                    <div className="stack" style={{ gap: 2, marginTop: 4 }}>
+                      {changeOutcome.files.map((item) => (
+                        <div className="mono small" key={String(item.path ?? "")} style={{ overflowWrap: "anywhere" }}>
+                          {t(lang, "projects.newversion.changed.line")
+                            .replace("{path}", text(item.path))
+                            .replace("{change}", changeWord(lang, item.change))
+                            .replace("{size}", bytesLabel(item.size))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            {dispatched !== null ? (
+              <Facts
+                items={[
+                  [t(lang, "projects.col.run"), text(dispatched.response.run_id)],
+                  [t(lang, "projects.col.status"), text(dispatched.response.state, t(lang, "runs.unknown"))],
+                  [t(lang, "projects.outcome.route"), `${text(dispatched.response.provider_used)} · ${text(dispatched.response.model_used)}`],
+                  [
+                    t(lang, "projects.outcome.duration"),
+                    typeof dispatched.response.duration_seconds === "number"
+                      ? `${dispatched.response.duration_seconds.toFixed(3)} s`
+                      : t(lang, "runs.unknown"),
+                  ],
+                  [t(lang, "runs.result.tokens"), dispatched.response.tokens === null || dispatched.response.tokens === undefined ? t(lang, "runs.unknown") : String(dispatched.response.tokens)],
+                ]}
+              />
+            ) : null}
+          </div>
+        </div>
+
+    </>
+  );
 
   return (
     <Card className="rise d1">
@@ -786,6 +1009,80 @@ const ProjectCard = ({
           </div>
         ))}
 
+        {/* ----------------------------------------------------- the project on disk */}
+        {/* THE ENTRANCE INTO THE PROJECT. The folder is shown here, next to the three
+            buttons that really open it on this machine, because a path on its own was
+            never an entrance. Each button is disabled with the backend's own sentence
+            when the action cannot be performed, so nothing on the card promises a click
+            that would do nothing. */}
+        <div data-testid="project-disk">
+          <div className="label">{t(lang, "projects.disk.title")}</div>
+          <div className="row between" style={{ gap: 10, flexWrap: "wrap", marginTop: 4 }}>
+            <span className="small mono" style={{ overflowWrap: "anywhere" }} data-testid="project-folder-path">
+              {folderPath}
+            </span>
+            <span className="small muted">
+              {t(lang, "projects.disk.files")}: {String(diskFiles)}
+            </span>
+          </div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+            {(["folder", "editor", "terminal"] as const).map((target) => {
+              const line = openTargets[target] ?? {};
+              const available = line.available === true;
+              const label =
+                target === "folder"
+                  ? t(lang, "projects.disk.open_folder")
+                  : target === "editor"
+                    ? t(lang, "projects.disk.open_editor")
+                    : t(lang, "projects.disk.open_terminal");
+              return (
+                <span key={target} data-testid={`project-open-${target}`}>
+                  <Button
+                    size="small"
+                    tone={target === "folder" ? "primary" : "ghost"}
+                    disabled={!available || openingTarget !== ""}
+                    disabledReason={available ? undefined : text(line.reason, t(lang, "projects.facts.none"))}
+                    onClick={() => onOpenTarget(target)}
+                  >
+                    {openingTarget === target ? t(lang, "state.loading") : label}
+                  </Button>
+                </span>
+              );
+            })}
+            <span data-testid="project-move-visible">
+              <Button
+                size="small"
+                tone="ghost"
+                disabled={movingToVisible || archived}
+                onClick={onMoveToVisible}
+              >
+                {movingToVisible ? t(lang, "projects.disk.moving") : t(lang, "projects.disk.move")}
+              </Button>
+            </span>
+          </div>
+          <div className="stack" style={{ gap: 2, marginTop: 8 }}>
+            {(["folder", "editor", "terminal"] as const)
+              .filter((target) => (openTargets[target] ?? {}).available !== true)
+              .map((target) => (
+                <div className="small muted" key={`why-open-${target}`} data-testid={`project-open-why-${target}`}>
+                  {text((openTargets[target] ?? {}).label, target)}: {text((openTargets[target] ?? {}).reason)}
+                </div>
+              ))}
+          </div>
+          {/* The absolute path is deliberately NOT printed here: this block shows the
+              root-relative folder beside the buttons, and the host path lives in the
+              collapsed «Технические детали» block (presentation.technical.folder_absolute). */}
+          <div className="small muted" style={{ marginTop: 6 }}>
+            {t(lang, "projects.disk.hint")}
+          </div>
+          {diskNotice !== "" ? (
+            <div className="notice" style={{ marginTop: 8 }} data-testid="project-disk-notice">
+              {diskNotice}
+            </div>
+          ) : null}
+          {diskFailure !== null ? <Refusal lang={lang} failure={diskFailure} /> : null}
+        </div>
+
         {/* --------------------------------------------------- no project yet */}
         {/* The only creation actions that exist when there is nothing to act on. They are
             the same ids the backend offers in `presentation.actions`. */}
@@ -807,6 +1104,8 @@ const ProjectCard = ({
             </div>
           </div>
         ) : null}
+
+        {changeBlock}
 
         {/* ---------------------------------------------------------- the preview */}
         {/* Project folder · files created · entry point · verification command · run
@@ -845,9 +1144,6 @@ const ProjectCard = ({
               }
             >
               {t(lang, "projects.preview.view")}
-            </Button>
-            <Button size="small" tone="ghost" onClick={() => setLaunchNote(t(lang, "projects.preview.folder_note"))}>
-              {t(lang, "projects.preview.folder_action")}
             </Button>
             <Button
               size="small"
@@ -1177,145 +1473,6 @@ const ProjectCard = ({
           </div>
         ) : null}
 
-        {/* ----------------------------------------------------------- new version */}
-        <div>
-          <div className="label">{t(lang, "projects.newversion.title")}</div>
-          <div className="stack" style={{ gap: 10, marginTop: 8 }}>
-            <Field
-              label={t(lang, "projects.newversion.label")}
-              hint={t(lang, "projects.newversion.hint")}
-              error={changeError}
-            >
-              <textarea
-                className="input"
-                rows={3}
-                ref={changeRef}
-                value={change}
-                onChange={(event) => onChange(event.target.value)}
-                placeholder={t(lang, "projects.newversion.placeholder")}
-              />
-            </Field>
-            <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-              <label className="field" style={{ flex: "0 1 190px" }}>
-                <span className="label">{t(lang, "projects.col.provider")}</span>
-                <select
-                  className="input"
-                  value={provider}
-                  onChange={(event) => onProvider(event.target.value)}
-                  disabled={backend.status !== "live"}
-                >
-                  <option value="">{t(lang, "projects.newversion.provider.auto")}</option>
-                  {providerOptions(backend).map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="field" style={{ flex: "0 1 240px" }}>
-                <span className="label">{t(lang, "projects.col.model")}</span>
-                {modelChoices.length > 0 ? (
-                  <select className="input" value={model} onChange={(event) => onModel(event.target.value)}>
-                    {modelChoices.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    className="input"
-                    type="text"
-                    value={model}
-                    onChange={(event) => onModel(event.target.value)}
-                    placeholder={t(lang, "forge.task.model.placeholder")}
-                  />
-                )}
-              </label>
-            </div>
-            <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-              <Button size="small" disabled={busy === "version"} onClick={onNewVersion}>
-                {busy === "version" ? t(lang, "projects.newversion.running") : t(lang, "projects.newversion.create")}
-              </Button>
-              {/* The switch is available for every routable provider, `mock` included:
-                  the Core's MOCK_DETERMINISTIC mode writes the deterministic scaffold
-                  when the run belongs to a lifecycle project, and honestly reports
-                  `no_changes` when it does not. That is the only free path that can
-                  create (or extend) a project at all, and it calls no model. */}
-              <label className="forge-toggle">
-                <input
-                  type="checkbox"
-                  checked={writeMode}
-                  onChange={(event) => onWriteMode(event.target.checked)}
-                />
-                <span>{t(lang, "projects.newversion.write")}</span>
-              </label>
-            </div>
-            {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
-            <div className="small muted">{t(lang, "projects.newversion.session.note")}</div>
-
-            {staged !== null ? (
-              <div className="stack" style={{ gap: 8 }}>
-                <div className="label">
-                  {t(lang, "projects.newversion.staged").replace("{version}", `v${text(staged.version)}`)}
-                </div>
-                <pre className="forge-output mono small">{text(staged.task_text)}</pre>
-                <div className="row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-                  <Button size="small" tone="primary" disabled={dispatching} onClick={onDispatch}>
-                    {dispatching ? t(lang, "projects.newversion.submitting") : t(lang, "projects.newversion.submit")}
-                  </Button>
-                  <span className="small muted">{t(lang, "projects.newversion.submit.hint")}</span>
-                </div>
-              </div>
-            ) : null}
-
-            {dispatchFailure !== null ? <Refusal lang={lang} failure={dispatchFailure} /> : null}
-
-            {/* THE HONEST RESULT OF A CHANGE. A finished run is not a new version: the
-                card says a new version exists only when the refreshed record's
-                `current_version` really moved, and otherwise prints the same sentence
-                the backend's own presentation uses. The run id is always named, so the
-                owner can open exactly that run. */}
-            {changeOutcome !== null ? (
-              <div
-                className={`notice ${changeOutcome.toVersion > changeOutcome.fromVersion ? "" : "warn"}`}
-                data-testid="change-outcome"
-              >
-                <div className="label">{t(lang, "projects.newversion.outcome.title")}</div>
-                <div style={{ marginTop: 6 }}>
-                  {!changeOutcome.attached
-                    ? t(lang, "projects.newversion.outcome.unattached")
-                    : changeOutcome.toVersion > changeOutcome.fromVersion
-                      ? t(lang, "projects.newversion.outcome.advanced")
-                          .replace("{version}", `v${changeOutcome.toVersion}`)
-                          .replace("{run}", changeOutcome.runId)
-                      : t(lang, "projects.newversion.outcome.not_written")}
-                </div>
-                <div className="small mono" style={{ marginTop: 6, wordBreak: "break-word" }}>
-                  {`${changeOutcome.attached ? "v" + changeOutcome.toVersion : "—"} · run ${changeOutcome.runId} · ${t(lang, "projects.col.files")}: ${changeOutcome.filesCreated}`}
-                </div>
-              </div>
-            ) : null}
-
-            {dispatched !== null ? (
-              <Facts
-                items={[
-                  [t(lang, "projects.col.run"), text(dispatched.response.run_id)],
-                  [t(lang, "projects.col.status"), text(dispatched.response.state, t(lang, "runs.unknown"))],
-                  [t(lang, "projects.outcome.route"), `${text(dispatched.response.provider_used)} · ${text(dispatched.response.model_used)}`],
-                  [
-                    t(lang, "projects.outcome.duration"),
-                    typeof dispatched.response.duration_seconds === "number"
-                      ? `${dispatched.response.duration_seconds.toFixed(3)} s`
-                      : t(lang, "runs.unknown"),
-                  ],
-                  [t(lang, "runs.result.tokens"), dispatched.response.tokens === null || dispatched.response.tokens === undefined ? t(lang, "runs.unknown") : String(dispatched.response.tokens)],
-                ]}
-              />
-            ) : null}
-          </div>
-        </div>
-
         {/* ------------------------------------------------------- technical details */}
         {/* Everything a reader needs to trace the card back to the record, and nothing
             that belongs to the owner's reading. It is collapsed until asked for. */}
@@ -1501,6 +1658,13 @@ export const Projects = ({
   const [busy, setBusy] = useState("");
   const [actionFailure, setActionFailure] = useState<Failure | null>(null);
   const [actionNotice, setActionNotice] = useState("");
+  // The entrance into the project: which target is being opened right now, the answer
+  // of the last «Переместить в видимую папку», and the backend's refusal when a target
+  // could not be performed. None of the three is guessed: each is a response.
+  const [openingTarget, setOpeningTarget] = useState("");
+  const [diskNotice, setDiskNotice] = useState("");
+  const [diskFailure, setDiskFailure] = useState<Failure | null>(null);
+  const [movingToVisible, setMovingToVisible] = useState(false);
 
   const loadDetail = useCallback(async (projectId: string): Promise<LifecycleDetail | null> => {
     if (projectId === "") {
@@ -1526,6 +1690,9 @@ export const Projects = ({
   const project = detail?.status === "ready" ? detail.value.project ?? null : null;
   const versions: LifecycleVersion[] = detail?.status === "ready" ? detail.value.versions ?? [] : [];
   const currentVersionNumber = typeof project?.current_version === "number" ? project.current_version : 0;
+  // The entrance block, read from the detail payload exactly as the backend derived it.
+  const openBlock: LifecycleOpen = detail?.status === "ready" ? detail.value.open ?? {} : {};
+  const folderBlock: LifecycleFolder = detail?.status === "ready" ? detail.value.folder ?? {} : {};
 
   // ------------------------------------------------------------------ artifacts
   // `null` means "the current version's manifest"; a number means a version the owner clicked.
@@ -1597,6 +1764,52 @@ export const Projects = ({
     }
     setPreviewState(outcome.value);
     await loadDetail(selectedId);
+  };
+
+  // ------------------------------------------------------------- the entrance
+  // One click, one route. The backend resolves the folder from the project record, so
+  // the request carries no path; when it refuses (no files, folder gone, VS Code absent)
+  // its own sentence is printed and nothing was started.
+  const openTarget = async (target: "folder" | "editor" | "terminal") => {
+    if (selectedId === "") return;
+    setOpeningTarget(target);
+    setDiskNotice("");
+    setDiskFailure(null);
+    const outcome = await openProjectTarget(selectedId, target);
+    setOpeningTarget("");
+    if (!outcome.ok) {
+      setDiskFailure(outcome.failure);
+      return;
+    }
+    const program = String(outcome.value.program ?? "");
+    const folder = String(outcome.value.diagnostics?.folder ?? outcome.value.folder ?? "");
+    const label = text(
+      (openBlock.targets ?? {})[target]?.label ?? target
+    );
+    setDiskNotice(`${label}: ${program} — ${folder}`);
+  };
+
+  const moveToVisible = async () => {
+    if (selectedId === "") return;
+    setMovingToVisible(true);
+    setDiskNotice("");
+    setDiskFailure(null);
+    const outcome = await moveProjectToVisibleFolder(selectedId);
+    setMovingToVisible(false);
+    if (!outcome.ok) {
+      setDiskFailure(outcome.failure);
+      return;
+    }
+    const already = outcome.value.already_visible === true;
+    const folder = String(outcome.value.folder ?? "");
+    const count = Number(outcome.value.moved_count ?? 0);
+    setDiskNotice(
+      already
+        ? t(lang, "projects.disk.already")
+        : t(lang, "projects.disk.moved").replace("{n}", String(count)).replace("{folder}", folder)
+    );
+    await loadDetail(selectedId);
+    await loadList();
   };
 
   // ---------------------------------------------------------------- local run
@@ -1902,6 +2115,8 @@ export const Projects = ({
   useEffect(() => {
     setActionFailure(null);
     setActionNotice("");
+    setDiskNotice("");
+    setDiskFailure(null);
     setStaged(null);
     setDispatched(null);
     setChangeOutcome(null);
@@ -1996,12 +2211,21 @@ export const Projects = ({
       refreshed !== null && typeof refreshed.project?.current_version === "number"
         ? refreshed.project.current_version
         : fromVersion;
+    // WHAT CHANGED, from the new version's own manifest: the paths, whether each was
+    // created or updated, and its size. A version that did not advance reports no files,
+    // which is exactly what the card prints («Изменения не записаны»).
+    let changed: LifecycleArtifact[] = [];
+    if (toVersion > fromVersion) {
+      const manifest = await loadProjectFiles(selectedId, toVersion);
+      if (manifest.ok) changed = manifest.value.files ?? [];
+    }
     setChangeOutcome({
       runId: String(outcome.value.response.run_id ?? ""),
       filesCreated: Number(outcome.value.response.files_created ?? 0),
       attached: String(outcome.value.response.lifecycle_project_id ?? "") === selectedId,
       fromVersion,
       toVersion,
+      files: changed,
     });
     await loadList();
     onRefresh();
@@ -2401,6 +2625,14 @@ export const Projects = ({
           onRunStop={() => void runStop()}
           onRunRestart={(digest) => void runRestart(digest)}
           onDelete={() => void deleteSelected()}
+          open={openBlock}
+          folder={folderBlock}
+          onOpenTarget={(target) => void openTarget(target)}
+          openingTarget={openingTarget}
+          diskNotice={diskNotice}
+          diskFailure={diskFailure}
+          onMoveToVisible={() => void moveToVisible()}
+          movingToVisible={movingToVisible}
         />
       ) : null}
       </div>

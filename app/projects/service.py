@@ -32,6 +32,7 @@ standard library only.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,6 +40,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.context.validation import find_forbidden_value_content
 from app.discovery.models import redaction_marker
+from app.projects.folders import UnsafeProjectFolder
 from app.projects.lifecycle import (
     IllegalTransition,
     LifecycleEvent,
@@ -466,13 +468,22 @@ class ProjectService:
 
         project_id = new_project_id()
         now = utc_now()
-        workspace = self._store.workspace_path(project_id, create=True)
+        name = _project_name(goal or specification.get("project_type", ""))
+        # The workspace is allocated **before** the record that names it is written, and
+        # which folder it is depends on the deployment's own project root: a visible
+        # folder on the owner's desktop when one is configured, the legacy hidden
+        # workspace otherwise. ``allocate_workspace`` creates it and refuses a folder it
+        # cannot prove to sit inside that root.
+        workspace, project_path, workspace_dir = self._store.allocate_workspace(
+            project_id, name
+        )
         project = LifecycleProject(
             project_id=project_id,
-            name=_project_name(goal or specification.get("project_type", "")),
+            name=name,
             status=ProjectStatus.WAITING_FOR_CONFIRMATION,
             workspace_id=project_id,
-            project_path=self._store.project_path_relative(project_id),
+            project_path=project_path,
+            workspace_dir=workspace_dir,
             created_at=now,
             updated_at=now,
             last_run_at="",
@@ -756,6 +767,173 @@ class ProjectService:
             restored = advance(project, LifecycleEvent(name="restore"))
             self._store.write(restored)
             return restored
+
+    # ------------------------------------------------------------- visible folder
+    def move_to_visible_folder(self, project_id: object) -> Dict[str, Any]:
+        """Deliver an existing project's files into the configured visible folder.
+
+        The owner's «Переместить в видимую папку». The **files** move; the record does
+        not: the same versions, the same manifest, the same run links stay in
+        ``.forge/projects/<id>/`` and only ``workspace_dir``/``project_path`` are
+        rewritten to name the new folder.
+
+        Byte identity is proved, not assumed: every file's SHA-256 is taken before the
+        copy and compared after it, and a destination that already holds *different*
+        bytes is refused instead of overwritten. The source is removed only once every
+        file has arrived and matched, so a failure leaves the project exactly where it
+        was. A project that is already visible is a no-op, reported as such.
+        """
+
+        identifier = _project_id(project_id)
+        with self._project_lock(identifier):
+            project = self.require_active(identifier)
+            if self._store.visible_root() is None:
+                raise ProjectError(
+                    "the project root is not configured, so there is no visible folder "
+                    "to move this project into"
+                )
+            current = self._store.workspace_path(identifier)
+            try:
+                target, published, recorded = self._store.allocate_workspace(
+                    identifier, project.name
+                )
+            except UnsafeProjectFolder as exc:
+                raise ProjectError(str(exc)) from exc
+
+            if _same_folder(current, target):
+                if str(project.workspace_dir or "").strip():
+                    return {
+                        "project": project,
+                        "moved": [],
+                        "already_visible": True,
+                        "folder": project.project_path,
+                    }
+                # The record still says "legacy" although the folder resolved to the
+                # visible one: nothing to move, but the record must be corrected so the
+                # workspace keeps resolving after a restart.
+                updated = replace(
+                    project,
+                    workspace_dir=str(target),
+                    project_path=published,
+                    updated_at=utc_now(),
+                )
+                self._store.write(updated)
+                return {
+                    "project": updated,
+                    "moved": [],
+                    "already_visible": True,
+                    "folder": published,
+                }
+
+            if not current.is_dir():
+                raise ProjectError(
+                    "the project workspace is missing, so there is nothing to move"
+                )
+
+            moved, problem = self._copy_workspace(current, target)
+            if problem:
+                raise ProjectError(problem)
+
+            updated = replace(
+                project,
+                workspace_dir=recorded,
+                project_path=published,
+                updated_at=utc_now(),
+            )
+            self._store.write(updated)
+            self._remove_emptied_workspace(current)
+            return {
+                "project": updated,
+                "moved": moved,
+                "already_visible": False,
+                "folder": published,
+            }
+
+    def _copy_workspace(
+        self, source: Path, destination: Path
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """Copy every file, prove its digest, then remove the source tree.
+
+        Returns the manifest of what moved and a problem code (empty on success). Every
+        digest is compared before a single source file is removed, so a mismatch leaves
+        both trees intact and the project readable where it was.
+        """
+
+        entries: List[Tuple[Path, Path, str]] = []
+        try:
+            candidates = sorted(path for path in source.rglob("*") if path.is_file())
+        except OSError:
+            return [], "source_workspace_unreadable"
+        for path in candidates:
+            if path.is_symlink():
+                return [], "source_workspace_contains_a_link"
+            relative = path.relative_to(source)
+            destination_path = destination / relative
+            try:
+                data = path.read_bytes()
+            except OSError:
+                return [], "source_file_unreadable"
+            digest = hashlib.sha256(data).hexdigest()
+            if destination_path.exists():
+                try:
+                    existing = destination_path.read_bytes()
+                except OSError:
+                    return [], "destination_file_unreadable"
+                if hashlib.sha256(existing).hexdigest() != digest:
+                    return [], "destination_file_differs"
+            entries.append((path, destination_path, digest))
+
+        moved: List[Dict[str, Any]] = []
+        for source_path, destination_path, digest in entries:
+            try:
+                data = source_path.read_bytes()
+            except OSError:
+                return [], "source_file_unreadable"
+            try:
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                destination_path.write_bytes(data)
+                arrived = destination_path.read_bytes()
+            except OSError:
+                return [], "copy_failed"
+            arrived_digest = hashlib.sha256(arrived).hexdigest()
+            if arrived_digest != digest:
+                # The copy did not reproduce the bytes: refuse, and leave the source.
+                return [], "byte_identity_not_preserved"
+            moved.append(
+                {
+                    "path": destination_path.relative_to(destination).as_posix(),
+                    "size": len(arrived),
+                    "sha256": arrived_digest,
+                }
+            )
+
+        for source_path, _destination_path, _digest in entries:
+            try:
+                source_path.unlink()
+            except OSError:  # pragma: no cover - a leftover copy is not a data loss
+                pass
+        return moved, ""
+
+    def _remove_emptied_workspace(self, source: Path) -> None:
+        """Remove the now-empty legacy workspace and its project directory.
+
+        Bounded and best effort: it only removes directories that are empty, and it
+        never walks above the project's own folder inside the store.
+        """
+
+        try:
+            for path in sorted(source.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                if path.is_dir():
+                    path.rmdir()
+            source.rmdir()
+        except OSError:
+            return
+        parent = source.parent
+        try:
+            if parent != self._store.root and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            return
 
     # ------------------------------------------------------------- deletion
     #
@@ -1116,6 +1294,20 @@ def _project_id(project_id: object) -> str:
     if not is_safe_project_id(project_id):
         raise UnknownProject(str(project_id))
     return str(project_id)
+
+
+def _same_folder(left: object, right: object) -> bool:
+    """Whether two paths name the same folder, Windows casing included."""
+
+    try:
+        one = Path(left).resolve(strict=False)
+        two = Path(right).resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    try:
+        return os.path.normcase(str(one)) == os.path.normcase(str(two))
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return False
 
 
 def _specification_dict(session: object) -> Dict[str, Any]:

@@ -515,6 +515,31 @@ ACTION_TARGETS: dict[str, dict] = {
         "ui_path": "/preview",
         "screen": "projects",
     },
+    # The owner's «вход в проект»: three real OS integrations, and the delivery of an
+    # existing project into the visible folder. They are rendered by the card's own
+    # «Проект на диске» block (beside the folder path) rather than by the generic action
+    # row, so `_actions` never emits them -- but they are part of the same closed
+    # vocabulary, and a route that disappears must fail here rather than on the click.
+    "open_folder": {
+        "route": ("POST", "/api/projects/{project_id}/open"),
+        "ui_path": "/open",
+        "screen": "projects",
+    },
+    "open_editor": {
+        "route": ("POST", "/api/projects/{project_id}/open"),
+        "ui_path": "/open",
+        "screen": "projects",
+    },
+    "open_terminal": {
+        "route": ("POST", "/api/projects/{project_id}/open"),
+        "ui_path": "/open",
+        "screen": "projects",
+    },
+    "move_to_visible": {
+        "route": ("POST", "/api/projects/{project_id}/move-to-visible-folder"),
+        "ui_path": "/move-to-visible-folder",
+        "screen": "projects",
+    },
     # ui/src/forge-result.ts::ResultActionId (the run result card)
     "open_files": {
         "route": ("GET", "/api/projects/{project_id}/files"),
@@ -697,6 +722,93 @@ class NoDeadActionTests(unittest.TestCase):
         # method the client uses, so neither affordance can become a dead click.
         self.assertIn(("POST", "/api/tasks/run"), self.routes)
         self.assertIn("/api/tasks/run", FORGE_CLIENT.read_text(encoding="utf-8"))
+
+    # ---------------------------------------------------------------- the entrance
+    def test_07_the_card_really_opens_the_project(self) -> None:
+        """The three open buttons exist, call the route, and carry their own target.
+
+        The measured failure this guards: «Открыть папку» printed a sentence saying a
+        browser cannot open folders. A button that performs nothing is the same defect as
+        a button that does not exist, so the wiring is asserted from the component's own
+        source: the handler exists, it calls the client function, and each of the three
+        targets is passed to it.
+        """
+
+        source = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn('data-testid="project-disk"', source)
+        for target in ("folder", "editor", "terminal"):
+            self.assertIn(f'data-testid={{`project-open-${{target}}`}}', source, target)
+        self.assertIn('(["folder", "editor", "terminal"] as const)', source)
+        self.assertIn("onOpenTarget(target)", source)
+        self.assertIn("openProjectTarget(selectedId, target)", source)
+        self.assertIn('from "../api/forge"', source)
+        self.assertIn("openProject as openProjectTarget", source)
+        # The disabled state is the backend's, and its sentence is printed.
+        self.assertIn("line.available === true", source)
+        self.assertIn("line.reason", source)
+
+    def test_08_the_correction_loop_is_a_first_class_block(self) -> None:
+        """«Что поправить?» is rendered above the run/facts blocks, not buried below.
+
+        It is the default way to edit a project, so its position is part of the promise:
+        a textarea and one «Исправить проект» button, before the technical blocks, whose
+        result names the new version and what it changed.
+        """
+
+        source = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn('t(lang, "projects.newversion.title")', source)
+        self.assertIn("const changeBlock = (", source)
+        self.assertIn("{changeBlock}", source)
+        self.assertIn('t(lang, "projects.newversion.submit")', source)
+        self.assertIn('data-testid="change-outcome"', source)
+        self.assertIn('data-testid="change-files"', source)
+        self.assertIn('t(lang, "projects.newversion.changed")', source)
+        self.assertIn('t(lang, "projects.newversion.changed.none")', source)
+        # Position: the correction block is rendered before the preview, the local-run
+        # panel, the artifact table and the collapsed diagnostics, i.e. it is not
+        # something the owner has to scroll past the technical detail to find.
+        rendered_at = source.index("{changeBlock}")
+        for later in ('{/* ---------------------------------------------------------- the preview */}',
+                      "<RunPanel",
+                      'id="project-artifacts"',
+                      '<details className="tech-details">',
+                      't(lang, "projects.preview.title")',
+                      't(lang, "projects.artifacts.title")'):
+            self.assertLess(rendered_at, source.index(later), later)
+
+    def test_09_the_absolute_folder_is_diagnostics_only(self) -> None:
+        """The card prints the relative folder above the fold and the absolute one below.
+
+        `presentation.facts` carries the record's own relative path; the absolute path is
+        a field of the collapsed technical block. This is the rule the acceptance test
+        checks against a live payload; here it is pinned structurally so a refactor
+        cannot quietly move it up the card.
+        """
+
+        card = build_project_presentation(
+            project={
+                "project_id": "proj-000000000abc",
+                "status": "COMPLETED",
+                "current_version": 1,
+                "project_path": "Forge Projects/Проект (proj-000000000abc)",
+                "workspace_id": "w",
+            },
+            versions=[{"version": 1, "file_count": 1, "verification": "passed",
+                       "acceptance": "passed", "run_id": "run-1"}],
+            files=[{"path": "app.py", "sha256": "0" * 64, "size": 10}],
+            workspace_exists=True,
+            folder_absolute=r"C:\Users\owner\Desktop\Forge Projects\Проект (proj-000000000abc)",
+        ).to_dict()
+        relative = "Forge Projects/Проект (proj-000000000abc)"
+        absolute = r"C:\Users\owner\Desktop\Forge Projects\Проект (proj-000000000abc)"
+        facts = {label: value for label, value in card["facts"]}
+        self.assertEqual(facts["Папка проекта"], relative)
+        for label, value in card["facts"]:
+            self.assertNotIn(absolute, value, label)
+        self.assertNotIn(absolute, card["headline"].__str__())
+        fields = {field["key"]: field["value"] for field in card["technical"]["fields"]}
+        self.assertEqual(fields["folder_absolute"], absolute)
+        self.assertTrue(card["technical"]["collapsed"])
 
 
 # --------------------------------------------------------------------------- #

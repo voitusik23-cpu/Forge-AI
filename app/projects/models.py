@@ -436,13 +436,22 @@ class LifecycleProject:
     updated copy through :func:`app.projects.lifecycle.advance`, and persists that
     copy. ``versions`` is an append-only list of :class:`ProjectVersion`.
 
-    ``project_path`` is **repository-relative** (``.forge/projects/<id>/workspace``)
-    so an API payload never publishes an absolute path of the host. ``workspace_id``
-    names the workspace the project owns; today it is the project id itself, because
-    one project owns exactly one workspace -- it is a separate named field so a
-    future multi-workspace project can set it differently without redefining the
-    record. ``previous_status`` is the status ``restore`` returns an archived
-    project to; it is only ever set by archiving.
+    ``project_path`` is the **published** folder of the project: repository-relative
+    for a project whose files live inside the store
+    (``.forge/projects/<id>/workspace``) and root-relative for one delivered to a
+    visible folder (``Forge Projects/My Project (proj-…)``). It never carries an
+    absolute path of the host, because it reaches an API payload.
+
+    ``workspace_dir`` is that folder's **absolute** location, or ``""`` for a project
+    that still lives in the legacy hidden workspace. It is stored in the record file
+    (where the store needs it to resolve the workspace after a restart) and is
+    deliberately **not** part of :meth:`to_dict`, so it can never be published; the
+    absolute path appears in the card's diagnostics block only. ``workspace_id`` names
+    the workspace the project owns; today it is the project id itself, because one
+    project owns exactly one workspace -- it is a separate named field so a future
+    multi-workspace project can set it differently without redefining the record.
+    ``previous_status`` is the status ``restore`` returns an archived project to; it is
+    only ever set by archiving.
     """
 
     project_id: str
@@ -450,6 +459,7 @@ class LifecycleProject:
     status: ProjectStatus
     workspace_id: str = ""
     project_path: str = ""
+    workspace_dir: str = ""
     created_at: str = ""
     updated_at: str = ""
     last_run_at: str = ""
@@ -526,8 +536,9 @@ class LifecycleProject:
         """The full record, in the shape the API publishes.
 
         It contains the specification (user text that was screened before storage),
-        identifiers, repo-relative paths, status words, sizes and hashes. It carries
-        no absolute path, no environment value and no file content.
+        identifiers, relative paths, status words, sizes and hashes. It carries no
+        absolute path, no environment value and no file content -- ``workspace_dir``
+        is excluded on purpose and written to the record file by the store alone.
         """
 
         return {
@@ -572,6 +583,7 @@ class LifecycleProject:
             status=ProjectStatus(str(data["status"])),
             workspace_id=str(data.get("workspace_id", "")),
             project_path=str(data.get("project_path", "")),
+            workspace_dir=str(data.get("workspace_dir", "") or ""),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             last_run_at=str(data.get("last_run_at", "")),

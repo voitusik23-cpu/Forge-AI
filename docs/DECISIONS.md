@@ -7388,3 +7388,182 @@ made.
 терминальную карточку, исполняемую из поставляемого TypeScript. Чего НЕ утверждается: сама модель
 может и после раунда 2 ответить планом — это показывает существующая карточка плана/повтора, а не
 завершение, и новой автоматической попытки не делается.
+
+## Decision: a delivered project is a visible folder, and the card has a real entrance into it
+
+### Context
+
+MEASURED, in the owner's own words: *«он должен работать как швейцарские часы: я вставляю промт и в
+конце получаю на рабочий стол готовый проект. Из Forge должен быть вход в проект — кнопка перехода»*.
+Three facts, each verified in the code before this change:
+
+- a lifecycle project's files lived in `.forge/projects/<id>/workspace` — a hidden subdirectory of the
+  repository's own store. The card published a repository-relative path and the preview block printed
+  a sentence saying a browser cannot open folders, so there was no folder the owner could open in
+  Explorer or in VS Code;
+- no route started anything on the machine: the only "open" affordances scrolled the page or printed
+  the path that was already on screen, which is indistinguishable from a dead click;
+- the correction loop existed (`POST /api/projects/{id}/versions` plus the run that fills the version)
+  but the block that drives it was titled «Добавить функцию / новая версия», sat below the artifact
+  table, and its result never said *what* had changed.
+
+### Decisions
+
+- **Two roots, and they are different things.** The *record* (JSON, versions, artifact manifest, run
+  links) stays in `.forge/projects/<id>/` — it is evidence and it is never moved. The *files* are
+  delivered to a **visible project root**: `%USERPROFILE%\Desktop\Forge Projects` by default, in a
+  normal folder named `<project name> (proj-<id>)`.
+- **The root is the application's own setting, not `.env`.** `app/config/app_settings.py` stores
+  `project_root` (and the roots previously used) in `.forge/settings.json`, written atomically, holding
+  no key and no provider configuration. `GET/POST /api/settings` are the only writers; «Настройки» has
+  a text field and «Использовать рабочий стол».
+- **The record, not the setting, says where an existing project lives.** `LifecycleProject.workspace_dir`
+  holds the absolute folder (written to the record file and deliberately excluded from `to_dict`, so it
+  can never be published); `project_path` holds the publishable form — root-relative for a visible
+  project, repository-relative for a legacy one. A project created before this change keeps working, and
+  changing the root does not move anything: it only decides the next project's folder.
+- **«Переместить в видимую папку» moves files, never history.** `ProjectService.move_to_visible_folder`
+  copies each file, compares SHA-256 before and after, refuses a destination that already holds
+  different bytes, and removes the source only after every file matched. The record keeps its versions;
+  only `workspace_dir`/`project_path` are rewritten.
+- **One trash root, the existing one.** A delete moves the folder — visible or legacy — into
+  `.forge/projects-deleted/<id>-<ts>`, where the listing and the restore already work. Restore puts the
+  folder back where the **trashed record** says it belongs, proved against the configured roots; a
+  recorded folder that no longer proves falls back to the legacy workspace and the record is rewritten.
+- **The boundary is re-proved for the new root.** `app/projects/folders.py` refuses a relative path, a
+  `..` segment, a device path, a path whose real (link-resolved) location leaves every configured root,
+  and a path inside `.git`; a junction planted inside the root is therefore refused as well. Workspace
+  *files* additionally refuse `.git` segments and anything the repository's existing secret recognizer
+  knows (`.env`, a private key), so Forge never writes a secret into a folder the owner can commit.
+- **Three OS integrations, allow-listed, with no shell.** `app/projects/opener.py` performs exactly
+  `explorer.exe <folder>`, `code <folder>` and `wt -d <folder>` (falling back to
+  `powershell -NoExit -Command Set-Location -LiteralPath '<folder>'`). The path is resolved server-side
+  from the record and never accepted from the request; every process is started with `shell=False` and
+  an argv; a target that cannot be performed answers `409 project_open_refused` with a plain sentence
+  and starts nothing. The card disables the button with that same sentence.
+- **The correction loop is one obvious block.** `POST /api/projects/{id}/versions` remains the only
+  staging path, and the card renders «Что поправить?» (textarea + «Исправить проект») above the
+  preview, the local-run panel and the artifacts, then reports the new version, the run id, and the
+  files the version's own manifest says changed (create/update + size). A run that wrote nothing says
+  «Изменения не записаны: новой версии нет» and shows no invented file list.
+
+### Rejected alternatives
+
+- **Move the record too.** It would put the proof of a project's history inside a folder the owner can
+  rename, move to the cloud or delete — and it would break the durable deletion marker and the trash.
+- **Store the root in `.env`.** `.env` holds deployment configuration and credentials; a folder the
+  owner picks is neither, and «Настройки» is where he expects to change it.
+- **Publish the absolute path everywhere.** The card keeps printing the relative folder above the fold;
+  the absolute path is a field of the collapsed diagnostics block, where it can be pasted.
+- **`shell=True` with a composed command string.** A folder name is user text; as a string it becomes
+  command syntax. The one command that must carry it quotes it with `-LiteralPath` and a doubled quote,
+  and is still started as an argv.
+- **Create the visible folder on first write instead of at project creation.** A record pointing at a
+  folder it does not have would be a lie the API publishes; the folder is created (and proved) before
+  the record that names it is written.
+- **A second trash root under the project root.** It would double the restore path and split the
+  durable "this id is deleted" marker across two directories.
+
+### Consequences and open questions
+
+`tests/test_project_visible_root.py`, `tests/test_project_open_actions.py` and
+`tests/test_owner_acceptance.py` (plus the extended `tests/test_flow_invariants.py`) are the evidence;
+the acceptance one walks the owner's sentence end to end with an in-process scripted provider and a
+recording opener, and never opens a real window. The launcher (`app/api/main.py`) composes the visible
+root from the settings file; a caller that builds its own `ProjectService` (every test, every laboratory
+script) keeps the legacy hidden workspace, which is why this change adds no Desktop traffic to the suite.
+Remaining limits: a folder the owner deletes by hand is reported (the open targets refuse with
+"папка проекта не найдена") but not recreated; `.forge/backups/run-<id>/` inside a project folder is the
+existing writer backup and is not a project file; there is no OS sandbox, so a program the owner starts
+from Forge still runs with his own token.
+
+## Решение: готовый проект — это видимая папка, а в карточке есть настоящий вход в него
+
+### Контекст
+
+ИЗМЕРЕНО, словами владельца: *«он должен работать как швейцарские часы: я вставляю промт и в конце
+получаю на рабочий стол готовый проект. Из Forge должен быть вход в проект — кнопка перехода»*. Три
+факта, каждый проверен в коде до этого изменения:
+
+- файлы проекта жизненного цикла лежали в `.forge/projects/<id>/workspace` — скрытом подкаталоге
+  хранилища самого репозитория. Карточка показывала путь относительно репозитория, а блок предпросмотра
+  печатал фразу о том, что браузер не открывает папки, поэтому не было папки, которую владелец мог бы
+  открыть в Проводнике или VS Code;
+- ни один маршрут ничего не запускал на машине: единственные «открывающие» элементы прокручивали
+  страницу или печатали уже показанный путь, что неотличимо от мёртвого клика;
+- цикл правок существовал (`POST /api/projects/{id}/versions` плюс запуск, заполняющий версию), но
+  блок назывался «Добавить функцию / новая версия», находился под таблицей артефактов, и его результат
+  никогда не говорил, *что именно* изменилось.
+
+### Принятые решения
+
+- **Два корня, и это разные вещи.** *Запись* (JSON, версии, манифест артефактов, связи с запусками)
+  остаётся в `.forge/projects/<id>/` — это доказательство, и оно не переносится. *Файлы* попадают в
+  **видимый корень проектов**: по умолчанию `%USERPROFILE%\Desktop\Forge Projects`, в обычную папку с
+  именем `<имя проекта> (proj-<id>)`.
+- **Корень — собственная настройка приложения, а не `.env`.** `app/config/app_settings.py` хранит
+  `project_root` (и ранее использованные корни) в `.forge/settings.json`, записываемом атомарно, без
+  ключей и конфигурации провайдеров. `GET/POST /api/settings` — единственные писатели; в «Настройках»
+  есть текстовое поле и кнопка «Использовать рабочий стол».
+- **Где живёт существующий проект, говорит запись, а не настройка.** `LifecycleProject.workspace_dir`
+  хранит абсолютную папку (пишется в файл записи и намеренно исключена из `to_dict`, поэтому не может
+  быть опубликована); `project_path` хранит публикуемую форму — относительную к корню для видимого
+  проекта и относительную к репозиторию для старого. Проект, созданный до этого изменения, продолжает
+  работать, а смена корня ничего не переносит: она определяет папку только следующего проекта.
+- **«Переместить в видимую папку» переносит файлы, а не историю.**
+  `ProjectService.move_to_visible_folder` копирует каждый файл, сравнивает SHA-256 до и после,
+  отказывает, если в приёмнике уже лежат другие байты, и удаляет источник только после совпадения всех
+  файлов. Запись сохраняет версии; переписываются только `workspace_dir`/`project_path`.
+- **Один корень корзины — существующий.** Удаление переносит папку (видимую или старую) в
+  `.forge/projects-deleted/<id>-<ts>`, где уже работают список и восстановление. Восстановление
+  возвращает папку туда, куда указывает **запись из корзины**, проверяя путь против настроенных корней;
+  если записанная папка больше не проходит проверку, проект возвращается в старое скрытое место, и
+  запись переписывается.
+- **Граница заново доказывается для нового корня.** `app/projects/folders.py` отказывает
+  относительному пути, сегменту `..`, пути устройства, пути, реальное (с разрешёнными ссылками)
+  положение которого выходит за все настроенные корни, и пути внутри `.git`; поэтому junction,
+  посаженный внутри корня, тоже отклоняется. *Файлы* рабочей области дополнительно отклоняют сегменты
+  `.git` и всё, что знает существующий распознаватель секретов репозитория (`.env`, приватный ключ),
+  чтобы Forge никогда не записал секрет в папку, которую владелец может закоммитить.
+- **Три интеграции ОС, по белому списку и без оболочки.** `app/projects/opener.py` выполняет ровно
+  `explorer.exe <папка>`, `code <папка>` и `wt -d <папка>` (с запасным
+  `powershell -NoExit -Command Set-Location -LiteralPath '<папка>'`). Путь разрешается на сервере из
+  записи и никогда не принимается из запроса; каждый процесс запускается с `shell=False` и вектором
+  аргументов; недоступное действие отвечает `409 project_open_refused` обычной фразой и ничего не
+  запускает. Кнопка в карточке отключается с той же фразой.
+- **Цикл правок — один очевидный блок.** `POST /api/projects/{id}/versions` остаётся единственным путём
+  подготовки версии, а карточка показывает «Что поправить?» (текстовое поле + «Исправить проект») выше
+  предпросмотра, панели локального запуска и артефактов, затем сообщает новую версию, id запуска и
+  файлы, которые изменила именно эта версия (создан/обновлён + размер). Запуск, ничего не записавший,
+  говорит «Изменения не записаны: новой версии нет» и не показывает выдуманный список файлов.
+
+### Отклонённые альтернативы
+
+- **Переносить и запись.** Тогда доказательство истории проекта лежало бы в папке, которую владелец
+  может переименовать, перенести в облако или удалить, — и это сломало бы долговечный маркер удаления и
+  корзину.
+- **Хранить корень в `.env`.** В `.env` лежат конфигурация развёртывания и секреты; выбранная папка —
+  ни то, ни другое, и менять её владелец ожидает в «Настройках».
+- **Публиковать абсолютный путь везде.** Карточка печатает относительную папку на виду; абсолютный путь
+  — поле свёрнутого блока технических деталей, откуда его можно скопировать.
+- **`shell=True` со склеенной строкой команды.** Имя папки — пользовательский текст; в строке оно
+  становится синтаксисом команды. Единственная команда, которой нужен путь текстом, заключает его в
+  `-LiteralPath` с удвоенной кавычкой и всё равно запускается вектором аргументов.
+- **Создавать видимую папку при первой записи, а не при создании проекта.** Запись, указывающая на
+  папку, которой нет, была бы ложью, которую API публикует; папка создаётся (и проверяется) до записи,
+  которая её называет.
+- **Вторая корзина под корнем проектов.** Она удвоила бы путь восстановления и раздвоила бы долговечный
+  маркер «этот id удалён» между двумя каталогами.
+
+### Следствия и открытые вопросы
+
+Доказательство — `tests/test_project_visible_root.py`, `tests/test_project_open_actions.py` и
+`tests/test_owner_acceptance.py` (плюс расширенный `tests/test_flow_invariants.py`); приёмочный тест
+проходит фразу владельца целиком с внутрипроцессным сценарным провайдером и записывающим opener-ом и
+никогда не открывает настоящее окно. Лаунчер (`app/api/main.py`) собирает видимый корень из файла
+настроек; вызывающий, который создаёт свой `ProjectService` (каждый тест, каждый лабораторный скрипт),
+сохраняет старое скрытое расположение — поэтому это изменение не добавляет набору тестов обращений к
+рабочему столу. Оставшиеся ограничения: удалённую вручную папку система сообщает (действия открытия
+отказывают фразой «папка проекта не найдена»), но не пересоздаёт; `.forge/backups/run-<id>/` внутри
+папки проекта — существующая резервная копия писателя, а не файл проекта; песочницы ОС нет, поэтому
+запущенная из Forge программа по-прежнему работает с токеном владельца.

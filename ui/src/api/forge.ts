@@ -946,6 +946,53 @@ export type LifecycleDetail = {
   run?: LifecycleRun;
   /** The manual equivalent of the writer's own `py_compile`, empty when nothing to compile. */
   verification_command?: string;
+  /** The project's folder: the record's own relative path and whether it is there now. */
+  folder?: LifecycleFolder;
+  /** What can really be opened, per target, and why not when it cannot. */
+  open?: LifecycleOpen;
+  /** The absolute paths of this surface, confined to the collapsed diagnostics block. */
+  diagnostics?: { folder_absolute?: string; project_root?: string };
+};
+
+/** One openable target (`folder`, `editor`, `terminal`) and whether it is available. */
+export type LifecycleOpenTarget = {
+  target?: string;
+  label?: string;
+  available?: boolean;
+  /** The backend's own sentence; shown verbatim beside the disabled button. */
+  reason?: string;
+};
+
+/**
+ * The entrance into the project (`POST /api/projects/{id}/open`).
+ *
+ * `available` is computed from the folder **on disk**: a project with no files, or whose
+ * folder is gone, has nothing to open and every target says so. The interface renders
+ * that sentence instead of offering a click that would do nothing.
+ */
+export type LifecycleOpen = {
+  targets?: Record<string, LifecycleOpenTarget>;
+  folder?: string;
+  folder_exists?: boolean;
+  files?: number;
+};
+
+/** Where the project's files live, as the detail payload publishes it. */
+export type LifecycleFolder = {
+  path?: string;
+  exists?: boolean;
+  files?: number;
+};
+
+/** The answer of one open action: what was started, and the folder it was pointed at. */
+export type LifecycleOpenResult = {
+  project_id?: string;
+  folder?: string;
+  target?: string;
+  opened?: boolean;
+  program?: string;
+  pid?: number;
+  diagnostics?: { folder?: string; arguments?: string[] };
 };
 
 /**
@@ -1263,6 +1310,65 @@ export const loadProjectHistory = (projectId: string): Promise<Result<LifecycleH
 /** `POST /api/projects/{id}/verify` — re-check the recorded artifacts; no provider is called. */
 export const verifyProject = (projectId: string): Promise<Result<LifecycleVerification>> =>
   postJson<LifecycleVerification>(projectPath(projectId, "/verify"));
+
+/**
+ * `POST /api/projects/{id}/open` — really open the project on this machine.
+ *
+ * `target` is one of `folder`, `editor`, `terminal`. The folder is resolved by the
+ * backend from the project record; the request never names a path. A target that cannot
+ * be performed answers `409` with a plain sentence (`project_open_refused`), which the
+ * card prints verbatim.
+ */
+export const openProject = (
+  projectId: string,
+  target: "folder" | "editor" | "terminal"
+): Promise<Result<LifecycleOpenResult>> =>
+  postJson<LifecycleOpenResult>(projectPath(projectId, "/open"), { target });
+
+/**
+ * `POST /api/projects/{id}/move-to-visible-folder` — deliver an existing project.
+ *
+ * The record keeps its versions and run links; only the files move into the configured
+ * project root. `moved` lists every file with the SHA-256 that proves the copy.
+ */
+export const moveProjectToVisibleFolder = (
+  projectId: string
+): Promise<
+  Result<{
+    project_id?: string;
+    already_visible?: boolean;
+    folder?: string;
+    moved?: Array<{ path?: string; size?: number; sha256?: string }>;
+    moved_count?: number;
+    project?: LifecycleProject;
+    diagnostics?: { folder_absolute?: string; project_root?: string };
+  }>
+> => postJson(projectPath(projectId, "/move-to-visible-folder"));
+
+/** `GET /api/settings` — the owner's project root, its default, and whether it exists. */
+export type ForgeSettings = {
+  ok?: boolean;
+  project_root?: string;
+  default_project_root?: string;
+  project_root_exists?: boolean;
+  project_roots_known?: string[];
+  settings_path?: string;
+  schema?: string;
+  created?: boolean;
+};
+
+export const loadSettings = (): Promise<Result<ForgeSettings>> =>
+  readJson<ForgeSettings>("/api/settings");
+
+/**
+ * `POST /api/settings` — set the project root, or restore the desktop default.
+ *
+ * The value is stored in the application's own settings file (`.forge/settings.json`),
+ * not in `.env`, and the folder is created here so a typo fails where it was typed.
+ */
+export const saveProjectRoot = (
+  body: { project_root: string } | { use_desktop: true }
+): Promise<Result<ForgeSettings>> => postJson<ForgeSettings>("/api/settings", body);
 
 /** `GET /api/projects/{id}/entrypoint` — the one entry point the manifest supports. */
 export const loadProjectEntryPoint = (

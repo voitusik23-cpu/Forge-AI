@@ -17,6 +17,8 @@ POST /api/projects/{id}/run  {confirm, digest}   -> start it, only with an expli
 POST /api/projects/{id}/run/stop                 -> terminate the process tree
 POST /api/projects/{id}/run/restart              -> stop, then start again under a fresh approval
 GET  /api/projects/{id}/run/log                  -> the redacted, bounded log
+POST /api/projects/{id}/open  {target}           -> really open folder / VS Code / terminal
+POST /api/projects/{id}/move-to-visible-folder   -> deliver the files to the owner's folder
 DELETE|POST /api/projects/{id}                   -> move the project into projects-deleted
 POST /api/projects/delete-empty                  -> the same move, for empty finished projects
 GET  /api/projects/deleted                       -> what the trash holds now
@@ -30,12 +32,10 @@ Four properties are deliberate:
   different path (``/api/projects/lifecycle``), and it is registered *before*
   ``/api/projects/{project_id}`` so the literal segment can never be captured as an
   id by the parameterised route.
-* **No absolute path and no file content** reaches a payload. A project publishes
-  its repository-relative ``project_path``; an artifact publishes a
-  workspace-relative path plus a repository-relative ``location``, a size, a
-  SHA-256, its create/update change and its verification relevance. The one absolute
-  value this module can return is the preview's own workspace root, and it is nested
-  inside ``diagnostics``.
+* **No absolute path and no file content** reaches a payload, with exactly one
+  deliberate exception: the card's ``diagnostics`` block carries the absolute folder,
+  so the owner can see and paste where his project really is. Everything above the
+  fold publishes the record's own relative form.
 * **The entry point comes from the manifest, never from prose.** The detail payload
   and the dedicated route both call
   :func:`app.projects.entrypoint.detect_entry_point` over the current version's
@@ -56,6 +56,8 @@ from app.projects.entrypoint import (
     EntryPoint,
     resolve_entry,
 )
+from app.projects.folders import count_files
+from app.projects.opener import OPEN_TARGETS, OpenRefusal, ProjectOpener
 from app.projects.preview import (
     LOCAL_RUN_NOT_WIRED,
     NO_ENTRY_POINT,
@@ -95,6 +97,7 @@ def register_project_routes(
     environment_facts: Any = None,
     preview_registry: Any = None,
     runner: Any = None,
+    opener: Any = None,
 ) -> None:
     """Attach the lifecycle routes to ``app`` and publish the service on its state.
 
@@ -118,6 +121,11 @@ def register_project_routes(
     (:class:`app.projects.runner.LocalRunner`). Like the registry it is created
     here when it is not supplied, so the routes and the tests share one composed
     object rather than two views of the same project.
+
+    ``opener`` is the one OS-integration opener (:class:`app.projects.opener.ProjectOpener`).
+    A test supplies one whose ``spawn`` records the argument vector, so the open buttons
+    can be proved without a real Explorer window opening on the machine running the
+    suite; the composition supplies the real one.
     """
 
     from fastapi import Body, HTTPException
@@ -132,6 +140,8 @@ def register_project_routes(
     app.state.forge_projects = projects
     registry = preview_registry if preview_registry is not None else PreviewRegistry()
     app.state.forge_previews = registry
+    project_opener = opener if opener is not None else ProjectOpener()
+    app.state.forge_opener = project_opener
     local_runner = (
         runner
         if runner is not None
@@ -178,6 +188,56 @@ def register_project_routes(
             return projects.store.workspace_path(project.project_id)
         except Exception:  # noqa: BLE001 - an unreadable workspace is an unknown fact
             return None
+
+    def _folder_facts(project: Any) -> Dict[str, Any]:
+        """What the card needs to offer a real entrance into the project.
+
+        ``path`` is the record's own relative folder (what the owner reads), ``exists``
+        says whether that folder is there *now*, and ``files`` is counted on disk rather
+        than read from the record: a version can name files the owner has since deleted,
+        and "open" must refuse in that case instead of opening an empty folder.
+        """
+
+        workspace = _workspace_of(project)
+        exists = False
+        files = 0
+        if workspace is not None:
+            try:
+                exists = bool(workspace.is_dir())
+            except OSError:  # pragma: no cover - defensive
+                exists = False
+            if exists:
+                files = count_files(workspace)
+        return {
+            "path": str(project.project_path or ""),
+            "exists": bool(exists),
+            "files": int(files),
+            "workspace": workspace,
+        }
+
+    def _open_block(project: Any, folder: Dict[str, Any]) -> Dict[str, Any]:
+        """Per-target availability plus the two facts every refusal rests on."""
+
+        try:
+            targets = project_opener.availability(
+                folder["workspace"] if folder["exists"] else None,
+                files=int(folder["files"]),
+            )
+        except Exception:  # noqa: BLE001 - an unreadable opener is "unavailable"
+            targets = {
+                target: {
+                    "target": target,
+                    "available": False,
+                    "reason": "Открытие недоступно в этой сборке.",
+                }
+                for target in OPEN_TARGETS
+            }
+        return {
+            "targets": targets,
+            "folder": folder["path"],
+            "folder_exists": bool(folder["exists"]),
+            "files": int(folder["files"]),
+        }
 
     def _entry_resolution(project: Any) -> Any:
         """The one entry point of the *current* version, from its manifest only.
@@ -285,7 +345,7 @@ def register_project_routes(
             runnable=bool(entry is not None and entry.runnable),
         )
 
-    def _presentation(project: Any) -> Dict[str, Any]:
+    def _presentation(project: Any, *, folder: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """The owner-facing card, derived from this project's own facts.
 
         Everything the card says comes from the record, its current version's
@@ -329,17 +389,21 @@ def register_project_routes(
             questions_open=status_word == "NEEDS_CLARIFICATION",
             provider_registry_ids=tuple(facts.get("provider_registry_ids") or ()),
             api_routes=tuple(facts.get("api_routes") or ()),
+            folder_absolute=(
+                str(folder.get("workspace") or "") if folder is not None else ""
+            ),
         ).to_dict()
 
     def _detail(project: Any) -> Dict[str, Any]:
         current = project.current()
         files = tuple(current.files) if current is not None else ()
         entry = _entry_of(project)
+        folder = _folder_facts(project)
         return {
             "project": project.to_dict(),
             "versions": [item.summary() for item in reversed(project.versions)],
             "files": [_artifact_payload(project, artifact) for artifact in files],
-            "presentation": _presentation(project),
+            "presentation": _presentation(project, folder=folder),
             # Additive, derived facts the card's top block and preview block read.
             # They are computed here (not stored) so a stale record cannot advertise
             # a file, an entry point or a running server it does not have.
@@ -350,7 +414,35 @@ def register_project_routes(
             "preview": _preview_payload(project, entry),
             "run": local_runner.status(_run_target(project)),
             "verification_command": _verification_command(project.project_path, current),
+            # ------------------------------------------------ the entrance into the project
+            # ``folder`` is what the card prints beside its open buttons; ``open`` says,
+            # per target, whether anything can really be started and why not. Both are
+            # derived from the folder on disk, never from the request.
+            "folder": {
+                "path": folder["path"],
+                "exists": bool(folder["exists"]),
+                "files": int(folder["files"]),
+            },
+            "open": _open_block(project, folder),
+            # The one place this surface publishes an absolute path on purpose: the
+            # owner needs to be able to see and paste where his project really is. It is
+            # nested under ``diagnostics``, which the card renders collapsed.
+            "diagnostics": {
+                "folder_absolute": (
+                    str(folder["workspace"]) if folder["workspace"] is not None else ""
+                ),
+                "project_root": _project_root_text(projects),
+            },
         }
+
+    def _project_root_text(owner: Any) -> str:
+        """The configured project root, as text, or "" when none is configured."""
+
+        try:
+            root = owner.store.visible_root()
+        except Exception:  # noqa: BLE001 - an unreadable root is "not configured"
+            return ""
+        return str(root) if root is not None else ""
 
     def _guard(call: Any) -> Any:
         try:
@@ -470,6 +562,89 @@ def register_project_routes(
             "verification": current.verification if current is not None else "",
             "acceptance": current.acceptance if current is not None else "",
             "status": project.status.value,
+        }
+
+    # ---------------------------------------------------------------- the entrance
+    #
+    # «Из Forge должен быть вход в проект». Three integrations exist and nothing else:
+    # the folder, VS Code, a terminal. The request names one of those three words; the
+    # folder is resolved here, from the record, and is never accepted from the body. A
+    # target that cannot be performed answers 409 with the opener's own sentence and
+    # starts nothing, so a disabled button on the card and a refused request say the
+    # same thing.
+    @app.post("/api/projects/{project_id}/open")
+    def open_project(
+        project_id: str,
+        payload: Optional[Dict[str, Any]] = Body(default=None),
+    ) -> Dict[str, Any]:
+        """Really open the project: its folder, VS Code, or a terminal at it."""
+
+        body = dict(payload or {})
+        target = body.get("target")
+        if not isinstance(target, str) or target not in OPEN_TARGETS:
+            raise body_error_exception(
+                "'target' must be one of: " + ", ".join(OPEN_TARGETS)
+            )
+        project = _guard(lambda: projects.open_project(_project_id(project_id)))
+        folder = _folder_facts(project)
+        try:
+            result = project_opener.open(
+                target,
+                folder["workspace"] if folder["exists"] else None,
+                files=int(folder["files"]),
+            )
+        except OpenRefusal as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **error_body(error_code=exc.code, code=exc.code),
+                    "error": str(exc),
+                    "target": target,
+                    "project_id": project.project_id,
+                    "folder": str(project.project_path or ""),
+                },
+            ) from exc
+        return {
+            "project_id": project.project_id,
+            "folder": str(project.project_path or ""),
+            **result.to_dict(),
+        }
+
+    @app.post("/api/projects/{project_id}/move-to-visible-folder")
+    def move_project_to_visible_folder(project_id: str) -> Dict[str, Any]:
+        """Deliver an existing project's files into the owner's visible folder.
+
+        The record keeps its versions, manifest and run links; only the files move. The
+        answer names what moved and where, and the absolute folder stays inside
+        ``diagnostics`` like every other absolute path on this surface.
+        """
+
+        project = _guard(lambda: projects.open_project(_project_id(project_id)))
+        if _has_live_process(project.project_id):
+            # A running child holds the folder open; moving it out from under the process
+            # is how a launched project ends up writing into a directory nobody can find.
+            raise _running_refusal(project.project_id)
+        result = _guard(
+            lambda: projects.move_to_visible_folder(project.project_id)
+        )
+        moved = list(result.get("moved") or ())
+        updated = result.get("project")
+        workspace = None
+        try:
+            workspace = projects.store.workspace_path(project.project_id)
+        except Exception:  # noqa: BLE001 - an unreadable workspace is an unknown fact
+            workspace = None
+        return {
+            "project_id": project.project_id,
+            "already_visible": bool(result.get("already_visible", False)),
+            "folder": str(result.get("folder") or ""),
+            "moved": moved,
+            "moved_count": len(moved),
+            "project": updated.to_dict() if updated is not None else project.to_dict(),
+            "diagnostics": {
+                "folder_absolute": str(workspace) if workspace is not None else "",
+                "project_root": _project_root_text(projects),
+            },
         }
 
     # --------------------------------------------------------------- deletion

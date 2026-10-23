@@ -218,6 +218,14 @@ ACTIONS: Mapping[str, str] = {
     "reverify": "Повторить проверку",
     "launch_local": "Запустить локально",
     "open_app": "Открыть приложение",
+    # The three real OS integrations and the delivery action. They are in this
+    # vocabulary because they are actions a card offers, but they are rendered by the
+    # card's own «Проект на диске» block (which shows the path beside them) rather than
+    # by the generic action row, so `_actions` never emits them.
+    "open_folder": "Открыть папку",
+    "open_editor": "Открыть в VS Code",
+    "open_terminal": "Открыть терминал",
+    "move_to_visible": "Переместить в видимую папку",
 }
 
 #: The statuses in which the lifecycle accepts a new version at all
@@ -508,6 +516,7 @@ def build_project_presentation(
     run_record_saved: Optional[bool] = None,
     provider_registry_ids: Sequence[str] = (),
     api_routes: Sequence[str] = (),
+    folder_absolute: str = "",
 ) -> ProjectPresentation:
     """Turn a project's facts into the card the owner reads.
 
@@ -686,6 +695,7 @@ def build_project_presentation(
         declared_outcome=declared_outcome,
         provider_registry_ids=provider_registry_ids,
         api_routes=api_routes,
+        folder_absolute=folder_absolute,
     )
 
     return ProjectPresentation(
@@ -1037,6 +1047,7 @@ def _technical(
     declared_outcome: str,
     provider_registry_ids: Sequence[str],
     api_routes: Sequence[str],
+    folder_absolute: str = "",
 ) -> Tuple[TechnicalField, ...]:
     """Every technical fact, in one block that is collapsed by default."""
 
@@ -1114,8 +1125,16 @@ def _technical(
         TechnicalField("workspace_id", "workspace id", _text(record.get("workspace_id"))),
         TechnicalField(
             "project_path",
-            "repository-relative folder",
+            "published folder (relative)",
             _text(record.get("project_path")),
+        ),
+        # The one absolute path the card may show, and it is in the collapsed block on
+        # purpose: the owner needs it to paste into Explorer, while the block above the
+        # fold keeps publishing the record's own relative folder.
+        TechnicalField(
+            "folder_absolute",
+            "folder (absolute)",
+            _text(folder_absolute, "неизвестно"),
         ),
         TechnicalField("plan_ref", "plan_ref", _text(record.get("plan_ref"))),
         TechnicalField("created_at", "created_at", _text(record.get("created_at"))),
