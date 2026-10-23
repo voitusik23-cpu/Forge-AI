@@ -25,14 +25,23 @@ The hard rules, each of which is a test:
   the API must be given ``{"confirm": true}`` and the digest the owner was shown,
   and the approval is single-use and expires;
 * ``subprocess.Popen(..., shell=False)`` with an explicitly minimal environment:
-  ``PATH``, ``SYSTEMROOT``, ``TEMP`` and ``PYTHONIOENCODING=utf-8`` only. No Forge
-  credential, no ``*_API_KEY`` and no ``.env`` value ever reaches a child;
+  ``PATH``, ``SYSTEMROOT``, ``TEMP`` and ``PYTHONIOENCODING=utf-8`` only, plus the
+  marker ``FORGE_SANDBOX=1``. No Forge credential, no ``*_API_KEY`` and no ``.env``
+  value ever reaches a child;
+* the child is **contained by the OS** where that is possible without administrator
+  rights (:mod:`app.execution.containment`): a job object with
+  ``KILL_ON_JOB_CLOSE``, a per-process memory ceiling and an active-process ceiling;
+  a suspended spawn whose primary token is lowered to low integrity and verified;
+  and a measured write boundary that records whether the child could write Forge's
+  own data. The run payload carries the measured result and never upgrades a guess
+  to a claim;
 * output is captured into two bounded ring buffers (64 KiB each), every line is
   scanned by the repository's own secret scanner and persisted redacted to
   ``.forge/projects/<id>/run.log``;
 * a one-shot command that overruns its timeout is killed (``TIMED_OUT``); a server
   that bound a port is *not* killed by that timeout, because for it the timeout only
-  answers "did it start";
+  answers "did it start". A server *is* killed when the configured maximum lifetime
+  (default: none) is reached;
 * stop kills the tree by verified pid (job object / Toolhelp snapshot /
   ``taskkill /T``), never by image name;
 * the child's network is **inherited**, and the result says so: there is no network
@@ -63,9 +72,25 @@ from app.execution.adapter import (
     close_process_tree_job,
     create_process_tree_job,
     process_tree_pids,
+    set_process_tree_job_limits,
     terminate_process_tree,
 )
 from app.execution.authorizer import ExecutionCoordinator
+from app.execution.containment import (
+    DEFAULT_MAX_PROCESSES,
+    DEFAULT_MEMORY_MB,
+    INTEGRITY_RESTRICTED,
+    INTEGRITY_UNCHANGED,
+    NETWORK_INHERITED,
+    SANDBOX_ENV_VAR,
+    SandboxLimits,
+    SandboxReport,
+    lower_process_integrity,
+    prepare_low_integrity_workspace,
+    probe_write_boundary,
+    process_integrity_level,
+    resume_process,
+)
 from app.execution.identity import CommandIdentity, WorkspaceIdentity
 from app.execution.intent import AuthorizedExecution, IntentBuilder
 from app.execution.profile import ExecutionEnvironmentType, ProjectExecutionProfile
@@ -167,6 +192,11 @@ RUNNABLE_KINDS = (
     ENTRY_KIND_NODE_SCRIPT,
     ENTRY_KIND_NODE_NPM,
 )
+
+#: A child is created suspended and only resumed after its token has been lowered to
+#: low integrity: without this window the child could run before the restriction
+#: applies, which would make the containment a race instead of a boundary.
+_CREATE_SUSPENDED = 0x00000004
 
 #: Per-stream capture bound. Beyond it the stream is truncated with a marker: an
 #: unbounded buffer would let a chatty child exhaust this process.
@@ -361,6 +391,7 @@ class _RunFacts:
     offline: bool = False
     served: bool = False
     stop_requested: bool = False
+    sandbox: SandboxReport = field(default_factory=SandboxReport)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     process: Optional[subprocess.Popen] = None
     job: Optional[int] = None
@@ -413,12 +444,25 @@ class LocalRunner:
         coordinator: Optional[ExecutionCoordinator] = None,
         timeout: float = DEFAULT_TIMEOUT,
         startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+        memory_mb: int = DEFAULT_MEMORY_MB,
+        max_processes: int = DEFAULT_MAX_PROCESSES,
+        server_lifetime: Optional[float] = None,
+        sandbox_enabled: bool = True,
     ) -> None:
         self._store = store if store is not None else ProjectStore()
         self._previews = previews
         self._coordinator = coordinator or ExecutionCoordinator()
         self._timeout = float(timeout)
         self._startup_timeout = float(startup_timeout)
+        # Containment configuration. ``server_lifetime`` is a wall-clock maximum for a
+        # *serving* process and is off by default: a preview the owner is using must
+        # not disappear on a timer unless the owner asked for one.
+        self._memory_mb = max(0, int(memory_mb))
+        self._max_processes = max(0, int(max_processes))
+        self._server_lifetime = (
+            float(server_lifetime) if server_lifetime not in (None, 0) else 0.0
+        )
+        self._sandbox_enabled = bool(sandbox_enabled)
         self._lock = threading.RLock()
         self._persist_lock = threading.Lock()
         self._runs: Dict[str, _RunFacts] = {}
@@ -960,7 +1004,21 @@ class LocalRunner:
         authorized: AuthorizedExecution,
         workspace: Path,
     ) -> Dict[str, Any]:
-        """Create the child inside the token's workspace and start supervising it."""
+        """Create the child inside the token's workspace and start supervising it.
+
+        Containment is layered around one ``Popen`` and every layer is recorded as
+        the fact it is:
+
+        1. the project's own folder is prepared for a low-integrity child;
+        2. a probe process, under the *same* containment, measures what the child
+           could write (its own folder, Forge's store root, a record there);
+        3. a job object with limits is created and the child is assigned to it;
+        4. the child is created suspended, its token is lowered to low integrity and
+           read back, and only then resumed.
+
+        If a step cannot be taken, the run still happens -- with the fact recorded as
+        not taken. That is the difference between containment and a claim of it.
+        """
 
         intent = authorized.intent
         command = (intent.resolved_executable or intent.executable,) + intent.argv
@@ -973,10 +1031,63 @@ class LocalRunner:
                 "the project workspace is no longer inside the authorized root",
             )
 
+        limits = SandboxLimits(
+            memory_mb=self._memory_mb, max_processes=self._max_processes
+        ).sanitized()
+        sandbox = facts.sandbox
+        sandbox.network = NETWORK_INHERITED
+        sandbox.server_lifetime_seconds = self._server_lifetime
         environment = self._minimal_environment()
+        drop_integrity = False
+        if not self._sandbox_enabled:
+            sandbox.disabled = True
+            sandbox.notes.append("containment is disabled for this runner")
+        elif os.name != "nt":
+            sandbox.notes.append(
+                "OS-level containment (job object, low-integrity token) is implemented "
+                "for Windows only; nothing is claimed on this platform"
+            )
+        else:
+            prepared = prepare_low_integrity_workspace(cwd)
+            sandbox.workspace_label = str(prepared.get("label", "unknown"))
+            sandbox.workspace_label_applied = bool(prepared.get("applied"))
+            drop_integrity = bool(prepared.get("low"))
+            if not drop_integrity:
+                sandbox.notes.append(
+                    "the project folder is not writable at low integrity, so the "
+                    "token was left unchanged"
+                )
+            else:
+                # Python and most build tools want a writable TEMP. The machine's TEMP
+                # is a medium-integrity folder a low child cannot write, so the
+                # child's TEMP points inside its own folder -- the one place it may
+                # write anyway.
+                temp_dir = cwd / ".forge-tmp"
+                try:
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    environment["TEMP"] = str(temp_dir)
+                    environment["TMP"] = str(temp_dir)
+                except OSError:
+                    sandbox.notes.append("no writable TEMP inside the project folder")
+            probe = probe_write_boundary(
+                interpreter=python_executable(),
+                cwd=cwd,
+                environment=environment,
+                workspace=cwd,
+                outside_directory=self._store_root(),
+                limits=limits,
+                drop_integrity=drop_integrity,
+            )
+            sandbox.writes_inside = str(probe.get("writes_inside", "unknown"))
+            sandbox.writes_outside = str(probe.get("writes_outside", "unknown"))
+            sandbox.probe_error = str(probe.get("probe_error", "") or "")
+
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        try:
-            process = subprocess.Popen(
+        if drop_integrity:
+            creationflags |= _CREATE_SUSPENDED
+
+        def spawn(flags: int) -> "subprocess.Popen[bytes]":
+            return subprocess.Popen(
                 list(command),
                 cwd=str(cwd),
                 env=environment,
@@ -984,24 +1095,123 @@ class LocalRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=False,
-                creationflags=creationflags,
+                creationflags=flags,
                 start_new_session=(os.name != "nt"),
             )
+
+        job: Optional[int] = None
+        limits_report: Optional[Dict[str, Any]] = None
+        if self._sandbox_enabled:
+            job = create_process_tree_job()
+            if job is not None:
+                limits_report = set_process_tree_job_limits(
+                    job, memory_mb=limits.memory_mb, max_processes=limits.max_processes
+                )
+                if limits_report is None:
+                    sandbox.notes.append("the job object accepted no limits")
+                    close_process_tree_job(job)
+                    job = None
+
+        try:
+            process = spawn(creationflags)
         except FileNotFoundError:
+            if job is not None:
+                close_process_tree_job(job)
             return self._refuse(
                 facts,
                 "executable_missing",
                 "the declared interpreter is not available on this machine",
             )
         except Exception as exc:  # noqa: BLE001 - a spawn failure is a refusal
+            if job is not None:
+                close_process_tree_job(job)
             return self._refuse(
                 facts, "spawn_failed", f"the process could not be started: {type(exc).__name__}"
             )
 
-        job = create_process_tree_job()
-        if job is not None and not assign_process_tree_job(job, process):
+        if job is not None and assign_process_tree_job(job, process):
+            sandbox.job_object = True
+            if limits_report:
+                sandbox.kill_on_close = bool(limits_report.get("kill_on_job_close"))
+                sandbox.process_memory_limit_mb = int(
+                    limits_report.get("process_memory_limit_mb") or 0
+                )
+                sandbox.active_process_limit = int(
+                    limits_report.get("active_process_limit") or 0
+                )
+                sandbox.memory_mb = sandbox.process_memory_limit_mb
+                sandbox.max_processes = (
+                    sandbox.active_process_limit if sandbox.active_process_limit else 0
+                )
+        elif job is not None:
             close_process_tree_job(job)
             job = None
+            sandbox.notes.append("the child could not be assigned to a job object")
+
+        if drop_integrity:
+            before = process_integrity_level(process.pid)
+            applied, level = lower_process_integrity(process)
+            after = process_integrity_level(process.pid)
+            sandbox.integrity_level_before = before
+            sandbox.integrity_level = after if after != "unknown" else level
+            if not applied:
+                sandbox.notes.append(
+                    "the child's token could not be lowered to low integrity; the "
+                    "measured write boundary describes the token it really has"
+                )
+            resumed = resume_process(process)
+            if not resumed:
+                # A suspended child that cannot be resumed must not be left hanging.
+                # It is killed and started again without the token layer, and the
+                # report says so instead of keeping a claim it did not deliver.
+                sandbox.probe_error = "resume_failed"
+                sandbox.writes_inside = "unknown"
+                sandbox.writes_outside = "unknown"
+                sandbox.notes.append("the child could not be resumed; restarted unchanged")
+                terminate_process_tree(process, job=job, exit_code=1)
+                if job is not None:
+                    close_process_tree_job(job)
+                    job = None
+                    sandbox.job_object = False
+                drop_integrity = False
+                sandbox.integrity_level_before = "unknown"
+                sandbox.integrity_level = "unknown"
+                try:
+                    process = spawn(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                    )
+                except Exception as exc:  # noqa: BLE001 - a second spawn failure
+                    return self._refuse(
+                        facts,
+                        "spawn_failed",
+                        f"the process could not be started: {type(exc).__name__}",
+                    )
+        if not drop_integrity:
+            sandbox.integrity_level = process_integrity_level(process.pid)
+            sandbox.integrity_level_before = sandbox.integrity_level
+        # The token is restricted when the child really runs below the owner's normal
+        # level. Whether Forge applied the change or the child inherited it (a
+        # low-labelled interpreter) is stated in ``detail.mechanism``.
+        if sandbox.integrity_level == "low":
+            sandbox.restricted_token = True
+            sandbox.integrity = INTEGRITY_RESTRICTED
+            if not sandbox.mechanism:
+                sandbox.mechanism = (
+                    "low_integrity_token" if drop_integrity else "inherited_low_integrity"
+                )
+        elif sandbox.integrity_level != "unknown":
+            sandbox.integrity = INTEGRITY_UNCHANGED
+            sandbox.mechanism = sandbox.mechanism or "unchanged"
+        if sandbox.writes_outside == "allowed" and sandbox.integrity_level == "low":
+            # The measured outcome, explained without upgrading it: the child really
+            # is low integrity, and it still reached Forge's data because that data
+            # (and the Forge process that wrote it) is low-integrity too. Integrity
+            # levels only separate a lower child from higher objects.
+            sandbox.notes.append(
+                "Forge's own files are reachable from this child: the Forge process "
+                "runs at the same low integrity level as the child, so its records "
+                "carry no higher label to protect them"
+            )
 
         now = _utc_now()
         with self._lock:
@@ -1028,6 +1238,7 @@ class LocalRunner:
             facts.diagnostics["cwd"] = str(cwd)
             facts.diagnostics["job_object"] = job is not None
             facts.diagnostics["environment_keys"] = sorted(environment)
+            facts.diagnostics["sandbox"] = sandbox.to_payload()
             self._runs[facts.project_id] = facts
 
         self._ensure_atexit()
@@ -1042,11 +1253,21 @@ class LocalRunner:
         self._persist(facts)
         return self._payload(facts, include_log=True)
 
+    def _store_root(self) -> Path:
+        """The directory that holds this project's records (Forge's own data)."""
+
+        try:
+            return Path(getattr(self._store, "root", default_projects_root()))
+        except (TypeError, ValueError):
+            return default_projects_root()
+
     def _minimal_environment(self) -> Dict[str, str]:
-        """Exactly four variables: PATH, SYSTEMROOT, TEMP, PYTHONIOENCODING.
+        """Five variables: PATH, SYSTEMROOT, TEMP, PYTHONIOENCODING, FORGE_SANDBOX.
 
         Everything else -- a Forge credential, a provider key, a value read from
         ``.env`` -- is *absent* rather than blanked, so a child cannot read it back.
+        ``FORGE_SANDBOX=1`` is a marker a program may read; it is not a boundary and
+        the payload never treats it as one.
         """
 
         environment: Dict[str, str] = {}
@@ -1055,6 +1276,7 @@ class LocalRunner:
             if value:
                 environment[name] = value
         environment["PYTHONIOENCODING"] = "utf-8"
+        environment[SANDBOX_ENV_VAR] = "1"
         return environment
 
     def _start_readers(self, facts: _RunFacts, process: subprocess.Popen) -> None:
@@ -1098,6 +1320,17 @@ class LocalRunner:
                 port = self._discover_port(process.pid)
                 if port:
                     self._publish_preview(facts, port)
+            if self._server_lifetime and facts.port and now - started > self._server_lifetime:
+                # A *serving* process has its own bound, configured by the owner and
+                # off by default. When it is reached the whole job is terminated, the
+                # same way a stop is.
+                with self._lock:
+                    facts.state = STOPPING
+                    facts.reason = (
+                        f"the server exceeded its {self._server_lifetime:g} s lifetime"
+                    )
+                self._finish(facts, process, None, timed_out=True)
+                return
             if facts.port == 0 and now > hard_deadline:
                 # A script that is meant to finish did not. A server that already
                 # bound a port is never killed by this deadline: for it the
@@ -1141,8 +1374,10 @@ class LocalRunner:
             # Reaping is attempted unconditionally: a child that spawns a helper and
             # returns would otherwise leave work running on the host. The kill goes
             # through the verified pid, its descendants and its job -- never a name.
+            # A job kill reports a non-zero code, so a terminated child is never
+            # mistaken for a clean ``exit 0``.
             try:
-                terminate_process_tree(process, job=job)
+                terminate_process_tree(process, job=job, exit_code=1)
             except Exception:  # noqa: BLE001 - a gone tree is the goal
                 pass
         if job is not None:
@@ -1355,6 +1590,15 @@ class LocalRunner:
             f"# entry: {facts.entry_kind} {facts.entry_path}",
             f"# command: {facts.command_display}",
             f"# network_policy: {facts.network_policy}",
+            (
+                "# sandbox: job_object=%s integrity=%s writes_outside=%s network=%s"
+                % (
+                    "on" if facts.sandbox.job_object else "off",
+                    facts.sandbox.integrity,
+                    facts.sandbox.writes_outside,
+                    facts.sandbox.network,
+                )
+            ),
         ]
         if facts.reason:
             header.append(f"# reason: {redact_output_text(facts.reason)}")
@@ -1459,6 +1703,7 @@ class LocalRunner:
             "network_policy": facts.network_policy,
             "offline": bool(facts.offline),
             "approval_required": True,
+            "sandbox": facts.sandbox.to_payload(),
             "log": {
                 "path": relative,
                 "relative_path": relative,

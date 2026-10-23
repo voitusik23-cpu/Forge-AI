@@ -234,6 +234,7 @@ def create_api_app(
     from app.api.project_routes import register_project_routes
     from app.api.settings_routes import register_settings_routes
     from app.config.app_settings import AppSettingsStore
+    from app.execution.containment import sandbox_settings_from_environment
     from app.projects.preview import PreviewRegistry
     from app.projects.runner import LocalRunner
     from app.api.routes import (
@@ -435,7 +436,11 @@ def create_api_app(
     runner = (
         project_runner
         if project_runner is not None
-        else LocalRunner(store=getattr(projects, "store", None), previews=previews)
+        else LocalRunner(
+            store=getattr(projects, "store", None),
+            previews=previews,
+            **sandbox_settings_from_environment(),
+        )
     )
     app.state.forge_runner = runner
     # The card's technical block needs facts the project store does not hold: the

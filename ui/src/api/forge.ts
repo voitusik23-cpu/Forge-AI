@@ -1047,6 +1047,32 @@ export type LifecyclePreview = {
 };
 
 /**
+ * The containment actually applied to the project's process, as measured.
+ *
+ * `job_object` is the Windows job object (kill-on-close, memory ceiling, process
+ * ceiling). `restricted_token` says the child's integrity level is below the owner's
+ * normal level; `integrity` is `restricted_token` or `unchanged` and is never set from
+ * an intention. `writes_outside` is the result of a write probe run under the same
+ * containment -- `blocked`, `allowed` or `unknown` -- where `allowed` means the child
+ * could write Forge's own project data. `network` is always inherited: there is no
+ * network isolation here. `limits` reports what the kernel accepted, with `0` meaning
+ * "not in effect".
+ */
+export type LifecycleSandbox = {
+  job_object?: boolean;
+  restricted_token?: boolean;
+  integrity?: string;
+  writes_outside?: string;
+  network?: string;
+  limits?: {
+    memory_mb?: number;
+    max_processes?: number;
+    active_process_limit?: number;
+  };
+  detail?: Record<string, unknown>;
+};
+
+/**
  * The local process (`GET/POST /api/projects/{id}/run`).
  *
  * `state` is the supervisor's own word -- one of `NOT_RUN`, `STARTING`, `RUNNING`,
@@ -1083,6 +1109,7 @@ export type LifecycleRun = {
   network_policy?: string;
   offline?: boolean;
   approval_required?: boolean;
+  sandbox?: LifecycleSandbox;
   log?: {
     path?: string;
     relative_path?: string;

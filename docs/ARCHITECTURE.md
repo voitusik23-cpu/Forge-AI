@@ -4905,15 +4905,62 @@ authority.
   the command **the digest was issued for**;
 * a refused chain returns `REFUSED` with the coordinator's own `denial_reason`;
 * the child is started with `subprocess.Popen(shell=False)`, `cwd` = the canonical authorized root,
-  `stdin=DEVNULL`, and an environment of exactly `PATH`, `SYSTEMROOT`, `TEMP` and
-  `PYTHONIOENCODING=utf-8`. A Forge credential, a provider key or a `.env` value is **absent**, not
-  blanked, so a child cannot read it back;
-* the tree is owned by a Windows job object when one can be created
+  `stdin=DEVNULL`, and an environment of exactly `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`,
+  `PYTHONIOENCODING=utf-8` and the marker `FORGE_SANDBOX=1`. A Forge credential, a provider key or a
+  `.env` value is **absent**, not blanked, so a child cannot read it back;
+* the tree is owned by a Windows job object that also carries the limits, and the child's token is
+  lowered to low integrity before it runs (see the next subsection).
 
 `terminate_process_tree` was lifted out of the adapter to module level so the supervisor and the
 adapter reap a tree with one implementation: job object, else a Toolhelp snapshot (descendants
 first), else `taskkill /PID <pid> /T /F`, and a process group on POSIX. Killing by image name never
 happens.
+
+### Containment of a launched project process
+
+`app/execution/containment.py` is the OS-level layer around exactly one spawned project process. It
+uses only `ctypes` from the standard library and needs no administrator rights. Every mechanism is
+listed here with the fact it produces.
+
+* **Job object with limits** (`CreateJobObjectW` + `SetInformationJobObject` with
+  `JobObjectExtendedLimitInformation`): `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (closing the last handle
+  kills the whole tree, including after a crash), `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (default 1024 MiB
+  per process) and `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` (default 16). The values are read back with
+  `QueryInformationJobObject`, so the payload can only publish a limit the kernel accepted; a limit
+  that could not be set is reported as `0`. `TerminateJobObject` is the stop path.
+* **Low-integrity token**, no admin: the child is created suspended (`Popen` with
+  `CREATE_SUSPENDED`), `OpenProcessToken(TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)` +
+  `SetTokenInformation(TokenIntegrityLevel, S-1-16-4096)` lowers its primary token before it runs a
+  single instruction, `GetTokenInformation` reads the level back, and the initial thread is resumed
+  (`Thread32First`/`OpenThread`/`ResumeThread`, with `NtResumeProcess` as a fallback). If the resume
+  fails the child is killed and started again unchanged — and the report says so.
+* **Labelled project folder**: before the token is lowered, the project's own folder is labelled low
+  integrity (`AddMandatoryAce` + `SetNamedSecurityInfoW` with `LABEL_SECURITY_INFORMATION`,
+  inheritable, no-write-up), so a low-integrity child can still write **its own** files. When the
+  folder cannot be labelled low, the token is left unchanged rather than breaking the run. The child's
+  `TEMP`/`TMP` point inside that folder for the same reason.
+* **Measured write boundary**: a short-lived probe process is launched under the *same* job limits, the
+  same token treatment, the same environment and the same working directory. It tries to create a file
+  in the project folder, to create a file in the project store root, and to overwrite a record Forge
+  placed there. The result becomes `writes_outside: "blocked" | "allowed" | "unknown"` — a
+  measurement. On a host where Forge itself runs at low integrity and its own data is low-labelled, the
+  honest answer is `allowed`; the payload then carries a note explaining exactly that, and the UI shows
+  a warning instead of a checkmark.
+* **Server lifetime** (`FORGE_SANDBOX_SERVER_LIFETIME_S`, default none): a process that bound a port
+  is terminated through the job when the configured maximum wall-clock lifetime is reached.
+
+The run payload carries `sandbox: {job_object, restricted_token, integrity, writes_outside, network,
+limits: {memory_mb, max_processes, active_process_limit}, detail}`. `network` is always
+`"inherited (not isolated)"`. The green state (`job_object` and `restricted_token` and
+`writes_outside == "blocked"`) is the only one the card may render as contained.
+
+**Not claimed, because it needs an administrator:** a default-deny network rule (Windows Firewall /
+WFP), `CreateProcessAsUser`/`CreateProcessWithTokenW` with a Safer-computed restricted token
+(`SeAssignPrimaryTokenPrivilege`), and an AppContainer profile with ACLs on every DLL the runtime
+loads. Those are the upgrade path, not a current behaviour.
+
+Costs: one extra short-lived probe process per start (bounded at 8 s, and `writes_outside` becomes
+`unknown` when it does not answer), and the containment is registered per run in memory only.
 
 ### States, approval and output
 
@@ -4981,12 +5028,18 @@ workspace, port, preview URL, process state, last event, logs; and the buttons �
 «Остановить», «Перезапустить», «Открыть preview», «Показать файлы», «Показать логи»,
 «Повторить проверку» — each only when its own facts allow it. The launch is an explicit confirmation
 that prints the exact command and the digest, and the block prints `RUN_BLOCKED`'s reason and next
-step verbatim.
+step verbatim. Below it, a small «Песочница» block lists the containment facts from the payload (job
+object, token, measured write boundary, network, limits, server lifetime). It shows the green
+«содержится» badge only when every layer is active and `writes_outside == "blocked"`; otherwise a
+write boundary that is not blocked is rendered as the warning «программа работает с вашими правами».
 
-`tests/test_local_execution.py` (29 tests, offline) covers the kinds, the allowlist and path
+`tests/test_local_execution.py` (30 tests, offline) covers the kinds, the allowlist and path
 refusals, the approval boundary, success, module and node execution, the timeout kill, the
 process-tree stop, the 64 KiB cap, the environment, restart, redaction, the process preview and its
-absence, the four stage words and the HTTP contract. `app/smoke_python_preview.py` and
+absence, the four stage words and the HTTP contract. `tests/test_run_sandbox.py` (13 tests, offline)
+covers the job-object tree kill by pid, the memory and active-process limits read back from the OS, the
+measured write boundary, the child environment, the payload shape, the refused/never-run/disabled
+states and the configured server lifetime. `app/smoke_python_preview.py` and
 `app/smoke_node_preview.py` walk materialize → entrypoint → approval → start → preview `GET` 200 →
 verification → stop; the node smoke prints `SKIPPED: node is not installed` and exits 0 when there is
 no node.
@@ -5046,15 +5099,65 @@ no node.
   команды, **для которой выдан отпечаток-дайджест**;
 * отказ цепочки возвращает `REFUSED` с собственным `denial_reason` координатора;
 * дочерний процесс стартует через `subprocess.Popen(shell=False)`, `cwd` = канонический
-  авторизованный корень, `stdin=DEVNULL` и окружение ровно из `PATH`, `SYSTEMROOT`, `TEMP` и
-  `PYTHONIOENCODING=utf-8`. Учётные данные Forge, ключ провайдера или значение `.env`
-  **отсутствуют**, а не обнуляются, поэтому дочерний процесс не может их прочитать;
-* дерево принадлежит job object Windows, когда его удаётся создать.
+  авторизованный корень, `stdin=DEVNULL` и окружение ровно из `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`,
+  `PYTHONIOENCODING=utf-8` и маркера `FORGE_SANDBOX=1`. Учётные данные Forge, ключ провайдера или
+  значение `.env` **отсутствуют**, а не обнуляются, поэтому дочерний процесс не может их прочитать;
+* дерево принадлежит job object Windows, который несёт и лимиты, а токен дочернего процесса
+  понижается до низкой целостности до его первого запуска (см. следующий подраздел).
 
 `terminate_process_tree` вынесена из адаптера на уровень модуля, чтобы супервизор и адаптер
 уничтожали дерево одной реализацией: job object, иначе снимок Toolhelp (сначала потомки), иначе
 `taskkill /PID <pid> /T /F`, а в POSIX — группа процессов. Убийства по имени образа не происходит
 никогда.
+
+### Содержание запущенного процесса проекта
+
+`app/execution/containment.py` — это OS-level слой вокруг ровно одного запущенного процесса проекта.
+Он использует только `ctypes` из стандартной библиотеки и не требует прав администратора. Каждый
+механизм перечислен здесь вместе с фактом, который он производит.
+
+* **Job object с лимитами** (`CreateJobObjectW` + `SetInformationJobObject` с
+  `JobObjectExtendedLimitInformation`): `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (закрытие последнего
+  handle убивает всё дерево, в том числе после падения процесса), `JOB_OBJECT_LIMIT_PROCESS_MEMORY`
+  (по умолчанию 1024 МиБ на процесс) и `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` (по умолчанию 16). Значения
+  читаются обратно через `QueryInformationJobObject`, поэтому в payload попадает только тот лимит,
+  который ядро приняло; лимит, который задать не удалось, сообщается как `0`. Остановка идёт через
+  `TerminateJobObject`.
+* **Токен низкой целостности**, без администратора: дочерний процесс создаётся приостановленным
+  (`Popen` с `CREATE_SUSPENDED`), `OpenProcessToken(TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)` +
+  `SetTokenInformation(TokenIntegrityLevel, S-1-16-4096)` понижает его primary token до выполнения
+  первой инструкции, `GetTokenInformation` читает уровень обратно, после чего начальный поток
+  возобновляется (`Thread32First`/`OpenThread`/`ResumeThread`, с `NtResumeProcess` как запасным
+  путём). Если возобновление не удалось, процесс убивается и запускается заново без понижения — и
+  отчёт говорит именно это.
+* **Помеченная папка проекта**: до понижения токена собственная папка проекта помечается низкой
+  целостностью (`AddMandatoryAce` + `SetNamedSecurityInfoW` с `LABEL_SECURITY_INFORMATION`,
+  наследуемо, no-write-up), чтобы дочерний процесс низкой целостности всё ещё мог писать **свои**
+  файлы. Если папку нельзя пометить, токен остаётся без изменений, а не ломает запуск. По той же
+  причине `TEMP`/`TMP` дочернего процесса указывают внутрь этой папки.
+* **Измеренная граница записи**: короткоживущий пробный процесс запускается под **теми же** лимитами
+  job object, с той же обработкой токена, тем же окружением и той же рабочей директорией. Он
+  пытается создать файл в папке проекта, создать файл в корне хранилища проектов и перезаписать
+  запись, которую Forge туда положил. Результат становится
+  `writes_outside: "blocked" | "allowed" | "unknown"` — это измерение. На хосте, где сам Forge
+  работает при низкой целостности и его данные помечены так же низко, честный ответ — `allowed`; в
+  payload тогда появляется пояснение, а интерфейс показывает предупреждение вместо галочки.
+* **Время жизни сервера** (`FORGE_SANDBOX_SERVER_LIFETIME_S`, по умолчанию нет): процесс, занявший
+  порт, уничтожается через job object по достижении заданного максимального времени жизни.
+
+Payload запуска несёт `sandbox: {job_object, restricted_token, integrity, writes_outside, network,
+limits: {memory_mb, max_processes, active_process_limit}, detail}`. `network` всегда
+`"inherited (not isolated)"`. Зелёное состояние (`job_object` и `restricted_token` и
+`writes_outside == "blocked"`) — единственное, что карточка может показать как «содержится».
+
+**Не заявляется, потому что требует администратора:** правило сети default-deny (Windows Firewall /
+WFP), `CreateProcessAsUser`/`CreateProcessWithTokenW` с restricted token от `SaferComputeTokenFromLevel`
+(`SeAssignPrimaryTokenPrivilege`) и профиль AppContainer с ACL на каждой DLL, которую загружает
+рантайм. Это путь обновления, а не текущее поведение.
+
+Цена: один дополнительный короткоживущий пробный процесс на запуск (ограничен 8 с; если он не
+ответил, `writes_outside` становится `unknown`) и хранение сведений о содержании только в памяти на
+время запуска.
 
 ### Состояния, одобрение и вывод
 
@@ -5123,12 +5226,18 @@ stdout и stderr читаются через `read1` (построчно буф�
 локально», «Остановить», «Перезапустить», «Открыть preview», «Показать файлы», «Показать логи»,
 «Повторить проверку» — каждая только когда это позволяют её собственные факты. Запуск — явное
 подтверждение, печатающее точную команду и отпечаток, а блок дословно печатает причину и следующий
-шаг для `RUN_BLOCKED`.
+шаг для `RUN_BLOCKED`. Ниже — небольшой блок «Песочница» с фактами содержания из payload (job object,
+токен, измеренная граница записи, сеть, лимиты, время жизни сервера). Зелёную отметку «содержится» он
+показывает только когда активны все слои и `writes_outside == "blocked"`; иначе незаблокированная
+граница записи выводится предупреждением «программа работает с вашими правами».
 
-`tests/test_local_execution.py` (29 тестов, офлайн) покрывает виды, отказы allowlist и путей,
+`tests/test_local_execution.py` (30 тестов, офлайн) покрывает виды, отказы allowlist и путей,
 границу одобрения, успешный запуск, модуль и node, убийство по таймауту, остановку дерева,
 ограничение 64 КиБ, окружение, перезапуск, редактирование секретов, процессный предпросмотр и его
-отсутствие, четыре слова этапа и HTTP-контракт. `app/smoke_python_preview.py` и
+отсутствие, четыре слова этапа и HTTP-контракт. `tests/test_run_sandbox.py` (13 тестов, офлайн)
+покрывает убийство дерева job object по pid, лимиты памяти и активных процессов, прочитанные из ОС,
+измеренную границу записи, окружение дочернего процесса, форму payload, состояния «отказано / не
+запускался / выключено» и настроенное время жизни сервера. `app/smoke_python_preview.py` и
 `app/smoke_node_preview.py` проходят путь материализация → точка входа → одобрение → запуск →
 `GET` предпросмотра 200 → проверка → остановка; node-smoke печатает
 `SKIPPED: node is not installed` и завершается с кодом 0, когда node нет.

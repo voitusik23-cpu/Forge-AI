@@ -7565,5 +7565,158 @@ from Forge still runs with his own token.
 сохраняет старое скрытое расположение — поэтому это изменение не добавляет набору тестов обращений к
 рабочему столу. Оставшиеся ограничения: удалённую вручную папку система сообщает (действия открытия
 отказывают фразой «папка проекта не найдена»), но не пересоздаёт; `.forge/backups/run-<id>/` внутри
-папки проекта — существующая резервная копия писателя, а не файл проекта; песочницы ОС нет, поэтому
-запущенная из Forge программа по-прежнему работает с токеном владельца.
+папки проекта — существующая резервная копия писателя, а не файл проекта; содержание запущенного
+процесса проекта появилось позже и описано в решении «Содержание запущенного процесса проекта»
+ниже — оно ограничивает дерево процессов и целостность токена, но не сеть и не файлы на хосте, где
+сам Forge работает при той же низкой целостности.
+
+---
+
+## Decision: a launched project runs inside a job object with a low-integrity token (v0.1)
+
+### Context
+
+MEASURED before this change: the process a project's own entry point ran as was created by
+`subprocess.Popen` with the owner's own token, merely assigned to a job object that carried no limits.
+Four consequences, each observed rather than assumed:
+
+* stop killed the tree, but nothing bounded it while it ran -- a runaway allocation or a process bomb
+  could take the machine down;
+* the child held the owner's full token: it could write anything the owner could write, including
+  Forge's own records in `.forge/projects/<id>/*.json`, the run store and the repository's `.env`;
+* the payload said `network_policy: "inherited"` and nothing about files or tokens, so the card could
+  not tell the owner what was and was not contained;
+* the `--offline` flag was already only a declaration, and there was no honest place to say so per run.
+
+The owner's last agreed item was an **honest** containment layer: implement what needs no administrator
+rights, and say precisely what it does and does not stop.
+
+### Decisions
+
+* **Two mechanisms, both stdlib `ctypes`, no new dependency.** `CreateJobObjectW` +
+  `SetInformationJobObject(JobObjectExtendedLimitInformation)` with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_PROCESS_MEMORY` and
+  `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`; and, for the token, `CREATE_SUSPENDED` + `OpenProcessToken` +
+  `SetTokenInformation(TokenIntegrityLevel, S-1-16-4096)` + `GetTokenInformation` + a documented
+  thread resume. `TerminateJobObject` is the stop path.
+* **Read the limits back.** The reported limits come from `QueryInformationJobObject`, never from the
+  values the code asked for: a limit the kernel did not accept is published as `0`.
+* **The token is only lowered when the project folder is writable at that level.** The folder is
+  labelled low integrity (`AddMandatoryAce` + `SetNamedSecurityInfoW`) first; if that is impossible the
+  token is left unchanged and the report says `integrity: "unchanged"` rather than breaking the run.
+  `TEMP`/`TMP` of a lowered child point inside its own folder.
+* **The write boundary is measured, not claimed.** A probe process under the *same* containment tries
+  to create a file in the project folder, create a file in the project store root and overwrite a record
+  Forge put there. `writes_outside` is `blocked` / `allowed` / `unknown` -- and `allowed` is rendered as
+  a warning, never as success. On a host where Forge itself runs at low integrity (measured here: the
+  repository, its store and even its `.venv` interpreters are low-labelled), that honest answer is
+  `allowed`, and the card says «программа работает с вашими правами».
+* **No admin-only layer is claimed.** Default-deny network needs Windows Firewall/WFP; a restricted
+  token from `SaferComputeTokenFromLevel` needs `CreateProcessAsUser` and
+  `SeAssignPrimaryTokenPrivilege`; AppContainer needs capability ACLs on every DLL of the runtime.
+  `network` is therefore always `"inherited (not isolated)"` and `--offline` stays a declaration.
+* **A refused, never-run or disabled sandbox cannot look contained.** The booleans default to false and
+  `writes_outside` to `unknown`; the only state that may be shown as contained is `job_object` **and**
+  `restricted_token` **and** `writes_outside == "blocked"`.
+
+### Rejected alternatives
+
+* **Claiming network isolation via proxy environment variables.** It is bypassed by any client that
+  opens a socket itself, and it would be a lie in the payload.
+* **`SaferComputeTokenFromLevel` + `CreateProcessAsUser`.** It fails without
+  `SeAssignPrimaryTokenPrivilege` on a normal user; pretending a restricted token exists would be the
+  exact dishonesty this change removes.
+* **An AppContainer.** It would be a real kernel boundary, but it needs ACLs on the interpreter's
+  installation outside the repository (and would break the run when they are missing).
+* **Lowering the token without labelling the project folder.** The child would be unable to write its
+  own output; a containment that breaks the feature is not acceptable.
+* **Guessing `writes_outside` from the token level.** The probe measures the process's actual ability;
+  this host proves why the guess would be wrong.
+
+### Consequences and open questions
+
+Evidence: `app/execution/containment.py`, the extended `app/execution/adapter.py`
+(`set_process_tree_job_limits`, `process_tree_job_limits`), `app/projects/runner.py`, the `sandbox`
+block and the «Песочница» panel in `ui/src/screens/Projects.tsx`, and `tests/test_run_sandbox.py`
+(13 offline tests: tree kill by pid, memory and process caps read back from the OS, the measured write
+boundary, the environment, the payload shape, the refused/never-run/disabled states, the configured
+server lifetime). Costs: one short-lived probe process per start (bounded at 8 s) and in-memory
+containment state per run. Open: on a host where Forge itself is low-integrity the token layer does not
+separate the child from Forge's data -- measured as `allowed` and shown as a warning; a genuine boundary
+there needs the administrator-only mechanisms listed above.
+
+---
+
+## Решение: запущенный процесс проекта работает внутри job object с токеном низкой целостности (v0.1)
+
+### Контекст
+
+ИЗМЕРЕНО до этого изменения: процесс, в котором работала собственная точка входа проекта, создавался
+через `subprocess.Popen` с токеном самого владельца и лишь приписывался к job object без лимитов.
+Четыре следствия, каждое наблюдённое, а не предположенное:
+
+* остановка убивала дерево, но ничто не ограничивало его во время работы — runaway-аллокация или
+  «бомба процессов» могли уронить машину;
+* дочерний процесс держал полный токен владельца: он мог писать всё, что мог писать владелец, включая
+  собственные записи Forge в `.forge/projects/<id>/*.json`, хранилище запусков и `.env` репозитория;
+* payload говорил `network_policy: "inherited"` и ничего — о файлах и токене, поэтому карточка не
+  могла сказать владельцу, что именно содержится, а что нет;
+* флаг `--offline` уже был только объявлением, и не было честного места сказать это на каждый запуск.
+
+Последний согласованный пункт владельца — **честный** слой содержания: реализовать то, что не требует
+прав администратора, и точно сказать, что он останавливает, а что нет.
+
+### Принятые решения
+
+* **Два механизма, оба на `ctypes` из стандартной библиотеки, без новой зависимости.**
+  `CreateJobObjectW` + `SetInformationJobObject(JobObjectExtendedLimitInformation)` с
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `JOB_OBJECT_LIMIT_PROCESS_MEMORY` и
+  `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`; и для токена — `CREATE_SUSPENDED` + `OpenProcessToken` +
+  `SetTokenInformation(TokenIntegrityLevel, S-1-16-4096)` + `GetTokenInformation` + документированное
+  возобновление потока. Остановка идёт через `TerminateJobObject`.
+* **Лимиты читаются обратно.** Сообщаемые лимиты берутся из `QueryInformationJobObject`, а не из того,
+  что просил код: лимит, который ядро не приняло, публикуется как `0`.
+* **Токен понижается только когда папка проекта доступна на запись при этом уровне.** Сначала папка
+  помечается низкой целостностью (`AddMandatoryAce` + `SetNamedSecurityInfoW`); если это невозможно,
+  токен остаётся без изменений и отчёт говорит `integrity: "unchanged"`, вместо того чтобы ломать
+  запуск. `TEMP`/`TMP` понижённого процесса указывают внутрь его собственной папки.
+* **Граница записи измеряется, а не заявляется.** Пробный процесс под **тем же** содержанием пытается
+  создать файл в папке проекта, создать файл в корне хранилища проектов и перезаписать запись, которую
+  положил Forge. `writes_outside` — это `blocked` / `allowed` / `unknown`, и `allowed` показывается
+  предупреждением, а не успехом. На хосте, где сам Forge работает при низкой целостности (здесь
+  измерено: репозиторий, его хранилище и даже интерпретаторы `.venv` помечены низко), честный ответ —
+  `allowed`, и карточка говорит «программа работает с вашими правами».
+* **Ни один слой, требующий администратора, не заявляется.** Default-deny сети требует Windows
+  Firewall/WFP; restricted token из `SaferComputeTokenFromLevel` требует `CreateProcessAsUser` и
+  `SeAssignPrimaryTokenPrivilege`; AppContainer требует ACL на каждой DLL рантайма. Поэтому `network`
+  всегда `"inherited (not isolated)"`, а `--offline` остаётся объявлением.
+* **Отказанное, не запускавшееся или выключенное содержание не может выглядеть содержащимся.** Булевы
+  поля по умолчанию false, `writes_outside` — `unknown`; единственное состояние, которое можно показать
+  как «содержится», — это `job_object` **и** `restricted_token` **и** `writes_outside == "blocked"`.
+
+### Отклонённые альтернативы
+
+* **Заявлять сетевую изоляцию через переменные окружения с прокси.** Это обходится любым клиентом,
+  который открывает сокет сам, и было бы ложью в payload.
+* **`SaferComputeTokenFromLevel` + `CreateProcessAsUser`.** Не работает без
+  `SeAssignPrimaryTokenPrivilege` у обычного пользователя; выдавать restricted token за существующий —
+  ровно та нечестность, которую это изменение убирает.
+* **AppContainer.** Это была бы настоящая граница ядра, но ей нужны ACL на установку интерпретатора вне
+  репозитория (и запуск ломался бы без них).
+* **Понижать токен без пометки папки проекта.** Дочерний процесс не смог бы записать свой собственный
+  вывод; содержание, ломающее функцию, недопустимо.
+* **Угадывать `writes_outside` по уровню токена.** Проба измеряет фактическую способность процесса;
+  этот хост доказывает, почему догадка была бы неверной.
+
+### Следствия и открытые вопросы
+
+Доказательство: `app/execution/containment.py`, расширенный `app/execution/adapter.py`
+(`set_process_tree_job_limits`, `process_tree_job_limits`), `app/projects/runner.py`, блок `sandbox` и
+панель «Песочница» в `ui/src/screens/Projects.tsx`, а также `tests/test_run_sandbox.py` (13 офлайн
+тестов: убийство дерева по pid, лимиты памяти и процессов, прочитанные из ОС, измеренная граница
+записи, окружение, форма payload, состояния «отказано / не запускался / выключено», настроенное время
+жизни сервера). Цена: один короткоживущий пробный процесс на запуск (ограничен 8 с) и состояние
+содержания в памяти на каждый запуск. Открыто: на хосте, где сам Forge работает при низкой
+целостности, слой токена не отделяет дочерний процесс от данных Forge — это измеряется как `allowed`
+и показывается предупреждением; настоящая граница там требует перечисленных выше механизмов, доступных
+только администратору.

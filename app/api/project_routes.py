@@ -64,9 +64,9 @@ from app.projects.preview import (
     PREVIEW_OWNED_BY_PROCESS,
     PreviewRegistry,
 )
+from app.execution.containment import sandbox_settings_from_environment
 from app.projects.runner import LocalRunner, RunTarget
 from app.projects.stage import project_stage
-
 __all__ = ["register_project_routes"]
 
 
@@ -145,7 +145,11 @@ def register_project_routes(
     local_runner = (
         runner
         if runner is not None
-        else LocalRunner(store=getattr(projects, "store", None), previews=registry)
+        else LocalRunner(
+            store=getattr(projects, "store", None),
+            previews=registry,
+            **sandbox_settings_from_environment(),
+        )
     )
     app.state.forge_runner = local_runner
 

@@ -330,6 +330,29 @@ const RunPanel = ({
   const canStart = runnable && digest !== "" && !live && state !== "STARTING";
   const canRestart = digest !== "" && !live && state !== "NOT_RUN";
 
+  // The containment facts. They are read from the backend and never re-derived here:
+  // `job_object`/`restricted_token` are what the process really has, `writes_outside`
+  // is a measured probe result, and `network` is always inherited.
+  const sandbox = run.sandbox ?? {};
+  const sandboxLimits = sandbox.limits ?? {};
+  const sandboxDetail = (sandbox.detail ?? {}) as Record<string, unknown>;
+  const sandboxJob = sandbox.job_object === true;
+  const sandboxToken = sandbox.restricted_token === true;
+  const sandboxWrites = String(sandbox.writes_outside ?? "unknown");
+  const sandboxMemory =
+    typeof sandboxLimits.memory_mb === "number" ? sandboxLimits.memory_mb : 0;
+  const sandboxProcesses =
+    typeof sandboxLimits.active_process_limit === "number"
+      ? sandboxLimits.active_process_limit
+      : 0;
+  const sandboxLifetime =
+    typeof sandboxDetail.server_lifetime_seconds === "number"
+      ? sandboxDetail.server_lifetime_seconds
+      : 0;
+  // The only state that may be shown as contained: every layer active and the write
+  // boundary measured as blocked. Anything less is reported as it is.
+  const sandboxContained = sandboxJob && sandboxToken && sandboxWrites === "blocked";
+
   return (
     <div>
       <div className="label">{t(lang, "projects.run.title")}</div>
@@ -353,6 +376,71 @@ const RunPanel = ({
       </div>
       <div className="small muted" style={{ marginTop: 6 }}>
         {t(lang, "projects.run.hint")}
+      </div>
+
+      {/* «Песочница»: exactly what the layer does, in measured facts. A layer that is
+          not active is never shown as a success, and a write boundary that is not
+          blocked is a warning -- the program runs with the owner's rights. */}
+      <div style={{ marginTop: 12 }}>
+        <div className="label">{t(lang, "projects.run.sandbox.title")}</div>
+        <div style={{ marginTop: 6 }}>
+          <Facts
+            items={[
+              [
+                t(lang, "projects.run.sandbox.job"),
+                sandboxJob
+                  ? t(lang, "projects.run.sandbox.job.on")
+                  : t(lang, "projects.run.sandbox.job.off"),
+              ],
+              [
+                t(lang, "projects.run.sandbox.token"),
+                sandboxToken
+                  ? t(lang, "projects.run.sandbox.token.low")
+                  : t(lang, "projects.run.sandbox.token.none"),
+              ],
+              [
+                t(lang, "projects.run.sandbox.writes"),
+                sandboxWrites === "blocked"
+                  ? t(lang, "projects.run.sandbox.writes.blocked")
+                  : sandboxWrites === "allowed"
+                    ? t(lang, "projects.run.sandbox.writes.allowed")
+                    : t(lang, "projects.run.sandbox.writes.unknown"),
+              ],
+              [t(lang, "projects.run.network"), t(lang, "projects.run.network.inherited")],
+              [
+                t(lang, "projects.run.sandbox.memory"),
+                sandboxMemory > 0
+                  ? `${sandboxMemory} ${t(lang, "projects.run.sandbox.mb")}`
+                  : t(lang, "projects.run.sandbox.not.set"),
+              ],
+              [
+                t(lang, "projects.run.sandbox.processes"),
+                sandboxProcesses > 0
+                  ? String(sandboxProcesses)
+                  : t(lang, "projects.run.sandbox.not.set"),
+              ],
+              [
+                t(lang, "projects.run.sandbox.lifetime"),
+                sandboxLifetime > 0
+                  ? `${sandboxLifetime} ${t(lang, "projects.run.sandbox.seconds")}`
+                  : t(lang, "projects.run.sandbox.lifetime.none"),
+              ],
+            ]}
+          />
+        </div>
+        {sandboxContained ? (
+          <div style={{ marginTop: 6 }}>
+            <Badge tone="ok">{t(lang, "projects.run.sandbox.contained")}</Badge>
+          </div>
+        ) : null}
+        {sandboxWrites !== "blocked" ? (
+          <div className="notice warn" style={{ marginTop: 8 }}>
+            <div className="label">{t(lang, "projects.run.sandbox.warning.title")}</div>
+            <div className="small" style={{ marginTop: 4 }}>
+              {t(lang, "projects.run.sandbox.warning.body")}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* A blocked run states the reason and the next step, in the backend's words. */}

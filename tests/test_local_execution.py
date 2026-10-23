@@ -13,10 +13,10 @@ What is proved, one rule per test group:
   command; anything else has no entry point at all.
 * **PART 2 -- the runner.** A command runs only with an explicit approval for this
   project and this exact argv (a changed command makes the approval stale), never
-  through a shell, with an environment that holds four variables and no secret, with
-  bounded and redacted output persisted beside the project, with a timeout that kills
-  a hanging script, and with a tree kill that leaves neither the child nor its
-  descendants alive.
+  through a shell, with an environment that holds no secret, with bounded and
+  redacted output persisted beside the project, with a timeout that kills a hanging
+  script, and with a tree kill that leaves neither the child nor its descendants
+  alive.
 * **PART 3 -- preview.** A process preview exists only while the project's own process
   is up and a localhost port was observed. A process that never bound a port has no
   URL, and the payload says why instead of inventing one.
@@ -570,12 +570,19 @@ class RunnerTests(_LocalExecutionCase):
         keys = json.loads(keys_line)
         expected = ["PATH", "PYTHONIOENCODING"]
         if os.name == "nt":
-            expected += ["SYSTEMROOT", "TEMP"]
+            # TEMP/TMP point inside the project folder when the child's token is
+            # lowered: the machine's TEMP is a higher-integrity folder, which a
+            # contained child cannot write.
+            expected += ["SYSTEMROOT", "TEMP", "TMP"]
+        expected += ["FORGE_SANDBOX"]
         self.assertEqual(sorted(keys), sorted(expected))
         for key in keys:
             self.assertFalse(key.upper().endswith("_API_KEY"), key)
             self.assertNotIn("SECRET", key.upper())
-            self.assertNotIn("FORGE", key.upper())
+            # The one ``FORGE_*`` variable a child may see is the containment marker:
+            # it says "you are contained", it never carries a credential.
+            if key.upper() != "FORGE_SANDBOX":
+                self.assertNotIn("FORGE", key.upper())
         self.assertNotIn("OPENAI", " ".join(keys))
 
     def test_19_a_restart_runs_the_command_again(self) -> None:

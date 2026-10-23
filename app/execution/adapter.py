@@ -260,6 +260,21 @@ def _kernel32() -> "ctypes.WinDLL":
         library.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         library.TerminateJobObject.restype = wintypes.BOOL
         library.TerminateJobObject.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        library.SetInformationJobObject.restype = wintypes.BOOL
+        library.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        library.QueryInformationJobObject.restype = wintypes.BOOL
+        library.QueryInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
         _KERNEL32 = library
     return _KERNEL32
 
@@ -289,11 +304,11 @@ def _assign_process_to_job(job: int, proc: "subprocess.Popen[bytes]") -> bool:
         return False
 
 
-def _terminate_process_tree_job(job: int) -> None:
+def _terminate_process_tree_job(job: int, exit_code: int = 0) -> None:
     """Terminate every process in the job, which is the whole tree at once."""
 
     try:
-        _kernel32().TerminateJobObject(ctypes.c_void_p(job), 0)
+        _kernel32().TerminateJobObject(ctypes.c_void_p(job), int(exit_code))
     except Exception:  # noqa: BLE001 - best effort, the caller still kills the child
         pass
 
@@ -323,6 +338,127 @@ def close_process_tree_job(job: int) -> None:
     _close_process_tree_job(job)
 
 
+#: Job object limits, from ``winnt.h``. Only the three this repository uses are
+#: named: a memory ceiling per process, a ceiling on how many processes the job may
+#: hold at once, and the rule that closing the last handle kills the whole job.
+JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+#: ``JOBOBJECTINFOCLASS`` member used to read and write the extended limits.
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def set_process_tree_job_limits(
+    job: int, *, memory_mb: int = 0, max_processes: int = 0
+) -> "dict[str, Any] | None":
+    """Cap the job's memory and process count, and make its close kill the tree.
+
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` is always set: it is what makes the job a
+    containment layer rather than a second kill path -- the tree dies when this
+    process closes the handle, including when it crashes without running any cleanup.
+
+    The reported values are then read back from the OS with
+    :func:`process_tree_job_limits`, so a caller can only publish a limit that is
+    really in effect. ``None`` means "the limits could not be set".
+    """
+
+    if os.name != "nt" or not job:
+        return None
+    flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    info = _JobObjectExtendedLimitInformation()
+    if isinstance(memory_mb, int) and memory_mb > 0:
+        flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        info.ProcessMemoryLimit = ctypes.c_size_t(int(memory_mb) * 1024 * 1024)
+    if isinstance(max_processes, int) and max_processes > 0:
+        flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        info.BasicLimitInformation.ActiveProcessLimit = int(max_processes)
+    info.BasicLimitInformation.LimitFlags = flags
+    try:
+        accepted = _kernel32().SetInformationJobObject(
+            ctypes.c_void_p(job),
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+    except Exception:  # noqa: BLE001 - unset limits are reported, not guessed
+        return None
+    if not accepted:
+        return None
+    return process_tree_job_limits(job)
+
+
+def process_tree_job_limits(job: int) -> "dict[str, Any] | None":
+    """The limits the kernel reports for ``job``, or ``None`` when unreadable."""
+
+    if os.name != "nt" or not job:
+        return None
+    info = _JobObjectExtendedLimitInformation()
+    returned = wintypes.DWORD(0)
+    try:
+        ok = _kernel32().QueryInformationJobObject(
+            ctypes.c_void_p(job),
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            ctypes.byref(returned),
+        )
+    except Exception:  # noqa: BLE001 - an unreadable limit is reported as unset
+        return None
+    if not ok:
+        return None
+    flags = int(info.BasicLimitInformation.LimitFlags)
+    return {
+        "kill_on_job_close": bool(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
+        "active_process_limit": (
+            int(info.BasicLimitInformation.ActiveProcessLimit)
+            if flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            else 0
+        ),
+        "process_memory_limit_mb": (
+            int(info.ProcessMemoryLimit) // (1024 * 1024)
+            if flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            else 0
+        ),
+    }
+
+
 def process_tree_pids(root_pid: int) -> Tuple[int, ...]:
     """``root_pid`` and its descendants from a Toolhelp snapshot (Windows only).
 
@@ -339,7 +475,7 @@ def process_tree_pids(root_pid: int) -> Tuple[int, ...]:
 
 
 def terminate_process_tree(
-    proc: "subprocess.Popen[bytes]", *, job: int | None = None
+    proc: "subprocess.Popen[bytes]", *, job: int | None = None, exit_code: int = 0
 ) -> None:
     """Terminate ``proc`` and every process it created, then wait briefly.
 
@@ -349,11 +485,15 @@ def terminate_process_tree(
     Windows (descendants first) with ``taskkill /T`` as the last fallback, and a
     process group on POSIX. Killing by name never happens: only the verified pid,
     its descendants, and the job they were assigned to.
+
+    ``exit_code`` is what a job-object kill reports for every process in the job. A
+    supervisor that is stopping a child on purpose passes a non-zero code so the
+    termination is not indistinguishable from a clean exit 0.
     """
 
     if os.name == "nt":
         if job is not None:
-            _terminate_process_tree_job(job)
+            _terminate_process_tree_job(job, exit_code)
         else:
             # Fallback path: enumerate the tree from a Toolhelp snapshot. A
             # snapshot failure returns an empty tree -- never "just the root" --

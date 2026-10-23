@@ -1588,6 +1588,17 @@ recorded in `RESIDUAL_RISK` and asserted by
 The previous blanket statement that Block 2 "is NOT implemented" was stale and has
 been removed.
 
+**One process kind now does have OS-level containment.** The project process that
+the local runner starts (`app/projects/runner.py`) is created inside a Windows job
+object with `KILL_ON_JOB_CLOSE`, a per-process memory cap and an active-process cap,
+and its primary token is lowered to low integrity before it runs
+(`app/execution/containment.py`, `tests/test_run_sandbox.py`). That is not a kernel
+filesystem sandbox: the child can still read what its token may read, and it can
+still write Forge's own data when that data carries the same low label (the payload
+then reports `writes_outside: "allowed"`). The tokens the execution plane itself
+uses for build steps, and every other subsystem, are unchanged: this section's
+"not implemented" statement is about them, not about the local runner.
+
 ### 4.5 Network authority is deny-by-default; the network is not isolated
 
 Network authority is server-side and fail-closed.
@@ -2464,7 +2475,11 @@ approval gate (an open owner decision).
 | Entry point from the artifact manifest only | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_materialization.py`, `tests/test_local_execution.py` |
 | Runnable kinds (python script/module, node script, declared npm script) | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_local_execution.py`; `app/smoke_python_preview.py`, `app/smoke_node_preview.py` |
 | Approval without dispatch (`ExecutionCoordinator.authorize`) | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_execution_authorization_hardening*.py`, `tests/test_local_execution.py` |
-| Supervised local process (states, tree stop, timeout, bounded redacted log) | **CURRENT / VERIFIED** | `app/projects/runner.py` — `tests/test_local_execution.py` |
+| Supervised local process (states, tree stop, timeout, bounded redacted log) | **CURRENT / VERIFIED** | `app/projects/runner.py` — `tests/test_local_execution.py`, `tests/test_run_sandbox.py` |
+| Job-object containment of a project process (kill-on-close, memory cap, active-process cap) | **CURRENT / VERIFIED** | `app/execution/containment.py`, `app/execution/adapter.py` (`set_process_tree_job_limits`), `app/projects/runner.py` — `tests/test_run_sandbox.py` |
+| Low-integrity token for a project process, with the measured level reported | **CURRENT / VERIFIED** | `app/execution/containment.py` (`lower_process_integrity`, `process_integrity_level`) — `tests/test_run_sandbox.py`; the payload says `restricted_token`/`integrity` and `detail.integrity_level` |
+| Measured write boundary of a project process (`writes_outside`) | **CURRENT / VERIFIED (measured, not guaranteed)** | `app/execution/containment.py` (`probe_write_boundary`) — `tests/test_run_sandbox.py`; it is `allowed` when Forge's own data carries the same integrity label as the child |
+| Configured maximum lifetime for a serving process | **CURRENT / VERIFIED** | `LocalRunner(server_lifetime=…)` via `FORGE_SANDBOX_SERVER_LIFETIME_S`, default none — `tests/test_run_sandbox.py` |
 | Shared process-tree kill (job object / Toolhelp / `taskkill /T`) | **CURRENT / VERIFIED** | `app/execution/adapter.py` (`terminate_process_tree`) — `tests/test_execution_timeout_and_tree_kill.py`, `tests/test_local_execution.py` |
 | Process preview for a running server | **CURRENT / VERIFIED** | `app/projects/preview.py` (`register_process`, observed listening port) — `tests/test_local_execution.py`, `tests/test_materialization.py` |
 | Local run / preview routes | **CURRENT / VERIFIED** | `app/api/project_routes.py` — `tests/test_local_execution.py` |
@@ -2474,8 +2489,10 @@ approval gate (an open owner decision).
 | Dependency installation (`pip install` / `npm install`) as part of a run | **REJECTED** — a missing dependency is reported as `RUN_BLOCKED` with the next step | `DECISIONS.md`, `app/projects/runner.py` |
 
 **Honest boundaries.** The supervisor states them rather than hiding them: the child is **not**
-network-isolated (`network_policy: "inherited"`), there is **no** OS-level filesystem sandbox (the
-`WorkspaceBoundary` constrains the paths the plane resolves, not the child's syscalls), the log is a
+network-isolated (`network_policy: "inherited"`, `sandbox.network: "inherited (not isolated)"`), the
+containment is a **Windows job object plus a low-integrity token**, not a kernel filesystem sandbox:
+`writes_outside` is a *measured* answer and is honestly `allowed` when Forge's own data carries the
+same integrity label as the child (as it does when Forge itself runs at low integrity), the log is a
 bounded 64 KiB-per-stream capture (later output is dropped with a marker), the preview URL exists only
 while the process is alive, and a process that outlives a hard process kill of the API server is not
 tracked after restart (the state is in memory and starts as `NOT_RUN`).
@@ -4076,7 +4093,11 @@ Stage 1 строится упорядоченными шагами. Шаги с 
 | Точка входа только из манифеста артефактов | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_materialization.py`, `tests/test_local_execution.py` |
 | Запускаемые виды (python script/module, node script, объявленный npm-скрипт) | **CURRENT / VERIFIED** | `app/projects/entrypoint.py` — `tests/test_local_execution.py`; `app/smoke_python_preview.py`, `app/smoke_node_preview.py` |
 | Одобрение без диспетчеризации (`ExecutionCoordinator.authorize`) | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_execution_authorization_hardening*.py`, `tests/test_local_execution.py` |
-| Управляемый локальный процесс (состояния, остановка дерева, таймаут, ограниченный очищенный лог) | **CURRENT / VERIFIED** | `app/projects/runner.py` — `tests/test_local_execution.py` |
+| Управляемый локальный процесс (состояния, остановка дерева, таймаут, ограниченный очищенный лог) | **CURRENT / VERIFIED** | `app/projects/runner.py` — `tests/test_local_execution.py`, `tests/test_run_sandbox.py` |
+| Содержание процесса проекта в job object (kill-on-close, лимит памяти, лимит активных процессов) | **CURRENT / VERIFIED** | `app/execution/containment.py`, `app/execution/adapter.py` (`set_process_tree_job_limits`), `app/projects/runner.py` — `tests/test_run_sandbox.py` |
+| Токен низкой целостности для процесса проекта с сообщением измеренного уровня | **CURRENT / VERIFIED** | `app/execution/containment.py` (`lower_process_integrity`, `process_integrity_level`) — `tests/test_run_sandbox.py`; payload сообщает `restricted_token`/`integrity` и `detail.integrity_level` |
+| Измеренная граница записи процесса проекта (`writes_outside`) | **CURRENT / VERIFIED (измерение, а не гарантия)** | `app/execution/containment.py` (`probe_write_boundary`) — `tests/test_run_sandbox.py`; значение `allowed`, когда данные самого Forge несут ту же метку целостности, что и ребёнок |
+| Настроенное максимальное время жизни обслуживающего процесса | **CURRENT / VERIFIED** | `LocalRunner(server_lifetime=…)` через `FORGE_SANDBOX_SERVER_LIFETIME_S`, по умолчанию нет — `tests/test_run_sandbox.py` |
 | Общее уничтожение дерева процессов (job object / Toolhelp / `taskkill /T`) | **CURRENT / VERIFIED** | `app/execution/adapter.py` (`terminate_process_tree`) — `tests/test_execution_timeout_and_tree_kill.py`, `tests/test_local_execution.py` |
 | Процессный предпросмотр работающего сервера | **CURRENT / VERIFIED** | `app/projects/preview.py` (`register_process`, наблюдаемый слушающий порт) — `tests/test_local_execution.py`, `tests/test_materialization.py` |
 | Маршруты локального запуска и предпросмотра | **CURRENT / VERIFIED** | `app/api/project_routes.py` — `tests/test_local_execution.py` |
@@ -4086,9 +4107,11 @@ Stage 1 строится упорядоченными шагами. Шаги с 
 | Установка зависимостей (`pip install` / `npm install`) как часть запуска | **REJECTED** — отсутствующая зависимость сообщается как `RUN_BLOCKED` со следующим шагом | `DECISIONS.md`, `app/projects/runner.py` |
 
 **Честные границы.** Супервизор их называет, а не скрывает: дочерний процесс **не** изолирован от
-сети (`network_policy: "inherited"`), **нет** OS-level песочницы файловой системы
-(`WorkspaceBoundary` ограничивает пути, которые разрешает сама плоскость, а не системные вызовы
-ребёнка), лог — это ограниченный захват 64 КиБ на поток (дальнейший вывод отбрасывается с
+сети (`network_policy: "inherited"`, `sandbox.network: "inherited (not isolated)"`), содержание — это
+**job object Windows плюс токен низкой целостности**, а не kernel-level файловая песочница:
+`writes_outside` — *измеренный* ответ, и он честно равен `allowed`, когда данные самого Forge несут
+ту же метку целостности, что и дочерний процесс (так бывает, когда сам Forge работает при низкой
+целостности), лог — это ограниченный захват 64 КиБ на поток (дальнейший вывод отбрасывается с
 маркером), URL предпросмотра существует только пока процесс жив, а процесс, переживший жёсткое
 убийство процесса API, после перезапуска не отслеживается (состояние в памяти и начинается с
 `NOT_RUN`).
@@ -4211,6 +4234,16 @@ frozen scope и никогда — из задачи, запроса или meta
 **PARTIAL/IMPLEMENTED**, как выше. OS-level песочница и изоляция остаются
 **DEFERRED**. Подготовка/mirroring входов workspace остаётся **PARTIAL** (см. §4.5).
 Прежнее утверждение, что Block 2 «НЕ реализован», было устаревшим и удалено.
+
+**Один вид процессов теперь действительно имеет OS-level содержание.** Процесс проекта,
+который запускает локальный супервизор (`app/projects/runner.py`), создаётся внутри job object
+Windows с `KILL_ON_JOB_CLOSE`, лимитом памяти на процесс и лимитом активных процессов, а его
+primary token понижается до низкой целостности до запуска (`app/execution/containment.py`,
+`tests/test_run_sandbox.py`). Это не kernel-level файловая песочница: дочерний процесс по-прежнему
+читает то, что позволяет его токен, и по-прежнему может писать данные самого Forge, когда они несут
+ту же низкую метку (payload тогда сообщает `writes_outside: "allowed"`). Токены, которыми пользуется
+сама плоскость исполнения для шагов сборки, и все остальные подсистемы не изменились: утверждение
+«не реализовано» в этом разделе — про них, а не про локальный запуск.
 
 ### 4.5 Сетевая authority — deny-by-default; сеть не изолирована
 
