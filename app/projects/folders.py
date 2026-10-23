@@ -95,17 +95,79 @@ _QUOTED_PHRASE = re.compile(
     r"|'([^']{2,160})'"
 )
 
-#: A leading verb that says *what to do*, not *what the thing is*. Only stripped from the
-#: front of the idea, and only from the front: «Приложение для рассылки» keeps its noun.
-#: Articles and possessives ("a", "the", "my") are deliberately **not** here: they are the
-#: start of a noun phrase ("A trashed project …"), and dropping them mangles the name.
+#: A leading word that says *what to do* or *how easy it is*, not *what the thing is*.
+#: Only stripped from the front of the idea, and only from the front -- repeatedly, so
+#: «Хочу простую локальную страницу» loses both «хочу» and «простую» -- because
+#: «Приложение для рассылки» must keep its noun. Articles and possessives ("a", "the",
+#: "my") are deliberately **not** here: they are the start of a noun phrase
+#: ("A trashed project …"), and dropping them mangles the name.
 _LEADING_FILLERS = frozenset(
     """
-    создай создайте сделай сделайте напиши напишите разработай разработайте
+    создай создайте сделай сделайте сделать напиши напишите разработай разработайте
     построй постройте собери соберите реализуй реализуйте
+    создать разработать построить собрать реализовать написать
     нужен нужна нужно нужны хочу хотел хотела хотим надо мне нам пожалуйста
+    сделаю сделаем создам создадим создаю напишу напишем требуется хотелось
+    простой простая простое простую простые простым простого прост
     create make build write develop generate implement realise realize please
+    to me can could would
     i i'd i’d want need like
+    """.split()
+)
+
+#: What a sentence ends with that says nothing about the product. Stripped from the end of
+#: the idea *before* the words are chosen, so «…, пожалуйста» cannot eat a word slot.
+_TRAILING_INTENT = (
+    "если можно",
+    "если не сложно",
+    "пожалуйста",
+    "срочно",
+    "if possible",
+    "please",
+    "asap",
+)
+
+#: Words that open the *next* part of a sentence rather than continue the noun phrase.
+#: Everything before the first of them is the head ("Телеграм-бот | для отслеживания
+#: чатов") and is the only part rewritten into the nominative; the rest of the idea keeps
+#: the grammar the owner already used, which is right after a preposition. "a"/"the" are
+#: here for English, where the article *starts* the head rather than following it.
+_PHRASE_BREAKS = frozenset(
+    """
+    в во с со к ко о об от до по из за на при для про через без
+    у между около после вместо кроме среди вокруг
+    the a an of for with to in on at by from
+    """.split()
+)
+
+#: A clause that describes the thing instead of naming it. The name stops in front of it,
+#: and in front of a comma for the same reason: «Лендинг для корпоратива, с регистрацией
+#: гостей» is named by its first two words, not by the whole sentence.
+_RELATIVE_CLAUSE = re.compile(
+    r"(?:\s*,\s*|\s+)(?:"
+    r"котор\w*|где|чтобы|чтоб|что|"
+    r"which|where|whose|who|whom|that"
+    r")\b",
+    re.IGNORECASE,
+)
+
+#: The colon rule's threshold: «CDP evidence: …» is named by what stands before the colon
+#: only while that head is already a phrase (2-5 words) rather than one bare word.
+_MIN_COLON_HEAD_WORDS = 2
+
+#: A word that is glued to the next one with a hyphen, as Russian and English already write
+#: «Телеграм-бот», «Веб-сайт», «e-mail». Only applied when a *next* word exists.
+_COMPOUND_PREFIXES = frozenset(
+    """
+    веб telegram телеграм чат sms смс email e-mail web
+    """.split()
+)
+
+#: Loanwords that already end in -у/-ю in every case. Rewriting them would invent a word
+#: («Меню» -> «Меня»), so the accusative rule leaves them exactly as typed.
+_INDECLINABLE = frozenset(
+    """
+    меню интервью шоу табу рагу пальто кино фото метро такси
     """.split()
 )
 
@@ -120,6 +182,9 @@ _TRAILING_FILLERS = frozenset(
 
 #: At least one letter or digit, in any script: "———" and "..." are not a name.
 _HAS_WORD_CHARACTER = re.compile(r"[^\W_]", re.UNICODE)
+
+#: A word the accusative rule may touch: Cyrillic letters and inner hyphens only.
+_CYRILLIC_WORD = re.compile(r"^[а-яёА-ЯЁ\-]+$")
 
 
 class UnsafeProjectFolder(ProjectError):
@@ -203,12 +268,161 @@ def _quoted_phrase(text: str) -> str:
 
 
 def _strip_leading_intent(text: str) -> str:
-    """Drop leading "what to do" words, keep the noun phrase that follows."""
+    """Drop leading "what to do" words, keep the noun phrase that follows.
+
+    Repeatedly: «Мне нужен простой сайт» is led by three such words, and stopping after
+    the first one would leave «нужен простой сайт» as the product's name.
+    """
 
     words = text.split()
     while words and words[0].lower().strip(".,:;!?—-–()") in _LEADING_FILLERS:
         words.pop(0)
     return " ".join(words)
+
+
+def _strip_trailing_intent(text: str) -> str:
+    """Drop the sentence's tail courtesies (``пожалуйста``, ``если можно``, ``срочно``)."""
+
+    changed = True
+    while changed:
+        changed = False
+        lowered = text.lower().rstrip(" .,:;!?—-–)")
+        for filler in _TRAILING_INTENT:
+            if not lowered.endswith(filler):
+                continue
+            head = text[: len(text) - len(filler)].rstrip(" .,:;!?—-–(")
+            if head.strip():
+                text = head
+                changed = True
+                break
+    return text
+
+
+def _cut_at_relative_clause(text: str) -> str:
+    """Keep the noun phrase that stands before a comma or a relative clause."""
+
+    match = _RELATIVE_CLAUSE.search(text)
+    if match is None:
+        return text
+    head = text[: match.start()].rstrip(" .,:;!?—-–")
+    return head or text
+
+
+def _cut_after_colon(text: str) -> str:
+    """Drop what follows the first colon when the head is already a phrase.
+
+    «Сайт для бронирования отелей: список, форма, подтверждение» is named «Сайт для
+    бронирования отелей»; a head of one word («Отчёт: …») is too thin to stand alone, so
+    the whole idea is left to the other rules.
+    """
+
+    head, separator, _ = text.partition(":")
+    if not separator:
+        return text
+    words = head.split()
+    if _MIN_COLON_HEAD_WORDS <= len(words) <= MAX_DERIVED_NAME_WORDS:
+        return head
+    return text
+
+
+def _nominative_part(part: str) -> str:
+    """One hyphen-free word rewritten from the accusative into the nominative.
+
+    Russian ideas are written as a request ("сделай страницу"), so the head noun arrives
+    in the accusative while a product's name is the nominative ("страница"). The rule is
+    deliberately suffix-only and narrow -- ``-ую``/``-юю`` for a feminine adjective,
+    ``-у``/``-ю`` for a feminine noun -- because those four endings have no nominative
+    reading in the language and everything else is left untouched. It is applied to
+    Cyrillic words only: an English "you" ends in "-u" and must never become "yoa".
+    """
+
+    if not part or not _CYRILLIC_WORD.match(part) or part.lower() in _INDECLINABLE:
+        return part
+    lowered = part.lower()
+    if lowered.endswith("ую") and len(lowered) > 4:
+        return part[:-2] + "ая"
+    if lowered.endswith("юю") and len(lowered) > 4:
+        return part[:-2] + "яя"
+    if lowered.endswith("у") and len(lowered) > 3:
+        return part[:-1] + "а"
+    if lowered.endswith("ю") and len(lowered) > 3:
+        return part[:-1] + "я"
+    return part
+
+
+def _nominative(word: str) -> str:
+    """A hyphenated word rewritten part by part («страницу-визитку» -> «страница-визитка»)."""
+
+    if "-" not in word:
+        return _nominative_part(word)
+    return "-".join(_nominative_part(part) for part in word.split("-"))
+
+
+def _head_end(words: list) -> int:
+    """Where the head noun phrase ends: the index of the first word that opens a new part."""
+
+    for index, word in enumerate(words):
+        if word.lower().strip(".,:;!?—-–()") in _PHRASE_BREAKS:
+            return index
+    return len(words)
+
+
+def _join_compound_prefixes(words: list) -> list:
+    """Glue a prefix to the word it belongs to: «телеграм бот» -> «телеграм-бот»."""
+
+    joined: list = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if (
+            word.lower() in _COMPOUND_PREFIXES
+            and index + 1 < len(words)
+            and "-" not in words[index + 1]
+        ):
+            joined.append(f"{word}-{words[index + 1]}")
+            index += 2
+            continue
+        joined.append(word)
+        index += 1
+    return joined
+
+
+def _capitalise(text: str) -> str:
+    """A product name starts with a capital; the rest keeps the owner's own case."""
+
+    return text[:1].upper() + text[1:] if text else text
+
+
+def _product_phrase(text: str) -> str:
+    """Turn the head of the idea into a noun phrase a product could be called."""
+
+    words = text.split()
+    end = _head_end(words)
+    words = [
+        _nominative(word) if index < end else word
+        for index, word in enumerate(words)
+    ]
+    return _capitalise(" ".join(_join_compound_prefixes(words)))
+
+
+def _head_phrase(text: str) -> str:
+    """The short noun phrase the idea contains, in the order the rules apply.
+
+    1. a comma or a relative clause ends the name («…, чтобы я мог читать почту»);
+    2. a colon with a phrase in front of it ends it too;
+    3. closing courtesies at the tail are dropped;
+    4. leading "create/make/I want/simple" words are dropped, repeatedly;
+    5. the first :data:`MAX_DERIVED_NAME_WORDS` words survive;
+    6. the head is rewritten into a product-like noun phrase
+       (:func:`_product_phrase`) -- nominative, compound prefixes hyphenated, a capital.
+    """
+
+    text = _cut_at_relative_clause(text)
+    text = _cut_after_colon(text)
+    text = _strip_trailing_intent(text)
+    text = _strip_leading_intent(text)
+    words = text.split()[:MAX_DERIVED_NAME_WORDS]
+    return _product_phrase(" ".join(words))
 
 
 def _cap_at_word_boundary(text: str, limit: int) -> str:
@@ -245,9 +459,14 @@ def derive_project_name(
     The rules, in order:
 
     1. **A quoted phrase wins.** If the idea contains «…», „…“, “…”, "…" or '…', the
-       first one is the name -- that is the owner naming his own product.
-    2. Otherwise the **first 3-5 meaningful words** of the idea: leading "create/make I
-       want" words are dropped because they say what to do, not what the thing is.
+       first one is the name -- that is the owner naming his own product -- and nothing
+       else is applied to it.
+    2. Otherwise the **noun phrase** the idea contains (:func:`_head_phrase`): the part
+       before a comma, a relative clause or a phrase-length colon head; leading
+       "create/make/I want/simple" words and trailing courtesies dropped; the first
+       :data:`MAX_DERIVED_NAME_WORDS` words kept, with the head rewritten from the
+       owner's request into a product's name («Хочу простую локальную страницу-визитку» ->
+       «Локальная страница-визитка», «телеграм бот для …» -> «Телеграм-бот для …»).
     3. Otherwise, and when nothing usable survives (empty idea, punctuation only),
        `Проект <N>` -- ``ordinal``, so consecutive nameless projects differ.
 
@@ -263,9 +482,7 @@ def derive_project_name(
     if quoted:
         text = quoted
     else:
-        text = " ".join(
-            _strip_leading_intent(text).split()[:MAX_DERIVED_NAME_WORDS]
-        )
+        text = _head_phrase(text)
     text = _clean_component(text)
     text = _cap_at_word_boundary(text, max(1, int(limit)))
     text = _trim_trailing_filler(text)

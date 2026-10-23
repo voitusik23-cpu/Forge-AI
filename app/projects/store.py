@@ -55,6 +55,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from app.projects.models import LifecycleProject, ProjectError, utc_now
 from app.projects.folders import (
     UnsafeProjectFolder,
+    canonical,
+    is_within,
     prove_folder,
     published_folder_path,
     visible_folder,
@@ -333,6 +335,64 @@ class ProjectStore:
                     roots.append(known)
         roots.append(self.root)
         return tuple(roots)
+
+    def visible_delivery_roots(self) -> Tuple[Path, ...]:
+        """The roots a project's **own folder** is delivered into, store root excluded.
+
+        This is the classification the «Проекты» list uses to tell the owner's projects
+        from the ones a test or a demo script left behind: a project whose files live in
+        one of these roots has a folder he can open in Explorer, and one that lives in
+        the legacy hidden workspace (``<store>/<id>/workspace``) was created by a process
+        that never configured a root -- the test suite and every scratch script.
+
+        Every root *this deployment has used* counts, not only the current one, so
+        changing the setting never makes an existing project look like junk. The store
+        root itself is never included: it is where the records live, and its subfolders
+        are exactly the legacy workspaces this method classifies as "not the owner's".
+        """
+
+        try:
+            roots = self.allowed_workspace_roots()
+        except ProjectError:  # pragma: no cover - an unusable root is "no visible root"
+            return ()
+        store_root = canonical(self.root)
+        found: List[Path] = []
+        for root in roots:
+            try:
+                path = canonical(root)
+            except ProjectError:  # pragma: no cover - defensive
+                continue
+            if path != store_root and path not in found:
+                found.append(path)
+        return tuple(found)
+
+    def in_visible_root(
+        self, project: object, *, roots: Optional[Tuple[Path, ...]] = None
+    ) -> bool:
+        """True when the record's files really live in one of the visible roots.
+
+        Read from the record's own ``workspace_dir`` and re-proved per call, never
+        inferred from the id or the name: a project is "visible" because its folder is,
+        and a record that carries no folder (the legacy layout) is not.
+
+        ``False`` -- not an exception -- when the recorded folder does not prove to be
+        inside a configured root: a list must stay readable even for a broken record, and
+        "we cannot prove it is the owner's folder" is honestly not a yes.
+
+        ``roots`` lets a caller that classifies a whole listing resolve the roots
+        (:meth:`visible_delivery_roots`, which probes the folders) **once** instead of
+        once per row.
+        """
+
+        recorded = str(getattr(project, "workspace_dir", "") or "").strip()
+        if not recorded:
+            return False
+        try:
+            folder = canonical(recorded)
+        except ProjectError:  # pragma: no cover - defensive
+            return False
+        known = self.visible_delivery_roots() if roots is None else roots
+        return any(is_within(folder, root) for root in known)
 
     def _legacy_workspace_path(self, project_id: object) -> Path:
         """``<store>/<id>/workspace``, re-proved to sit inside the store root."""

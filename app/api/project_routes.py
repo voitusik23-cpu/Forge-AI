@@ -467,13 +467,19 @@ def register_project_routes(
     # an id.
     @app.get("/api/projects/lifecycle")
     def list_project_lifecycle(archived: Optional[bool] = None) -> List[Dict[str, Any]]:
-        """Every project, newest change first, as one bounded summary line each."""
+        """Every project, newest change first, as one bounded summary line each.
+
+        Each row carries one additive fact, ``in_visible_root``: whether the project's
+        files really live under a configured **visible** project root (a folder the owner
+        can open), as opposed to the legacy hidden workspace that every test and scratch
+        script leaves behind. The list itself is not filtered here -- the whole listing
+        stays the whole listing, so a client can count what it hides and offer to show
+        it -- and the flag is derived per request from the record and the deployment's
+        own roots, never from a request value.
+        """
 
         include_archived = True if archived is None else bool(archived)
-        return [
-            project.summary()
-            for project in projects.list_projects(include_archived=include_archived)
-        ]
+        return [dict(item) for item in projects.summaries(include_archived=include_archived)]
 
     @app.get("/api/projects/deleted")
     def list_deleted_projects(

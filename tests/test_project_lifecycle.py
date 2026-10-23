@@ -1043,6 +1043,10 @@ class ProjectApiTests(_ProjectTestCase):
                 "last_run_at",
                 "file_count",
                 "project_path",
+                # Additive and derived per request: whether the project's files really
+                # live under a configured visible root. The «Проекты» list draws those
+                # rows by default and keeps a test's leftovers one click away.
+                "in_visible_root",
             },
         )
         self.assertEqual(row["project_id"], project.project_id)

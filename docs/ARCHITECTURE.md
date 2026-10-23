@@ -5661,14 +5661,34 @@ description, truncated mid-word, and an unwritable preferred root turned the own
 refusal he could not get past.
 
 **The name is derived, never copied.** `app/projects/folders.py::derive_project_name` decides it
-deterministically: a **quoted phrase** wins («Почтовый центр»), otherwise the **first 3–5 meaningful
-words** (leading "create/make/I want" words dropped, a dangling conjunction trimmed), otherwise
-`Проект <N>` with `N` the store's project count. The result is one Windows-safe component — forbidden
-characters replaced, spaces collapsed, trailing dots/spaces stripped, Cyrillic preserved — capped at
-**40 characters at a word boundary**, and `visible_folder` numbers a colliding name (`(2)`, `(3)`, …)
-instead of sharing or failing; an empty leftover folder is taken over. The record keeps the whole idea in
-`specification`; `name` is the short one the card shows. A retry of the same project still reuses its own
-folder (`allow_existing`).
+deterministically: a **quoted phrase** wins («Почтовый центр»), otherwise the **noun phrase the idea
+contains**, otherwise `Проект <N>` with `N` the store's project count. The noun phrase is cut at the first
+comma or relative clause («…, чтобы я мог читать почту»), at a colon whose head is already 2–5 words, and
+at the first `MAX_DERIVED_NAME_WORDS` (5) words; leading "create/make/I want/simple" words are dropped
+**repeatedly** («Хочу простую локальную страницу-визитку» → «Локальная страница-визитка») and trailing
+courtesies («пожалуйста», «если можно», «срочно») are removed. The head is then rewritten into a product's
+name: the accusative becomes the nominative for the part **before the first preposition** (`-ую`→`-ая`,
+`-у`→`-а`, with a short documented list of indeclinables left alone), compound prefixes are hyphenated
+(«телеграм бот» → «Телеграм-бот»), and the first letter is capitalised while the owner's own case is kept.
+The result is one Windows-safe component — forbidden characters replaced, spaces collapsed, trailing
+dots/spaces stripped, Cyrillic preserved — capped at **40 characters at a word boundary**, and
+`visible_folder` numbers a colliding name (`(2)`, `(3)`, …) instead of sharing or failing; an empty leftover
+folder is taken over. The record keeps the whole idea in `specification`; `name` is the short one the card
+shows. A retry of the same project still reuses its own folder (`allow_existing`).
+
+**The list does not become a ribbon again.** `GET /api/projects/lifecycle` publishes one additive fact per
+row, `in_visible_root`: `ProjectStore.in_visible_root` resolves the record's own `workspace_dir` and proves
+it sits inside a **visible** delivery root (`visible_delivery_roots` — the resolved root plus every root this
+deployment has used, never the store root). A project whose files live in the legacy hidden workspace
+(`.forge/projects/<id>/workspace`) — which is where every test and laboratory script writes — is therefore
+`false`, and «Проекты» draws only the `true` rows by default, offers «Показать всё ({n} скрыто)» for the
+rest and states the hidden count. The *answer* is never filtered: the whole listing stays whole, so the
+screen can count what it hides. When no row is in a visible root (a deployment that configured no root), the
+rule shows everything rather than hiding everything. The table itself is bounded by
+`ui/src/project-list.js` (`PROJECT_LIST_PAGE_SIZE` = 25, «Показать ещё» for the next page), the same bound
+the trash already uses, so a ribbon cannot re-form in one screenful. The one-off tidy of the owner's own
+store was performed through the existing `DELETE /api/projects/{id}` route (41 records into
+`.forge/projects-deleted/`, nothing erased) and left his project untouched.
 
 **The root is probed, not trusted.** `app/projects/root_selection.py` owns the order: the configured root →
 `%USERPROFILE%\Forge Projects` → `%USERPROFILE%\Documents\Forge Projects` → `%LOCALAPPDATA%\Forge Projects`
@@ -5697,11 +5717,15 @@ than the ACL. On this host that turned "is this folder writable?" into a request
 (measured: `mkdtemp` did not return in 20 s; a single `os.mkdir` refuses in the same millisecond). The probe
 therefore builds its own name and calls `mkdir` once.
 
-**Evidence.** `tests/test_project_visible_root.py` (44 tests: the name rules, uniqueness, the candidate
-order, fall through, total refusal, remembered root, the settings report), `tests/test_project_open_actions.py`
-(27 tests: the fallback answer, the typed 409 with the list, the retry on the same session, a writable root
-used as-is), `tests/test_owner_acceptance.py` (the owner's own idea end to end, with and without an
-unwritable root).
+**Evidence.** `tests/test_project_visible_root.py` (50 tests: the name rules — the owner's four ideas, the
+repeated leading words, the colon and relative-clause cuts, the English equivalents and the 40-character cap
+— uniqueness, the candidate order, fall through, total refusal, remembered root, the settings report),
+`tests/test_project_list_filter.py` (7 tests: the visible-root fact on the route, the default view, the
+«Показать всё» toggle, a project that is always visible, the 25-row page and «Показать ещё», and the archive
+tab — the list rule itself executed with Node from `ui/src/project-list.js`),
+`tests/test_project_open_actions.py` (27 tests: the fallback answer, the typed 409 with the list, the retry
+on the same session, a writable root used as-is), `tests/test_owner_acceptance.py` (the owner's own idea end
+to end, with and without an unwritable root).
 
 ## Готовые проекты: видимая папка и настоящий вход в неё v0.1
 
@@ -5794,15 +5818,36 @@ C:\Users\<owner>\Desktop\Forge Projects\Создай локальное прил
 собственное действие владельца в отказ, из которого не было выхода.
 
 **Имя выводится, а не копируется.** `app/projects/folders.py::derive_project_name` определяет его
-детерминированно: побеждает **фраза в кавычках** («Почтовый центр»), иначе — **первые 3–5 значимых слов**
-(ведущие «создай/сделай/хочу» отбрасываются, повисший союз/предлог в конце обрезается), иначе
-`Проект <N>`, где `N` — число проектов в хранилище. Результат — один безопасный для Windows компонент
-пути: запрещённые символы заменены, пробелы схлопнуты, конечные точки и пробелы срезаны, кириллица
-сохранена, длина — не больше **40 символов по границе слова**; `visible_folder` при совпадении
-нумерует имя (`(2)`, `(3)`, …) вместо того, чтобы делить папку или падать, а пустая оставшаяся папка
-переиспользуется. Полная идея остаётся в `specification` записи; `name` — короткое имя, которое
-показывает карточка. Повторная попытка того же проекта по-прежнему получает свою собственную папку
-(`allow_existing`).
+детерминированно: побеждает **фраза в кавычках** («Почтовый центр»), иначе — **именная группа, которая
+есть в идее**, иначе `Проект <N>`, где `N` — число проектов в хранилище. Именная группа обрезается по
+первой запятой или придаточному («…, чтобы я мог читать почту»), по двоеточию, если перед ним уже 2–5
+слов, и по первым `MAX_DERIVED_NAME_WORDS` (5) словам; ведущие «создай/сделай/хочу/простой»
+отбрасываются **повторно** («Хочу простую локальную страницу-визитку» → «Локальная страница-визитка»), а
+хвостовые любезности («пожалуйста», «если можно», «срочно») удаляются. Затем голова переписывается в имя
+продукта: винительный падеж становится именительным для части **до первого предлога** (`-ую`→`-ая`,
+`-у`→`-а`, короткий документированный список несклоняемых слов не трогается), составные приставки
+соединяются дефисом («телеграм бот» → «Телеграм-бот»), а первая буква становится заглавной при
+сохранении регистра остальных слов. Результат — один безопасный для Windows компонент пути: запрещённые
+символы заменены, пробелы схлопнуты, конечные точки и пробелы срезаны, кириллица сохранена, длина — не
+больше **40 символов по границе слова**; `visible_folder` при совпадении нумерует имя (`(2)`, `(3)`, …)
+вместо того, чтобы делить папку или падать, а пустая оставшаяся папка переиспользуется. Полная идея
+остаётся в `specification` записи; `name` — короткое имя, которое показывает карточка. Повторная попытка
+того же проекта по-прежнему получает свою собственную папку (`allow_existing`).
+
+**Список больше не превращается в ленту.** `GET /api/projects/lifecycle` публикует по каждому проекту
+один аддитивный факт — `in_visible_root`: `ProjectStore.in_visible_root` разрешает собственный
+`workspace_dir` записи и доказывает, что он лежит внутри **видимого** корня доставки
+(`visible_delivery_roots` — разрешённый корень плюс все корни, которыми это развёртывание пользовалось,
+но никогда сам корень хранилища). Проект, чьи файлы лежат в старом скрытом рабочем каталоге
+(`.forge/projects/<id>/workspace`) — а именно туда пишет каждый тест и каждый лабораторный скрипт, —
+получает `false`, поэтому «Проекты» по умолчанию рисует только строки `true`, остальные отдаёт кнопкой
+«Показать всё ({n} скрыто)» и сообщает, сколько строк скрыто. Сам *ответ* никогда не фильтруется: полный
+список остаётся полным, поэтому экран может посчитать то, что он скрывает. Когда ни одна строка не лежит
+в видимом корне (развёртывание без настроенного корня), правило показывает всё, а не скрывает всё. Сама
+таблица ограничена `ui/src/project-list.js` (`PROJECT_LIST_PAGE_SIZE` = 25, «Показать ещё» для следующей
+страницы) — тем же приёмом, что уже применяет корзина, поэтому лента не может снова занять весь экран.
+Разовая уборка хранилища владельца выполнена существующим маршрутом `DELETE /api/projects/{id}`
+(41 запись в `.forge/projects-deleted/`, ничего не стёрто), его собственный проект не тронут.
 
 **Корень проверяется, а не предполагается.** `app/projects/root_selection.py` задаёт порядок:
 настроенный корень → `%USERPROFILE%\Forge Projects` → `%USERPROFILE%\Documents\Forge Projects` →
@@ -5834,8 +5879,12 @@ C:\Users\<owner>\Desktop\Forge Projects\Создай локальное прил
 который не отвечал вовсе (измерено: `mkdtemp` не вернулся за 20 с; одиночный `os.mkdir` отказывает за
 ту же миллисекунду). Поэтому проба строит имя сама и вызывает `mkdir` один раз.
 
-**Доказательства.** `tests/test_project_visible_root.py` (44 теста: правила имени, уникальность, порядок
-кандидатов, переход к следующему, полный отказ, запомненный корень, отчёт в настройках),
+**Доказательства.** `tests/test_project_visible_root.py` (50 тестов: правила имени — четыре идеи
+владельца, повтор ведущих слов, обрезка по двоеточию и придаточному, английские эквиваленты и предел в 40
+символов — уникальность, порядок кандидатов, переход к следующему, полный отказ, запомненный корень,
+отчёт в настройках), `tests/test_project_list_filter.py` (7 тестов: факт видимого корня в маршруте,
+вид по умолчанию, переключатель «Показать всё», всегда видимый проект владельца, страница в 25 строк и
+«Показать ещё», вкладка архива — само правило списка исполняется через Node из `ui/src/project-list.js`),
 `tests/test_project_open_actions.py` (27 тестов: ответ с запасным вариантом, типизированный 409 со
 списком, повтор на той же сессии, записываемый корень используется как есть),
 `tests/test_owner_acceptance.py` (идея владельца сквозным проходом — с недоступным корнем и без него).

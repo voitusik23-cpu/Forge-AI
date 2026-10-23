@@ -930,6 +930,13 @@ export type LifecycleSummary = {
   last_run_at?: string;
   file_count?: number;
   project_path?: string;
+  /**
+   * Whether this project's files really live under a configured **visible** project
+   * root (a folder the owner can open). The list draws the `true` rows by default and
+   * keeps the rest one click away, so a project the test suite left in the hidden
+   * workspace cannot become the ribbon the owner complained about.
+   */
+  in_visible_root?: boolean;
 };
 
 /**

@@ -587,16 +587,20 @@ class ProjectNameTests(_Base):
         self.assertLessEqual(len(name), MAX_DERIVED_NAME_CHARS, name)
         self.assertTrue(name, "the name must never be empty")
         # Never a partial word: the name is a *contiguous* run of whole words from the
-        # idea (the leading «Создай» is dropped by rule 2, so it need not start at 0).
+        # idea. The comparison is case-insensitive because the derived name is a product
+        # name and therefore capitalised; the leading «Создай» is dropped by rule 2, so
+        # the run need not start at 0.
         idea_words = idea.split()
         name_words = name.split()
         start = next(
             index
             for index in range(len(idea_words))
-            if idea_words[index] == name_words[0]
+            if idea_words[index].lower() == name_words[0].lower()
         )
         self.assertEqual(
-            name_words, idea_words[start : start + len(name_words)], name
+            [word.lower() for word in name_words],
+            [word.lower() for word in idea_words[start : start + len(name_words)]],
+            name,
         )
         self.assertFalse(name.endswith(" "), "trailing spaces are stripped")
 
@@ -626,12 +630,135 @@ class ProjectNameTests(_Base):
 
     def test_06_cyrillic_and_other_scripts_are_preserved(self) -> None:
         self.assertEqual(
-            derive_project_name("Создай справочник сотрудников"), "справочник сотрудников"
+            derive_project_name("Создай справочник сотрудников"), "Справочник сотрудников"
         )
         self.assertEqual(derive_project_name("Приложение «Ёжик»"), "Ёжик")
         self.assertEqual(derive_project_name("Создай 工具 для дома"), "工具 для дома")
         for name in ("Ёжик", "инструмент", "工具"):
             self.assertTrue(any(character.isalpha() for character in name))
+
+    # ------------------------------------------------------------------ product names
+    # The owner's own complaint: a name derived from an idea still read like the task,
+    # not like a product. These are the four ideas from his screenshot, with the names
+    # the rule must produce for them.
+
+    def test_09_the_owners_ideas_become_product_names(self) -> None:
+        self.assertEqual(
+            derive_project_name(
+                "Хочу простую локальную страницу-визитку с приветствием и названием проекта."
+            ),
+            "Локальная страница-визитка",
+        )
+        self.assertEqual(
+            derive_project_name(
+                "Сделать лендинг для новогоднего корпоратива с регистрацией гостей"
+            ),
+            "Лендинг для новогоднего корпоратива",
+        )
+        self.assertEqual(
+            derive_project_name(
+                "телеграм бот для отслеживания чатов и анализа сообщений "
+                "если их там очень много"
+            ),
+            "Телеграм-бот для отслеживания чатов",
+        )
+        self.assertEqual(derive_project_name(OWNER_IDEA), "Почтовый центр")
+        # The record's own name is the same phrase, so the list and the folder agree.
+        for idea in (
+            "Хочу простую локальную страницу-визитку с приветствием и названием проекта.",
+            "Сделать лендинг для новогоднего корпоратива с регистрацией гостей",
+            "телеграм бот для отслеживания чатов и анализа сообщений если их там очень много",
+        ):
+            name = derive_project_name(idea)
+            self.assertNotIn("Хочу", name)
+            self.assertNotIn("Сделать", name)
+            self.assertNotIn("если их там", name)
+            self.assertLessEqual(len(name), MAX_DERIVED_NAME_CHARS, name)
+
+    def test_10_leading_intent_words_are_stripped_repeatedly(self) -> None:
+        # One strip is not enough: the owner chains a verb, a pronoun, a modal word and
+        # an adjective before the noun that actually names the thing.
+        self.assertEqual(
+            derive_project_name("Мне нужен простой сайт для бронирования отелей"),
+            "Сайт для бронирования отелей",
+        )
+        self.assertEqual(
+            derive_project_name("Хочу создать простую страницу для рецептов"),
+            "Страница для рецептов",
+        )
+        self.assertEqual(
+            derive_project_name("Please create a landing page for a bakery"),
+            "A landing page",
+        )
+        # Only from the *front*: a word that names the product is never dropped.
+        self.assertEqual(
+            derive_project_name("Создай приложение для рассылки писем"),
+            "Приложение для рассылки писем",
+        )
+
+    def test_11_a_colon_ends_the_name_when_the_head_is_a_phrase(self) -> None:
+        self.assertEqual(
+            derive_project_name(
+                "Сайт для бронирования отелей: список отелей, форма брони и подтверждение"
+            ),
+            "Сайт для бронирования отелей",
+        )
+        # A head of one word is too thin to stand alone, so the whole idea is used.
+        self.assertNotEqual(derive_project_name("Отчёт: продажи за 2026 год"), "Отчёт")
+
+    def test_12_a_relative_clause_never_becomes_the_name(self) -> None:
+        self.assertEqual(
+            derive_project_name(
+                "Сайт для школы, который показывает расписание и замены учителей"
+            ),
+            "Сайт для школы",
+        )
+        self.assertEqual(
+            derive_project_name("Приложение, где я записываю расходы семьи"),
+            "Приложение",
+        )
+        self.assertEqual(
+            derive_project_name(
+                "Каталог растений чтобы искать по названию и уходу"
+            ),
+            "Каталог растений",
+        )
+
+    def test_13_the_english_equivalents_follow_the_same_rules(self) -> None:
+        self.assertEqual(
+            derive_project_name("I need a landing page for a New Year party"),
+            "A landing page",
+        )
+        self.assertEqual(
+            derive_project_name("Create a telegram bot for tracking chats"),
+            "A telegram-bot for tracking",
+        )
+        self.assertEqual(
+            derive_project_name("Build me a “Mail Hub” desktop tool"), "Mail Hub"
+        )
+        # The leading article of an English phrase is part of the noun phrase and stays.
+        self.assertEqual(
+            derive_project_name("A trashed project that was archived"),
+            "A trashed project",
+        )
+
+    def test_14_the_cap_is_kept_at_a_word_boundary(self) -> None:
+        idea = (
+            "Сделай приложение для учёта домашних расходов с отчётами по категориям "
+            "и экспортом в таблицу"
+        )
+        name = derive_project_name(idea)
+        self.assertLessEqual(len(name), MAX_DERIVED_NAME_CHARS, name)
+        self.assertEqual(name, name.strip())
+        self.assertFalse(name.endswith((" ", "-", ",")), name)
+        # The cap really bites: a short limit cuts at a word boundary, never mid-word.
+        short = derive_project_name(idea, limit=20)
+        self.assertLessEqual(len(short), 20, short)
+        self.assertTrue(short, "the cap never empties the name")
+        self.assertIn(short.split()[0].lower(), idea.lower())
+        # An idea whose *only* word is longer than the limit is clipped, not dropped:
+        # an empty folder name would be worse than a short one.
+        self.assertTrue(derive_project_name("Суперкалифраджилистикэкспиалидоция", limit=10))
 
     def test_07_a_colliding_folder_is_numbered_never_shared(self) -> None:
         root = self.base / "collisions"

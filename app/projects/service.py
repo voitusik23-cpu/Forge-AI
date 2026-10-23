@@ -399,6 +399,35 @@ class ProjectService:
             self._store.list_projects(include_archived=include_archived)
         )
 
+    def in_visible_root(self, project: object) -> bool:
+        """True when the project's files really live in a configured visible root.
+
+        Delegated to the store, which owns the record and the configured roots. It is
+        the fact the «Проекты» list filters on: a project delivered into a folder the
+        owner can open, versus one left in the hidden workspace by a test.
+        """
+
+        return self._store.in_visible_root(project)
+
+    def summaries(self, *, include_archived: bool = True) -> Tuple[Dict[str, Any], ...]:
+        """The lifecycle list: one bounded summary per project, each with its root fact.
+
+        The extra ``in_visible_root`` field is additive -- every existing key of
+        :meth:`LifecycleProject.summary` is unchanged -- and it is derived here rather
+        than stored, so a record whose folder moved reports where it is *now*. The
+        visible roots are resolved once for the whole listing: they are probed on disk,
+        and one answer per request is enough.
+        """
+
+        roots = self._store.visible_delivery_roots()
+        return tuple(
+            {
+                **project.summary(),
+                "in_visible_root": self._store.in_visible_root(project, roots=roots),
+            }
+            for project in self.list_projects(include_archived=include_archived)
+        )
+
     def project_for_session(self, session_id: object) -> str:
         """The project a confirmed discovery session produced, or ``""``."""
 

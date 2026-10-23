@@ -7942,3 +7942,107 @@ A generated project that hard-codes a busy port still cannot start: the app repo
 этого исправления. Сгенерированный проект с жёстко заданным занятым портом
 по-прежнему не запустится: приложение сообщает `FAILED` с собственным кодом выхода
 дочернего процесса, а локальный запуск остаётся настоящей попыткой запуска.
+
+## Decision: the list is the owner's, and a name reads like a product v0.4
+
+**Decision.** Two product defects are closed by two rules, and the store's data is tidied
+through the routes that already exist.
+
+1. **The list draws the owner's projects.** `GET /api/projects/lifecycle` publishes one
+   additive fact per row, `in_visible_root` (`ProjectStore.in_visible_root`): the
+   record's own `workspace_dir`, proved to sit inside a **visible** delivery root. «Проекты»
+   draws the `true` rows by default and offers «Показать всё ({n} скрыто)» for the rest.
+   The *answer* is never filtered — the whole listing stays whole — so the screen can
+   count what it hides, and a deployment with no visible root shows everything rather
+   than hiding everything. The table is bounded to one page (`ui/src/project-list.js`,
+   `PROJECT_LIST_PAGE_SIZE` = 25) with «Показать ещё», the same shape the trash uses.
+2. **A derived name is a noun phrase, not a task sentence.** `derive_project_name` cuts
+   the idea at a comma, a relative clause and a phrase-length colon head; drops leading
+   "create/make/I want/simple" words *repeatedly* and trailing courtesies; keeps five
+   words and 40 characters at a word boundary; rewrites the part before the first
+   preposition from the accusative into the nominative; hyphenates compound prefixes; and
+   capitalises the first letter. A quoted phrase still wins outright.
+
+**Why.** The owner opened «Проекты» and saw 42 rows of task sentences — 41 of them
+records the test suite and the demo scripts had left in the hidden workspace — with his
+only real project («Почтовый центр») lost in the middle of them. A name derived from an
+idea also read like the request («Хочу простую локальную страницу-визитку…») instead of
+like a product.
+
+**Rejected alternatives.** Filtering the API answer (a client could no longer say how much
+it hid); deleting the records outright (the trash already exists and a mistake must be one
+click from undone, so the tidy went through `DELETE /api/projects/{id}` one by one);
+guessing from the name alone (evidence is the folder, the name and the file count);
+lower-casing the whole derived name (it would destroy proper nouns such as `FastAPI`);
+normalising every word of the idea (after a preposition the owner's grammar is already
+right: «Лендинг для новогоднего корпоратива»).
+
+**Evidence.** `tests/test_project_list_filter.py` (7 tests: the visible-root fact, the
+default view, the toggle, a project that is always visible, the page and «Показать ещё»,
+the archive tab; the list rule itself is executed with Node from
+`ui/src/project-list.js`), `tests/test_project_visible_root.py` (the owner's four ideas,
+repeated leading words, the colon and relative-clause cuts, the English equivalents, the
+cap), `tests/test_project_lifecycle.py` (the additive field), plus the existing
+`tests/test_project_delete.py`, `tests/test_api.py`, `tests/test_owner_acceptance.py` and
+`tests/test_user_journey.py`.
+
+**Consequences and open limits.** `demo-projects` is in `project_roots_known` on this
+host, so a record delivered there counted as visible until the tidy moved it; the rule
+itself is "inside a root this deployment has delivered into", not "inside the root of the
+current setting". The nominative rewrite is suffix-only (`-ую/-юю/-у/-ю`) with a documented
+list of indeclinables, so a first-person verb that survives the leading fillers could be
+rewritten; such verbs are in the filler list for that reason. `in_visible_root` is derived
+per request, so a record whose folder is gone reports `false` and stays hidden behind the
+toggle instead of disappearing.
+
+## Решение: список принадлежит владельцу, а имя читается как продукт v0.4
+
+**Решение.** Два продуктовых дефекта закрываются двумя правилами, а данные хранилища
+приводятся в порядок существующими маршрутами.
+
+1. **Список рисует проекты владельца.** `GET /api/projects/lifecycle` публикует по каждой
+   строке один аддитивный факт — `in_visible_root` (`ProjectStore.in_visible_root`):
+   собственный `workspace_dir` записи, доказанно лежащий внутри **видимого** корня
+   доставки. «Проекты» по умолчанию рисует строки `true`, а для остальных предлагает
+   «Показать всё ({n} скрыто)». Сам *ответ* никогда не фильтруется — полный список
+   остаётся полным, — поэтому экран может посчитать скрытое, а развёртывание без
+   видимого корня показывает всё, а не скрывает всё. Таблица ограничена одной страницей
+   (`ui/src/project-list.js`, `PROJECT_LIST_PAGE_SIZE` = 25) с «Показать ещё» — тем же
+   приёмом, что применяет корзина.
+2. **Выведенное имя — именная группа, а не предложение задачи.** `derive_project_name`
+   обрезает идею по запятой, придаточному и двоеточию с головой в 2–5 слов; **повторно**
+   отбрасывает ведущие «создай/сделай/хочу/простой» и хвостовые любезности; оставляет
+   пять слов и 40 символов по границе слова; переписывает часть до первого предлога из
+   винительного падежа в именительный; соединяет составные приставки дефисом; делает
+   первую букву заглавной. Фраза в кавычках по-прежнему побеждает полностью.
+
+**Почему.** Владелец открыл «Проекты» и увидел 42 строки предложений-задач — 41 из них
+оставили набор тестов и демонстрационные скрипты в скрытом рабочем каталоге, — а его
+единственный настоящий проект («Почтовый центр») терялся посередине. Имя, выведенное из
+идеи, тоже читалось как запрос («Хочу простую локальную страницу-визитку…»), а не как
+продукт.
+
+**Отклонённые альтернативы.** Фильтровать сам ответ API (клиент больше не смог бы
+сказать, сколько он скрыл); стереть записи (корзина уже есть, и ошибка должна
+отменяться одним нажатием, поэтому уборка шла через `DELETE /api/projects/{id}` по
+одной); угадывать по одному имени (доказательство — папка, имя и число файлов);
+приводить всё выведенное имя к нижнему регистру (это уничтожило бы имена вроде
+`FastAPI`); нормализовать каждое слово идеи (после предлога грамматика владельца уже
+верна: «Лендинг для новогоднего корпоратива»).
+
+**Доказательство.** `tests/test_project_list_filter.py` (7 тестов: факт видимого корня,
+вид по умолчанию, переключатель, всегда видимый проект, страница и «Показать ещё»,
+вкладка архива; само правило списка исполняется через Node из `ui/src/project-list.js`),
+`tests/test_project_visible_root.py` (четыре идеи владельца, повтор ведущих слов, обрезка
+по двоеточию и придаточному, английские эквиваленты, предел), `tests/test_project_lifecycle.py`
+(аддитивное поле), а также существующие `tests/test_project_delete.py`,
+`tests/test_api.py`, `tests/test_owner_acceptance.py` и `tests/test_user_journey.py`.
+
+**Следствия и открытые ограничения.** `demo-projects` на этом хосте входит в
+`project_roots_known`, поэтому запись, доставленная туда, считалась видимой, пока уборка
+её не перенесла; само правило — «внутри корня, в который это развёртывание доставляло
+проекты», а не «внутри корня текущей настройки». Переписывание в именительный работает
+только по окончаниям (`-ую/-юю/-у/-ю`) и документированному списку несклоняемых, поэтому
+глагол в первом лице, переживший ведущие филлеры, мог бы быть переписан; такие глаголы
+для того и внесены в список. `in_visible_root` вычисляется на каждый запрос, поэтому
+запись, чья папка исчезла, сообщает `false` и остаётся за переключателем, а не пропадает.

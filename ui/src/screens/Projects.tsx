@@ -25,6 +25,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
 import { IconRefresh } from "../components/Icons";
 import { t, type Lang } from "../i18n";
+import { PROJECT_LIST_PAGE_SIZE, projectListRows } from "../project-list.js";
 import type { BackendState } from "../api/client";
 import {
   OFFLINE_PROVIDER,
@@ -1725,10 +1726,23 @@ export const Projects = ({
   }, [loadList]);
 
   const summaries = list.status === "ready" ? list.value : [];
-  const visible = useMemo(
-    () => summaries.filter((project) => (filter === "archive" ? project.archived === true : project.archived !== true)),
-    [summaries, filter]
+  // Which rows this screen draws: the owner's visible-root projects by default, the
+  // whole listing behind «Показать всё», one page at a time. The rule itself lives in
+  // `ui/src/project-list.js`, which the regression test executes directly, so the
+  // screen cannot drift from what is asserted about it.
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  const [listShown, setListShown] = useState(0);
+  const slice = useMemo(
+    () =>
+      projectListRows({
+        summaries,
+        archived: filter === "archive",
+        showAll: showAllProjects,
+        shown: listShown,
+      }),
+    [summaries, filter, showAllProjects, listShown]
   );
+  const visible = slice.rows;
 
   /**
    * Open one project: select it, then bring its card into view once the card exists.
@@ -2380,9 +2394,27 @@ export const Projects = ({
       <Card className="rise">
         <CardHead
           title={t(lang, "projects.list.title")}
-          hint={`/api/projects/lifecycle · ${summaries.length}`}
+          hint={`/api/projects/lifecycle · ${slice.drawn} / ${summaries.length}`}
           action={
             <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+              {/* Transparency, not a hidden cut: the button names how many rows the
+                  default view keeps out of sight, and brings them back unchanged. */}
+              {slice.hidden > 0 ? (
+                <span data-testid="projects-show-all">
+                  <Button
+                    size="small"
+                    tone={showAllProjects ? "ghost" : "default"}
+                    onClick={() => {
+                      setShowAllProjects((value) => !value);
+                      setListShown(0);
+                    }}
+                  >
+                    {showAllProjects
+                      ? t(lang, "projects.list.only_visible")
+                      : t(lang, "projects.list.show_all").replace("{n}", String(slice.hidden))}
+                  </Button>
+                </span>
+              ) : null}
               <Button
                 size="small"
                 tone="ghost"
@@ -2472,6 +2504,33 @@ export const Projects = ({
           </table>
         )}
 
+        {/* A bounded view, not a hidden one: the heading keeps the real count, this line
+            states how much of it is drawn, and «Показать ещё» reveals the next page --
+            exactly what the trash already does. The whole listing is still what
+            `GET /api/projects/lifecycle` answered. */}
+        {slice.hasMore ? (
+          <div
+            className="row"
+            data-testid="projects-list-more"
+            style={{ gap: 8, flexWrap: "wrap", marginTop: 8, alignItems: "center" }}
+          >
+            <Button
+              size="small"
+              tone="ghost"
+              onClick={() => setListShown(slice.drawn + PROJECT_LIST_PAGE_SIZE)}
+            >
+              {t(lang, "projects.trash.more")
+                .replace("{shown}", String(slice.drawn))
+                .replace("{total}", String(slice.tabTotal))}
+            </Button>
+            <span className="small muted" data-testid="projects-list-bounded">
+              {t(lang, "projects.list.bounded")
+                .replace("{shown}", String(slice.drawn))
+                .replace("{total}", String(slice.tabTotal))}
+            </span>
+          </div>
+        ) : null}
+
         {/* What the bulk cleanup would do, before it does it. The list is printed by id,
             because "the ribbon of junk" is exactly the rows the owner recognises. */}
         {bulkStep === "confirm" ? (
@@ -2511,6 +2570,11 @@ export const Projects = ({
         ) : null}
 
         <div className="small muted" style={{ marginTop: 8 }}>
+          {slice.scope === "visible-root" && slice.hidden > 0 ? (
+            <div data-testid="projects-list-scope">
+              {t(lang, "projects.list.scope").replace("{n}", String(slice.hidden))}
+            </div>
+          ) : null}
           {t(lang, "projects.list.hint")}
         </div>
       </Card>
