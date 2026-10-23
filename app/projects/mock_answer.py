@@ -20,13 +20,28 @@ project.
 
 It is deterministic: the same task text always produces the same bytes, so a smoke
 or an end-to-end test can assert on them.
+
+**Only the offline ``mock`` provider may receive it.** :func:`deterministic_project_answer`
+builds the text; :func:`deterministic_answer_for_provider` is the one entry point the
+run path calls, and it returns ``""`` for every other provider. That guard is what
+stops a real provider's empty answer from being answered with this scaffold: a
+project must never hold a template the model did not write.
 """
 
 from __future__ import annotations
 
 import html
 
-__all__ = ["MOCK_ANSWER_BANNER", "deterministic_project_answer"]
+__all__ = [
+    "MOCK_ANSWER_BANNER",
+    "MOCK_PROVIDER_NAME",
+    "deterministic_answer_for_provider",
+    "deterministic_project_answer",
+]
+
+
+#: The one provider name this scaffold belongs to: the offline ``mock``.
+MOCK_PROVIDER_NAME = "mock"
 
 
 #: Printed in the run's output and written into both files, so a reader never
@@ -42,6 +57,24 @@ def _title(task_text: object) -> str:
     if not collapsed:
         return "Forge project"
     return collapsed[:MAX_TITLE_CHARS]
+
+
+def deterministic_answer_for_provider(
+    provider_name: object, task_text: object = ""
+) -> str:
+    """The scaffold for the offline ``mock`` provider, and for **nothing else**.
+
+    A real provider returned no file block is a fact about the model, not an
+    invitation for Forge to write its own template: this returns ``""`` for every
+    provider except ``mock``, so the caller has nothing to apply and must say
+    honestly that the project was not created. The comparison is case-insensitive
+    and whitespace-insensitive, and an unknown/empty provider name (which cannot
+    name the offline path anyway) is refused too.
+    """
+
+    if str(provider_name or "").strip().lower() != MOCK_PROVIDER_NAME:
+        return ""
+    return deterministic_project_answer(task_text)
 
 
 def deterministic_project_answer(task_text: object = "") -> str:

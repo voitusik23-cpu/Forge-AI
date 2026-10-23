@@ -7817,3 +7817,128 @@ already delivered to another root: the record's folder is re-proved against all 
 зависает внутри ОС, таймаут не применяется — проба это прямой системный вызов, а измеренное зависание
 шло из стандартной библиотеки, а не из ОС. Запасной вариант не переносит проект, уже выданный в другой
 корень: папка из записи заново доказывается против всех известных корней.
+
+## Write-mode durability, no scaffold substitution, and launchable static pages v0.3
+
+**Decision.** Three measured defects in the write-mode/project path are closed by one
+rule each, and nothing else changes.
+
+1. **The effective write mode is part of the durable record.**
+   `project_state["write_mode"]` is written by both task paths with the same string the
+   response reports (`MOCK_DETERMINISTIC`, `REAL_PROVIDER_EXPLICIT`, or `""` for a run
+   that did not write). A run that had the checkbox on and reported
+   `REAL_PROVIDER_EXPLICIT` used to leave the key absent, so a write-mode run that
+   silently degraded to "not allowed to write" was indistinguishable from one that
+   wrote. The record and the response now cannot disagree.
+2. **The deterministic scaffold belongs to the offline `mock` provider and to nothing
+   else.** `app.projects.mock_answer.deterministic_answer_for_provider(provider_name,
+   task_text)` returns `""` for every other provider, and the offline path asks it with
+   the *effective* provider name — not with the write-mode string alone. On the provider
+   path an answer that carries **no** fenced block with a `path=` header (after the one
+   existing retry) applies nothing: the writer is not called, no version advances, and
+   the run ends as a failure with `Проект не создан: модель не вернула файлы` and
+   `files_created = 0`. A real provider's silence is never answered with Forge's own
+   template.
+3. **A static page is runnable.** `static_html` reports `runnable: true`,
+   `serve_kind: "static"` and the fixed display sentence `открыть в браузере (preview)`;
+   its launch is the existing read-only preview route. The card offers «Запустить
+   локально» and «Открыть приложение» for it, and the run panel's launch button calls
+   that preview route instead of asking the runner for a process it cannot start. The
+   honest refusals stay: a process kind whose argv was not resolved is still not
+   runnable, and the runner still refuses a `static_html` entry with
+   `static_entry_point` (the preview route, not the runner, is a page's launch).
+
+**Why.** The owner asked for a mail-centre application and received a five-file static
+scaffold inside a project that reported nothing about how it had been written; and the
+same project's card said its page could not be run while the preview served it with
+HTTP 200. Each of the three facts above was the missing half of an honesty rule the
+product already claimed.
+
+**Rejected alternatives.** Recording the mode only in the response (the record is what
+an operator reads after a restart); inferring the mode from `code_write` (a write that
+was refused has no mode in it either); treating "no file block" as success (that is the
+substitution this decision forbids); making `static_html` a process entry so the
+existing run button applies (arbitrary execution instead of a preview); keeping
+`runnable: false` and only relabelling the button (the button would call a route that
+refuses).
+
+**Evidence.** `tests/test_write_output_contract.py` (write mode recorded for a real
+provider and for a read-only run; the guard refuses every provider but `mock`; the
+writer is never called for an answer with no file; a real answer with files is written
+from its own text), `tests/test_projects_change_run.py` (a zero-file change keeps the
+previous version current, records the mode and names the sentence),
+`tests/test_materialization.py` (the static entry is runnable with the preview sentence;
+the API publishes both launch actions), `tests/test_project_truth_presentation.py`.
+`python -m compileall -q app tests` and `git diff --check` are clean, and the full
+suite runs.
+
+**Consequences and open limits.** The single retry still carries only the hard
+instruction and the workspace listing, not the task text (pinned by
+`tests/test_write_output_contract.py::test_09`): a real provider re-asked without its
+task can answer an unrelated project, and that answer is applied because it *is* the
+model's answer. Widening the retry prompt is a product decision, not part of this fix.
+A generated project that hard-codes a busy port still cannot start: the app reports
+`FAILED` with the child's own exit code, and the local run stays a real launch attempt.
+
+## Сохранность режима записи, отсутствие подстановки каркаса и запускаемые статические страницы v0.3
+
+**Решение.** Три измеренных дефекта на пути режима записи и проекта закрываются по
+одному правилу каждый, и больше ничего не меняется.
+
+1. **Эффективный режим записи — часть durable-записи.**
+   `project_state["write_mode"]` пишется обоими путями задачи той же строкой, что
+   сообщает ответ (`MOCK_DETERMINISTIC`, `REAL_PROVIDER_EXPLICIT` или `""` для запуска
+   без записи). Раньше запуск с включённым флажком, сообщивший
+   `REAL_PROVIDER_EXPLICIT`, оставлял ключ отсутствующим, поэтому тихая деградация до
+   «писать нельзя» была неотличима от запуска, который писал. Теперь запись и ответ не
+   могут расходиться.
+2. **Детерминированный каркас принадлежит офлайн-провайдеру `mock` и никому больше.**
+   `app.projects.mock_answer.deterministic_answer_for_provider(provider_name,
+   task_text)` возвращает `""` для любого другого провайдера, и офлайн-путь
+   спрашивает её с *эффективным* именем провайдера, а не только со строкой режима
+   записи. На пути провайдера ответ, не содержащий **ни одного** блока с заголовком
+   `path=` (после единственного существующего повтора), не применяется: писатель не
+   вызывается, версия не продвигается, и запуск завершается неудачей с
+   `Проект не создан: модель не вернула файлы` и `files_created = 0`. Молчание
+   реального провайдера никогда не заменяется собственным шаблоном Forge.
+3. **Статическая страница запускаема.** `static_html` сообщает `runnable: true`,
+   `serve_kind: "static"` и фиксированную строку показа
+   `открыть в браузере (preview)`; её запуск — существующий маршрут предпросмотра
+   только для чтения. Карточка предлагает для неё «Запустить локально» и «Открыть
+   приложение», а кнопка запуска в панели запуска вызывает этот маршрут предпросмотра,
+   а не просит раннер о процессе, который тот не может запустить. Честные отказы
+   остаются: вид-процесс без разрешённого argv по-прежнему не запускаем, и раннер
+   по-прежнему отказывает точке входа `static_html` с `static_entry_point` (запуск
+   страницы — маршрут предпросмотра, а не раннер).
+
+**Почему.** Владелец просил приложение «Почтовый центр», а получил статический каркас
+из пяти файлов внутри проекта, который ничего не сообщал о том, как он был записан; и
+карточка того же проекта говорила, что страницу нельзя запустить, тогда как
+предпросмотр отдавал её с HTTP 200. Каждый из трёх фактов выше — недостающая половина
+правила честности, которое продукт уже обещал.
+
+**Отклонённые альтернативы.** Записывать режим только в ответ (запись читает оператор
+после перезапуска); выводить режим из `code_write` (у отказанной записи режима в ней
+тоже нет); считать «нет файлового блока» успехом (это и есть запрещённая подстановка);
+сделать `static_html` видом-процессом, чтобы работала существующая кнопка запуска
+(произвольное исполнение вместо предпросмотра); оставить `runnable: false` и лишь
+переименовать кнопку (кнопка вызывала бы маршрут, который отказывает).
+
+**Доказательство.** `tests/test_write_output_contract.py` (режим записан для реального
+провайдера и для запуска только на чтение; гард отказывает всем провайдерам кроме
+`mock`; для ответа без файлов писатель не вызывается; ответ с файлами записывается из
+своего текста), `tests/test_projects_change_run.py` (нулевая доработка сохраняет
+текущую версию, записывает режим и называет фразу),
+`tests/test_materialization.py` (статическая точка входа запускаема со строкой
+предпросмотра; API публикует оба действия запуска),
+`tests/test_project_truth_presentation.py`. `python -m compileall -q app tests` и
+`git diff --check` чисты, полный набор тестов прогоняется.
+
+**Следствия и открытые ограничения.** Единственный повтор по-прежнему несёт только
+жёсткую инструкцию и листинг рабочей области, без текста задачи (закреплено
+`tests/test_write_output_contract.py::test_09`): реальный провайдер, переспрошенный без
+своей задачи, может ответить посторонним проектом, и такой ответ применяется, потому
+что это *ответ модели*. Расширение промпта повтора — продуктовое решение, а не часть
+этого исправления. Сгенерированный проект с жёстко заданным занятым портом
+по-прежнему не запустится: приложение сообщает `FAILED` с собственным кодом выхода
+дочернего процесса, а локальный запуск остаётся настоящей попыткой запуска.

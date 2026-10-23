@@ -981,6 +981,10 @@ def _actions(
     )
 
     if launch_role == "open":
+        # A page is the one thing this product can launch with no process: the card's
+        # two buttons both go through the existing read-only preview route, so both
+        # are enabled. Reporting the page as "nothing to start" was the measured
+        # defect -- the preview route served it with HTTP 200 while the card refused.
         lines.append(
             ActionLine(
                 action_id="open_app",
@@ -993,9 +997,11 @@ def _actions(
             ActionLine(
                 action_id="launch_local",
                 label=ACTIONS["launch_local"],
-                enabled=False,
-                visible=False,
-                reason="Запускать локально нечего: в проекте есть страница, её открывают.",
+                enabled=True,
+                reason=(
+                    f"{launch_path} открывается в браузере через локальный "
+                    "предпросмотр (preview)"
+                ),
             )
         )
     elif launch_role == "run":

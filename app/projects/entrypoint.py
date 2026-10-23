@@ -34,6 +34,10 @@ What it may and may not do
   deployment really has -- and ``run_command`` is the same thing as the display
   string a person reads. Neither value is ever taken from a request, a model
   answer, or prose.
+* A **static page has no argv**: its launch is the product's existing read-only
+  preview route, so ``runnable`` is true and ``run_command`` is the fixed sentence
+  :data:`STATIC_RUN_COMMAND`. Reporting such a page as unrunnable (while the same
+  route answered HTTP 200) was the measured defect this half of the module fixes.
 * A runnable kind whose interpreter (or ``npm``) does not exist is still reported,
   with an **empty** ``command`` and a ``reason``: the shape is recognised, and the
   honest answer is that it could not be launched. A caller maps that to
@@ -70,6 +74,7 @@ __all__ = [
     "EntryPoint",
     "EntryResolution",
     "MAX_PACKAGE_JSON_BYTES",
+    "STATIC_RUN_COMMAND",
     "detect_entry_point",
     "entry_digest",
     "node_executable",
@@ -92,8 +97,9 @@ ENTRY_KIND_NODE_NPM = "node_npm"
 ENTRY_KIND_PYTHON = ENTRY_KIND_PYTHON_SCRIPT
 ENTRY_KIND_NODE = ENTRY_KIND_NODE_NPM
 
-#: Every kind this module may return. ``static_html`` is the only one a browser can
-#: open with no command at all; the other four are runnable kinds.
+#: Every kind this module may return. All five are launchable by the product: a
+#: static page through the read-only preview route, the other four through a process
+#: whose argv this module resolved.
 ENTRY_KINDS = (
     ENTRY_KIND_STATIC_HTML,
     ENTRY_KIND_PYTHON_SCRIPT,
@@ -114,6 +120,13 @@ REASON_NPM_SCRIPT = "only a declared start or dev script may run"
 #: Serving kind: a static file server, or a process that may bind a port.
 SERVE_KIND_STATIC = "static"
 SERVE_KIND_PROCESS = "process"
+
+#: The one sentence a static page carries instead of a command. A static entry has no
+#: argv -- the product's existing read-only preview route serves the file, and that
+#: *is* the launch -- so the card prints this sentence where a process kind prints its
+#: command. Without it the page was reported as "no run command: nothing to start",
+#: while the same preview route answered HTTP 200.
+STATIC_RUN_COMMAND = "открыть в браузере (preview)"
 
 #: What the project is written in, for the card's «Язык проекта» fact.
 LANGUAGE_HTML = "HTML"
@@ -344,9 +357,17 @@ class EntryPoint:
 
     @property
     def runnable(self) -> bool:
-        """True when this entry point has a command that could be started."""
+        """True when the product can really launch this entry point.
 
-        return self.serve_kind == SERVE_KIND_PROCESS and bool(self.command)
+        A static page is launched by the existing read-only preview route, so it is
+        runnable with no command at all; a process kind is runnable only when its
+        argv was resolved server-side (a recognised shape whose interpreter is
+        missing is *not* runnable, and the card must say so).
+        """
+
+        if self.serve_kind == SERVE_KIND_STATIC:
+            return True
+        return bool(self.command)
 
     @property
     def digest(self) -> str:
@@ -483,10 +504,12 @@ def _node_script_name(workspace: object) -> str:
 
 
 def _static(path: str) -> EntryPoint:
+    """A page the preview route serves read-only: runnable, with no argv at all."""
+
     return EntryPoint(
         kind=ENTRY_KIND_STATIC_HTML,
         path=path,
-        run_command="",
+        run_command=STATIC_RUN_COMMAND,
         serve_kind=SERVE_KIND_STATIC,
     )
 

@@ -52,6 +52,7 @@ from app.projects.entrypoint import (
     ENTRY_KIND_STATIC_HTML,
     SERVE_KIND_PROCESS,
     SERVE_KIND_STATIC,
+    STATIC_RUN_COMMAND,
     detect_entry_point,
 )
 from app.projects.materialize import (
@@ -401,7 +402,16 @@ class EntryPointTests(_MaterializationCase):
         self.assertEqual(entry.kind, ENTRY_KIND_STATIC_HTML)
         self.assertEqual(entry.path, "index.html")
         self.assertEqual(entry.serve_kind, SERVE_KIND_STATIC)
-        self.assertEqual(entry.run_command, "")
+        # A static page is launched by the existing read-only preview route: no argv,
+        # but runnable, and the command the card prints is the fixed sentence. It used
+        # to report ``runnable: false`` with an empty command while the same route
+        # answered HTTP 200 -- the measured defect this assertion pins.
+        self.assertEqual(entry.command, ())
+        self.assertIs(entry.runnable, True)
+        self.assertEqual(entry.run_command, STATIC_RUN_COMMAND)
+        self.assertEqual(STATIC_RUN_COMMAND, "открыть в браузере (preview)")
+        self.assertEqual(entry.to_dict()["runnable"], True)
+        self.assertFalse(entry.reason)
 
     def test_11_python_entries_keep_their_priority(self) -> None:
         for path, expected_priority in (("app.py", 0), ("main.py", 1), ("server.py", 2)):
@@ -1047,6 +1057,21 @@ class NoSecretsInPayloadTests(_MaterializationCase):
         self.assertEqual(detail["entrypoint"]["path"], "index.html")
         self.assertTrue(detail["preview"]["available"])
         self.assertFalse(detail["preview"]["running"])
+        # A static page is RUNNABLE: its launch is the existing preview route, the
+        # command the card prints is the fixed sentence, and the card offers both
+        # launch buttons. It used to say `runnable: false` with no command while the
+        # same route answered 200 -- the measured "unrunnable static site" defect.
+        self.assertIs(detail["entrypoint"]["runnable"], True, detail["entrypoint"])
+        self.assertEqual(detail["entrypoint"]["run_command"], STATIC_RUN_COMMAND)
+        self.assertIs(detail["preview"]["runnable"], True, detail["preview"])
+        self.assertEqual(detail["preview"]["run_command"], STATIC_RUN_COMMAND)
+        actions = {
+            str(item["id"]): item
+            for item in detail["presentation"]["actions"]
+        }
+        for action_id in ("launch_local", "open_app"):
+            self.assertIs(actions[action_id]["visible"], True, action_id)
+            self.assertIs(actions[action_id]["enabled"], True, action_id)
         self.assertIn("compileall", detail["verification_command"])
         self.assertNotIn(str(self.workspace()), json.dumps(detail))
 

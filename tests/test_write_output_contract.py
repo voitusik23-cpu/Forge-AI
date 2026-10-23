@@ -43,8 +43,18 @@ from app.agent_runtime.output_contract import (
     build_retry_prompt,
 )
 from app.api.models import TaskRunRequest
-from app.api.service import ForgeApiService
+from app.api.service import (
+    NO_FILES_FROM_MODEL_SENTENCE,
+    WRITE_MODE_PROJECT_STATE_KEY,
+    WRITE_MODE_REAL_PROVIDER_EXPLICIT,
+    ForgeApiService,
+)
 from app.orchestrator.models import Run, RunState, TaskResult
+from app.projects.mock_answer import (
+    MOCK_ANSWER_BANNER,
+    deterministic_answer_for_provider,
+    deterministic_project_answer,
+)
 from app.runtime.run_store import RunStore
 from app.tools.workspace import Workspace
 from offline_runtime import offline_runtime
@@ -403,6 +413,145 @@ class RetryRuleTests(_ServiceCase):
         self.assert_retry_not_recorded(outcome.response)
         self.assertFalse(outcome.response.success)
         self.assertEqual(self._files(), [])
+
+
+# --------------------------------------------------------------------------- #
+# 4. the effective write mode survives into the durable record
+# --------------------------------------------------------------------------- #
+
+
+class WriteModeRecordTests(_ServiceCase):
+    """``project_state.write_mode`` states the mode the run really used.
+
+    The measured defect: the UI showed ``REAL_PROVIDER_EXPLICIT`` and the run wrote
+    files, but the durable record had no ``write_mode`` at all -- so a write-mode run
+    that silently degraded to "not allowed to write" was indistinguishable from one
+    that did. The response and the record must publish the same string.
+    """
+
+    def write_mode_of(self, response) -> object:
+        record = self.service.get_run_record(response.run_id) or {}
+        return (record.get("project_state") or {}).get(WRITE_MODE_PROJECT_STATE_KEY)
+
+    def test_15_a_real_provider_write_mode_is_recorded_and_reported(self) -> None:
+        self._install(FENCED_ANSWER)
+        outcome = self.service.run_task_detailed(self._request())
+        response = outcome.response
+
+        self.assertTrue(response.success, response.error)
+        self.assertEqual(response.write_mode, WRITE_MODE_REAL_PROVIDER_EXPLICIT)
+        self.assertEqual(response.files_created, 1)
+        # The durable record carries the SAME effective mode string.
+        self.assertEqual(
+            self.write_mode_of(response), WRITE_MODE_REAL_PROVIDER_EXPLICIT
+        )
+        record = self.service.get_run_record(response.run_id)
+        self.assertEqual(
+            record["project_state"][WRITE_MODE_PROJECT_STATE_KEY],
+            response.write_mode,
+        )
+
+    def test_16_a_read_only_run_records_the_empty_mode(self) -> None:
+        self._install(FENCED_ANSWER)
+        outcome = self.service.run_task_detailed(self._request(write_mode=False))
+        response = outcome.response
+
+        self.assertEqual(response.write_mode, "")
+        self.assertEqual(response.files_created, 0)
+        self.assertEqual(self.write_mode_of(response), "")
+        self.assertEqual(self._files(), [])
+
+    def test_17_a_run_that_never_resolved_a_mode_records_the_empty_mode(self) -> None:
+        # The flag alone authorizes nothing: no model name -> no write mode, and the
+        # record says exactly that instead of leaving the key absent.
+        self._install(FENCED_ANSWER)
+        outcome = self.service.run_task_detailed(self._request(model_name=None))
+        response = outcome.response
+
+        self.assertEqual(response.write_mode, "")
+        self.assertEqual(self.write_mode_of(response), "")
+        self.assertEqual(self._files(), [])
+
+
+# --------------------------------------------------------------------------- #
+# 5. a real provider's empty answer is never answered with Forge's template
+# --------------------------------------------------------------------------- #
+
+
+class NoScaffoldSubstitutionTests(_ServiceCase):
+    """The deterministic mock scaffold belongs to the offline ``mock`` provider alone.
+
+    A real provider that returns no file block is a fact about the model. Forge asks
+    once more (the rule above) and then says honestly that no project was created; it
+    never writes its own template into the owner's project. These tests assert the
+    guard itself *and* that the writer is never handed the scaffold.
+    """
+
+    def test_18_the_guard_refuses_every_provider_but_mock(self) -> None:
+        for provider in ("deepseek", "openrouter", "radox", "anthropic", "", None, " mock_v2"):
+            self.assertEqual(
+                deterministic_answer_for_provider(provider, "Почтовый центр"),
+                "",
+                provider,
+            )
+        # ... and only ``mock`` (any case, any padding) receives it.
+        for provider in ("mock", "MOCK", " mock "):
+            answer = deterministic_answer_for_provider(provider, "Почтовый центр")
+            self.assertIn(MOCK_ANSWER_BANNER, answer, provider)
+            self.assertEqual(answer, deterministic_project_answer("Почтовый центр"))
+
+    def test_19_a_real_provider_without_files_never_reaches_the_writer(self) -> None:
+        from unittest import mock as unittest_mock
+
+        from app.api import service as service_module
+
+        calls: list[dict] = []
+        real = service_module.apply_changes
+
+        def spy(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return real(*args, **kwargs)
+
+        fake = self._install(PROSE_ANSWER, PROSE_ANSWER)
+        with unittest_mock.patch.object(service_module, "apply_changes", spy):
+            outcome = self.service.run_task_detailed(self._request())
+        response = outcome.response
+
+        self.assertEqual(len(fake.calls), 2, "the retry must still be asked once")
+        self.assertEqual(calls, [], "the writer was called for an answer with no file")
+        self.assertFalse(response.success)
+        self.assertEqual(response.files_created, 0)
+        self.assertEqual(self._files(), [])
+        self.assertIsNotNone(response.error)
+        self.assertIn(NO_FILES_FROM_MODEL_SENTENCE, str(response.error))
+        self.assertEqual(
+            NO_FILES_FROM_MODEL_SENTENCE, "Проект не создан: модель не вернула файлы"
+        )
+        # Nothing on disk carries Forge's scaffold.
+        self.assertEqual(self._files(), [])
+
+    def test_20_a_real_provider_with_files_is_written_from_its_own_answer(self) -> None:
+        from unittest import mock as unittest_mock
+
+        from app.api import service as service_module
+
+        calls: list[dict] = []
+        real = service_module.apply_changes
+
+        def spy(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return real(*args, **kwargs)
+
+        self._install(FENCED_ANSWER)
+        with unittest_mock.patch.object(service_module, "apply_changes", spy):
+            outcome = self.service.run_task_detailed(self._request())
+        response = outcome.response
+
+        self.assertTrue(response.success, response.error)
+        self.assertEqual(len(calls), 1, "the answer must be applied exactly once")
+        for call in calls:
+            self.assertNotIn(MOCK_ANSWER_BANNER, str(call["args"][0]))
+        self.assertEqual(self._files(), ["api_screen.py"])
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience only

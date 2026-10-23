@@ -484,8 +484,13 @@ class ActionGatingTests(unittest.TestCase):
             files=[_artifact("index.html")],
             workspace_exists=True,
         )
+        # A page is launched by the existing read-only preview route: both buttons are
+        # offered, because both really work for it. Hiding «Запустить локально» made a
+        # servable page look unrunnable while the preview answered HTTP 200.
         self.assertTrue(page.offers("open_app"))
-        self.assertFalse(page.action("launch_local").visible)
+        self.assertTrue(page.offers("launch_local"))
+        self.assertTrue(page.action("launch_local").visible)
+        self.assertIn("preview", page.action("launch_local").reason)
         self.assertEqual(page.launch_role, "open")
         self.assertEqual(page.launch_path, "index.html")
 

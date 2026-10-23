@@ -55,6 +55,7 @@ from app.agent_runtime.outcome import (
 )
 from app.agent_runtime.code_writer import (
     STATUS_APPLIED,
+    STATUS_NO_CHANGES,
     WriteResult,
     apply_changes,
     build_workspace_context,
@@ -343,6 +344,23 @@ WRITE_MODE_MOCK_DETERMINISTIC = "MOCK_DETERMINISTIC"
 #: the request names both the provider and the model. Naming only one is not enough.
 WRITE_MODE_REAL_PROVIDER_EXPLICIT = "REAL_PROVIDER_EXPLICIT"
 WRITE_MODES = frozenset({WRITE_MODE_MOCK_DETERMINISTIC, WRITE_MODE_REAL_PROVIDER_EXPLICIT})
+
+#: The ``project_state`` key recording the *effective* write mode of a run.
+#:
+#: The response has always published ``write_mode``; the durable record did not, so
+#: a run that really wrote in ``REAL_PROVIDER_EXPLICIT`` mode left
+#: ``project_state.write_mode`` absent -- indistinguishable from a run that was never
+#: allowed to write. The record now carries the same string the response reports (and
+#: ``""`` for a run that did not write), written by both task paths.
+WRITE_MODE_PROJECT_STATE_KEY = "write_mode"
+
+#: The honest sentence a write-mode run ends with when the model returned no file
+#: block at all -- after the single retry, when a retry happened. Nothing was written,
+#: no project version advances, and Forge never substitutes a template (the
+#: deterministic mock scaffold belongs to the offline ``mock`` provider alone).
+NO_FILES_FROM_MODEL_SENTENCE = "Проект не создан: модель не вернула файлы"
+#: The writer's own reason word for that outcome, recorded beside the sentence.
+NO_FILES_FROM_MODEL_REASON = "the answer carried no fenced block with a path header"
 
 #: The ``project_state`` key of a materialisation into a project's own workspace.
 MATERIALIZATION_PROJECT_STATE_KEY = "project_materialization"
@@ -4095,15 +4113,23 @@ class ForgeApiService:
         # scaffold (`app.projects.mock_answer`), which *does* carry files: the writer,
         # the boundary, py_compile, the manifest and the project record are all the
         # real ones, and the labels in the output and in both files say so.
+        #
+        # THE SCAFFOLD BELONGS TO THE OFFLINE ``mock`` PROVIDER AND TO NOTHING ELSE.
+        # The guard is asked with the *effective* provider name, not with the write
+        # mode string alone, and an empty return means "no scaffold": a real
+        # provider's answer is never replaced by Forge's own template.
         if write_mode:
+            answer = ""
             if (
                 write_mode == WRITE_MODE_MOCK_DETERMINISTIC
                 and project_workspace is not None
             ):
-                from app.projects.mock_answer import deterministic_project_answer
+                from app.projects.mock_answer import deterministic_answer_for_provider
 
-                answer = deterministic_project_answer(task.description)
-            else:
+                answer = deterministic_answer_for_provider(
+                    self._selected_provider_name(req), task.description
+                )
+            if not answer:
                 answer = self._offline_write_answer(plan)
             write_result = self._apply_model_changes(
                 answer=answer,
@@ -4170,6 +4196,9 @@ class ForgeApiService:
             "project_files_created": False,
             "artifact_manifest_saved": False,
             "files_created": files_created,
+            # The mode this run really used, in the durable record -- the same string
+            # the response reports. ``""`` means the run was not allowed to write.
+            WRITE_MODE_PROJECT_STATE_KEY: str(write_mode or ""),
         }
         # THE CLARIFICATION CONTEXT on the offline path. It produces no questions of
         # its own (its answer is a deterministic report, not a model's prose), so a
@@ -4676,8 +4705,17 @@ class ForgeApiService:
         )
         files_created = 0
         if write_mode:
-            answer = provider_answer
-            if success and isinstance(answer, str) and answer.strip():
+            answer = provider_answer if isinstance(provider_answer, str) else ""
+            # The answer is the ONLY source of files in write mode. An answer that
+            # carries no fenced block with a ``path=`` header -- after the single
+            # retry has already run above -- means the model returned no file, so
+            # nothing is applied and NOTHING IS SUBSTITUTED: the deterministic
+            # scaffold belongs to the offline ``mock`` provider alone, and writing it
+            # here is exactly how a project ended up holding a template instead of
+            # the requested application.
+            dispatch_succeeded = success
+            carries_files = bool(answer.strip()) and carries_file_changes(answer)
+            if success and carries_files:
                 write_result = self._apply_model_changes(
                     answer=answer,
                     workspace=scope.workspace,
@@ -4696,7 +4734,25 @@ class ForgeApiService:
                     f"({write_result.status})"
                     + (f": {write_result.reason}" if write_result.reason else "")
                 )
+            elif dispatch_succeeded and answer.strip():
+                # The model answered, the answer named no file, and the single retry
+                # named none either. The writer is not called at all: there is nothing
+                # to apply, and a template is never a substitute for an answer. The
+                # run ends as a failure with the owner's own sentence.
+                success = False
+                files_created = 0
+                refusal = WriteResult(
+                    status=STATUS_NO_CHANGES, reason=NO_FILES_FROM_MODEL_REASON
+                )
+                self._record_write_outcome(api_run_store, run_id, task_id, refusal)
+                output = f"{output or ''}\n\n{render_write_report(refusal)}".lstrip("\n")
+                error = (
+                    f"{NO_FILES_FROM_MODEL_SENTENCE} "
+                    f"(write mode: {NO_FILES_FROM_MODEL_REASON})"
+                )
             else:
+                # The dispatch itself failed, or produced no text at all: its own
+                # honest error stands and nothing is written.
                 success = False
                 if not error:
                     error = "write mode: the provider produced no usable answer"
@@ -4787,6 +4843,10 @@ class ForgeApiService:
             "project_files_created": False,
             "artifact_manifest_saved": False,
             "files_created": files_created,
+            # The mode this run really used, in the durable record -- the same string
+            # the response reports. Without it a real write-mode run read back as
+            # "no write mode at all", which is how a silently degraded run hid.
+            WRITE_MODE_PROJECT_STATE_KEY: str(write_mode or ""),
         }
         # THE ROUND THIS RUN REALLY BELONGS TO, as the response publishes it: 2 when the
         # owner's answers were carried (the forced round), 1 when this run asked

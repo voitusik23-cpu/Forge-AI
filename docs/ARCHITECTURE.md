@@ -4098,12 +4098,27 @@ POST /api/tasks/run  { category: "code", write_mode: true }
   marked by a bounded `PROJECT_STATE_UPDATED` event, so `GET /api/runs/{run_id}`
   reports it. `TaskRunResponse` is unchanged; the human-readable report (status,
   files, verification, diff) is appended to `output`.
+- The **effective mode** is written beside it as `project_state["write_mode"]`: the
+  same string the response reports (`MOCK_DETERMINISTIC` / `REAL_PROVIDER_EXPLICIT` /
+  `""`), written by both task paths. Before it was recorded, a real write-mode run
+  read back as having no mode at all, so a silent degradation to "not allowed to
+  write" was indistinguishable from a run that wrote.
+- A real provider's answer that carries **no** file block is applied as *nothing*:
+  the single retry runs once, the writer is not called with a substitute, and the run
+  ends as a failure whose reason is `Проект не создан: модель не вернула файлы`
+  with `files_created = 0`. The deterministic scaffold in
+  `app.projects.mock_answer` is reachable only through
+  `deterministic_answer_for_provider(provider_name, ...)`, which returns `""` for
+  every provider except the offline `mock` — so a real provider can never be answered
+  with Forge's own template.
 - `success` is true only for `applied` with passing verification; every other
   status fails the run with its reason. The idempotency lifecycle write on the
   provider path now happens after write mode, so a keyed run cannot be recorded
   `COMPLETED` while nothing was written.
 - On the offline provider the "answer" is the deterministic plan text, which
-  names no file: the pipeline runs end to end and reports `no_changes`.
+  names no file: the pipeline runs end to end and reports `no_changes`. With a
+  lifecycle project it is the mock scaffold instead, and only in
+  `MOCK_DETERMINISTIC` mode.
 
 ### Verified limitation
 
@@ -4196,12 +4211,27 @@ POST /api/tasks/run  { category: "code", write_mode: true }
   отмечается ограниченным событием `PROJECT_STATE_UPDATED`, поэтому
   `GET /api/runs/{run_id}` его сообщает. `TaskRunResponse` не изменён;
   человекочитаемый отчёт (статус, файлы, проверка, diff) добавляется в `output`.
+- **Эффективный режим** записывается рядом как `project_state["write_mode"]` — та же
+  строка, что сообщает ответ (`MOCK_DETERMINISTIC` / `REAL_PROVIDER_EXPLICIT` / `""`),
+  и пишут её оба пути задачи. Пока она не записывалась, реальный write-mode запуск
+  читался как запуск вообще без режима, поэтому тихая деградация до «писать нельзя»
+  была неотличима от запуска, который писал.
+- Ответ реального провайдера, не содержащий **ни одного** файлового блока, применяется
+  как *ничего*: единственный повтор выполняется один раз, писатель не вызывается с
+  заменой, и запуск завершается неудачей с причиной
+  `Проект не создан: модель не вернула файлы` и `files_created = 0`.
+  Детерминированный каркас в `app.projects.mock_answer` доступен только через
+  `deterministic_answer_for_provider(provider_name, ...)`, которая возвращает `""`
+  для любого провайдера кроме офлайн `mock`, — поэтому ответить реальному провайдеру
+  собственным шаблоном Forge невозможно.
 - `success` истинен только для `applied` с пройденной проверкой; любой другой
   статус проваливает запуск с его причиной. Запись lifecycle идемпотентности на
   пути провайдера теперь происходит после write mode, поэтому ключевой запуск не
   может быть записан как `COMPLETED` при отсутствии записи.
 - На offline-провайдере «ответ» — это детерминированный текст плана, который не
-  называет ни одного файла: конвейер проходит целиком и сообщает `no_changes`.
+  называет ни одного файла: конвейер проходит целиком и сообщает `no_changes`. При
+  наличии lifecycle-проекта ответом служит mock-каркас, и только в режиме
+  `MOCK_DETERMINISTIC`.
 
 ### Проверенное ограничение
 
@@ -4874,6 +4904,7 @@ payloads outside `diagnostics`:
 
 | kind | argv | display |
 | --- | --- | --- |
+| `static_html` | *(none — the preview route serves it)* | `открыть в браузере (preview)` |
 | `python_script` | `<venv python> <script>` | `python app.py` |
 | `python_module` | `<venv python> -m <package>` | `python -m pkg` |
 | `node_script` | `<node> <script>` | `node server.js` |
@@ -4885,6 +4916,12 @@ resolved once and cached. `npm` is started as `node <npm-cli.js> run <script>` b
 cannot execute the `npm.cmd` wrapper without a command interpreter, and this repository never uses a
 shell; `npm install` is never part of any command. A recognised shape whose runtime is absent carries
 `reason` and an **empty** command — the runner reports `RUN_BLOCKED`, it never invents a command.
+
+`runnable` is true for a `static_html` entry: its launch is the existing read-only preview route,
+which needs no argv. Reporting it as unrunnable while that same route answered HTTP 200 was the
+measured defect; the card now enables «Запустить локально» and «Открыть приложение» for it, and the
+run panel's launch button calls the preview route (it never asks the runner for a process it cannot
+start). A process kind is `runnable` only when its argv was really resolved.
 
 ### The sanctioned execution path
 
@@ -5067,6 +5104,7 @@ no node.
 
 | вид | argv | показ |
 | --- | --- | --- |
+| `static_html` | *(нет — страницу отдаёт маршрут предпросмотра)* | `открыть в браузере (preview)` |
 | `python_script` | `<venv python> <script>` | `python app.py` |
 | `python_module` | `<venv python> -m <package>` | `python -m pkg` |
 | `node_script` | `<node> <script>` | `node server.js` |
@@ -5079,6 +5117,13 @@ no node.
 репозитории не используется; `npm install` никогда не входит ни в одну команду. Распознанная форма
 без рантайма несёт `reason` и **пустую** команду — раннер сообщает `RUN_BLOCKED` и не придумывает
 команду.
+
+Для точки входа `static_html` `runnable` истинен: её запуск — существующий маршрут предпросмотра
+только для чтения, которому не нужен argv. Отчёт о ней как о незапускаемой, пока тот же маршрут
+отвечал HTTP 200, был измеренным дефектом; теперь карточка включает «Запустить локально» и
+«Открыть приложение», а кнопка запуска в панели запуска вызывает маршрут предпросмотра (она никогда
+не просит раннер о процессе, который тот не может запустить). Вид-процесс `runnable` только тогда,
+когда его argv действительно разрешён.
 
 ### Санкционированный путь исполнения
 

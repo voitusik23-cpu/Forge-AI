@@ -275,6 +275,13 @@ const ArtifactTable = ({ lang, artifacts }: { lang: Lang; artifacts: LifecycleAr
  * prints the **exact command** and its digest, and only the confirmation calls the
  * backend. The digest is what the backend compares, so a command that changed cannot
  * be run under the previous approval.
+ *
+ * A **static page** is launched by the existing read-only preview route: it has no
+ * argv and no digest to approve, so its confirmation prints the fixed sentence and
+ * the accepted button calls `onPreviewStart` — the same route the preview block
+ * uses. Refusing the page here ("no run command: nothing to start") is the measured
+ * defect this wiring removes; the runner's own refusal stays for API callers that
+ * insist on a process.
  */
 const RunPanel = ({
   lang,
@@ -283,6 +290,7 @@ const RunPanel = ({
   preview,
   busy,
   onStart,
+  onPreviewStart,
   onStop,
   onRestart,
   onVerify,
@@ -295,6 +303,7 @@ const RunPanel = ({
   preview: LifecyclePreview;
   busy: string;
   onStart: (digest: string) => void;
+  onPreviewStart: () => void;
   onStop: () => void;
   onRestart: (digest: string) => void;
   onVerify: () => void;
@@ -308,6 +317,9 @@ const RunPanel = ({
   const command = String(run.command ?? entrypoint?.run_command ?? "");
   const digest = String(run.entrypoint_digest ?? entrypoint?.digest ?? "");
   const runnable = entrypoint !== null && entrypoint.runnable === true;
+  // A static page is launched by the preview route: it has no argv and no digest.
+  const staticEntry =
+    entrypoint !== null && String(entrypoint.serve_kind ?? "") === "static";
   const blocked = state === "RUN_BLOCKED" || state === "REFUSED";
   const lines = Array.isArray(run.log?.lines) ? run.log?.lines ?? [] : [];
   const logPath = String(run.log?.relative_path ?? run.log?.path ?? "");
@@ -327,8 +339,18 @@ const RunPanel = ({
         ? String(run.reason)
         : t(lang, "projects.facts.none");
 
-  const canStart = runnable && digest !== "" && !live && state !== "STARTING";
-  const canRestart = digest !== "" && !live && state !== "NOT_RUN";
+  // A static entry needs no digest: the preview route serves the page and answers a
+  // URL. It is also already launched while its preview runs, so the button stays off
+  // then (the preview block offers «Открыть приложение» instead). A process entry
+  // still requires the digest the backend will compare.
+  const canStart =
+    runnable &&
+    !live &&
+    state !== "STARTING" &&
+    (staticEntry
+      ? preview.available === true && preview.running !== true
+      : digest !== "");
+  const canRestart = !staticEntry && digest !== "" && !live && state !== "NOT_RUN";
 
   // The containment facts. They are read from the backend and never re-derived here:
   // `job_object`/`restricted_token` are what the process really has, `writes_outside`
@@ -523,9 +545,13 @@ const RunPanel = ({
           <pre className="forge-output mono small" style={{ marginTop: 6 }}>
             {command}
           </pre>
-          <div className="small mono" style={{ marginTop: 4, wordBreak: "break-word" }}>
-            {t(lang, "projects.run.confirm.digest")}: {digest}
-          </div>
+          {/* A static page has no argv to approve, so there is no digest to show:
+              the preview route is what the accepted button calls. */}
+          {staticEntry ? null : (
+            <div className="small mono" style={{ marginTop: 4, wordBreak: "break-word" }}>
+              {t(lang, "projects.run.confirm.digest")}: {digest}
+            </div>
+          )}
           <div className="small muted" style={{ marginTop: 4 }}>
             {t(lang, "projects.run.confirm.note")}
           </div>
@@ -538,6 +564,7 @@ const RunPanel = ({
                 const action = confirming;
                 setConfirming("");
                 if (action === "restart") onRestart(digest);
+                else if (staticEntry) onPreviewStart();
                 else onStart(digest);
               }}
             >
@@ -1284,7 +1311,9 @@ const ProjectCard = ({
         {/* The command, the folder, the port, the process state and the logs. Every
             button appears only when the backend's own facts make it applicable; the
             launch itself goes through an explicit confirmation that prints the exact
-            command, and the digest it shows is the value the backend compares. */}
+            command, and the digest it shows is the value the backend compares. A
+            static page has no command: «Запустить локально» calls the same preview
+            route the block above uses. */}
         <RunPanel
           lang={lang}
           run={run}
@@ -1293,6 +1322,7 @@ const ProjectCard = ({
           busy={runBusy}
           canVerify={fileTotal > 0 && hasRun}
           onStart={onRunStart}
+          onPreviewStart={onPreviewStart}
           onStop={onRunStop}
           onRestart={onRunRestart}
           onVerify={onVerify}

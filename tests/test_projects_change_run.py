@@ -49,7 +49,11 @@ import urllib.request
 from app.agents.provider_agent import ProviderAgent
 from app.agents.providers.base import Provider, ProviderRequest, ProviderResponse
 from app.api.server import create_api_app
-from app.api.service import ForgeApiService
+from app.api.service import (
+    NO_FILES_FROM_MODEL_SENTENCE,
+    WRITE_MODE_REAL_PROVIDER_EXPLICIT,
+    ForgeApiService,
+)
 from app.discovery.service import DiscoveryService
 from app.discovery.store import DiscoveryStore
 from app.projects.presentation import RUN_NO_CHANGE_NOTICE
@@ -606,6 +610,22 @@ class ChangeFromProjectsScreenTests(_Case):
         )
         self.assertEqual(int(zero_run.get("files_created", -1)), 0, zero_run)
         self.assertEqual(str(zero_run.get("lifecycle_project_id", "")), project_id)
+        # THE HONEST END. The model answered, the answer named no file, the one retry
+        # named none either: nothing was written and the run says so in the owner's
+        # words instead of substituting Forge's own scaffold. The write mode it really
+        # used is in the durable record, beside the same string in the response.
+        if not self.live:
+            self.assertEqual(
+                str(zero_run.get("write_mode", "")), WRITE_MODE_REAL_PROVIDER_EXPLICIT
+            )
+            self.assertIn(NO_FILES_FROM_MODEL_SENTENCE, str(zero_run.get("error") or ""))
+            zero_record = self._json(
+                self.client.get(f"/api/runs/{zero_run['run_id']}"), "zero-file run record"
+            )
+            self.assertEqual(
+                str((zero_record.get("project_state") or {}).get("write_mode")),
+                str(zero_run.get("write_mode")),
+            )
         unchanged = self._detail(project_id)
         self.assertEqual(
             str(unchanged["project"]["current_version"]), "2",
