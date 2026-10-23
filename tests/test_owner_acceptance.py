@@ -634,5 +634,163 @@ class OwnerAcceptanceTest(unittest.TestCase):
         print("\n".join(self.steps))
 
 
+#: The idea the owner really submitted, copied character for character from the live
+#: failure. The project's folder was named
+#: «Создай локальное приложение «Почтовый центр» — только Python (ст» -- the first 60
+#: characters of this paragraph, cut mid-word.
+OWNER_LIVE_IDEA = (
+    "Создай локальное приложение «Почтовый центр» — только Python (стек: FastAPI), "
+    "чтобы я мог читать и отправлять почту с рабочего стола"
+)
+
+
+class OwnerLiveCaseTest(unittest.TestCase):
+    """The owner's exact case, end to end: a long Russian idea with a quoted name.
+
+    Two defects met in one HTTP answer on his machine:
+
+    * the folder was named from the raw description, truncated mid-word;
+    * an unwritable preferred root turned his own action into a refusal.
+
+    This test drives the real surface with his own text: the folder is the quoted name,
+    short and valid; the whole idea is still in the specification; the project lands in
+    the configured root when it is writable; and when it is **not**, the same confirm
+    succeeds in the documented fallback and says so in plain language.
+    """
+
+    def setUp(self) -> None:
+        base = (
+            REPOSITORY
+            / ".forge"
+            / "test-owner-live-case"
+            / f"{os.getpid()}-{id(self)}"
+        )
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base.resolve()
+        self.records = self.base / "records"
+        self.discovery_root = self.base / "discovery"
+        self.run_workspace = self.base / "workspace"
+        for directory in (self.records, self.discovery_root, self.run_workspace):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.settings_path = self.base / "settings.json"
+        self.visible = self.base / "profile" / "Forge Projects"
+
+    def _app(self, *, root: pathlib.Path, candidates=None):
+        """The real surface, composed exactly as ``main.py`` composes it.
+
+        The settings file is this test's own, and the policy reads the *same* settings the
+        routes read -- including ``remember``/``known`` -- so "which folder is used" and
+        "which folder is reported" cannot disagree, which is the property the owner needs.
+        """
+
+        from fastapi.testclient import TestClient
+
+        from app.projects.root_selection import ProjectRootPolicy
+        from app.projects.service import ProjectService
+        from app.projects.store import ProjectStore
+
+        settings = AppSettingsStore(path=self.settings_path)
+        settings.set_project_root(str(root))
+        policy = ProjectRootPolicy(
+            lambda: settings.project_root(),
+            remember=settings.remember_fallback_root,
+            known=settings.known_project_roots,
+            candidates=candidates,
+        )
+        projects = ProjectService(
+            ProjectStore(root=self.records, root_policy=policy)
+        )
+        service = ForgeApiService(
+            runtime=offline_runtime(),
+            run_store=RunStore(root=self.base / "runs"),
+            workspace=Workspace(self.run_workspace),
+            authorized_project_id=WORKSPACE_PROJECT_ID,
+        )
+        app = create_api_app(
+            service,
+            discovery_service=DiscoveryService(
+                DiscoveryStore(root=self.discovery_root)
+            ),
+            project_service=projects,
+            project_opener=ProjectOpener(
+                which=_FakeWhich(),
+                spawn=_RecordingSpawn(),
+                exists=lambda item: False,
+            ),
+            settings_store=settings,
+        )
+        return TestClient(app), projects
+
+    def _session(self, client, idea: str) -> str:
+        opened = client.post("/api/discovery/sessions", json={"goal": idea}).json()
+        session_id = str(opened["session"]["session_id"])
+        if opened["session"].get("state") != "READY_FOR_PLANNING":
+            client.post(
+                f"/api/discovery/sessions/{session_id}/skip",
+                json={"reason": "достаточно для первой версии"},
+            )
+        return session_id
+
+    def test_01_his_idea_becomes_a_short_quoted_folder_name(self) -> None:
+        self.visible.mkdir(parents=True, exist_ok=True)
+        client, projects = self._app(
+            root=self.visible, candidates=lambda preferred: [preferred]
+        )
+        session_id = self._session(client, OWNER_LIVE_IDEA)
+        answer = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        body = answer.json()
+        project_id = str(body["project"]["project_id"])
+        # The short, human name and the folder that carries it.
+        self.assertEqual(body["project"]["name"], "Почтовый центр")
+        folder = projects.store.workspace_path(project_id)
+        self.assertEqual(folder.name, f"Почтовый центр ({project_id})")
+        self.assertNotIn("Создай", folder.name)
+        self.assertLessEqual(len(folder.name), 40 + len(project_id) + 3)
+        # The full idea is not lost: it is in the specification, where it belongs.
+        record = projects.open_project(project_id)
+        self.assertEqual(record.specification["goal"], OWNER_LIVE_IDEA)
+        # A writable root is used as it is, with nothing announced.
+        self.assertNotIn("project_root", body)
+        settings = client.get("/api/settings").json()
+        self.assertFalse(settings["project_root_used_fallback"])
+        self.assertEqual(settings["project_root_effective"], str(self.visible))
+
+    def test_02_the_same_confirm_survives_an_unwritable_desktop_root(self) -> None:
+        # The owner's real situation: the configured Desktop root cannot be created by
+        # this process, so the documented fallback is used instead -- and said out loud.
+        blocker = self.base / "not-a-folder"
+        blocker.write_text("x", encoding="utf-8")
+        blocked = blocker / "Forge Projects"
+        self.visible.mkdir(parents=True, exist_ok=True)
+        client, projects = self._app(
+            root=blocked, candidates=lambda preferred: [blocked, self.visible]
+        )
+        session_id = self._session(client, OWNER_LIVE_IDEA)
+        answer = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        body = answer.json()
+        project_id = str(body["project"]["project_id"])
+        notice = body["project_root"]
+        self.assertTrue(notice["fallback"])
+        self.assertEqual(notice["root"], str(self.visible))
+        self.assertIn("недоступна для записи", notice["notice"])
+        self.assertIn(str(self.visible), notice["notice"])
+        self.assertTrue(notice["attempted"][0]["reason"])
+        folder = projects.store.workspace_path(project_id)
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(folder.parent, self.visible.resolve())
+        # The name is short here too: the fallback changes *where*, not *what*.
+        self.assertEqual(body["project"]["name"], "Почтовый центр")
+        self.assertEqual(folder.name, f"Почтовый центр ({project_id})")
+        # The settings screen agrees with the response, and the choice is remembered.
+        settings = client.get("/api/settings").json()
+        self.assertTrue(settings["project_root_used_fallback"])
+        self.assertEqual(settings["project_root_effective"], str(self.visible))
+        self.assertIn(str(self.visible), settings["project_root_notice"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

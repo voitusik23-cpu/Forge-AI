@@ -97,9 +97,6 @@ MAX_ARTIFACT_BYTES = 512 * 1024
 #: The longest change request that is stored and handed to the run path.
 MAX_CHANGE_REQUEST_CHARS = 4000
 
-#: The longest project name derived from a goal.
-MAX_PROJECT_NAME_CHARS = 80
-
 #: Classification outcomes (from ``app.runtime.run_store``) that prove a success.
 _TERMINAL_SUCCESS = "TERMINAL_SUCCESS"
 
@@ -441,6 +438,38 @@ class ProjectService:
         return f"{project.project_path}/{artifact.path}"
 
     # ------------------------------------------------------------- creation
+    def _derived_name(self, idea: object) -> str:
+        """The short project name, numbered only when nothing can be derived from it."""
+
+        from app.projects.folders import (
+            derive_project_name,
+            is_fallback_project_name,
+        )
+
+        name = derive_project_name(idea)
+        if not is_fallback_project_name(name):
+            return name
+        # «Проект <N>»: the ordinal is the count of projects this store already holds, so
+        # two ideas that carry no name of their own do not produce two «Проект 1».
+        try:
+            ordinal = 1 + len(self._store.list_projects())
+        except Exception:  # noqa: BLE001 - a damaged listing must not block creation
+            ordinal = 1
+        return derive_project_name(idea, ordinal=ordinal)
+
+    def project_root_decision(self) -> Optional[Any]:
+        """Where the next project's folder really goes, and why that folder.
+
+        ``None`` when the deployment configured no root (the legacy hidden workspace).
+        The answer is the **writable** root: the configured one when it can hold a
+        project, otherwise the first documented fallback. Only when every candidate
+        fails does the resolution raise
+        :class:`app.projects.root_selection.ProjectRootUnavailable` -- a typed conflict
+        that names every attempted folder and the OS reason for each.
+        """
+
+        return self._store.root_decision()
+
     def create_from_discovery(
         self, session: object, *, plan_ref: str = ""
     ) -> LifecycleProject:
@@ -468,7 +497,11 @@ class ProjectService:
 
         project_id = new_project_id()
         now = utc_now()
-        name = _project_name(goal or specification.get("project_type", ""))
+        # The **name** is short and human; the full idea stays in the specification.
+        # Measured on the owner's machine: naming the folder from the raw description
+        # produced «Создай локальное приложение «Почтовый центр» — только Python (ст»,
+        # truncated mid-word. The derivation rules live in ``app.projects.folders``.
+        name = self._derived_name(goal or specification.get("goal", ""))
         # The workspace is allocated **before** the record that names it is written, and
         # which folder it is depends on the deployment's own project root: a visible
         # folder on the owner's desktop when one is configured, the legacy hidden
@@ -1327,15 +1360,6 @@ def _specification_dict(session: object) -> Dict[str, Any]:
         if isinstance(converted, Mapping):
             return dict(converted)
     return {}
-
-
-def _project_name(text: object) -> str:
-    """A bounded, single-line project name derived from the goal text."""
-
-    collapsed = " ".join(str(text or "").split())
-    if not collapsed:
-        return "Untitled project"
-    return collapsed[:MAX_PROJECT_NAME_CHARS]
 
 
 def _version_task_text(project: LifecycleProject, version: int, change_text: str) -> str:

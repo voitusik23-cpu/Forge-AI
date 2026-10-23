@@ -192,28 +192,55 @@ def register_discovery_routes(
     def confirm_session(session_id: str) -> Any:
         """Confirm the specification, and create its project record exactly here.
 
-        A project record cannot be created, the confirmation still happened (the
-        specification is frozen) but the answer is a **typed refusal** carrying the
-        project layer's own sentence -- for example "папку проекта не удалось создать:
-        <path> (PermissionError)" when the configured project root is not writable. It
-        is a 409, not a 500: the request was well-formed and the server declined for a
-        reason it can name, and the owner has to be able to read that reason.
+        The project's folder is resolved **before** anything is written: the configured
+        root is probed, and an unwritable one falls through to the documented candidate
+        list (``%USERPROFILE%\\Forge Projects``, then ``Documents``, then
+        ``%LOCALAPPDATA%``, then ``.forge/projects-visible`` inside the repository). The
+        owner is told, in the response, which folder was really used and why
+        (``project_root``), and only when **every** candidate fails is a typed 409
+        returned -- carrying the full list of attempted paths and the OS reason for each,
+        never a stack trace.
+
+        A failed confirmation does not consume the session: it was already frozen by
+        ``discovery.confirm`` (which is idempotent), so the owner can retry the same
+        session -- after fixing the permission -- and the retry succeeds.
         """
 
         from app.projects.models import ProjectError
+        from app.projects.root_selection import ProjectRootUnavailable
 
         try:
             session = discovery.confirm(_session_id(session_id))
         except DiscoveryError as exc:
             raise _refusal(exc) from exc
         project = None
+        decision = None
         if projects is not None:
             try:
+                # The writable root is resolved *before* the record, so the folder the
+                # record names is the folder the owner is told about.
+                decision = projects.project_root_decision()
                 # The specification is frozen exactly here, so the durable record is
                 # created exactly here: created in WAITING_FOR_CONFIRMATION and then
                 # confirmed to PLANNED, before any run can be attached to it.
                 project = projects.create_from_discovery(session)
                 project = projects.confirm(project.project_id)
+            except ProjectRootUnavailable as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        **error_body(error_code=exc.code, code=exc.code),
+                        "error": str(exc),
+                        "project_root": {
+                            "preferred": (
+                                str(exc.preferred) if exc.preferred is not None else ""
+                            ),
+                            "attempted": [
+                                attempt.to_dict() for attempt in exc.attempts
+                            ],
+                        },
+                    },
+                ) from exc
             except ProjectError as exc:
                 raise HTTPException(
                     status_code=409,
@@ -222,7 +249,12 @@ def register_discovery_routes(
                         "error": str(exc),
                     },
                 ) from exc
-        return _session_payload(session, project)
+        payload = _session_payload(session, project)
+        if decision is not None and decision.fallback:
+            # Additive: which folder was used instead of the configured one, and why. A
+            # silent fallback would be a lie about where the owner's project lives.
+            payload["project_root"] = decision.to_dict()
+        return payload
 
     @app.post("/api/discovery/sessions/{session_id}/cancel")
     def cancel_session(session_id: str) -> Any:

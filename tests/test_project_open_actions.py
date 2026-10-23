@@ -468,17 +468,24 @@ class MoveToVisibleFolderRouteTests(_Case):
 
 
 class UnusableProjectRootTests(unittest.TestCase):
-    """A project root that cannot be created is a typed refusal, never a 500.
+    """The preferred root is a preference: an unwritable one is a sentence, not a refusal.
 
-    MEASURED on this host while photographing the delivered folder: the configured root
-    was not writable by the API process, and `POST /api/discovery/sessions/{id}/confirm`
-    answered **500 internal_execution_error** -- the owner's own action, reported as a
-    server fault with no sentence. The project layer already refused correctly
-    (`UnsafeProjectFolder` carries "папку проекта не удалось создать: <path> (PermissionError)");
-    what was missing was the HTTP boundary translating it.
+    MEASURED on the owner's own machine, live: `POST /api/discovery/sessions/{id}/confirm`
+    answered **409 unsafe_project_folder** -- *«папку проекта не удалось создать:
+    C:\\Users\\<owner>\\Desktop\\Forge Projects\\… (PermissionError)»* -- and he could not
+    create a project at all, because the Desktop he had configured is protected for the
+    token Forge runs under. One unwritable folder must never cost the owner his project:
+
+    * the configured root is probed first and used when it can really hold a folder;
+    * an unwritable one falls through to the documented candidates, the response says which
+      folder was used and why (``project_root``), and the project is really there;
+    * only when **every** candidate fails is one typed 409 returned, listing every
+      attempted path and the OS reason for each;
+    * a failed confirmation leaves the session usable, so a retry after the permission is
+      fixed succeeds on the same session.
     """
 
-    def test_01_confirm_with_an_uncreatable_root_is_409_with_the_reason(self) -> None:
+    def setUp(self) -> None:
         base = (
             REPOSITORY
             / ".forge"
@@ -488,47 +495,147 @@ class UnusableProjectRootTests(unittest.TestCase):
         shutil.rmtree(base, ignore_errors=True)
         base.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
-        # The root's parent is a FILE, so no folder can ever be created beneath it.
-        blocker = base / "not-a-folder"
-        blocker.write_text("x", encoding="utf-8")
-        records = base / "records"
-        records.mkdir(parents=True, exist_ok=True)
-        store = ProjectStore(root=records, visible_root=blocker / "projects")
-        projects = ProjectService(store)
-        discovery = DiscoveryService(DiscoveryStore(root=base / "discovery"))
-        workspace_root = base / "workspace"
-        workspace_root.mkdir(parents=True, exist_ok=True)
+        self.base = base.resolve()
+        # A path whose parent is a FILE: no folder can ever be created beneath it, on any
+        # host, whatever its ACLs -- the deterministic stand-in for the owner's protected
+        # Desktop.
+        self.blocker = self.base / "not-a-folder"
+        self.blocker.write_text("x", encoding="utf-8")
+        self.good = self.base / "profile" / "Forge Projects"
+        self.records = self.base / "records"
+        self.records.mkdir(parents=True, exist_ok=True)
+        self.discovery_root = self.base / "discovery"
+        self.run_workspace = self.base / "workspace"
+        self.run_workspace.mkdir(parents=True, exist_ok=True)
+        self.discovery = DiscoveryService(DiscoveryStore(root=self.discovery_root))
+        self.candidates: list[pathlib.Path] | None = None
+
+    def _client(self, *, preferred=None, candidates=None) -> tuple[object, ProjectService]:
+        """The real app, with the project root's candidate list under test control."""
+
+        from fastapi.testclient import TestClient
+
+        from app.projects.root_selection import ProjectRootPolicy
+
+        policy = ProjectRootPolicy(
+            self.blocker / "Forge Projects" if preferred is None else preferred,
+            candidates=(
+                (lambda item: list(self.candidates))
+                if candidates is None
+                else candidates
+            ),
+        )
+        projects = ProjectService(ProjectStore(root=self.records, root_policy=policy))
         runtime = offline_runtime()
         service = ForgeApiService(
             runtime=runtime,
-            run_store=RunStore(root=base / "runs"),
-            workspace=Workspace(workspace_root),
+            run_store=RunStore(root=self.base / "runs"),
+            workspace=Workspace(self.run_workspace),
             authorized_project_id=WORKSPACE_PROJECT_ID,
         )
-        from fastapi.testclient import TestClient
-
         app = create_api_app(
             service,
-            discovery_service=discovery,
+            discovery_service=self.discovery,
             project_service=projects,
             project_opener=ProjectOpener(
                 which=_FakeWhich({}), spawn=_RecordingSpawn(), exists=lambda item: False
             ),
         )
-        client = TestClient(app)
+        return TestClient(app), projects
+
+    def _session(self, client) -> str:
         opened = client.post("/api/discovery/sessions", json={"goal": GOAL}).json()
         session_id = str(opened["session"]["session_id"])
         if opened["session"].get("state") != "READY_FOR_PLANNING":
             client.post(
                 f"/api/discovery/sessions/{session_id}/skip", json={"reason": "test"}
             )
+        return session_id
+
+    def test_01_an_unwritable_root_falls_back_and_the_response_says_so(self) -> None:
+        self.candidates = [self.blocker / "Forge Projects", self.good]
+        client, projects = self._client(candidates=lambda preferred: list(self.candidates))
+        session_id = self._session(client)
+        answer = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        body = answer.json()
+        # The owner is told, in plain words, which folder is used and why.
+        block = body["project_root"]
+        self.assertTrue(block["fallback"])
+        self.assertEqual(block["root"], str(self.good))
+        self.assertIn("недоступна для записи", block["notice"])
+        self.assertIn(str(self.good), block["notice"])
+        self.assertIn("проекты сохраняются в", block["notice"])
+        self.assertEqual(
+            [entry["path"] for entry in block["attempted"]],
+            [str(self.blocker / "Forge Projects"), str(self.good)],
+        )
+        self.assertFalse(block["attempted"][0]["writable"])
+        self.assertTrue(block["attempted"][0]["reason"], "the OS reason must be recorded")
+        # …and the project's folder really is there, not in the unusable root.
+        project = projects.open_project(body["project"]["project_id"])
+        folder = projects.store.workspace_path(project.project_id)
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(folder.parent, self.good.resolve())
+        self.assertEqual(project.workspace_dir, str(folder))
+        self.assertTrue(project.project_path.endswith(folder.name))
+
+    def test_02_every_candidate_failing_is_one_typed_409_listing_them(self) -> None:
+        dead = [self.blocker / name for name in ("a", "b", "c")]
+        client, _projects = self._client(candidates=lambda preferred: list(dead))
+        session_id = self._session(client)
         answer = client.post(f"/api/discovery/sessions/{session_id}/confirm")
         self.assertEqual(answer.status_code, 409, answer.text)
         detail = answer.json()["detail"]
-        self.assertEqual(detail["code"], "unsafe_project_folder")
-        self.assertIn("не удалось создать", detail["error"])
-        # Nothing was recorded: the confirmation refused instead of half-creating.
-        self.assertEqual(list(records.glob("proj-*.json")), [])
+        self.assertEqual(detail["code"], "project_root_unavailable")
+        self.assertIn("не удалось найти папку для проектов", detail["error"])
+        listed = detail["project_root"]["attempted"]
+        self.assertEqual([entry["path"] for entry in listed], [str(path) for path in dead])
+        for entry in listed:
+            self.assertFalse(entry["writable"], entry)
+            self.assertTrue(entry["reason"], entry)
+        # Not one word of a stack trace, and nothing was recorded.
+        self.assertNotIn("Traceback", answer.text)
+        self.assertEqual(list(self.records.glob("proj-*.json")), [])
+
+    def test_03_a_failed_confirm_leaves_the_session_usable_and_the_retry_succeeds(self) -> None:
+        self.candidates = [self.blocker / "a", self.blocker / "b"]
+        client, projects = self._client(candidates=lambda preferred: list(self.candidates))
+        session_id = self._session(client)
+        first = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(first.status_code, 409, first.text)
+        # The refusal did not consume the session: it is still the same, usable session.
+        read = client.get(f"/api/discovery/sessions/{session_id}")
+        self.assertEqual(read.status_code, 200, read.text)
+        self.assertEqual(read.json()["session"]["state"], "CONFIRMED")
+        self.assertEqual(read.json()["session"]["session_id"], session_id)
+        # The permission is fixed -- the same session now produces the project.
+        self.candidates = [self.blocker / "a", self.good]
+        second = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(second.status_code, 200, second.text)
+        body = second.json()
+        self.assertEqual(body["session"]["session_id"], session_id)
+        folder = projects.store.workspace_path(body["project"]["project_id"])
+        self.assertEqual(folder.parent, self.good.resolve())
+        self.assertTrue(folder.is_dir())
+
+    def test_04_a_writable_root_is_used_as_is(self) -> None:
+        self.candidates = [self.good, self.base / "never"]
+        client, projects = self._client(
+            preferred=self.good, candidates=lambda item: list(self.candidates)
+        )
+        session_id = self._session(client)
+        answer = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        body = answer.json()
+        self.assertNotIn(
+            "project_root",
+            body,
+            "a fallback that did not happen must not be announced",
+        )
+        folder = projects.store.workspace_path(body["project"]["project_id"])
+        self.assertEqual(folder.parent, self.good.resolve())
+        self.assertFalse((self.base / "never").exists(), "the next candidate was not probed")
 
 
 if __name__ == "__main__":  # pragma: no cover

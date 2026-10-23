@@ -40,11 +40,15 @@ from typing import Iterable, Optional, Tuple
 from app.projects.models import ProjectError
 
 __all__ = [
+    "FALLBACK_PROJECT_NAME",
+    "MAX_DERIVED_NAME_CHARS",
     "MAX_FOLDER_NAME_CHARS",
     "UnsafeProjectFolder",
     "canonical",
     "count_files",
+    "derive_project_name",
     "is_within",
+    "is_fallback_project_name",
     "prove_folder",
     "published_folder_path",
     "safe_project_folder_name",
@@ -56,6 +60,20 @@ __all__ = [
 #: `` (proj-<12 hex>)`` suffix are added.
 MAX_FOLDER_NAME_CHARS = 64
 
+#: How long a *derived* project name may be. Measured on the owner's machine: a folder
+#: called «Создай локальное приложение «Почтовый центр» — только Python (ст» is not a
+#: name, it is the first 60 characters of a paragraph. 40 is a full sentence of Russian
+#: («Сайт для бронирования отелей в Сочи») and still leaves the path far from ``MAX_PATH``.
+MAX_DERIVED_NAME_CHARS = 40
+
+#: How many words of the idea become the name when no quoted phrase names the product.
+MAX_DERIVED_NAME_WORDS = 5
+
+#: What a project is called when the idea is empty, punctuation, or a single symbol.
+#: ``<N>`` is the ordinal the caller supplies -- a folder that exists is numbered by
+#: :func:`visible_folder`, so two nameless projects never share a folder.
+FALLBACK_PROJECT_NAME = "Проект"
+
 #: Windows device names, which cannot be used as a directory name whatever the suffix.
 _RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -65,6 +83,43 @@ _RESERVED_NAMES = frozenset(
 
 #: Everything Windows refuses inside a single path component, plus control characters.
 _UNSAFE_CHARACTERS = re.compile(r'[\x00-\x1f<>:"/\\|?*]+')
+
+#: A quoted phrase, in every quote pair the owner may plausibly type. The product name is
+#: what he put in quotes: «Создай приложение «Почтовый центр»» is a mail client, not a
+#: request to create an application called «Создай приложение «Почтовый центр»».
+_QUOTED_PHRASE = re.compile(
+    r"«([^«»]{2,160})»"
+    r"|„([^„“]{2,160})“"
+    r"|“([^“”]{2,160})”"
+    r'|"([^"]{2,160})"'
+    r"|'([^']{2,160})'"
+)
+
+#: A leading verb that says *what to do*, not *what the thing is*. Only stripped from the
+#: front of the idea, and only from the front: «Приложение для рассылки» keeps its noun.
+#: Articles and possessives ("a", "the", "my") are deliberately **not** here: they are the
+#: start of a noun phrase ("A trashed project …"), and dropping them mangles the name.
+_LEADING_FILLERS = frozenset(
+    """
+    создай создайте сделай сделайте напиши напишите разработай разработайте
+    построй постройте собери соберите реализуй реализуйте
+    нужен нужна нужно нужны хочу хотел хотела хотим надо мне нам пожалуйста
+    create make build write develop generate implement realise realize please
+    i i'd i’d want need like
+    """.split()
+)
+
+#: A word that cannot end a name: it joins the name to something the cap cut off. «Сайт
+#: для бронирования отелей в» is not a name; «Сайт для бронирования отелей» is.
+_TRAILING_FILLERS = frozenset(
+    """
+    в во с со к ко о об от до по из за на при для и или а но
+    the a an of for with and or to in on at by from
+    """.split()
+)
+
+#: At least one letter or digit, in any script: "———" and "..." are not a name.
+_HAS_WORD_CHARACTER = re.compile(r"[^\W_]", re.UNICODE)
 
 
 class UnsafeProjectFolder(ProjectError):
@@ -123,18 +178,156 @@ def safe_project_folder_name(name: object) -> str:
     return text or "Untitled project"
 
 
-def visible_folder(root: Path, project_id: str, name: object) -> Path:
-    """``<root>/<name> (proj-<id>)``, proved to sit inside ``root``.
+def _clean_component(text: object) -> str:
+    """One path component's worth of text: no separators, no control characters."""
+
+    cleaned = _UNSAFE_CHARACTERS.sub(" ", str(text or ""))
+    return " ".join(cleaned.split()).strip()
+
+
+def _quoted_phrase(text: str) -> str:
+    """The first quoted phrase in the idea, or ``""``.
+
+    The owner's own words for the thing are the best name there is, and quotes are how
+    he marks them: «Создай локальное приложение «Почтовый центр» — только Python»
+    contains exactly one product name, and it is not the paragraph around it.
+    """
+
+    match = _QUOTED_PHRASE.search(text)
+    if match is None:
+        return ""
+    for group in match.groups():
+        if group:
+            return " ".join(group.split()).strip(" .")
+    return ""
+
+
+def _strip_leading_intent(text: str) -> str:
+    """Drop leading "what to do" words, keep the noun phrase that follows."""
+
+    words = text.split()
+    while words and words[0].lower().strip(".,:;!?—-–()") in _LEADING_FILLERS:
+        words.pop(0)
+    return " ".join(words)
+
+
+def _cap_at_word_boundary(text: str, limit: int) -> str:
+    """``text`` shortened to at most ``limit`` characters, never mid-word.
+
+    A word that alone exceeds the limit is the one exception: a name may be shortened
+    inside it rather than become empty, because an empty folder name is worse than a
+    clipped one.
+    """
+
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    head = cut.rsplit(" ", 1)[0].rstrip(" .,;:!?—-–(")
+    if not head:
+        head = cut.strip()
+    return head
+
+
+def _trim_trailing_filler(text: str) -> str:
+    """Drop a conjunction or preposition the cap left dangling at the end."""
+
+    words = text.split()
+    while len(words) > 1 and words[-1].lower().strip(".,:;!?") in _TRAILING_FILLERS:
+        words.pop()
+    return " ".join(words)
+
+
+def derive_project_name(
+    idea: object, *, ordinal: int = 1, limit: int = MAX_DERIVED_NAME_CHARS
+) -> str:
+    """A short, human name for a project, derived deterministically from the idea.
+
+    The rules, in order:
+
+    1. **A quoted phrase wins.** If the idea contains «…», „…“, “…”, "…" or '…', the
+       first one is the name -- that is the owner naming his own product.
+    2. Otherwise the **first 3-5 meaningful words** of the idea: leading "create/make I
+       want" words are dropped because they say what to do, not what the thing is.
+    3. Otherwise, and when nothing usable survives (empty idea, punctuation only),
+       `Проект <N>` -- ``ordinal``, so consecutive nameless projects differ.
+
+    Whatever the source, the result is one Windows-safe path component: the characters
+    Windows forbids are replaced by spaces, spaces are collapsed, trailing dots and
+    spaces are stripped, Cyrillic and every other script are preserved verbatim, and the
+    text is capped at ``limit`` characters **at a word boundary** so it never ends with
+    a partial word.
+    """
+
+    text = " ".join(str(idea or "").split())
+    quoted = _quoted_phrase(text)
+    if quoted:
+        text = quoted
+    else:
+        text = " ".join(
+            _strip_leading_intent(text).split()[:MAX_DERIVED_NAME_WORDS]
+        )
+    text = _clean_component(text)
+    text = _cap_at_word_boundary(text, max(1, int(limit)))
+    text = _trim_trailing_filler(text)
+    text = text.strip(" .")
+    if not text or not _HAS_WORD_CHARACTER.search(text):
+        number = int(ordinal) if isinstance(ordinal, int) and ordinal > 0 else 1
+        return f"{FALLBACK_PROJECT_NAME} {number}"
+    return text
+
+
+def is_fallback_project_name(name: object) -> bool:
+    """True when ``name`` is the nameless-project fallback (``Проект <N>``)."""
+
+    text = " ".join(str(name or "").split())
+    if text == FALLBACK_PROJECT_NAME:
+        return True
+    head, _, tail = text.partition(" ")
+    return head == FALLBACK_PROJECT_NAME and tail.isdigit()
+
+
+def _is_empty_directory(path: Path) -> bool:
+    """True when ``path`` is a directory with nothing in it (and readable)."""
+
+    try:
+        if not path.is_dir():
+            return False
+        return next(iter(path.iterdir()), None) is None
+    except OSError:
+        return False
+
+
+def visible_folder(
+    root: Path, project_id: str, name: object, *, allow_existing: bool = False
+) -> Path:
+    """``<root>/<name> (<project_id>)``, proved to sit inside ``root``.
 
     The suffix carries the identifier, so two projects with the same name never share
-    a folder and an existing folder is never reused by a different project.
+    a folder. When that exact folder **already exists** and it is not the folder of the
+    project being created (``allow_existing`` is how a retry says "it is mine"), the
+    name is numbered -- ``(2)``, ``(3)``, ... -- instead of failing or being shared:
+    creating a project must never die because a folder of that name is already there.
+    An *empty* leftover folder is taken over rather than orphaned.
     """
 
     if not str(project_id or "").strip():
         raise UnsafeProjectFolder("у проекта нет идентификатора: папка не может быть создана")
-    folder_name = f"{safe_project_folder_name(name)} ({str(project_id).strip()})"
+    identifier = str(project_id).strip()
+    stem = safe_project_folder_name(name)
     root_path = canonical(root)
-    candidate = root_path / folder_name
+    candidate = root_path / f"{stem} ({identifier})"
+    if not allow_existing and candidate.exists():
+        emptied = _is_empty_directory(candidate)
+        if not emptied:
+            for index in range(2, 1000):
+                numbered = root_path / f"{stem} ({index}) ({identifier})"
+                if not numbered.exists():
+                    candidate = numbered
+                    break
+            else:  # pragma: no cover - a thousand same-named folders is not a case
+                raise UnsafeProjectFolder(
+                    "свободное имя для папки проекта не нашлось"
+                )
     if not is_within(canonical(candidate), root_path):
         raise UnsafeProjectFolder("папка проекта оказалась вне выбранного корня")
     return candidate

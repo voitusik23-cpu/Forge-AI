@@ -59,6 +59,10 @@ from app.projects.folders import (
     published_folder_path,
     visible_folder,
 )
+from app.projects.root_selection import (
+    ProjectRootDecision,
+    ProjectRootPolicy,
+)
 
 __all__ = [
     "DELETED_DIRECTORY_NAME",
@@ -259,51 +263,74 @@ class ProjectStore:
     the root in «Настройки» takes effect for the next project without a restart. It is
     only ever consulted for a project that is being **created**; an existing project is
     resolved from its own record.
+
+    ``visible_root`` is a *preference*, not a promise. A root the process cannot write to
+    (measured: the owner's protected Desktop) must never make a project creation fail, so
+    the store resolves it through :class:`ProjectRootPolicy`: the configured root first,
+    then the documented fallback folders, and only when **none** of them can be written
+    does :class:`ProjectRootUnavailable` travel to the HTTP layer as a typed refusal.
+    ``root_policy`` replaces that default policy when the deployment also wants the chosen
+    fallback **remembered** (in ``.forge/settings.json``) and its previous roots kept
+    reachable.
     """
 
-    def __init__(self, root: Optional[object] = None, *, visible_root: object = None) -> None:
+    def __init__(
+        self,
+        root: Optional[object] = None,
+        *,
+        visible_root: object = None,
+        root_policy: Optional[ProjectRootPolicy] = None,
+    ) -> None:
         self.root = Path(root) if root is not None else default_projects_root()
         self._visible_root = visible_root
+        if root_policy is not None:
+            self._policy: Optional[ProjectRootPolicy] = root_policy
+        elif visible_root is not None:
+            self._policy = ProjectRootPolicy(visible_root)
+        else:
+            self._policy = None
 
     # ------------------------------------------------------- the visible root
     def visible_root(self) -> Optional[Path]:
-        """The configured project root, or ``None`` when none is configured.
+        """The folder the next project is delivered into, or ``None`` when not configured.
 
-        An unusable value is ``None`` rather than an exception: a broken setting must
+        The answer is the **writable** one: a configured root that cannot hold a project
+        is replaced by the first fallback that can, and only a complete refusal raises
+        (:class:`ProjectRootUnavailable`, a typed conflict, never a server fault).
+
+        An unusable *value* is ``None`` rather than an exception: a broken setting must
         not make the project list unreadable, and a project created while it is broken
         simply lands in the legacy workspace (which still works).
         """
 
-        source = self._visible_root
-        if source is None:
+        decision = self.root_decision()
+        return None if decision is None else decision.root
+
+    def root_decision(self) -> Optional[ProjectRootDecision]:
+        """Where the next project goes and why, or ``None`` when no root is configured."""
+
+        if self._policy is None:
             return None
-        if callable(source):
-            try:
-                source = source()
-            except Exception:  # noqa: BLE001 - an unreadable setting is "not configured"
-                return None
-        if source is None:
-            return None
-        try:
-            path = Path(str(source)).expanduser()
-        except (TypeError, ValueError):
-            return None
-        if not path.is_absolute() or any(part == ".." for part in path.parts):
-            return None
-        return path
+        return self._policy.resolve()
 
     def allowed_workspace_roots(self) -> Tuple[Path, ...]:
         """The roots a project folder may live under: the project root, then the store.
 
         Both come from the deployment's configuration. Nothing here is derived from a
         request, and the only record-derived value is *which* of these roots a project's
-        folder is proved against.
+        folder is proved against. Every root this deployment has used is included, so a
+        project delivered to a fallback folder -- or to a folder chosen before the owner
+        changed the setting -- stays reachable instead of becoming unreadable.
         """
 
         roots: List[Path] = []
         visible = self.visible_root()
         if visible is not None:
             roots.append(visible)
+        if self._policy is not None:
+            for known in self._policy.known_roots():
+                if known not in roots:
+                    roots.append(known)
         roots.append(self.root)
         return tuple(roots)
 
@@ -388,7 +415,12 @@ class ProjectStore:
             workspace = self._legacy_workspace_path(identifier)
             workspace.mkdir(parents=True, exist_ok=True)
             return workspace, self.project_path_relative(identifier), ""
-        folder = visible_folder(root, identifier, name)
+        # A project that already has a record owns the folder of its own name: a retry, a
+        # move, or a second delivery reuses it instead of inventing ``… (2)``. A folder
+        # that exists without a record is not this project's, so the name is numbered.
+        folder = visible_folder(
+            root, identifier, name, allow_existing=self.exists(identifier)
+        )
         try:
             folder.mkdir(parents=True, exist_ok=True)
         except OSError as exc:

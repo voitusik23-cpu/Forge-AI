@@ -7720,3 +7720,100 @@ there needs the administrator-only mechanisms listed above.
 целостности, слой токена не отделяет дочерний процесс от данных Forge — это измеряется как `allowed`
 и показывается предупреждением; настоящая граница там требует перечисленных выше механизмов, доступных
 только администратору.
+
+## A derived project name and a writable project root v0.1
+
+**Context.** The owner could not create a project at all. `POST /api/discovery/sessions/{id}/confirm`
+answered `409 unsafe_project_folder` with *«папку проекта не удалось создать:
+…\Desktop\Forge Projects\Создай локальное приложение «Почтовый центр» — только Python (ст
+(proj-…) (PermissionError)»*: the folder was named from the first ~60 characters of his description, and
+the preferred root — his Desktop — was not writable by the process.
+
+**Decisions.**
+
+* **The folder name is derived from the idea by a documented rule, not copied from it.** A quoted phrase
+  wins (the owner naming his own product), then the first 3–5 meaningful words, then `Проект <N>`; the
+  result is one Windows-safe component capped at 40 characters at a word boundary, and a collision is
+  numbered (`(2)`, `(3)`, …) rather than shared or refused. The full idea stays in `specification`.
+  *Why:* a name is a label, and the first 60 characters of a paragraph are not one. *Rejected:* keeping
+  the long name and only shortening the path — the card would still show a sentence where a name belongs.
+* **The project root is a preference, resolved by probing, with a fixed fallback order.** Configured root
+  → `%USERPROFILE%\Forge Projects` → `%USERPROFILE%\Documents\Forge Projects` →
+  `%LOCALAPPDATA%\Forge Projects` → `.forge\projects-visible` inside the repository. *Why:* a project
+  creation must never die because one folder is protected; the last candidate is the folder the product
+  always owns. *Rejected:* refusing with a 409 the owner cannot act on (the measured failure), and
+  silently using the legacy hidden workspace (that is the original complaint about invisible projects).
+* **The chosen fallback is remembered separately from the preference.** `project_root_fallback` in
+  `.forge/settings.json` plus an entry in `project_roots_known`; `project_root` is untouched. *Why:* the
+  fallback is a fact about this machine, not a new choice; overwriting the setting would move his projects
+  for good the first time a permission changed, and dropping the root from the known list would make
+  already-delivered projects unopenable.
+* **Only a total failure is a refusal, and it is typed.** `ProjectRootUnavailable`
+  (`code="project_root_unavailable"`) carries every attempted path and the OS reason; the route answers one
+  409, never a stack trace.
+* **The probe uses one `mkdir`, never `tempfile.mkdtemp`.** On Windows `mkdtemp` retries `PermissionError`
+  10 000 times because it trusts `os.access(dir, W_OK)` (the read-only attribute, not the ACL). Measured
+  here: a protected folder made `mkdtemp` fail to return in 20 s while a single `os.mkdir` refused in the
+  same millisecond. A writability probe that can hang is worse than the refusal it was meant to prevent.
+
+**Evidence.** `app/projects/root_selection.py`, `app/projects/folders.py` (`derive_project_name`,
+`visible_folder`), `app/config/app_settings.py` (`project_root_fallback`, `describe`),
+`app/api/discovery_routes.py` (the additive `project_root` block and the typed 409),
+`tests/test_project_visible_root.py` (44 tests), `tests/test_project_open_actions.py` (27 tests),
+`tests/test_owner_acceptance.py` (the owner's own idea, with and without an unwritable root).
+
+**Consequences and open limits.** Every `workspace_path` resolution now probes the root (four file
+operations); that is the price of an honest answer on a machine whose permissions change. If a candidate's
+writability itself hangs inside the OS, no timeout is applied — the probe is a direct syscall, and the
+measured hang came from the standard library, not from the OS. The fallback does not retry a project
+already delivered to another root: the record's folder is re-proved against all known roots instead.
+
+## Производное имя проекта и корень, в который можно писать v0.1
+
+**Контекст.** Владелец не мог создать проект вообще. `POST /api/discovery/sessions/{id}/confirm` отвечал
+`409 unsafe_project_folder` с текстом «папку проекта не удалось создать:
+…\Desktop\Forge Projects\Создай локальное приложение «Почтовый центр» — только Python (ст (proj-…)
+(PermissionError)»: папка называлась первыми ~60 символами описания, а предпочтительный корень — его
+Рабочий стол — был недоступен процессу для записи.
+
+**Решения.**
+
+* **Имя папки выводится из идеи по задокументированному правилу, а не копируется из неё.** Побеждает
+  фраза в кавычках (владелец сам называет продукт), затем первые 3–5 значимых слов, затем `Проект <N>`;
+  результат — один безопасный для Windows компонент пути длиной до 40 символов по границе слова, а
+  совпадение нумеруется (`(2)`, `(3)`, …), а не делится и не приводит к отказу. Полная идея остаётся в
+  `specification`. *Почему:* имя — это ярлык, а первые 60 символов абзаца им не являются. *Отклонено:*
+  оставить длинное имя и сокращать только путь — карточка всё равно показывала бы предложение там, где
+  должно быть имя.
+* **Корень проектов — предпочтение, разрешаемое пробой, с фиксированным порядком запасных вариантов.**
+  Настроенный корень → `%USERPROFILE%\Forge Projects` → `%USERPROFILE%\Documents\Forge Projects` →
+  `%LOCALAPPDATA%\Forge Projects` → `.forge\projects-visible` внутри репозитория. *Почему:* создание
+  проекта не должно умирать из-за одной защищённой папки; последний кандидат — папка, которая всегда
+  принадлежит продукту. *Отклонено:* отказ 409, с которым владелец ничего не может сделать (измеренный
+  отказ), и молчаливое использование старой скрытой рабочей области (это и есть исходная жалоба на
+  невидимые проекты).
+* **Выбранный запасной корень запоминается отдельно от предпочтения.** `project_root_fallback` в
+  `.forge/settings.json` плюс запись в `project_roots_known`; `project_root` не трогается. *Почему:*
+  запасной вариант — факт об этой машине, а не новый выбор; перезапись настройки увела бы его проекты
+  навсегда при первом изменении прав, а удаление корня из списка известных сделало бы уже выданные
+  проекты неоткрываемыми.
+* **Отказом является только полный отказ, и он типизирован.** `ProjectRootUnavailable`
+  (`code="project_root_unavailable"`) несёт все испробованные пути и причину от ОС; маршрут отвечает
+  одним 409, никогда трассировкой.
+* **Проба делает один `mkdir`, а не `tempfile.mkdtemp`.** На Windows `mkdtemp` повторяет
+  `PermissionError` 10 000 раз, потому что доверяет `os.access(dir, W_OK)` (атрибут «только чтение», а не
+  ACL). Измерено здесь: на защищённой папке `mkdtemp` не вернулся за 20 с, тогда как одиночный
+  `os.mkdir` отказал за ту же миллисекунду. Проба доступности, которая может зависнуть, хуже отказа,
+  который она должна была предотвратить.
+
+**Доказательство.** `app/projects/root_selection.py`, `app/projects/folders.py` (`derive_project_name`,
+`visible_folder`), `app/config/app_settings.py` (`project_root_fallback`, `describe`),
+`app/api/discovery_routes.py` (аддитивный блок `project_root` и типизированный 409),
+`tests/test_project_visible_root.py` (44 теста), `tests/test_project_open_actions.py` (27 тестов),
+`tests/test_owner_acceptance.py` (собственная идея владельца — с недоступным корнем и без него).
+
+**Следствия и открытые ограничения.** Каждое разрешение `workspace_path` теперь пробует корень (четыре
+файловые операции); это цена честного ответа на машине, где права меняются. Если доступность кандидата
+зависает внутри ОС, таймаут не применяется — проба это прямой системный вызов, а измеренное зависание
+шло из стандартной библиотеки, а не из ОС. Запасной вариант не переносит проект, уже выданный в другой
+корень: папка из записи заново доказывается против всех известных корней.

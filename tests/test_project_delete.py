@@ -816,11 +816,15 @@ class TrashListingTests(_DeleteTestCase):
         self.assertEqual(newest["deleted_at"], "2026-01-09T12:00:00")
         self.assertEqual(newest["status"], "ARCHIVED")
         self.assertEqual(newest["file_count"], 0)
-        self.assertEqual(newest["name"], "A trashed project that was archived")
+        # The name is the **record's** own name. A project's name is now derived from the
+        # idea by `derive_project_name` (short, at a word boundary, an article kept), so
+        # the listing is asserted against the record rather than against the goal text.
+        self.assertEqual(newest["name"], archived.name)
         self.assertEqual(oldest["deleted_at"], "2026-01-08T12:00:00")
         self.assertEqual(oldest["status"], "COMPLETED")
         self.assertEqual(oldest["file_count"], 1)
-        self.assertEqual(oldest["name"], "A trashed project that held a file")
+        self.assertEqual(oldest["name"], with_files.name)
+        self.assertTrue(newest["name"].startswith("A trashed project"), newest["name"])
         for row in rows:
             self.assertTrue(row["record_present"])
             self.assertTrue(row["folder_present"])

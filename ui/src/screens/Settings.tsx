@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead } from "../components/Primitives";
 import { VersionLine } from "../components/VersionLine";
 import {
@@ -52,6 +52,7 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [failure, setFailure] = useState<Failure | null>(null);
+  const input = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async () => {
     const outcome = await loadSettings();
@@ -88,9 +89,29 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
     );
   };
 
+  /**
+   * «Сменить папку»: the action a fallback must offer.
+   *
+   * When the configured folder cannot be written to, the projects really live somewhere can
+   * else -- and that is a fact the owner has to be able to act on, not just read. The button
+   * puts the cursor in the field and selects the current path, so the next keystroke replaces
+   * it; the save button beside it is the existing, validated route.
+   */
+  const changeFolder = () => {
+    const field = input.current;
+    if (field) {
+      field.focus();
+      field.select();
+    }
+    setNotice(t(lang, "projects.settings.change.hint"));
+  };
+
   const current = String(settings?.project_root ?? "");
-  const fallback = String(settings?.default_project_root ?? "");
+  const fallbackRoot = String(settings?.default_project_root ?? "");
   const exists = settings?.project_root_exists === true;
+  const effective = String(settings?.project_root_effective ?? "");
+  const usedFallback = settings?.project_root_used_fallback === true;
+  const rootNotice = String(settings?.project_root_notice ?? "");
 
   return (
     <Card className="rise d2">
@@ -106,9 +127,10 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
             className="input"
             type="text"
             value={value}
+            ref={input}
             spellCheck={false}
             onChange={(event) => setValue(event.target.value)}
-            placeholder={fallback}
+            placeholder={fallbackRoot}
             data-testid="settings-project-root"
           />
         </label>
@@ -122,6 +144,11 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
               {busy === "save" ? t(lang, "state.loading") : t(lang, "projects.settings.save")}
             </Button>
           </span>
+          <span data-testid="settings-project-root-change">
+            <Button size="small" tone="ghost" onClick={changeFolder}>
+              {t(lang, "projects.settings.change")}
+            </Button>
+          </span>
           <span data-testid="settings-project-root-desktop">
             <Button
               size="small"
@@ -133,14 +160,33 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
             </Button>
           </span>
         </div>
+        {usedFallback ? (
+          <div className="notice warn" data-testid="settings-project-root-fallback">
+            <div>
+              {t(lang, "projects.settings.fallback")
+                .replace("{preferred}", current)
+                .replace("{root}", effective)}
+            </div>
+            {rootNotice !== "" ? (
+              <div className="small mono" style={{ marginTop: 6, overflowWrap: "anywhere" }}>
+                {rootNotice}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {effective !== "" ? (
+          <div className="small mono" data-testid="settings-project-root-effective" style={{ overflowWrap: "anywhere" }}>
+            {t(lang, "projects.settings.effective").replace("{path}", effective)}
+          </div>
+        ) : null}
         {current !== "" ? (
           <div className="small mono" style={{ overflowWrap: "anywhere" }}>
             {current} {exists ? "" : `· ${t(lang, "projects.save.unknown")}`}
           </div>
         ) : null}
-        {fallback !== "" ? (
+        {fallbackRoot !== "" ? (
           <div className="small muted">
-            {t(lang, "projects.settings.default").replace("{path}", fallback)}
+            {t(lang, "projects.settings.default").replace("{path}", fallbackRoot)}
           </div>
         ) : null}
         {notice !== "" ? (

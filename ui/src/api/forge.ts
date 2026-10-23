@@ -731,6 +731,30 @@ export type DiscoverySessionPayload = {
   chosen?: DiscoveryValueOrigin[];
   /** What the Core auto-selected so far, field by field. */
   auto_selected?: DiscoveryValueOrigin[];
+  /** The project the confirmation produced: its short name and its folder. */
+  project?: LifecycleSummary;
+  /**
+   * Present only when the configured project folder could not be used and another one
+   * was. It names the folder that really holds the project, the configured one, the
+   * plain-language reason, and every path that was probed.
+   */
+  project_root?: ProjectRootChoice;
+};
+
+/** One probed candidate folder: whether it can hold a project, and the OS reason. */
+export type ProjectRootAttempt = {
+  path?: string;
+  writable?: boolean;
+  reason?: string;
+};
+
+/** Where the project's files really went, and why it is not the configured folder. */
+export type ProjectRootChoice = {
+  root?: string;
+  preferred?: string;
+  fallback?: boolean;
+  notice?: string;
+  attempted?: ProjectRootAttempt[];
 };
 
 /** `GET .../specification` answers the derived spec plus the text a task would carry. */
@@ -896,7 +920,8 @@ export type LifecycleVersion = {
   files?: LifecycleArtifact[];
 };
 
-/** `Project.summary()`: the one-line projection of the lifecycle list. */export type LifecycleSummary = {
+/** `Project.summary()`: the one-line projection of the lifecycle list. */
+export type LifecycleSummary = {
   project_id?: string;
   name?: string;
   status?: string;
@@ -930,8 +955,7 @@ export type LifecycleProject = {
   previous_status?: string | null;
 };
 
-/** `GET /api/projects/{id}`: the record, every version (newest first) and the current artifacts. */
-export type LifecycleDetail = {
+/** `GET /api/projects/{id}`: the record, every version (newest first) and the current artifacts. */export type LifecycleDetail = {
   project?: LifecycleProject;
   versions?: LifecycleVersion[];
   files?: LifecycleArtifact[];
@@ -1378,6 +1402,14 @@ export type ForgeSettings = {
   project_root?: string;
   default_project_root?: string;
   project_root_exists?: boolean;
+  /** The folder projects are *really* delivered into (the fallback when it had to be). */
+  project_root_effective?: string;
+  /** The remembered fallback, empty when the configured root works. */
+  project_root_fallback?: string;
+  project_root_used_fallback?: boolean;
+  /** A plain-language sentence: which folder is used, and why not the configured one. */
+  project_root_notice?: string;
+  project_root_attempted?: ProjectRootAttempt[];
   project_roots_known?: string[];
   settings_path?: string;
   schema?: string;

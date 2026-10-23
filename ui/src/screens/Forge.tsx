@@ -231,6 +231,36 @@ const failureHint = (lang: Lang, failure: Failure): string => {
   return "";
 };
 
+/**
+ * What the confirmation produced, in the owner's words.
+ *
+ * Three facts, never one: the specification is confirmed; the project has a short name and a
+ * real folder; and, when the configured desktop folder could not be written to, which folder
+ * was used instead and why. The last one is the sentence that turns a silent move into an
+ * explained one -- the failure this replaces was a 409 with no way forward.
+ */
+const confirmationNotice = (lang: Lang, payload: DiscoverySessionPayload): string => {
+  const parts: string[] = [t(lang, "forge.discovery.spec.confirmed")];
+  const name = String(payload.project?.name ?? "").trim();
+  const folder = String(payload.project?.project_path ?? "").trim();
+  if (name !== "") {
+    parts.push(
+      t(lang, "forge.project.created")
+        .replace("{name}", name)
+        .replace("{folder}", folder !== "" ? folder : "—")
+    );
+  }
+  const root = payload.project_root;
+  if (root?.fallback) {
+    parts.push(
+      t(lang, "forge.project.root.fallback")
+        .replace("{preferred}", String(root.preferred ?? "—"))
+        .replace("{root}", String(root.root ?? "—"))
+    );
+  }
+  return parts.join(" · ");
+};
+
 /** One honest message per failure kind: 401/403, no answer at all, or an answered error. */
 const FailureNotice = ({
   lang,
@@ -859,7 +889,7 @@ export const Forge = ({
       return;
     }
     adoptSession(outcome.value);
-    setDiscoveryNotice(t(lang, "forge.discovery.spec.confirmed"));
+    setDiscoveryNotice(confirmationNotice(lang, outcome.value));
     setPhase("run");
   };
 

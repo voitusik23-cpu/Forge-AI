@@ -5591,9 +5591,10 @@ nothing says «Изменения не записаны: новой версии
 appears once, in the collapsed «Технические детали» block; above the fold the card keeps the relative
 path.
 
-**Evidence.** `tests/test_project_visible_root.py` (28 tests: the setting, allocation, publishing,
-escapes/junctions, migration with SHA-256 identity, reversible deletion),
-`tests/test_project_open_actions.py` (23 tests: the three argv vectors, refusals, the route, the migration
+**Evidence.** `tests/test_project_visible_root.py` (44 tests: the setting, allocation, publishing,
+escapes/junctions, migration with SHA-256 identity, reversible deletion, and -- added with the fix below --
+the name rules and the writable-root fallback),
+`tests/test_project_open_actions.py` (27 tests: the three argv vectors, refusals, the route, the migration
 route), `tests/test_owner_acceptance.py` (one offline end-to-end journey: idea → questions → confirm →
 run → files in the visible root → open folder → correction → v2 with v1 byte-identical → preview 200 →
 delete → restore in the same visible folder), and the extended `tests/test_flow_invariants.py` (every new
@@ -5604,6 +5605,58 @@ opener's spawn is recorded.
 **Limits.** A folder the owner deletes by hand is refused with "папка проекта не найдена" and not
 recreated; `.forge/backups/run-<id>/` inside a project folder is the existing writer backup, not a project
 file; there is no OS sandbox, so a program started from Forge still runs with the owner's token.
+
+## Delivered projects: a short name and a root that is really writable v0.1
+
+**Measured failure, live.** `POST /api/discovery/sessions/disc-…/confirm` answered
+`409 unsafe_project_folder` with *«папку проекта не удалось создать:
+C:\Users\<owner>\Desktop\Forge Projects\Создай локальное приложение «Почтовый центр» — только Python
+(ст (proj-270fc266d515) (PermissionError)»*. Two defects in one answer: the folder was named from the raw
+description, truncated mid-word, and an unwritable preferred root turned the owner's own action into a
+refusal he could not get past.
+
+**The name is derived, never copied.** `app/projects/folders.py::derive_project_name` decides it
+deterministically: a **quoted phrase** wins («Почтовый центр»), otherwise the **first 3–5 meaningful
+words** (leading "create/make/I want" words dropped, a dangling conjunction trimmed), otherwise
+`Проект <N>` with `N` the store's project count. The result is one Windows-safe component — forbidden
+characters replaced, spaces collapsed, trailing dots/spaces stripped, Cyrillic preserved — capped at
+**40 characters at a word boundary**, and `visible_folder` numbers a colliding name (`(2)`, `(3)`, …)
+instead of sharing or failing; an empty leftover folder is taken over. The record keeps the whole idea in
+`specification`; `name` is the short one the card shows. A retry of the same project still reuses its own
+folder (`allow_existing`).
+
+**The root is probed, not trusted.** `app/projects/root_selection.py` owns the order: the configured root →
+`%USERPROFILE%\Forge Projects` → `%USERPROFILE%\Documents\Forge Projects` → `%LOCALAPPDATA%\Forge Projects`
+→ `<repository>\.forge\projects-visible`. Each candidate is probed by creating a temporary directory,
+writing a temporary file and deleting both (`probe_writable`); the first writable one wins and the decision
+is a value object (`ProjectRootDecision`: root, preferred, attempts with the OS reason, `fallback`,
+`notice`). `ProjectStore` resolves through `ProjectRootPolicy`, so **every** composition — the launcher,
+a test, a laboratory script — falls back instead of dying; `ProjectRootUnavailable` (a `ProjectError`,
+`code="project_root_unavailable"`) is raised only when every candidate fails, and the confirm route answers
+it as one typed `409` listing every attempted path and its OS reason, never a stack trace. The chosen
+fallback is remembered as `project_root_fallback` in `.forge/settings.json` (the owner's `project_root` is
+**not** overwritten) and added to `project_roots_known`, so a project delivered there stays openable after
+the preference changes; `GET /api/settings` reports `project_root_effective`, `project_root_used_fallback`,
+`project_root_notice` and `project_root_attempted`, and the confirm response carries an additive
+`project_root` block when a fallback happened. The resolved root flows unchanged into `project_path`, the
+open-folder/editor/terminal actions, deletion and restore. «Настройки» shows the folder really used and
+offers «Сменить папку».
+
+**A failed confirm leaves the session usable.** `discovery.confirm` is idempotent and the record is created
+only after the workspace exists, so a refused confirm changes nothing and the same session can be confirmed
+again once the permission is fixed (`tests/test_project_open_actions.py` proves both halves).
+
+**Measured hazard.** `tempfile.mkdtemp(dir=<protected folder>)` retries `PermissionError` ten thousand
+times on Windows, because it consults `os.access(dir, W_OK)`, which reads the read-only attribute rather
+than the ACL. On this host that turned "is this folder writable?" into a request that never answered
+(measured: `mkdtemp` did not return in 20 s; a single `os.mkdir` refuses in the same millisecond). The probe
+therefore builds its own name and calls `mkdir` once.
+
+**Evidence.** `tests/test_project_visible_root.py` (44 tests: the name rules, uniqueness, the candidate
+order, fall through, total refusal, remembered root, the settings report), `tests/test_project_open_actions.py`
+(27 tests: the fallback answer, the typed 409 with the list, the retry on the same session, a writable root
+used as-is), `tests/test_owner_acceptance.py` (the owner's own idea end to end, with and without an
+unwritable root).
 
 ## Готовые проекты: видимая папка и настоящий вход в неё v0.1
 
@@ -5670,9 +5723,10 @@ callable над этой настройкой, поэтому её измене�
 Абсолютная папка появляется один раз — в свёрнутом блоке «Технические детали»; на виду карточка
 сохраняет относительный путь.
 
-**Доказательства.** `tests/test_project_visible_root.py` (28 тестов: настройка, размещение, публикация,
-выходы за границу/junction, миграция с проверкой SHA-256, обратимое удаление),
-`tests/test_project_open_actions.py` (23 теста: три вектора аргументов, отказы, маршрут, маршрут
+**Доказательства.** `tests/test_project_visible_root.py` (44 теста: настройка, размещение, публикация,
+выходы за границу/junction, миграция с проверкой SHA-256, обратимое удаление, а также — добавленные
+описанным ниже исправлением — правила имени и запасной корень),
+`tests/test_project_open_actions.py` (27 тестов: три вектора аргументов, отказы, маршрут, маршрут
 миграции), `tests/test_owner_acceptance.py` (один офлайн-сквозной проход: идея → вопросы →
 подтверждение → запуск → файлы в видимом корне → открытие папки → правка → v2 при байт-идентичной v1 →
 предпросмотр 200 → удаление → восстановление в той же видимой папке) и расширенный
@@ -5684,3 +5738,59 @@ callable над этой настройкой, поэтому её измене�
 пересоздаёт; `.forge/backups/run-<id>/` внутри папки проекта — существующая резервная копия писателя, а
 не файл проекта; песочницы ОС нет, поэтому запущенная из Forge программа по-прежнему работает с токеном
 владельца.
+
+## Готовые проекты: короткое имя и корень, в который действительно можно писать v0.1
+
+**Измеренный отказ, вживую.** `POST /api/discovery/sessions/disc-…/confirm` ответил
+`409 unsafe_project_folder` с текстом «папку проекта не удалось создать:
+C:\Users\<owner>\Desktop\Forge Projects\Создай локальное приложение «Почтовый центр» — только Python
+(ст (proj-270fc266d515) (PermissionError)». Два дефекта в одном ответе: папка называлась по исходному
+описанию, обрезанному посреди слова, а недоступный для записи предпочтительный корень превращал
+собственное действие владельца в отказ, из которого не было выхода.
+
+**Имя выводится, а не копируется.** `app/projects/folders.py::derive_project_name` определяет его
+детерминированно: побеждает **фраза в кавычках** («Почтовый центр»), иначе — **первые 3–5 значимых слов**
+(ведущие «создай/сделай/хочу» отбрасываются, повисший союз/предлог в конце обрезается), иначе
+`Проект <N>`, где `N` — число проектов в хранилище. Результат — один безопасный для Windows компонент
+пути: запрещённые символы заменены, пробелы схлопнуты, конечные точки и пробелы срезаны, кириллица
+сохранена, длина — не больше **40 символов по границе слова**; `visible_folder` при совпадении
+нумерует имя (`(2)`, `(3)`, …) вместо того, чтобы делить папку или падать, а пустая оставшаяся папка
+переиспользуется. Полная идея остаётся в `specification` записи; `name` — короткое имя, которое
+показывает карточка. Повторная попытка того же проекта по-прежнему получает свою собственную папку
+(`allow_existing`).
+
+**Корень проверяется, а не предполагается.** `app/projects/root_selection.py` задаёт порядок:
+настроенный корень → `%USERPROFILE%\Forge Projects` → `%USERPROFILE%\Documents\Forge Projects` →
+`%LOCALAPPDATA%\Forge Projects` → `<репозиторий>\.forge\projects-visible`. Каждый кандидат проверяется
+пробой: создаётся временная папка, в неё пишется временный файл, оба удаляются (`probe_writable`);
+побеждает первый доступный для записи, а решение — объект-значение (`ProjectRootDecision`: корень,
+предпочтение, попытки с причиной от ОС, `fallback`, `notice`). `ProjectStore` разрешает корень через
+`ProjectRootPolicy`, поэтому **любая** композиция — лаунчер, тест, лабораторный скрипт — уходит в
+запасной вариант вместо отказа; `ProjectRootUnavailable` (это `ProjectError`, `code="project_root_unavailable"`)
+возникает только когда недоступны все кандидаты, и маршрут подтверждения отвечает на него одним
+типизированным `409` со списком всех испробованных путей и причиной ОС для каждого — без трассировки.
+Выбранный запасной корень запоминается как `project_root_fallback` в `.forge/settings.json` (значение
+`project_root` владельца **не** перезаписывается) и добавляется в `project_roots_known`, поэтому
+проект, положенный туда, остаётся открываемым и после смены предпочтения; `GET /api/settings` сообщает
+`project_root_effective`, `project_root_used_fallback`, `project_root_notice` и `project_root_attempted`,
+а ответ подтверждения несёт аддитивный блок `project_root`, когда запасной вариант действительно
+использован. Разрешённый корень без изменений попадает в `project_path`, действия «Открыть папку»,
+«Открыть в VS Code», «Открыть терминал», удаление и восстановление. «Настройки» показывают реально
+используемую папку и предлагают «Сменить папку».
+
+**Неудавшееся подтверждение оставляет сессию пригодной.** `discovery.confirm` идемпотентен, а запись
+создаётся только после того, как папка проекта существует, поэтому отказ ничего не меняет и ту же
+сессию можно подтвердить снова, когда доступ исправлен (обе половины доказаны в
+`tests/test_project_open_actions.py`).
+
+**Измеренная опасность.** `tempfile.mkdtemp(dir=<защищённая папка>)` на Windows повторяет
+`PermissionError` десять тысяч раз, потому что опирается на `os.access(dir, W_OK)`, а он читает атрибут
+«только чтение», а не ACL. На этом хосте проверка «можно ли писать в эту папку?» превращалась в запрос,
+который не отвечал вовсе (измерено: `mkdtemp` не вернулся за 20 с; одиночный `os.mkdir` отказывает за
+ту же миллисекунду). Поэтому проба строит имя сама и вызывает `mkdir` один раз.
+
+**Доказательства.** `tests/test_project_visible_root.py` (44 теста: правила имени, уникальность, порядок
+кандидатов, переход к следующему, полный отказ, запомненный корень, отчёт в настройках),
+`tests/test_project_open_actions.py` (27 тестов: ответ с запасным вариантом, типизированный 409 со
+списком, повтор на той же сессии, записываемый корень используется как есть),
+`tests/test_owner_acceptance.py` (идея владельца сквозным проходом — с недоступным корнем и без него).

@@ -27,6 +27,14 @@ Two values live in it:
     not make the projects already delivered to the previous root unreadable. A
     project folder is therefore only ever accepted under a root the **owner**
     configured -- never under a path a request or a record supplied.
+
+``project_root_fallback``
+    the folder projects were actually delivered into because the configured root could
+    not be written to (measured: a protected Desktop, `PermissionError`). It is
+    remembered so the same fallback is reused instead of being re-chosen on every call,
+    and it is added to ``project_roots_known``. It is *not* the owner's choice: his
+    ``project_root`` is untouched, so «Сменить папку» (or fixing the permission) brings
+    the projects back to the folder he asked for.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     "DEFAULT_PROJECT_ROOT_NAME",
+    "PROJECT_ROOT_FALLBACK_KEY",
     "PROJECT_ROOT_KEY",
     "PROJECT_ROOTS_KNOWN_KEY",
     "SETTINGS_ENV_VAR",
@@ -58,6 +67,10 @@ SETTINGS_SCHEMA_VERSION = "forge.settings.v1"
 
 PROJECT_ROOT_KEY = "project_root"
 PROJECT_ROOTS_KNOWN_KEY = "project_roots_known"
+
+#: The root actually used when the configured one was not writable. Separate from
+#: ``project_root`` on purpose: the owner's choice is not overwritten by a fallback.
+PROJECT_ROOT_FALLBACK_KEY = "project_root_fallback"
 
 #: The folder created on the owner's desktop by default.
 DEFAULT_PROJECT_ROOT_NAME = "Forge Projects"
@@ -202,6 +215,7 @@ class AppSettingsStore:
             return {}
         root = data.get(PROJECT_ROOT_KEY)
         known = data.get(PROJECT_ROOTS_KNOWN_KEY)
+        fallback = data.get(PROJECT_ROOT_FALLBACK_KEY)
         return {
             "schema": str(data.get("schema", "") or ""),
             PROJECT_ROOT_KEY: root if isinstance(root, str) else "",
@@ -210,14 +224,17 @@ class AppSettingsStore:
             ]
             if isinstance(known, list)
             else [],
+            PROJECT_ROOT_FALLBACK_KEY: fallback if isinstance(fallback, str) else "",
             "updated_at": str(data.get("updated_at", "") or ""),
         }
 
-    def _write(self, root: Path, known: Iterable[object]) -> Path:
-        """Atomically persist ``root`` and the known roots, newest first."""
+    def _write(
+        self, root: Path, known: Iterable[object], *, fallback: str = ""
+    ) -> Path:
+        """Atomically persist ``root``, the fallback root and the known roots."""
 
         entries: List[str] = []
-        for item in (str(root), *[str(value) for value in known]):
+        for item in (str(root), str(fallback or ""), *[str(value) for value in known]):
             if item and item not in entries:
                 entries.append(item)
         payload = {
@@ -226,6 +243,8 @@ class AppSettingsStore:
             PROJECT_ROOTS_KNOWN_KEY: entries[:MAX_KNOWN_ROOTS],
             "updated_at": _now_iso(),
         }
+        if str(fallback or ""):
+            payload[PROJECT_ROOT_FALLBACK_KEY] = str(fallback)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         with temporary.open("w", encoding="utf-8") as handle:
@@ -256,18 +275,54 @@ class AppSettingsStore:
         return default_project_root()
 
     def known_project_roots(self) -> Tuple[Path, ...]:
-        """Every root this deployment has used, the current one first."""
+        """Every root this deployment has used, the current one first.
+
+        The remembered fallback comes second: a project delivered to it must keep
+        resolving after the preferred root becomes writable again.
+        """
 
         current = self.project_root()
         found: List[Path] = [current]
+        fallback = self.remembered_root()
+        if fallback is not None and fallback not in found:
+            found.append(fallback)
         for item in self.read().get(PROJECT_ROOTS_KNOWN_KEY) or ():
             path = _as_path(item)
             if path is not None and path not in found:
                 found.append(path)
         return tuple(found)
 
+    def remembered_root(self) -> Optional[Path]:
+        """The fallback root this deployment used last time, or ``None``."""
+
+        return _as_path(self.read().get(PROJECT_ROOT_FALLBACK_KEY))
+
+    def remember_fallback_root(self, value: object) -> Path:
+        """Remember the root projects were delivered into because the other one failed.
+
+        ``project_root`` -- the owner's own choice -- is deliberately **not** replaced:
+        a fallback is a fact about this machine, not a new preference, and overwriting
+        the setting would silently move his projects for good the first time a
+        permission changed.
+        """
+
+        root = normalise_project_root(str(value))
+        if self.project_root() == root:
+            return root
+        document = self.read()
+        if str(root) == str(document.get(PROJECT_ROOT_FALLBACK_KEY) or ""):
+            return root
+        known = [item for item in self.known_project_roots() if item != root]
+        self._write(self.project_root(), known, fallback=str(root))
+        return root
+
     def set_project_root(self, value: object) -> Path:
-        """Store ``value`` as the project root and remember the previous ones."""
+        """Store ``value`` as the project root and remember the previous ones.
+
+        Choosing a root is a new decision, so a remembered fallback from the old
+        configuration is dropped: it was an answer to a question the owner just asked
+        differently.
+        """
 
         root = normalise_project_root(value)
         known = [item for item in self.known_project_roots() if item != root]
@@ -292,23 +347,75 @@ class AppSettingsStore:
             ) from exc
         return root
 
-    def describe(self) -> Dict[str, object]:
+    def describe(self, *, candidates: Optional[Iterable[object]] = None) -> Dict[str, object]:
         """What «Настройки» shows about the root: the value, the default, and the truth.
 
         This is the one place an absolute path of the host is published on purpose: the
         owner has to be able to see and paste the folder he chose. It is *his* setting,
         not a project's internal path, and no request value reaches it.
+
+        It also answers the question he actually asks after a refusal -- *where did my
+        projects go?* -- by probing the configured root and reporting the folder that
+        will really be used: ``project_root_effective``, ``project_root_used_fallback``,
+        and a plain-language ``project_root_notice``. A complete refusal is reported as
+        fields, not as an exception: a settings screen that 500s tells him nothing.
         """
 
         root = self.project_root()
+        fallback = self.remembered_root()
+        effective: Optional[Path] = None
+        notice = ""
+        used_fallback = False
+        attempted: List[Dict[str, object]] = []
+        try:
+            decision = self.resolve_project_root(candidates=candidates)
+        except Exception as exc:  # noqa: BLE001 - a refusal is a fact to report, not a crash
+            attempted = [
+                attempt.to_dict()
+                for attempt in getattr(exc, "attempts", ()) or ()
+            ]
+            notice = str(exc)
+        else:
+            if decision is not None:
+                effective = decision.root
+                used_fallback = bool(decision.fallback)
+                notice = decision.notice
+                attempted = [attempt.to_dict() for attempt in decision.attempts]
         return {
             "project_root": str(root),
             "default_project_root": str(default_project_root()),
             "project_root_exists": bool(root.is_dir()),
+            "project_root_effective": str(effective) if effective is not None else "",
+            "project_root_fallback": str(fallback) if fallback is not None else "",
+            "project_root_used_fallback": used_fallback,
+            "project_root_notice": notice,
+            "project_root_attempted": attempted,
             "project_roots_known": [str(item) for item in self.known_project_roots()],
             "settings_path": str(self._path),
             "schema": SETTINGS_SCHEMA_VERSION,
         }
+
+    def resolve_project_root(
+        self, *, candidates: Optional[Iterable[object]] = None
+    ) -> Optional[object]:
+        """The writable root the next project goes into, and the reason it is that one.
+
+        Returns an :class:`app.projects.root_selection.ProjectRootDecision`, or ``None``
+        when no root is configured. The chosen fallback is remembered here, once, so the
+        next call reuses it instead of re-deciding where the owner's projects live.
+        """
+
+        from app.projects.root_selection import resolve_writable_root
+
+        preferred = self.project_root()
+        decision = resolve_writable_root(
+            preferred,
+            remembered=self.remembered_root(),
+            candidates=candidates,
+        )
+        if decision.fallback:
+            self.remember_fallback_root(decision.root)
+        return decision
 
 
 def _now_iso() -> str:

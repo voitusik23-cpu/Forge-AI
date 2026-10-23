@@ -100,16 +100,29 @@ def compose_project_service(settings: Any) -> Any:
     is supplied as a callable, so editing it takes effect for the next project without a
     restart.
 
+    The preference is resolved, not trusted. On the owner's machine the desktop folder
+    cannot be written to by this process (`PermissionError` on a low-integrity token), and
+    that must cost him a sentence, not a project: the policy probes the configured root,
+    falls through the documented candidates, **remembers** the one it used in
+    ``.forge/settings.json`` (``project_root_fallback``), and keeps every root this
+    deployment has used in the boundary check so already-delivered projects stay openable.
+
     The record directory (``.forge/projects``) is untouched: versions, the artifact
     manifest and run links stay there. ``create_api_app`` composes no such service by
     itself -- a test or a laboratory script that builds its own app keeps the legacy
     hidden workspace and never writes into the owner's desktop.
     """
 
+    from app.projects.root_selection import ProjectRootPolicy
     from app.projects.service import ProjectService
     from app.projects.store import ProjectStore
 
-    return ProjectService(ProjectStore(visible_root=lambda: settings.project_root()))
+    policy = ProjectRootPolicy(
+        lambda: settings.project_root(),
+        remember=settings.remember_fallback_root,
+        known=settings.known_project_roots,
+    )
+    return ProjectService(ProjectStore(root_policy=policy))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

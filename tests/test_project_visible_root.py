@@ -17,7 +17,12 @@ property, offline and with throwaway stores:
 5. the boundary is re-proved for the new root: ``..``, an absolute path outside it, a
    junction that leaves it, ``.git`` and ``.env`` are refused;
 6. deletion still moves the folder into the store's trash and restore brings it back to
-   the visible root, unchanged.
+   the visible root, unchanged;
+7. the folder is **named** from the idea by a documented rule (quoted phrase, else the
+   first meaningful words, else ``Проект <N>``), never by its first 60 characters;
+8. an unwritable configured root is a **preference that failed**, not a refusal: the
+   documented fallback list is probed, the first writable folder is used, remembered and
+   reported, and only a total failure is a typed refusal.
 
 No model, no network, no browser: every object here is the production one, and the
 only thing a test replaces is a path.
@@ -36,19 +41,31 @@ import unittest.mock
 
 from app.config.app_settings import (
     DEFAULT_PROJECT_ROOT_NAME,
+    PROJECT_ROOT_FALLBACK_KEY,
+    PROJECT_ROOT_KEY,
     AppSettingsError,
     AppSettingsStore,
     default_project_root,
     default_settings_path,
 )
 from app.projects.folders import (
+    FALLBACK_PROJECT_NAME,
+    MAX_DERIVED_NAME_CHARS,
     UnsafeProjectFolder,
+    derive_project_name,
     prove_folder,
     published_folder_path,
     safe_project_folder_name,
     visible_folder,
 )
 from app.projects.models import is_safe_relative_path
+from app.projects.root_selection import (
+    ProjectRootPolicy,
+    ProjectRootUnavailable,
+    candidate_roots,
+    probe_writable,
+    resolve_writable_root,
+)
 from app.projects.service import ProjectService
 from app.projects.store import (
     DELETED_DIRECTORY_NAME,
@@ -518,6 +535,315 @@ class DeletionTests(_Base):
         resolved = elsewhere.store.workspace_path(project.project_id)
         self.assertIn(self.root.resolve(), resolved.parents)
         self.assertTrue((resolved / "app.py").is_file())
+
+
+# --------------------------------------------------------------------------- #
+# 6. the project's NAME: short, human, derived, never the first 60 characters
+# --------------------------------------------------------------------------- #
+
+#: The owner's own idea, copied from the live failure. The folder was named
+#: «Создай локальное приложение «Почтовый центр» — только Python (ст».
+OWNER_IDEA = (
+    "Создай локальное приложение «Почтовый центр» — только Python (стек: FastAPI), "
+    "чтобы я мог читать и отправлять почту с рабочего стола"
+)
+
+
+class ProjectNameTests(_Base):
+    """The name rule: quoted phrase, else the first meaningful words, else «Проект <N>»."""
+
+    def test_01_a_quoted_phrase_is_the_name(self) -> None:
+        self.assertEqual(derive_project_name(OWNER_IDEA), "Почтовый центр")
+        self.assertEqual(
+            derive_project_name('Сделай приложение "Почтовый центр" для Windows'),
+            "Почтовый центр",
+        )
+        self.assertEqual(
+            derive_project_name("Сделай приложение „Почтовый центр“ для Windows"),
+            "Почтовый центр",
+        )
+        self.assertEqual(
+            derive_project_name("Build me a “Mail Hub” desktop tool"), "Mail Hub"
+        )
+
+    def test_02_the_owners_folder_name_is_short_and_valid(self) -> None:
+        name = derive_project_name(OWNER_IDEA)
+        self.assertLessEqual(len(name), MAX_DERIVED_NAME_CHARS)
+        self.assertEqual(name, "Почтовый центр")
+        # And the folder really is short, with the id suffix as its only extra part.
+        service = self._service()
+        project = service.create_from_discovery(_Session(OWNER_IDEA))
+        folder = service.store.workspace_path(project.project_id)
+        self.assertEqual(folder.name, f"Почтовый центр ({project.project_id})")
+        self.assertNotIn("Создай", folder.name)
+        self.assertNotIn("(ст", folder.name)
+
+    def test_03_a_long_idea_is_capped_at_a_word_boundary(self) -> None:
+        idea = (
+            "Создай приложение для учёта домашних расходов с отчётами по категориям "
+            "и экспортом в таблицу, а также напоминаниями о платежах"
+        )
+        name = derive_project_name(idea)
+        self.assertLessEqual(len(name), MAX_DERIVED_NAME_CHARS, name)
+        self.assertTrue(name, "the name must never be empty")
+        # Never a partial word: the name is a *contiguous* run of whole words from the
+        # idea (the leading «Создай» is dropped by rule 2, so it need not start at 0).
+        idea_words = idea.split()
+        name_words = name.split()
+        start = next(
+            index
+            for index in range(len(idea_words))
+            if idea_words[index] == name_words[0]
+        )
+        self.assertEqual(
+            name_words, idea_words[start : start + len(name_words)], name
+        )
+        self.assertFalse(name.endswith(" "), "trailing spaces are stripped")
+
+    def test_04_characters_windows_refuses_are_removed(self) -> None:
+        name = derive_project_name('Отчёт: продажи/план*2026? "да" <нет> |\\')
+        for forbidden in '<>:"/\\|?*':
+            self.assertNotIn(forbidden, name, name)
+        self.assertTrue(name.strip(), "a name made only of punctuation is not usable")
+        self.assertNotIn("  ", name, "spaces are collapsed")
+
+    def test_05_an_empty_or_meaningless_idea_falls_back_and_is_numbered(self) -> None:
+        for idea in ("", "   ", "!!!", "———", "...", None, "\t\n"):
+            name = derive_project_name(idea)
+            self.assertEqual(name, f"{FALLBACK_PROJECT_NAME} 1", repr(idea))
+        self.assertEqual(
+            derive_project_name("", ordinal=4), f"{FALLBACK_PROJECT_NAME} 4"
+        )
+        # The fallback is still a usable folder name, and it is unique per project.
+        service = self._service()
+        one = service.create_from_discovery(_Session(""))
+        two = service.create_from_discovery(_Session(""))
+        first = service.store.workspace_path(one.project_id)
+        second = service.store.workspace_path(two.project_id)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.name.startswith(FALLBACK_PROJECT_NAME), first.name)
+        self.assertTrue(second.name.startswith(FALLBACK_PROJECT_NAME), second.name)
+
+    def test_06_cyrillic_and_other_scripts_are_preserved(self) -> None:
+        self.assertEqual(
+            derive_project_name("Создай справочник сотрудников"), "справочник сотрудников"
+        )
+        self.assertEqual(derive_project_name("Приложение «Ёжик»"), "Ёжик")
+        self.assertEqual(derive_project_name("Создай 工具 для дома"), "工具 для дома")
+        for name in ("Ёжик", "инструмент", "工具"):
+            self.assertTrue(any(character.isalpha() for character in name))
+
+    def test_07_a_colliding_folder_is_numbered_never_shared(self) -> None:
+        root = self.base / "collisions"
+        root.mkdir(parents=True, exist_ok=True)
+        first = visible_folder(root, "proj-aaaaaaaaaaaa", "Почтовый центр")
+        first.mkdir()
+        (first / "app.py").write_bytes(b"print(1)\n")
+        # The same folder name for a *different* project id, with the folder of that name
+        # already taken by another project's files: numbered, never reused or overwritten.
+        taken = root / "Почтовый центр (proj-bbbbbbbbbbbb)"
+        taken.mkdir()
+        (taken / "keep.py").write_bytes(b"do not touch\n")
+        second = visible_folder(root, "proj-bbbbbbbbbbbb", "Почтовый центр")
+        self.assertEqual(second.name, "Почтовый центр (2) (proj-bbbbbbbbbbbb)")
+        self.assertEqual((taken / "keep.py").read_bytes(), b"do not touch\n")
+        # A retry of the *same* project takes its own folder back instead of numbering it.
+        again = visible_folder(root, "proj-aaaaaaaaaaaa", "Почтовый центр", allow_existing=True)
+        self.assertEqual(again, first)
+        # An empty leftover folder is taken over, not orphaned.
+        empty = root / "Ещё один (proj-cccccccccccc)"
+        empty.mkdir()
+        self.assertEqual(
+            visible_folder(root, "proj-cccccccccccc", "Ещё один"), empty
+        )
+
+    def test_08_the_record_keeps_the_whole_idea(self) -> None:
+        service = self._service()
+        project = service.create_from_discovery(_Session(OWNER_IDEA))
+        self.assertEqual(project.specification["goal"], OWNER_IDEA)
+        self.assertEqual(project.name, "Почтовый центр")
+        self.assertLess(len(project.name), len(OWNER_IDEA))
+
+
+# --------------------------------------------------------------------------- #
+# 7. an unwritable preferred root is a fallback, never a refusal
+# --------------------------------------------------------------------------- #
+
+
+class WritableRootTests(_Base):
+    """Probe the configured root; use the first writable candidate; remember it."""
+
+    def _blocker(self) -> pathlib.Path:
+        """A path whose parent is a FILE: no folder can be created beneath it."""
+
+        blocker = self.base / "not-a-folder"
+        blocker.write_text("x", encoding="utf-8")
+        return blocker / "Forge Projects"
+
+    def test_01_the_candidate_order_is_the_documented_one(self) -> None:
+        preferred = self.base / "configured"
+        ordered = candidate_roots(
+            preferred,
+            home=self.base / "home",
+            local_appdata=self.base / "localappdata",
+            repository=self.base / "repo",
+        )
+        self.assertEqual(
+            ordered,
+            (
+                preferred,
+                self.base / "home" / "Forge Projects",
+                self.base / "home" / "Documents" / "Forge Projects",
+                self.base / "localappdata" / "Forge Projects",
+                self.base / "repo" / ".forge" / "projects-visible",
+            ),
+        )
+        # A remembered fallback is tried right after the preference, so a working fallback
+        # does not jump to a different folder on the next call.
+        with_remembered = candidate_roots(
+            preferred,
+            remembered=self.base / "remembered",
+            home=self.base / "home",
+            local_appdata=self.base / "localappdata",
+            repository=self.base / "repo",
+        )
+        self.assertEqual(with_remembered[1], self.base / "remembered")
+
+    def test_02_an_unwritable_first_candidate_falls_through_and_is_reported(self) -> None:
+        blocked = self._blocker()
+        good = self.base / "profile" / "Forge Projects"
+        decision = resolve_writable_root(blocked, candidates=[blocked, good])
+        self.assertEqual(decision.root, good)
+        self.assertTrue(decision.fallback)
+        self.assertEqual(
+            [attempt.path for attempt in decision.attempts], [blocked, good]
+        )
+        self.assertTrue(decision.attempts[0].reason, "the OS reason must be recorded")
+        self.assertTrue(good.is_dir(), "the chosen folder really exists")
+        self.assertIn(str(good), decision.notice)
+        self.assertIn("недоступна для записи", decision.notice)
+        self.assertIn("проекты сохраняются", decision.notice)
+        # The refusal sentence names the OS's own error, never a traceback.
+        self.assertNotIn("Traceback", decision.attempts[0].reason)
+
+    def test_03_every_candidate_failing_is_one_typed_refusal_with_the_list(self) -> None:
+        blocked = self.base / "not-a-folder"
+        blocked.write_text("x", encoding="utf-8")
+        dead = [blocked / name for name in ("one", "two", "three")]
+        with self.assertRaises(ProjectRootUnavailable) as caught:
+            resolve_writable_root(dead[0], candidates=dead)
+        exc = caught.exception
+        self.assertEqual(exc.code, "project_root_unavailable")
+        self.assertEqual([attempt.path for attempt in exc.attempts], dead)
+        for attempt in exc.attempts:
+            self.assertFalse(attempt.writable)
+            self.assertTrue(attempt.reason)
+        # The message is a sentence listing every attempted folder, not a stack trace.
+        for path in dead:
+            self.assertIn(str(path), str(exc))
+        self.assertNotIn("Traceback", str(exc))
+
+    def test_04_a_writable_root_is_used_as_is(self) -> None:
+        decision = resolve_writable_root(
+            self.visible, candidates=[self.visible, self.base / "never"]
+        )
+        self.assertEqual(decision.root, self.visible)
+        self.assertFalse(decision.fallback)
+        self.assertEqual(decision.notice, "")
+        self.assertFalse((self.base / "never").exists(), "the next candidate was not probed")
+        # Nothing is left behind by the probe itself.
+        self.assertEqual(
+            [item.name for item in self.visible.iterdir() if ".forge-probe-" in item.name],
+            [],
+        )
+
+    def test_05_a_project_created_through_the_policy_lands_in_the_fallback(self) -> None:
+        blocked = self._blocker()
+        good = self.base / "profile" / "Forge Projects"
+        policy = ProjectRootPolicy(blocked, candidates=lambda item: [blocked, good])
+        store = ProjectStore(root=self.root, root_policy=policy)
+        service = ProjectService(store)
+        project = service.create_from_discovery(_Session(OWNER_IDEA))
+        folder = store.workspace_path(project.project_id)
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(folder.parent, good.resolve())
+        # The resolved root flows into the record and the published path, unchanged.
+        self.assertEqual(project.workspace_dir, str(folder))
+        self.assertEqual(
+            project.project_path, published_folder_path(good, folder)
+        )
+        self.assertTrue(project.project_path.startswith(f"{DEFAULT_PROJECT_ROOT_NAME}/"))
+        # …and every later action resolves the same folder (open, delete, restore).
+        self.assertEqual(store.workspace_path(project.project_id), folder)
+        store.write_workspace_file(project.project_id, "app.py", b"print(1)\n")
+        deleted = service.delete(project.project_id)
+        self.assertFalse(folder.exists())
+        service.restore_deleted(project.project_id)
+        self.assertEqual(store.workspace_path(project.project_id), folder)
+        self.assertTrue((folder / "app.py").is_file())
+        self.assertTrue(deleted["trash_name"])
+
+    def test_06_the_chosen_root_is_remembered_in_the_settings_file(self) -> None:
+        blocked = self._blocker()
+        good = self.base / "profile" / "Forge Projects"
+        path = self.base / "settings.json"
+        settings = AppSettingsStore(path=path)
+        settings.set_project_root(str(blocked))
+        decision = settings.resolve_project_root(candidates=[blocked, good])
+        self.assertEqual(decision.root, good)
+        self.assertTrue(decision.fallback)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        # The owner's own choice is NOT overwritten by the fallback…
+        self.assertEqual(document[PROJECT_ROOT_KEY], str(blocked))
+        # …but the folder that was really used is remembered, in the application's file.
+        self.assertEqual(document[PROJECT_ROOT_FALLBACK_KEY], str(good))
+        lowered = json.dumps(document, ensure_ascii=False).lower()
+        for forbidden in ("api_key", "token", "password", "secret", "bearer"):
+            self.assertNotIn(forbidden, lowered)
+        # A restart reads it back, and the next call reuses it (it is the second
+        # candidate, right after the preference) instead of inventing another one.
+        again = AppSettingsStore(path=path)
+        self.assertEqual(again.remembered_root(), good)
+        self.assertIn(
+            good.resolve(strict=False),
+            [item.resolve(strict=False) for item in again.known_project_roots()],
+        )
+        second = again.resolve_project_root()
+        self.assertEqual(second.root, good)
+
+    def test_07_the_default_candidate_list_ends_inside_the_repository(self) -> None:
+        # The last resort is a folder this deployment always owns: if it is not writable,
+        # nothing is, and the typed refusal says so.
+        repository = REPOSITORY.resolve()
+        self.assertEqual(
+            candidate_roots(self.base / "x")[-1], repository / ".forge" / "projects-visible"
+        )
+        self.assertTrue(probe_writable(self.base / "fresh").writable)
+
+    def test_08_the_settings_screen_reports_the_folder_that_is_really_used(self) -> None:
+        blocked = self._blocker()
+        good = self.base / "profile" / "Forge Projects"
+        settings = AppSettingsStore(path=self.base / "settings.json")
+        settings.set_project_root(str(blocked))
+        settings.resolve_project_root(candidates=[blocked, good])
+        described = settings.describe()
+        self.assertEqual(described["project_root"], str(blocked))
+        self.assertEqual(described["project_root_effective"], str(good))
+        self.assertTrue(described["project_root_used_fallback"])
+        self.assertIn(str(good), str(described["project_root_notice"]))
+        self.assertEqual(
+            [entry["path"] for entry in described["project_root_attempted"]],
+            [str(blocked), str(good)],
+        )
+        # A root that is writable reports itself, with no fallback announced.
+        clean = AppSettingsStore(path=self.base / "clean.json")
+        clean.set_project_root(str(self.base / "writable"))
+        plain = clean.describe()
+        self.assertFalse(plain["project_root_used_fallback"])
+        self.assertEqual(plain["project_root_notice"], "")
+        self.assertEqual(
+            plain["project_root_effective"], str(self.base / "writable")
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
