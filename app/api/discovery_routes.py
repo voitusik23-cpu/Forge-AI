@@ -190,17 +190,38 @@ def register_discovery_routes(
 
     @app.post("/api/discovery/sessions/{session_id}/confirm")
     def confirm_session(session_id: str) -> Any:
+        """Confirm the specification, and create its project record exactly here.
+
+        A project record cannot be created, the confirmation still happened (the
+        specification is frozen) but the answer is a **typed refusal** carrying the
+        project layer's own sentence -- for example "папку проекта не удалось создать:
+        <path> (PermissionError)" when the configured project root is not writable. It
+        is a 409, not a 500: the request was well-formed and the server declined for a
+        reason it can name, and the owner has to be able to read that reason.
+        """
+
+        from app.projects.models import ProjectError
+
         try:
             session = discovery.confirm(_session_id(session_id))
         except DiscoveryError as exc:
             raise _refusal(exc) from exc
         project = None
         if projects is not None:
-            # The specification is frozen exactly here, so the durable record is
-            # created exactly here: created in WAITING_FOR_CONFIRMATION and then
-            # confirmed to PLANNED, before any run can be attached to it.
-            project = projects.create_from_discovery(session)
-            project = projects.confirm(project.project_id)
+            try:
+                # The specification is frozen exactly here, so the durable record is
+                # created exactly here: created in WAITING_FOR_CONFIRMATION and then
+                # confirmed to PLANNED, before any run can be attached to it.
+                project = projects.create_from_discovery(session)
+                project = projects.confirm(project.project_id)
+            except ProjectError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        **error_body(error_code=exc.code, code=exc.code),
+                        "error": str(exc),
+                    },
+                ) from exc
         return _session_payload(session, project)
 
     @app.post("/api/discovery/sessions/{session_id}/cancel")

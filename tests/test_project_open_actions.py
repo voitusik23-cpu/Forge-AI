@@ -467,5 +467,69 @@ class MoveToVisibleFolderRouteTests(_Case):
         self.assertEqual(answer.status_code, 404, answer.text)
 
 
+class UnusableProjectRootTests(unittest.TestCase):
+    """A project root that cannot be created is a typed refusal, never a 500.
+
+    MEASURED on this host while photographing the delivered folder: the configured root
+    was not writable by the API process, and `POST /api/discovery/sessions/{id}/confirm`
+    answered **500 internal_execution_error** -- the owner's own action, reported as a
+    server fault with no sentence. The project layer already refused correctly
+    (`UnsafeProjectFolder` carries "папку проекта не удалось создать: <path> (PermissionError)");
+    what was missing was the HTTP boundary translating it.
+    """
+
+    def test_01_confirm_with_an_uncreatable_root_is_409_with_the_reason(self) -> None:
+        base = (
+            REPOSITORY
+            / ".forge"
+            / "test-open-actions-root"
+            / f"{os.getpid()}-{id(self)}"
+        )
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        # The root's parent is a FILE, so no folder can ever be created beneath it.
+        blocker = base / "not-a-folder"
+        blocker.write_text("x", encoding="utf-8")
+        records = base / "records"
+        records.mkdir(parents=True, exist_ok=True)
+        store = ProjectStore(root=records, visible_root=blocker / "projects")
+        projects = ProjectService(store)
+        discovery = DiscoveryService(DiscoveryStore(root=base / "discovery"))
+        workspace_root = base / "workspace"
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        runtime = offline_runtime()
+        service = ForgeApiService(
+            runtime=runtime,
+            run_store=RunStore(root=base / "runs"),
+            workspace=Workspace(workspace_root),
+            authorized_project_id=WORKSPACE_PROJECT_ID,
+        )
+        from fastapi.testclient import TestClient
+
+        app = create_api_app(
+            service,
+            discovery_service=discovery,
+            project_service=projects,
+            project_opener=ProjectOpener(
+                which=_FakeWhich({}), spawn=_RecordingSpawn(), exists=lambda item: False
+            ),
+        )
+        client = TestClient(app)
+        opened = client.post("/api/discovery/sessions", json={"goal": GOAL}).json()
+        session_id = str(opened["session"]["session_id"])
+        if opened["session"].get("state") != "READY_FOR_PLANNING":
+            client.post(
+                f"/api/discovery/sessions/{session_id}/skip", json={"reason": "test"}
+            )
+        answer = client.post(f"/api/discovery/sessions/{session_id}/confirm")
+        self.assertEqual(answer.status_code, 409, answer.text)
+        detail = answer.json()["detail"]
+        self.assertEqual(detail["code"], "unsafe_project_folder")
+        self.assertIn("не удалось создать", detail["error"])
+        # Nothing was recorded: the confirmation refused instead of half-creating.
+        self.assertEqual(list(records.glob("proj-*.json")), [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
