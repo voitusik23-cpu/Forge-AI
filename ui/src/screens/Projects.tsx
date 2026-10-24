@@ -21,11 +21,18 @@
 //   clickable and the backend's 409 is printed with its code and message: an archived project
 //   must be able to demonstrate that it is frozen.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
 import { IconRefresh } from "../components/Icons";
 import { t, type Lang } from "../i18n";
 import { PROJECT_LIST_PAGE_SIZE, projectListRows } from "../project-list.js";
+import {
+  createProjectRouter,
+  projectHash,
+  projectView,
+  type ProjectRouter,
+  type ProjectView,
+} from "../project-navigation.js";
 import type { BackendState } from "../api/client";
 import {
   OFFLINE_PROVIDER,
@@ -147,36 +154,16 @@ const changeWord = (lang: Lang, change: unknown): string => {
   return text(word);
 };
 
-/**
- * Bring the project card to the top of the shell's scrolling region.
- *
- * The shell has exactly one scrolling element (`.content`, see base.css) and the card
- * renders below the list, so without this a click on «Открыть» changed a row's highlight
- * and nothing else -- the measured "does nothing". The offset is computed explicitly
- * rather than with `scrollIntoView`, whose ancestor resolution inside a grid/flex child of
- * an `overflow: auto` container is exactly the kind of thing that silently scrolls a little
- * and leaves the card off screen.
- *
- * The last attempt is recorded on `window.__forgeScroll` so a CDP check can read what the
- * code actually did instead of inferring it from a picture.
- */
-const revealProjectCard = (): void => {
-  const card = document.getElementById("project-card");
-  if (card === null) return;
-  const content = card.closest(".content") as HTMLElement | null;
-  if (content === null) return;
-  const target =
-    card.getBoundingClientRect().top -
-    content.getBoundingClientRect().top +
-    content.scrollTop -
-    8;
-  content.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
-  (window as unknown as Record<string, unknown>).__forgeScroll = {
-    target: Math.round(target),
-    scrollTopBefore: Math.round(content.scrollTop),
-    cardHeight: Math.round(card.getBoundingClientRect().height),
-  };
-};
+// «Открыть» is a **navigation**, not a selection.
+//
+// The measured complaint (twice): the owner pressed «Открыть» on the «Почтовый центр»
+// row and nothing happened. The card used to render *below* the list and the click only
+// selected an id and scrolled towards it, which on a list that fills the window is
+// indistinguishable from an inert button. The project screen therefore has its own
+// address -- `#/projects/<id>`, resolved by `ui/src/project-navigation.js` -- and it
+// **replaces** the list: the browser's Back returns to the list, a reload with the same
+// hash lands on the same project, and the screen changes within the same frame as the
+// click. Nothing below scrolls the owner anywhere: the detail view starts at the top.
 
 
 /** The four facts of a refused call, printed as they arrived. A 409 is never softened. */
@@ -1710,10 +1697,35 @@ export const Projects = ({
 }) => {
   const live = backend.status === "live";
 
+  // ------------------------------------------------------------------ the address
+  // The screen the owner sees is the address the page carries. One router per mounted
+  // screen; it reads `location.hash`, pushes a history entry per navigation and tells
+  // this component what the address now names. `selectedId` below is derived from it,
+  // so a project card can never be shown at an address that names the list (or the
+  // other way round).
+  const routerRef = useRef<ProjectRouter | null>(null);
+  const [view, setView] = useState<ProjectView>(() => projectView(window.location.hash));
+
+  useEffect(() => {
+    const router = createProjectRouter(window);
+    routerRef.current = router;
+    const unsubscribe = router.subscribe((next) => setView(next));
+    // The address may have changed between the first render and this effect.
+    setView(router.current());
+    return () => {
+      unsubscribe();
+      router.dispose();
+      if (routerRef.current === router) routerRef.current = null;
+    };
+  }, []);
+
   // ------------------------------------------------------------------ the list
   const [list, setList] = useState<Load<LifecycleSummary[]>>({ status: "loading" });
   const [filter, setFilter] = useState<"active" | "archive">("active");
-  const [selectedId, setSelectedId] = useState("");
+  // The project the screen draws is exactly the project its address names. «Назад к
+  // проектам», the browser's Back and a reload all change the address, and with it this
+  // one value: leaving the project screen cannot leave a stale card behind.
+  const selectedId = view.view === "detail" ? view.projectId : "";
 
   const loadList = useCallback(async () => {
     setList({ status: "loading" });
@@ -1745,23 +1757,20 @@ export const Projects = ({
   const visible = slice.rows;
 
   /**
-   * Open one project: select it, then bring its card into view once the card exists.
+   * Open one project: navigate to its own screen, `#/projects/<id>`.
    *
-   * The card renders below the list, so selecting alone looked like nothing happened on a
-   * screen with more rows than fit: the measured complaint. The scroll is therefore tied to
-   * the card's *content* arriving (`detail`), not to the click: at click time the card is
-   * still the «выберите проект» placeholder, and scrolling to that would stop short.
+   * This is the fix for the dead click, and it is deliberately not a "select and
+   * scroll": the address changes, the list is replaced by the project screen, and Back
+   * returns to the list because the navigation pushed a history entry.
    */
-  const scrollToCard = useRef(false);
   const openProject = useCallback((projectId: string) => {
     if (projectId === "") return;
-    scrollToCard.current = true;
-    setSelectedId(projectId);
+    routerRef.current?.open(projectId);
   }, []);
 
   // A click on another screen's «Открыть файлы»/«Запустить локально» arrives here as
-  // `focusProjectId`. It selects that project and scrolls to its card once the list is
-  // readable; the detail route is fetched by the existing effect on `selectedId`.
+  // `focusProjectId`. It navigates to that project's screen; the detail route is then
+  // fetched by the existing effect on `selectedId`.
   useEffect(() => {
     if (focusProjectId === "") return;
     openProject(focusProjectId);
@@ -1776,13 +1785,13 @@ export const Projects = ({
     setFilter(found.archived === true ? "archive" : "active");
   }, [focusProjectId, focusNonce, list, summaries]);
 
-  // Keep the selection valid across a refresh: a project that vanished must not leave a card
-  // describing a record nobody can fetch any more.
+  // Keep the address honest across a refresh: a project that vanished must not leave a
+  // screen describing a record nobody can fetch any more. The list is the answer.
   useEffect(() => {
     if (selectedId === "") return;
     if (list.status !== "ready") return;
     if (summaries.some((project) => project.project_id === selectedId)) return;
-    setSelectedId("");
+    routerRef.current?.showList();
   }, [list, summaries, selectedId]);
 
   // ---------------------------------------------------------------- the detail
@@ -1797,6 +1806,34 @@ export const Projects = ({
   const [diskNotice, setDiskNotice] = useState("");
   const [diskFailure, setDiskFailure] = useState<Failure | null>(null);
   const [movingToVisible, setMovingToVisible] = useState(false);
+  // The row's own entrance. «Открыть папку» on a row acts without leaving the list, so
+  // its answer is printed under exactly the row that was clicked: the program and its
+  // pid when Explorer started, the backend's refusal sentence when it did not.
+  const [rowOpening, setRowOpening] = useState("");
+  const [rowNotice, setRowNotice] = useState<{ projectId: string; text: string } | null>(null);
+  const [rowFailure, setRowFailure] = useState<{ projectId: string; failure: Failure } | null>(null);
+
+  const openRowFolder = async (projectId: string) => {
+    if (projectId === "") return;
+    setRowOpening(projectId);
+    setRowNotice(null);
+    setRowFailure(null);
+    const outcome = await openProjectTarget(projectId, "folder");
+    setRowOpening("");
+    if (!outcome.ok) {
+      setRowFailure({ projectId, failure: outcome.failure });
+      return;
+    }
+    const value = outcome.value;
+    const pid = typeof value.pid === "number" ? value.pid : 0;
+    setRowNotice({
+      projectId,
+      text: t(lang, "projects.row.open_notice")
+        .replace("{program}", text(value.program))
+        .replace("{pid}", String(pid))
+        .replace("{folder}", text(value.folder)),
+    });
+  };
 
   const loadDetail = useCallback(async (projectId: string): Promise<LifecycleDetail | null> => {
     if (projectId === "") {
@@ -1806,16 +1843,9 @@ export const Projects = ({
     setDetail({ status: "loading" });
     const outcome = await loadProjectDetail(projectId);
     setDetail(outcome.ok ? { status: "ready", value: outcome.value } : { status: "failed", failure: outcome.failure });
-    if (!scrollToCard.current) return outcome.ok ? outcome.value : null;
-    scrollToCard.current = false;
-    // Two frames: one for React to commit the card, one for the browser to lay it out.
-    // Smooth scrolling is then a real animation from the list the user was looking at.
-    window.requestAnimationFrame(() =>
-      window.requestAnimationFrame(() => revealProjectCard())
-    );
-    // The loaded record is returned as well: a caller that has just changed the
-    // project (a dispatched change run) reads the new `current_version` from it
-    // instead of guessing it from the run's own response.
+    // The loaded record is returned: a caller that has just changed the project (a
+    // dispatched change run) reads the new `current_version` from it instead of guessing
+    // it from the run's own response.
     return outcome.ok ? outcome.value : null;
   }, []);
 
@@ -1914,11 +1944,14 @@ export const Projects = ({
       return;
     }
     const program = String(outcome.value.program ?? "");
+    const pid = typeof outcome.value.pid === "number" ? outcome.value.pid : 0;
     const folder = String(outcome.value.diagnostics?.folder ?? outcome.value.folder ?? "");
     const label = text(
       (openBlock.targets ?? {})[target]?.label ?? target
     );
-    setDiskNotice(`${label}: ${program} — ${folder}`);
+    // The backend's own answer, printed as it arrived: which program started, with which
+    // pid, at which folder. A pid of 0 means the OS did not report one, and is not dressed up.
+    setDiskNotice(`${label}: ${program}${pid > 0 ? ` (PID ${pid})` : ""} — ${folder}`);
   };
 
   const moveToVisible = async () => {
@@ -2084,7 +2117,9 @@ export const Projects = ({
         .replace("{id}", identifier)
         .replace("{path}", moved)
     );
-    setSelectedId("");
+    // The record is gone, so its address is gone too: the list is where the owner ends up,
+    // and the result above the trash says what happened to the project he was looking at.
+    routerRef.current?.showList();
     setDetail(null);
     await loadList();
     await loadTrash();
@@ -2142,9 +2177,9 @@ export const Projects = ({
     setTrashNotice(t(lang, "projects.trash.restored").replace("{id}", identifier));
     await loadList();
     await loadTrash();
-    // The card the click restored is selected, so its files and versions are one
-    // click away and the row is visibly back in the list.
-    setSelectedId(identifier);
+    // The restored record is opened on its own screen: its files, versions and actions
+    // are one frame away, and the address says which project is on screen.
+    openProject(identifier);
     onRefresh();
   };
 
@@ -2198,9 +2233,9 @@ export const Projects = ({
           t(lang, "projects.delete.bulk.skipped").replace("{n}", String(skipped))
       );
     }
-    // A selection that was just removed must not leave a card describing a gone record.
+    // A project that was just removed must not leave a screen describing a gone record.
     if (selectedId !== "" && removedIds.includes(selectedId)) {
-      setSelectedId("");
+      routerRef.current?.showList();
       setDetail(null);
     }
     await loadList();
@@ -2365,32 +2400,70 @@ export const Projects = ({
 
   return (
     <div className="content">
-      <div className="row between" style={{ marginBottom: 18 }}>
-        <div>
-          <h1 style={{ margin: 0, fontSize: "var(--t-title)" }}>{t(lang, "nav.projects")}</h1>
-          <div className="small muted" style={{ marginTop: 4 }}>
-            {t(lang, "projects.subtitle")}
+      {/* The project screen is its own screen: it replaces the list and starts at the
+          top, so the card (title, status word, files, folder, actions) is fully visible
+          without scrolling. «← Назад к проектам» and the browser's Back both return. */}
+      {view.view === "detail" ? (
+        <div className="row between" style={{ marginBottom: 18, alignItems: "flex-start" }} data-testid="project-detail-head">
+          <div style={{ minWidth: 0 }}>
+            <span data-testid="project-detail-back">
+              <Button size="small" tone="ghost" onClick={() => routerRef.current?.showList()}>
+                {t(lang, "projects.detail.back")}
+              </Button>
+            </span>
+            <h1 style={{ margin: "10px 0 0", fontSize: "var(--t-title)" }} data-testid="project-detail-title">
+              {text(project?.name, t(lang, "projects.card.title"))}
+            </h1>
+            <div className="small muted" style={{ marginTop: 4, wordBreak: "break-all" }}>
+              {t(lang, "projects.detail.hint").replace("{hash}", projectHash(selectedId))}
+            </div>
+          </div>
+          <div className="row">
+            <Button size="small" tone="ghost" onClick={onHelp}>
+              {t(lang, "help.how")}
+            </Button>
+            <Button
+              onClick={() => {
+                void loadList();
+                onRefresh();
+                if (selectedId !== "") void loadDetail(selectedId);
+              }}
+            >
+              <IconRefresh size={15} /> {t(lang, "action.refresh")}
+            </Button>
           </div>
         </div>
-        <div className="row">
-          <Button size="small" tone="ghost" onClick={onHelp}>
-            {t(lang, "help.how")}
-          </Button>
-          <Button
-            onClick={() => {
-              void loadList();
-              onRefresh();
-              if (selectedId !== "") void loadDetail(selectedId);
-            }}
-          >
-            <IconRefresh size={15} /> {t(lang, "action.refresh")}
-          </Button>
+      ) : (
+        <div className="row between" style={{ marginBottom: 18 }}>
+          <div>
+            <h1 style={{ margin: 0, fontSize: "var(--t-title)" }}>{t(lang, "nav.projects")}</h1>
+            <div className="small muted" style={{ marginTop: 4 }}>
+              {t(lang, "projects.subtitle")}
+            </div>
+          </div>
+          <div className="row">
+            <Button size="small" tone="ghost" onClick={onHelp}>
+              {t(lang, "help.how")}
+            </Button>
+            <Button
+              onClick={() => {
+                void loadList();
+                onRefresh();
+                if (selectedId !== "") void loadDetail(selectedId);
+              }}
+            >
+              <IconRefresh size={15} /> {t(lang, "action.refresh")}
+            </Button>
+          </div>
         </div>
-      </div>
+      )}
 
       {!live ? <div className="notice warn" style={{ marginBottom: 16 }}>{t(lang, "state.offline")}</div> : null}
 
       {/* --------------------------------------------------------------- the list */}
+      {view.view === "list" ? (
+      <>
+      <div data-testid="projects-list">
       <Card className="rise">
         <CardHead
           title={t(lang, "projects.list.title")}
@@ -2464,12 +2537,21 @@ export const Projects = ({
               {visible.map((project) => {
                 const id = String(project.project_id ?? "");
                 const archived = project.archived === true;
+                // Whether «Открыть папку» can act is decided from the record's own facts:
+                // a project that holds no files (or has no id at all) is refused by the
+                // backend, so the button is off here with the same sentence, never a
+                // click that would do nothing.
+                const canOpenFolder =
+                  id !== "" && typeof project.file_count === "number" && project.file_count > 0;
+                const folderReason =
+                  id === "" ? t(lang, "projects.delete.no_id") : t(lang, "projects.row.no_files");
                 return (
+                  <Fragment key={id}>
                   <tr
-                    key={id}
                     className={id === selectedId ? "selected" : ""}
                     style={{ cursor: "pointer" }}
                     onClick={() => openProject(id)}
+                    data-testid="project-row"
                   >
                     <td style={{ fontWeight: 600 }}>
                       {text(project.name, t(lang, "projects.card.untitled"))}
@@ -2493,11 +2575,60 @@ export const Projects = ({
                       {archived ? <div className="small muted">{t(lang, "projects.badge.archived")}</div> : null}
                     </td>
                     <td>
-                      <Button size="small" onClick={() => openProject(id)}>
-                        {t(lang, "projects.action.open")}
-                      </Button>
+                      {/* The two entrances, both real. The primary one navigates to the
+                          project's own screen; the second really opens the folder through
+                          POST /api/projects/{id}/open and prints the backend's answer
+                          ("explorer.EXE · PID …") right under this row. The wrapping span
+                          stops these clicks from also firing the row's navigation. */}
+                      <span
+                        className="row"
+                        style={{ gap: 6, flexWrap: "wrap" }}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <span data-testid="project-row-open">
+                          <Button size="small" tone="primary" onClick={() => openProject(id)}>
+                            {t(lang, "projects.action.open")}
+                          </Button>
+                        </span>
+                        <span data-testid="project-row-open-folder">
+                          <Button
+                            size="small"
+                            tone="ghost"
+                            disabled={!canOpenFolder || rowOpening === id}
+                            disabledReason={canOpenFolder ? undefined : folderReason}
+                            onClick={() => void openRowFolder(id)}
+                          >
+                            {rowOpening === id
+                              ? t(lang, "state.loading")
+                              : t(lang, "projects.action.open_folder")}
+                          </Button>
+                        </span>
+                      </span>
+                      {/* The visible half of a disabled control's reason: the tooltip
+                          carries the same sentence, but a screenshot has to show why the
+                          button is off, exactly as the card's disk block does. */}
+                      {!canOpenFolder ? (
+                        <div className="small muted" data-testid="project-row-open-folder-why">
+                          {t(lang, "projects.action.open_folder")}: {folderReason}
+                        </div>
+                      ) : null}
                     </td>
                   </tr>
+                  {rowNotice !== null && rowNotice.projectId === id ? (
+                    <tr data-testid="project-row-open-notice">
+                      <td colSpan={7}>
+                        <div className="notice">{rowNotice.text}</div>
+                      </td>
+                    </tr>
+                  ) : null}
+                  {rowFailure !== null && rowFailure.projectId === id ? (
+                    <tr data-testid="project-row-open-failure">
+                      <td colSpan={7}>
+                        <Refusal lang={lang} failure={rowFailure.failure} />
+                      </td>
+                    </tr>
+                  ) : null}
+                  </Fragment>
                 );
               })}
             </tbody>
@@ -2578,6 +2709,7 @@ export const Projects = ({
           {t(lang, "projects.list.hint")}
         </div>
       </Card>
+      </div>
 
       {/* ---------------------------------------------------------- deleted projects */}
       {/* Collapsed by default: the trash is where a mistake can be undone, not a second
@@ -2730,8 +2862,12 @@ export const Projects = ({
         </div>
       </Card>
       </div>
+      </>
+      ) : null}
 
       {/* ------------------------------------------------------------- the card */}
+      {view.view === "detail" ? (
+      <div data-testid="project-detail">
       <div id="project-card">
       {selectedId === "" ? (
         <Card className="rise d1">
@@ -2873,9 +3009,11 @@ export const Projects = ({
           )}
         </Card>
       ) : null}
+      </div>
+      ) : null}
 
       {/* Where a project comes from, stated where the owner looks for a "create" button. */}
-      {list.status === "ready" && summaries.length === 0 ? (
+      {view.view === "list" && list.status === "ready" && summaries.length === 0 ? (
         <Card className="rise d1" tight>
           <div className="small muted">{t(lang, "projects.create.via_discovery")}</div>
         </Card>

@@ -13,6 +13,7 @@ import { Settings } from "./screens/Settings";
 import { Help } from "./screens/Help";
 import { Auth } from "./screens/Auth";
 import { loadBackend, type BackendState } from "./api/client";
+import { PROJECT_HASH_PREFIX, PROJECT_LIST_HASH } from "./project-navigation.js";
 import { CONTEXT_TOPIC } from "./help-content";
 import {
   applyAppearance,
@@ -37,7 +38,15 @@ const toneOf = (value: unknown): "ok" | "warn" | "danger" | "idle" => {
 
 export const App = () => {
   const params = new URLSearchParams(window.location.search);
-  const startSection = params.get("nav") ?? "forge";
+  // The «Проекты» screen has its own addresses (`#/projects` for the list and
+  // `#/projects/<id>` for one project), so a reload with that address must land on that
+  // screen -- a project address must not open Forge. `?nav=` stays the way to open any
+  // other section.
+  const startSection =
+    window.location.hash === PROJECT_LIST_HASH ||
+    window.location.hash.startsWith(PROJECT_HASH_PREFIX)
+      ? "projects"
+      : params.get("nav") ?? "forge";
   const [lang, setLang] = useState<Lang>(params.get("lang") === "en" ? "en" : "ru");
   const [screen, setScreen] = useState<"app" | "auth">(params.get("screen") === "auth" ? "auth" : "app");
   const [backend, setBackend] = useState<BackendState>({ status: "loading" });
@@ -80,12 +89,27 @@ export const App = () => {
     };
   }, []);
 
+  /**
+   * Leave the project screen's address behind when another section is opened.
+   *
+   * `#/projects/<id>` names the project screen and is honoured on reload, so a rail
+   * click that left it in place would make the next reload jump back into a project the
+   * owner had already left. `replaceState` strips it without touching the history, so a
+   * reload behaves exactly as it did before the address existed.
+   */
+  const clearProjectHash = useCallback(() => {
+    if (window.location.hash.startsWith(PROJECT_LIST_HASH)) {
+      window.history.replaceState({}, "", window.location.pathname + window.location.search);
+    }
+  }, []);
+
   const openHelp = useCallback(
     (topic?: string) => {
+      clearProjectHash();
       setHelpTopic(topic ?? CONTEXT_TOPIC[nav] ?? "project");
       setNav("help");
     },
-    [nav]
+    [nav, clearProjectHash]
   );
 
   /**
@@ -108,10 +132,14 @@ export const App = () => {
     setNav("projects");
   }, []);
 
-  const selectSection = useCallback((section: string) => {
-    setNav(section);
-    if (section === "help") setHelpTopic(CONTEXT_TOPIC.help);
-  }, []);
+  const selectSection = useCallback(
+    (section: string) => {
+      if (section !== "projects") clearProjectHash();
+      setNav(section);
+      if (section === "help") setHelpTopic(CONTEXT_TOPIC.help);
+    },
+    [clearProjectHash]
+  );
 
   if (screen === "auth") {
     return <Auth lang={lang} onLanguage={setLang} onEnter={() => setScreen("app")} />;
