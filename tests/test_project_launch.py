@@ -17,13 +17,16 @@ server but left the owner looking for a URL. This file proves ``POST
 3. it **reuses** a running server: the second click starts no second process, it only
    opens the window again (``reused: true``, same URL, same server pid);
 4. it refuses **honestly** -- no files, no entry point, no approval, a process that died
-   without a port -- with one plain sentence, and a refused launch starts no window at
-   all;
+   without a port -- with one plain sentence and the run's own facts (state, exit code,
+   redacted log tail), and a refused launch starts no window at all;
 5. the window is Chrome in app mode first, Edge second, the default browser last, with
    the exact argument vector: ``--app=<url> --window-size=1280,900
    --user-data-dir=<repo>/.forge/app-profile/<project-id>``, never a shell;
-6. a process that dies but leaves a static page in its folder is reported plainly and
-   the static page is served read-only instead (``fallback: true`` plus the failure).
+6. a process that dies but leaves a static page in its folder is reported plainly and the
+   page is offered as an explicit second action (``fallback_available`` plus a real
+   ``fallback_url``); it is shown only when the caller asks with ``fallback: true``;
+7. no launch ever opens a portless URL, and the child (and the containment probe) are
+   created without a console window.
 
 The OS opener is always injected: no real browser window opens on the machine running
 this suite. ``shell=False`` and the exact argv are asserted instead.
@@ -34,6 +37,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import subprocess
 import time
 import unittest
 from unittest import mock
@@ -54,7 +58,13 @@ from app.projects.app_window import (
     WindowRefusal,
 )
 from app.projects.entrypoint import resolve_entry
-from app.projects.launcher import LaunchRefusal, ProjectLauncher
+from app.projects.launcher import (
+    CONSOLE_INPUT_MESSAGE,
+    NOT_A_SERVER_MESSAGE,
+    LaunchRefusal,
+    ProjectLauncher,
+    looks_like_console_prompt,
+)
 from app.projects.runner import RunTarget
 from app.projects.service import ProjectService
 from app.projects.store import PROJECTS_ROOT_ENV_VAR, ProjectStore
@@ -89,6 +99,13 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
 """
 
 STATIC_PAGE = "<!doctype html><title>Launch me</title><h1>LAUNCH-STATIC-OK</h1>\n"
+
+#: A project that writes a console prompt and exits without ever binding a port.
+#: This is the shape the owner's console-only application has to be diagnosed as.
+PROMPT_APP = """\
+print("Введите пароль:", flush=True)
+raise SystemExit(3)
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -554,7 +571,10 @@ class LauncherUnitTests(unittest.TestCase):
         self.assertEqual(len(self.spawn.calls), 2, "the window was opened again")
         self.assertEqual(self.spawn.calls[0]["vector"][1], f"--app={first.url}")
 
-    def test_11_a_dead_process_is_reported_and_a_static_page_is_shown_instead(self) -> None:
+    def test_11_a_dead_process_is_refused_and_the_caller_never_sees_a_browser(self) -> None:
+        # The old behaviour served the project's static page silently. That is exactly
+        # what showed the owner a blank page: the run he asked for was never reported.
+        # Now the page is *offered* in the refusal and nothing is opened.
         (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
         entry = self._entry()
         runner = _FakeRunner(
@@ -567,6 +587,44 @@ class LauncherUnitTests(unittest.TestCase):
             },
         )
         previews = _FakePreviews()
+        with self.assertRaises(LaunchRefusal) as raised:
+            self._launcher(runner=runner, previews=previews).launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=2,
+                confirm=True,
+                digest="d",
+            )
+        refusal = raised.exception
+        self.assertIn(NOT_A_SERVER_MESSAGE, str(refusal))
+        self.assertIn("кодом 1", str(refusal))
+        self.assertEqual(refusal.reason_code, "port_not_opened")
+        self.assertEqual(refusal.facts["run_state"], "FAILED")
+        self.assertEqual(refusal.facts["exit_code"], 1)
+        self.assertEqual(
+            refusal.facts["log_tail"], ["OSError: [WinError 10048] port busy"]
+        )
+        self.assertTrue(refusal.facts["fallback_available"])
+        self.assertEqual(refusal.facts["fallback_url"], "http://127.0.0.1:5002/index.html")
+        self.assertEqual(refusal.facts["fallback_page"], "index.html")
+        self.assertEqual(
+            self.spawn.calls, [], "a portless refusal must open no browser at all"
+        )
+        self.assertEqual(len(previews.started_calls), 1, "the offer has a real URL")
+
+    def test_11b_the_static_page_is_shown_only_on_an_explicit_request(self) -> None:
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        entry = self._entry()
+        runner = _FakeRunner(
+            started={
+                "state": "FAILED",
+                "url": "",
+                "exit_code": 1,
+                "log": {"lines": ["Address already in use"]},
+            },
+        )
+        previews = _FakePreviews()
         result = self._launcher(runner=runner, previews=previews).launch(
             project_id=PROJECT_ID,
             target=self._target(entry),
@@ -574,15 +632,12 @@ class LauncherUnitTests(unittest.TestCase):
             files=2,
             confirm=True,
             digest="d",
+            static_fallback=True,
         )
         self.assertTrue(result.fallback)
-        self.assertEqual(result.entry_kind, "static_html")
+        self.assertTrue(result.launched)
         self.assertEqual(result.url, "http://127.0.0.1:5002/index.html")
-        self.assertIn("процесс завершился", result.notice)
-        self.assertIn("кодом 1", result.notice)
-        self.assertIn("index.html", result.notice)
-        self.assertEqual(len(previews.started_calls), 1)
-        self.assertEqual(previews.started_calls[0]["entry"].path, "index.html")
+        self.assertIn("По запросу показана статическая страница index.html", result.notice)
         self.assertEqual(self.spawn.calls[0]["vector"][1], f"--app={result.url}")
 
     def test_12_a_dead_process_with_no_static_page_is_a_plain_refusal(self) -> None:
@@ -605,13 +660,89 @@ class LauncherUnitTests(unittest.TestCase):
                 confirm=True,
                 digest="d",
             )
-        self.assertIn("Проект не открылся", str(raised.exception))
+        self.assertIn(NOT_A_SERVER_MESSAGE, str(raised.exception))
         self.assertIn("кодом 2", str(raised.exception))
-        self.assertEqual(raised.exception.reason_code, "run_failed")
+        self.assertEqual(raised.exception.reason_code, "port_not_opened")
         self.assertEqual(raised.exception.facts["run_state"], "FAILED")
         self.assertEqual(raised.exception.facts["exit_code"], 2)
         self.assertEqual(raised.exception.facts["log_tail"], ["boom"])
+        self.assertFalse(raised.exception.facts["fallback_available"])
         self.assertEqual(self.spawn.calls, [], "a refusal opens no window")
+
+    def test_12b_a_portless_url_is_never_opened(self) -> None:
+        # A supervisor that handed back a URL without a port must not become a browser
+        # window at port 80: the launch refuses and names the reason.
+        entry = self._entry()
+        runner = _FakeRunner(started={"state": "RUNNING", "url": "http://127.0.0.1/"})
+        with self.assertRaises(LaunchRefusal) as raised:
+            self._launcher(runner=runner).launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=1,
+                confirm=True,
+                digest="d",
+            )
+        self.assertIn("без порта", str(raised.exception))
+        self.assertIn(NOT_A_SERVER_MESSAGE, str(raised.exception))
+        self.assertEqual(raised.exception.facts["url"], "http://127.0.0.1/")
+        self.assertEqual(self.spawn.calls, [])
+        self.assertEqual(self.startfile.urls, [])
+
+    def test_12c_a_prompt_like_log_is_diagnosed_as_waiting_for_console_input(self) -> None:
+        entry = self._entry()
+        runner = _FakeRunner(
+            started={
+                "state": "FAILED",
+                "url": "",
+                "exit_code": 3,
+                "log": {
+                    "path": ".forge/projects/proj-0123456789ab/run.log",
+                    "lines": ["Выбрать действие:", "--- stderr ---", "EOFError"],
+                },
+            },
+        )
+        with self.assertRaises(LaunchRefusal) as raised:
+            self._launcher(runner=runner).launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=1,
+                confirm=True,
+                digest="d",
+            )
+        refusal = raised.exception
+        self.assertIn(CONSOLE_INPUT_MESSAGE, str(refusal))
+        self.assertIn(NOT_A_SERVER_MESSAGE, str(refusal))
+        self.assertIn(".forge/projects/proj-0123456789ab/run.log", str(refusal))
+        self.assertTrue(refusal.facts["waiting_for_input"])
+        self.assertEqual(refusal.reason_code, "console_input_required")
+        self.assertEqual(refusal.facts["log_tail"][0], "Выбрать действие:")
+        self.assertEqual(self.spawn.calls, [], "a prompt is diagnosed, never shown")
+
+    def test_12d_the_prompt_detector_reads_the_owner_s_own_words(self) -> None:
+        for lines in (
+            ["Выбрать действие:"],
+            ["Введите пароль"],
+            ["Press Enter to continue"],
+            ["input your choice"],
+        ):
+            self.assertTrue(looks_like_console_prompt(lines), lines)
+        self.assertFalse(looks_like_console_prompt(["listening on 127.0.0.1:8765"]))
+        self.assertFalse(looks_like_console_prompt(["--- stderr ---"]))
+        self.assertFalse(looks_like_console_prompt([]))
+        # A real crash is a crash, not a prompt: the live 409 evidence showed
+        # "Traceback (most recent call last):" being mistaken for a prompt.
+        self.assertFalse(
+            looks_like_console_prompt(
+                [
+                    "Traceback (most recent call last):",
+                    '  File "app.py", line 885, in main',
+                    "    server = ThreadingHTTPServer((HOST, PORT), Handler)",
+                    "PermissionError: [WinError 10013] access denied",
+                ]
+            )
+        )
 
     def test_13_a_running_static_preview_is_reused(self) -> None:
         (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
@@ -941,6 +1072,134 @@ class LaunchRouteTests(unittest.TestCase):
         self.assertEqual(body["window"], WINDOW_DEFAULT_BROWSER)
         self.assertEqual(body["pid"], 0)
         self.assertEqual(self.startfile.urls, [body["url"]])
+        self.assertEqual(self.spawn.calls, [])
+
+    def test_09_the_child_and_the_probe_are_created_without_a_console_window(self) -> None:
+        """The console window the owner saw is a process-creation flag, not a mystery.
+
+        Forge runs under ``pythonw`` (no console), so a child created without
+        ``CREATE_NO_WINDOW`` gets a fresh console from Windows. Both the project's own
+        process and the containment probe must carry the flag; the child keeps its own
+        process group and never gets a *new console*.
+        """
+
+        client = self._client()
+        project = self._project(files={"app.py": SERVING.encode("utf-8")})
+        digest = client.get(f"/api/projects/{project.project_id}").json()["entrypoint"]["digest"]
+
+        real_popen = subprocess.Popen
+        calls: list[dict] = []
+
+        def recording_popen(*args, **kwargs):
+            calls.append(
+                {
+                    "argv": [str(part) for part in (args[0] if args else ())],
+                    "flags": int(kwargs.get("creationflags") or 0),
+                }
+            )
+            return real_popen(*args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=recording_popen):
+            answer = self._launch(
+                client,
+                project.project_id,
+                {"confirm": True, "entrypoint_digest": digest},
+            )
+        self.assertEqual(answer.status_code, 200, answer.text)
+
+        no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        self.assertTrue(no_window, "this proof is about a Windows host")
+        new_console = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
+        self.assertTrue(calls, "the launch created at least the project's process")
+        for call in calls:
+            self.assertTrue(
+                call["flags"] & no_window,
+                f"a created process has no CREATE_NO_WINDOW: {call}",
+            )
+            if new_console:
+                self.assertFalse(
+                    call["flags"] & new_console,
+                    f"a created process asked for a new console: {call}",
+                )
+        child = [
+            call
+            for call in calls
+            if any(str(part).endswith("app.py") for part in call["argv"])
+        ]
+        self.assertTrue(child, f"the project's own process was not recorded: {calls}")
+        self.assertTrue(
+            child[0]["flags"] & subprocess.CREATE_NEW_PROCESS_GROUP,
+            "the child keeps its own process group",
+        )
+
+    def test_10_a_console_app_is_refused_with_its_log_and_offered_as_a_static_choice(
+        self,
+    ) -> None:
+        """The owner's real case, end to end: a project that never becomes a server.
+
+        The current version's entry point is ``app.py``; it writes a prompt-like line
+        and exits. The launch must answer ``409 project_launch_refused`` with the run's
+        state, exit code and redacted log tail, must open **no** browser, and must offer
+        the static page only as an explicit second request.
+        """
+
+        client = self._client()
+        project = self._project(files={"app.py": PROMPT_APP.encode("utf-8")})
+        # The current version's manifest names only ``app.py`` (as the owner's project
+        # v2 does); the stale ``index.html`` from an earlier version still sits in the
+        # folder. That is exactly the page the old code opened silently.
+        workspace = self.store.workspace_path(project.project_id, create=True)
+        pathlib.Path(workspace, "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        detail = client.get(f"/api/projects/{project.project_id}").json()
+        self.assertEqual(detail["entrypoint"]["kind"], "python_script")
+        digest = str(detail["entrypoint"]["digest"])
+
+        answer = self._launch(
+            client,
+            project.project_id,
+            {"confirm": True, "entrypoint_digest": digest},
+        )
+        self.assertEqual(answer.status_code, 409, answer.text)
+        detail = answer.json()["detail"]
+        self.assertEqual(detail["code"], "project_launch_refused")
+        self.assertIn(NOT_A_SERVER_MESSAGE, detail["error"])
+        self.assertIn(CONSOLE_INPUT_MESSAGE, detail["error"])
+        self.assertEqual(detail["run_state"], "FAILED")
+        self.assertEqual(detail["exit_code"], 3)
+        self.assertTrue(detail["waiting_for_input"])
+        self.assertIn("Введите пароль:", detail["log_tail"])
+        self.assertTrue(detail["fallback_available"])
+        fallback_url = str(detail["fallback_url"])
+        self.assertTrue(fallback_url.startswith("http://127.0.0.1:"), fallback_url)
+        self.assertTrue(fallback_url.endswith("/index.html"), fallback_url)
+        self.assertEqual(self.spawn.calls, [], "a portless launch opens no browser")
+        self.assertEqual(self.startfile.urls, [])
+
+        # The offer has a real URL: the read-only preview really answers.
+        with urllib.request.urlopen(fallback_url, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn(b"LAUNCH-STATIC-OK", response.read())
+
+        # The explicit second request is what shows the page -- and only then a window.
+        chosen = self._launch(
+            client,
+            project.project_id,
+            {"confirm": True, "entrypoint_digest": digest, "fallback": True},
+        )
+        self.assertEqual(chosen.status_code, 200, chosen.text)
+        body = chosen.json()
+        self.assertTrue(body["fallback"])
+        self.assertTrue(body["launched"])
+        self.assertEqual(body["url"], fallback_url)
+        self.assertEqual(len(self.spawn.calls), 1, "the explicit request opens one window")
+        self.assertEqual(self.spawn.calls[0]["vector"][1], f"--app={fallback_url}")
+        self.assertEqual(self.startfile.urls, [])
+
+    def test_11_a_bad_fallback_flag_is_a_bad_body(self) -> None:
+        client = self._client()
+        project = self._project(files={"index.html": STATIC_PAGE.encode("utf-8")})
+        answer = self._launch(client, project.project_id, {"fallback": "yes"})
+        self.assertEqual(answer.status_code, 400, answer.text)
         self.assertEqual(self.spawn.calls, [])
 
 

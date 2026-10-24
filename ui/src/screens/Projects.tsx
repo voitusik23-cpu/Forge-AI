@@ -229,6 +229,85 @@ const Refusal = ({ lang, failure, onRetry }: { lang: Lang; failure: Failure; onR
   );
 };
 
+/**
+ * The launch refusal's own facts: process state, exit code, the redacted log tail, and
+ * the explicit offer of the project's saved page.
+ *
+ * A portless launch is never dressed as a success, and the saved page is a separate
+ * click — the card must not silently replace the run the owner asked for.
+ */
+const LaunchFacts = ({
+  lang,
+  failure,
+  onFallback,
+  busy,
+}: {
+  lang: Lang;
+  failure: Failure;
+  onFallback: () => void;
+  busy: boolean;
+}) => {
+  const fields = failure.fields ?? {};
+  const runState = text(fields.run_state, "");
+  const exitCode = fields.exit_code;
+  const logTail = Array.isArray(fields.log_tail)
+    ? fields.log_tail.map((line) => String(line)).filter((line) => line.trim() !== "")
+    : [];
+  const fallbackAvailable =
+    fields.fallback_available === true &&
+    typeof fields.fallback_url === "string" &&
+    fields.fallback_url !== "";
+  const waiting = fields.waiting_for_input === true;
+  if (runState === "" && (exitCode === null || exitCode === undefined) && logTail.length === 0 && !fallbackAvailable) {
+    return null;
+  }
+  return (
+    <div style={{ marginTop: 8 }} data-testid="project-launch-facts">
+      <div className="row" style={{ gap: 14, flexWrap: "wrap" }}>
+        <span className="small muted">
+          {t(lang, "projects.launch.facts.state")}:{" "}
+          <span className="mono">{text(runState)}</span>
+        </span>
+        <span className="small muted">
+          {t(lang, "projects.launch.facts.exit")}:{" "}
+          <span className="mono">
+            {exitCode === null || exitCode === undefined ? "—" : String(exitCode)}
+          </span>
+        </span>
+      </div>
+      {waiting ? (
+        <div className="small" style={{ marginTop: 6 }}>
+          {t(lang, "projects.launch.facts.input")}
+        </div>
+      ) : null}
+      {logTail.length > 0 ? (
+        <div style={{ marginTop: 6 }}>
+          <div className="label">{t(lang, "projects.launch.facts.log")}</div>
+          <pre
+            className="small mono"
+            style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}
+          >
+            {logTail.join("\n")}
+          </pre>
+        </div>
+      ) : null}
+      {fallbackAvailable ? (
+        <div
+          className="row"
+          style={{ gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}
+        >
+          <span data-testid="project-launch-fallback">
+            <Button size="small" disabled={busy} onClick={onFallback}>
+              {t(lang, "projects.launch.fallback.action")}
+            </Button>
+          </span>
+          <span className="small muted">{t(lang, "projects.launch.fallback.hint")}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 /** The same fact grid the Кузница card uses, so both screens read a record the same way. */
 const Facts = ({ items }: { items: Array<[string, string]> }) => (
   <div className="forge-facts">
@@ -663,6 +742,7 @@ const ProjectCard = ({
   onRunStop,
   onRunRestart,
   onLaunch,
+  onLaunchFallback,
   launchBusy,
   launchNotice,
   launchFailure,
@@ -748,6 +828,11 @@ const ProjectCard = ({
    * now called «Подробнее».
    */
   onLaunch: () => void;
+  /**
+   * The explicit second action a refused launch offers: show the project's saved static
+   * page because the process never became a server. It is never automatic.
+   */
+  onLaunchFallback: () => void;
   launchBusy: boolean;
   /** The sentence a successful launch printed: the URL that is now open. */
   launchNotice: string;
@@ -1190,6 +1275,12 @@ const ProjectCard = ({
           {launchFailure !== null ? (
             <div style={{ marginTop: 8 }} data-testid="project-launch-failure">
               <Refusal lang={lang} failure={launchFailure} />
+              <LaunchFacts
+                lang={lang}
+                failure={launchFailure}
+                onFallback={onLaunchFallback}
+                busy={launchBusy}
+              />
             </div>
           ) : null}
           {launchNotice !== "" ? (
@@ -2130,7 +2221,7 @@ export const Projects = ({
   // already shown for this entry point, so the runner's approval keeps naming the exact
   // command; a static page needs none. The answer is printed as it arrived: the URL that
   // is open in its own window, or the backend's refusal verbatim.
-  const launchSelected = async () => {
+  const launchSelected = async (staticFallback = false) => {
     if (selectedId === "") return;
     const digest = String(entrypoint?.digest ?? "");
     setLaunchBusy(true);
@@ -2138,7 +2229,7 @@ export const Projects = ({
     setActionNotice("");
     setLaunchFailure(null);
     setLaunchNotice("");
-    const outcome = await launchProject(selectedId, digest === "" ? undefined : digest);
+    const outcome = await launchProject(selectedId, digest === "" ? undefined : digest, staticFallback);
     setLaunchBusy(false);
     if (!outcome.ok) {
       setLaunchFailure(outcome.failure);
@@ -3178,6 +3269,7 @@ export const Projects = ({
           onRunStop={() => void runStop()}
           onRunRestart={(digest) => void runRestart(digest)}
           onLaunch={() => void launchSelected()}
+          onLaunchFallback={() => void launchSelected(true)}
           launchBusy={launchBusy}
           launchNotice={launchNotice}
           launchFailure={launchFailure}

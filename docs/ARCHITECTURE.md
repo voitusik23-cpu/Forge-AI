@@ -4942,9 +4942,10 @@ authority.
   the command **the digest was issued for**;
 * a refused chain returns `REFUSED` with the coordinator's own `denial_reason`;
 * the child is started with `subprocess.Popen(shell=False)`, `cwd` = the canonical authorized root,
-  `stdin=DEVNULL`, and an environment of exactly `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`,
-  `PYTHONIOENCODING=utf-8` and the marker `FORGE_SANDBOX=1`. A Forge credential, a provider key or a
-  `.env` value is **absent**, not blanked, so a child cannot read it back;
+  `stdin=DEVNULL`, `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows (the owner never sees a
+  console window), and an environment of exactly `PATH`, `SYSTEMROOT`, `TEMP`, `TMP`,
+  `PYTHONIOENCODING=utf-8`, `PYTHONUNBUFFERED=1` and the marker `FORGE_SANDBOX=1`. A Forge credential,
+  a provider key or a `.env` value is **absent**, not blanked, so a child cannot read it back;
 * the tree is owned by a Windows job object that also carries the limits, and the child's token is
   lowered to low integrity before it runs (see the next subsection).
 
@@ -4998,6 +4999,59 @@ loads. Those are the upgrade path, not a current behaviour.
 
 Costs: one extra short-lived probe process per start (bounded at 8 s, and `writes_outside` becomes
 `unknown` when it does not answer), and the containment is registered per run in memory only.
+
+### Launch into the project's own window
+
+`POST /api/projects/{id}/launch` is one request that resolves the entry point, starts (or reuses) the
+project through the runner's approval chain, waits for the port the supervisor **observed**, and opens
+`http://127.0.0.1:<port>/...` in its own OS window (`app/projects/app_window.py`). Four rules are
+invariants, not best effort:
+
+* **No console window, ever.** Forge runs under `pythonw` (no console), so a console-subsystem child
+  created without `CREATE_NO_WINDOW` gets a new console from Windows -- the black window the owner saw
+  when «Запустить приложение» started a project. The project child and the containment probe both carry
+  the flag; the port scan (`netstat`) and the tree-kill fallback (`taskkill`) carry it too.
+* **No portless URL.** A launch opens only a loopback URL with an explicit port, and only the port the
+  supervisor read from the child's own sockets. If no port was observed within the 10 s readiness
+  budget, no browser opens at all: the route answers typed `409 project_launch_refused` with
+  `run_state`, `exit_code`, the redacted 20-line `log_tail`, `log_path` and the sentence «Приложение не
+  стало сервером: порт не открылся».
+* **A blocking application is diagnosed, not shown.** A child whose log holds a prompt-like line (ends
+  with `:` or contains `Выбрать`/`Введите`/`Enter`/`input`) is reported with `waiting_for_input: true`
+  and «Приложение ждёт ввода в консоли — так запускать нельзя»; nothing is typed into it and its
+  console is never displayed.
+* **The static page is a choice, not a substitute.** When the folder also holds `index.html`, the
+  refusal carries `fallback_available: true` and a real `fallback_url` from the read-only preview.
+  Only a second request with `{"fallback": true}` serves and opens that page; nothing falls back
+  silently.
+* **Approval, containment and reuse are unchanged.** `confirm` + `entrypoint_digest` still go through
+  `LocalRunner.start_confirmed`, the sandbox is still the job object plus the low-integrity token, and
+  a running server is still reused (`reused: true`) instead of restarted.
+
+#### Русская версия
+
+`POST /api/projects/{id}/launch` — один запрос: определить точку входа, запустить (или переиспользовать)
+проект через цепочку одобрения раннера, дождаться порта, который супервизор **наблюдал**, и открыть
+`http://127.0.0.1:<порт>/...` в отдельном окне ОС. Пять правил обязательны:
+
+* **Никаких консольных окон.** Forge работает под `pythonw` (консоли нет), поэтому дочерний процесс
+  консольной подсистемы без `CREATE_NO_WINDOW` получает от Windows новое консольное окно — то самое
+  чёрное окно, которое увидел владелец. Флаг несут и процесс проекта, и probe; `netstat` и `taskkill`
+  тоже.
+* **Никаких URL без порта.** Открывается только loopback-URL с явным портом, и только порт, прочитанный
+  из сокетов самого ребёнка. Если за 10 с порт не появился, браузер не открывается вовсе: маршрут
+  отвечает типизированным `409 project_launch_refused` с `run_state`, `exit_code`, очищенным хвостом
+  журнала (20 строк), `log_path` и фразой «Приложение не стало сервером: порт не открылся».
+* **Блокирующее приложение диагностируется, а не показывается.** Если в журнале есть похожая на
+  приглашение строка (заканчивается на `:` или содержит `Выбрать`/`Введите`/`Enter`/`input`), ответ
+  несёт `waiting_for_input: true` и «Приложение ждёт ввода в консоли — так запускать нельзя»; ввод не
+  отправляется, консоль не показывается.
+* **Статическая страница — выбор, а не подмена.** Если в папке есть `index.html`, отказ несёт
+  `fallback_available: true` и настоящий `fallback_url`; страница показывается только по второму
+  запросу с `{"fallback": true}`.
+* **Одобрение, сдерживание и переиспользование не меняются.** `confirm` + `entrypoint_digest`
+  по-прежнему идут через `LocalRunner.start_confirmed`, sandbox остаётся job object + low-integrity
+  token, а работающий сервер переиспользуется.
 
 ### States, approval and output
 

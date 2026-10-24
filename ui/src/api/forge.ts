@@ -325,6 +325,14 @@ export type Failure = {
    * merging them into a generic error.
    */
   code?: string;
+  /**
+   * The refusal's structured fields, when the surface published an object as its
+   * `detail`. A launch refusal carries the run's state, its exit code, the redacted log
+   * tail and — when the folder holds a static page — `fallback_available`/
+   * `fallback_url`. The screen prints them as facts instead of flattening the refusal
+   * into one sentence.
+   */
+  fields?: Record<string, unknown>;
 };
 
 export type Result<T> = { ok: true; value: T } | { ok: false; failure: Failure };
@@ -393,6 +401,14 @@ const failureOf = async (path: string, response: Response): Promise<Failure> => 
   const kind: FailureKind =
     response.status === 401 || response.status === 403 ? "unauthorized" : "error";
   const code = machineCodeOf(body);
+  const detail =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).detail
+      : undefined;
+  const fields =
+    detail && typeof detail === "object" && !Array.isArray(detail)
+      ? (detail as Record<string, unknown>)
+      : undefined;
   return {
     kind,
     status: response.status,
@@ -400,6 +416,7 @@ const failureOf = async (path: string, response: Response): Promise<Failure> => 
     detail:
       serverMessageOf(body) || detailOf(body, `${response.status} ${response.statusText}`.trim()),
     ...(code === "" ? {} : { code }),
+    ...(fields === undefined ? {} : { fields }),
   };
 };
 
@@ -1414,15 +1431,19 @@ export const openProject = (
  * standalone window with no address bar. `confirm` plus `entrypoint_digest` is the same
  * approval `POST /run` needs; a static page needs neither, so the digest is omitted when
  * the card has none. A refusal is a `409` with one plain sentence
- * (`project_launch_refused`), which the card prints verbatim.
+ * (`project_launch_refused`), which the card prints verbatim. `staticFallback` is the
+ * owner's explicit choice of the project's saved page, offered by that refusal as
+ * `fallback_available`; without it a process that never became a server opens nothing.
  */
 export const launchProject = (
   projectId: string,
-  digest?: string
+  digest?: string,
+  staticFallback = false
 ): Promise<Result<LifecycleLaunch>> =>
   postJson<LifecycleLaunch>(projectPath(projectId, "/launch"), {
     confirm: true,
     ...(digest ? { entrypoint_digest: digest } : {}),
+    ...(staticFallback ? { fallback: true } : {}),
   });
 
 /**

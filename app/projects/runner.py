@@ -198,6 +198,14 @@ RUNNABLE_KINDS = (
 #: applies, which would make the containment a race instead of a boundary.
 _CREATE_SUSPENDED = 0x00000004
 
+#: A console application run **without a console window**. Forge itself runs under
+#: ``pythonw`` (no console), so a console-subsystem child created without this flag
+#: gets a brand-new console allocated by Windows -- the black window the owner saw
+#: when «Запустить приложение» started the project. It is combined with
+#: ``CREATE_NEW_PROCESS_GROUP``: the child keeps its own group and its pipes, and no
+#: window is ever shown. ``0`` off Windows.
+_CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+
 #: Per-stream capture bound. Beyond it the stream is truncated with a marker: an
 #: unbounded buffer would let a chatty child exhaust this process.
 MAX_LOG_BYTES = 64 * 1024
@@ -1083,6 +1091,9 @@ class LocalRunner:
             sandbox.probe_error = str(probe.get("probe_error", "") or "")
 
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        if os.name == "nt":
+            # No console window: the project runs, but the owner never sees a console.
+            creationflags |= _CREATE_NO_WINDOW
         if drop_integrity:
             creationflags |= _CREATE_SUSPENDED
 
@@ -1177,9 +1188,12 @@ class LocalRunner:
                 sandbox.integrity_level_before = "unknown"
                 sandbox.integrity_level = "unknown"
                 try:
-                    process = spawn(
+                    retry_flags = (
                         subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
                     )
+                    if os.name == "nt":
+                        retry_flags |= _CREATE_NO_WINDOW
+                    process = spawn(retry_flags)
                 except Exception as exc:  # noqa: BLE001 - a second spawn failure
                     return self._refuse(
                         facts,
@@ -1262,12 +1276,16 @@ class LocalRunner:
             return default_projects_root()
 
     def _minimal_environment(self) -> Dict[str, str]:
-        """Five variables: PATH, SYSTEMROOT, TEMP, PYTHONIOENCODING, FORGE_SANDBOX.
+        """Six variables: PATH, SYSTEMROOT, TEMP, PYTHONIOENCODING, PYTHONUNBUFFERED,
+        FORGE_SANDBOX.
 
         Everything else -- a Forge credential, a provider key, a value read from
         ``.env`` -- is *absent* rather than blanked, so a child cannot read it back.
         ``FORGE_SANDBOX=1`` is a marker a program may read; it is not a boundary and
-        the payload never treats it as one.
+        the payload never treats it as one. ``PYTHONUNBUFFERED=1`` matters for honesty,
+        not speed: stdout is a pipe here, so a project's startup prints (including a
+        console prompt) would otherwise sit in Python's block buffer and never reach
+        the log the owner is pointed at.
         """
 
         environment: Dict[str, str] = {}
@@ -1276,6 +1294,7 @@ class LocalRunner:
             if value:
                 environment[name] = value
         environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUNBUFFERED"] = "1"
         environment[SANDBOX_ENV_VAR] = "1"
         return environment
 
@@ -1680,7 +1699,9 @@ class LocalRunner:
             "project_id": facts.project_id,
             "state": facts.state,
             "running": facts.alive,
-            "serving": bool(facts.port),
+            # A port is a fact of the last process, not a promise about a dead one: a
+            # finished run must never claim it is still serving.
+            "serving": bool(facts.port) and bool(facts.alive),
             "reason": facts.reason,
             "next_step": facts.next_step,
             "blocked_code": facts.blocked_code,
@@ -1823,6 +1844,8 @@ def _windows_listening_ports(pids: Sequence[int]) -> Tuple[int, ...]:
             capture_output=True,
             timeout=10,
             check=False,
+            # A helper the owner never asked to see: no console window, ever.
+            creationflags=_CREATE_NO_WINDOW,
         )
     except Exception:  # noqa: BLE001 - an unreadable table is "unknown", not a port
         return ()

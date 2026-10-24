@@ -37,10 +37,19 @@ Honesty
 
 Every failure is a :class:`LaunchRefusal` carrying one plain sentence: no files, no
 entry point, an unlaunchable kind, the approvals missing or stale, the process dying
-without binding a port, the window program missing. When a process dies but the
-project's folder holds a static page, that page is served read-only and opened
-instead, and the answer says both facts (``fallback: true`` plus the failure in
-``notice``): the owner sees *something* and is not told the run succeeded.
+without binding a port, the window program missing. A process that never bound a port
+is **never** followed by a browser window: the answer is a typed refusal with the run's
+state, its exit code and the redacted tail of its log, because a URL without a port
+would show the owner a blank page and teach him nothing. When the project's folder also
+holds a static page, that page is offered as ``fallback_available``/``fallback_url`` --
+an explicit second action the caller must ask for (``static_fallback: true``), never a
+silent substitution for the run the owner actually requested.
+
+A blocking console application is diagnosed, not shown. The child is created without a
+console window (``CREATE_NO_WINDOW``); when its output reads like a prompt (a line that
+ends with ``:`` or contains ``Выбрать``/``Введите``/``Enter``/``input``) or when it exits
+without a port, the refusal says «Приложение ждёт ввода в консоли — так запускать
+нельзя» and points at the log. No input is ever sent to the child.
 
 A desktop-kind entry point has no windowed form in the product today; the kind set
 is empty and a recognised-but-desktop kind is refused with a typed sentence rather
@@ -59,6 +68,7 @@ from app.projects.app_window import (
     AppWindowOpener,
     WindowRefusal,
     WindowResult,
+    is_loopback_url_with_port,
 )
 from app.projects.entrypoint import (
     SERVE_KIND_STATIC,
@@ -77,13 +87,16 @@ from app.projects.runner import (
 from app.projects.store import is_safe_project_id
 
 __all__ = [
+    "CONSOLE_INPUT_MESSAGE",
     "DESKTOP_ENTRY_KINDS",
     "LaunchRefusal",
     "LaunchResult",
     "NO_ENTRY_MESSAGE",
     "NO_FILES_MESSAGE",
+    "NOT_A_SERVER_MESSAGE",
     "ProjectLauncher",
     "READINESS_TIMEOUT_SECONDS",
+    "looks_like_console_prompt",
 ]
 
 #: Entry kinds that need a desktop window this product cannot host yet. The set is
@@ -107,6 +120,58 @@ NO_FILES_MESSAGE = (
     "Сначала выполните запуск, который создаст файлы."
 )
 NO_ENTRY_MESSAGE = "Точка входа не найдена: запускать нечего."
+
+#: The plain sentence a no-port launch owes the owner. It is the first thing the
+#: refusal says, before the exit code and the log path.
+NOT_A_SERVER_MESSAGE = "Приложение не стало сервером: порт не открылся."
+
+#: The sentence for a child that looks like it is waiting for console input. Forge has
+#: no console to type into: such an application cannot be started this way.
+CONSOLE_INPUT_MESSAGE = "Приложение ждёт ввода в консоли — так запускать нельзя."
+
+#: What a prompt-like line looks like. The rule is deliberately plain: a line that ends
+#: with a colon, or that names one of the four words below, is a prompt.
+_PROMPT_WORDS = ("выбрать", "введите", "enter", "input")
+
+#: Structural lines of a Python traceback are not prompts, even though the header ends
+#: with a colon. A crash must be reported as a crash, not as "waiting for input".
+_TRACEBACK_PREFIXES = (
+    "traceback (most recent call last)",
+    "during handling of the above exception",
+    "the above exception was the direct cause",
+)
+
+
+def looks_like_console_prompt(lines: Any) -> bool:
+    """Whether a log's lines look like an application waiting for console input.
+
+    This is a diagnosis, not an accusation: nothing here proves *why* a process is
+    silent. It only recognises the two cheap shapes -- a line that ends with ``:``
+    (``Введите пароль:``) and a line that contains one of the prompt words. Traceback
+    structure and indented source frames are skipped: ``Traceback (most recent call
+    last):`` is a crash, and calling it a prompt would hide the real error. The caller
+    prints the sentence and points at the log; it never types anything into the child.
+    """
+
+    for raw in lines or ():
+        original = str(raw or "").rstrip("\r\n")
+        line = original.strip()
+        if not line or line.startswith("--- ") or line.startswith("# "):
+            # Forge's own log header and stream markers are not the child's output.
+            continue
+        lowered = line.casefold()
+        if lowered.startswith(_TRACEBACK_PREFIXES):
+            continue
+        if line.startswith(("File \"", "File '")):
+            continue
+        if original.startswith((" ", "\t")):
+            # Indented lines are source frames / continuation, never a prompt.
+            continue
+        if line.endswith(":") or line.endswith("："):
+            return True
+        if any(word in lowered for word in _PROMPT_WORDS):
+            return True
+    return False
 
 
 class LaunchRefusal(ProjectError):
@@ -146,8 +211,9 @@ class LaunchResult:
     #: window was really opened. The field is explicit so the payload never has to infer
     #: success from the presence of a URL.
     launched: bool = True
-    #: Set only when a process failed and a static page was shown instead. The
-    #: sentence names the failure, so the fallback is never a silent success.
+    #: Set only when the caller explicitly asked for the project's static page
+    #: (``static_fallback: true``) and that page was served instead of a process. The
+    #: sentence names the request, so the fallback is never a silent success.
     notice: str = ""
     fallback: bool = False
 
@@ -208,6 +274,7 @@ class ProjectLauncher:
         confirm: object = False,
         digest: object = None,
         archived: bool = False,
+        static_fallback: bool = False,
     ) -> LaunchResult:
         """Show the project, starting it only when it is not already running.
 
@@ -215,6 +282,11 @@ class ProjectLauncher:
         archive state, the files on disk, the entry point, the kind. Only after all
         of them a process may be started, and only the runner's own approval chain
         can start it.
+
+        ``static_fallback`` is the owner's **explicit** request for the project's
+        static page (the choice the refusal offers as ``fallback_available``). It is
+        consulted only when the declared process did not become a server; without it a
+        dead process is a refusal and no window opens.
         """
 
         key = str(project_id or "")
@@ -257,14 +329,23 @@ class ProjectLauncher:
             return self._launch_page(key, target, entry)
 
         return self._launch_process(
-            key, target, entry, confirm=confirm, digest=digest
+            key,
+            target,
+            entry,
+            confirm=confirm,
+            digest=digest,
+            static_fallback=bool(static_fallback),
         )
 
     # ----------------------------------------------------------- a static page
-    def _launch_page(
-        self, project_id: str, target: Any, entry: EntryPoint, *, notice: str = ""
-    ) -> LaunchResult:
-        """Serve a static page read-only (or reuse its preview) and open it."""
+    def _ensure_page_url(
+        self, project_id: str, target: Any, entry: EntryPoint
+    ) -> Tuple[str, bool]:
+        """Serve a static page read-only (or reuse its preview) and return its URL.
+
+        The URL is always the preview's own, built from the ephemeral port the server
+        really bound: there is no guessed port and no portless form.
+        """
 
         if self._previews is None:
             raise LaunchRefusal(
@@ -295,6 +376,22 @@ class ProjectLauncher:
                     reason_code="preview_failed",
                     facts={"project_id": project_id, "entry_kind": str(entry.kind)},
                 )
+        if not is_loopback_url_with_port(url):
+            # The preview builds its URL from a bound port; a value that does not carry
+            # one is not opened either -- the same rule as a project process.
+            raise LaunchRefusal(
+                "У локального предпросмотра нет порта: открывать нечего.",
+                reason_code="preview_failed",
+                facts={"project_id": project_id, "entry_kind": str(entry.kind)},
+            )
+        return url, reused
+
+    def _launch_page(
+        self, project_id: str, target: Any, entry: EntryPoint, *, notice: str = ""
+    ) -> LaunchResult:
+        """Serve a static page read-only (or reuse its preview) and open it."""
+
+        url, reused = self._ensure_page_url(project_id, target, entry)
         window = self._open_window(project_id, url)
         return LaunchResult(
             project_id=project_id,
@@ -316,8 +413,15 @@ class ProjectLauncher:
         *,
         confirm: object,
         digest: object,
+        static_fallback: bool = False,
     ) -> LaunchResult:
-        """Start (or reuse) the declared process, wait for its port, open the URL."""
+        """Start (or reuse) the declared process, wait for its port, open the URL.
+
+        A URL is opened only when it carries the port the runner really observed
+        (``http://127.0.0.1:<port>/``). A process that did not become a server is a
+        typed refusal -- or, when the caller explicitly asked for it, the project's
+        static page -- and never a browser pointed at nothing.
+        """
 
         if self._runner is None:
             raise LaunchRefusal(
@@ -361,8 +465,19 @@ class ProjectLauncher:
 
         if url == "":
             url, status = self._wait_for_url(project_id, target)
+        state = str(status.get("state", "") or state)
         if url == "":
-            return self._process_failure(project_id, target, entry, status, state)
+            if static_fallback:
+                return self._explicit_static_fallback(
+                    project_id, target, entry, status, state
+                )
+            raise self._port_refusal(project_id, target, entry, status, state)
+        if not is_loopback_url_with_port(url):
+            # Defence in depth: the opener refuses this too, but the refusal has to
+            # carry the run's facts, and no window may be opened for it.
+            raise self._port_refusal(
+                project_id, target, entry, status, state, url=url
+            )
 
         window = self._open_window(project_id, url)
         return LaunchResult(
@@ -469,7 +584,7 @@ class ProjectLauncher:
             self._sleep(READINESS_POLL_SECONDS)
             status = self._safe_status(project_id, target)
 
-    def _process_failure(
+    def _explicit_static_fallback(
         self,
         project_id: str,
         target: Any,
@@ -477,58 +592,120 @@ class ProjectLauncher:
         status: Dict[str, Any],
         state: str,
     ) -> LaunchResult:
-        """Report the death plainly, then show a static page if the folder holds one.
+        """Serve the project's static page because the caller explicitly asked for it.
 
-        A process that never bound a port is a failure with a sentence, never a
-        silent no-op. The project's own static page may still be the result the
-        owner wanted to see; it is served read-only and opened, and the answer keeps
-        both facts: ``fallback: true`` and the failure in ``notice``.
+        This is the second action the refusal offers as ``fallback_available``: the
+        owner read that the application never became a server, and chose the saved
+        page on purpose. It is never taken on his behalf.
         """
 
-        sentence, facts = self._failure_sentence(status, state)
         page = self._static_page_on_disk(getattr(target, "workspace", None))
-        if page is not None:
-            notice = f"{sentence} Показана статическая страница {page.path}."
-            try:
-                return self._launch_page(project_id, target, page, notice=notice)
-            except LaunchRefusal:
-                # The fallback did not work either: the failure above is the answer.
-                pass
-        raise LaunchRefusal(sentence, reason_code="run_failed", facts=facts)
+        if page is None:
+            raise self._port_refusal(
+                project_id, target, entry, status, state, fallback_requested=True
+            )
+        _facts, sentence = self._refusal_facts(status, state)
+        notice = (
+            f"{sentence} По запросу показана статическая страница {page.path}."
+        )
+        return self._launch_page(project_id, target, page, notice=notice)
 
-    def _failure_sentence(
+    def _port_refusal(
+        self,
+        project_id: str,
+        target: Any,
+        entry: EntryPoint,
+        status: Dict[str, Any],
+        state: str,
+        *,
+        url: str = "",
+        fallback_requested: bool = False,
+    ) -> LaunchRefusal:
+        """The honest answer to a process that never became a server.
+
+        Nothing is opened. The refusal carries the run's state, its exit code, the
+        redacted tail of its log (including the prompt-like line, when that is what the
+        log shows) and -- when the folder holds one -- the project's static page as an
+        explicit *offer*: ``fallback_available`` plus a real ``fallback_url``. The page
+        is served read-only so the offer has a URL, but no window is opened for it here.
+        """
+
+        facts, sentence = self._refusal_facts(status, state)
+        facts["project_id"] = project_id
+        facts["entry_kind"] = str(entry.kind)
+        if url:
+            facts["url"] = url
+            sentence = (
+                "Адрес проекта без порта: открывать нечего. " + NOT_A_SERVER_MESSAGE
+            )
+        if fallback_requested:
+            facts["fallback_requested"] = True
+        page = self._static_page_on_disk(getattr(target, "workspace", None))
+        fallback_url = ""
+        if page is not None:
+            try:
+                fallback_url, _reused = self._ensure_page_url(project_id, target, page)
+            except LaunchRefusal:
+                fallback_url = ""
+        facts["fallback_available"] = fallback_url != ""
+        if fallback_url:
+            facts["fallback_url"] = fallback_url
+            facts["fallback_page"] = page.path if page is not None else ""
+            if page is not None:
+                sentence = (
+                    f"{sentence} Сохранённую страницу {page.path} можно показать "
+                    "отдельным действием."
+                )
+        reason_code = (
+            "console_input_required"
+            if facts.get("waiting_for_input")
+            else "port_not_opened"
+        )
+        facts["refusal_reason"] = reason_code
+        return LaunchRefusal(sentence, reason_code=reason_code, facts=facts)
+
+    def _refusal_facts(
         self, status: Dict[str, Any], state: str
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> Tuple[Dict[str, Any], str]:
+        """The run's own facts and the one sentence a no-port launch owes the owner."""
+
         code = status.get("exit_code")
         reason = str(status.get("reason", "") or "")
         event = str(status.get("last_event", "") or "")
+        log = dict(status.get("log", {}) or {})
         lines = [
             str(item)
-            for item in (status.get("log", {}) or {}).get("lines", []) or []
+            for item in log.get("lines", []) or []
             if str(item).strip() != ""
         ]
-        tail = lines[-8:]
+        tail = lines[-20:]
+        run_state = str(status.get("state", "") or state)
+        waiting = looks_like_console_prompt(tail)
         facts: Dict[str, Any] = {
-            "run_state": str(status.get("state", "") or state),
+            "run_state": run_state,
             "exit_code": code if isinstance(code, int) else None,
             "run_reason": reason,
+            "last_event": event,
+            "waiting_for_input": bool(waiting),
             "log_tail": tail,
+            "log_path": str(log.get("path", "") or ""),
         }
-        if str(status.get("state", "") or state) in TERMINAL_STATES:
-            sentence = "Проект не открылся: процесс завершился"
+        sentence = NOT_A_SERVER_MESSAGE
+        if run_state in TERMINAL_STATES:
             if isinstance(code, int):
-                sentence = f"{sentence} с кодом {code}"
-            sentence = f"{sentence}, не открыв локальный порт."
-            if reason:
-                sentence = f"{sentence} Причина: {reason}."
-            elif event:
-                sentence = f"{sentence} Событие: {event}."
-            return sentence, facts
-        timeout = f"{self._readiness_timeout:g}"
-        return (
-            f"Проект не открылся: за {timeout} с процесс не открыл локальный порт.",
-            facts,
-        )
+                sentence = f"{sentence} Процесс завершился с кодом {code}."
+            else:
+                sentence = f"{sentence} Процесс завершился, не открыв порт."
+        else:
+            timeout = f"{self._readiness_timeout:g}"
+            sentence = (
+                f"{sentence} За {timeout} с процесс не открыл локальный порт."
+            )
+        if waiting:
+            sentence = f"{CONSOLE_INPUT_MESSAGE} {sentence}"
+        if facts["log_path"]:
+            sentence = f"{sentence} Журнал: {facts['log_path']}."
+        return facts, sentence
 
     def _static_page_on_disk(self, workspace: Any) -> Optional[EntryPoint]:
         """The project's own static page, read from the folder as it really is.

@@ -37,10 +37,14 @@ import subprocess
 import time
 import unittest
 
+from unittest import mock
+
+from app.execution import containment as containment_module
 from app.execution.containment import (
     NETWORK_INHERITED,
     SandboxLimits,
     directory_integrity_level,
+    probe_write_boundary,
     process_integrity_level,
 )
 from app.projects.entrypoint import detect_entry_point
@@ -512,6 +516,48 @@ class PrimitiveTests(unittest.TestCase):
     def test_13_the_project_folder_label_is_a_measured_fact(self) -> None:
         label = directory_integrity_level(REPO_ROOT)
         self.assertIn(label, ("low", "medium", "high", "unknown"))
+
+    def test_14_a_probe_that_times_out_is_unknown_and_not_an_exception(self) -> None:
+        """A hung probe must be reported, never crash the start it measured.
+
+        Measured in the full suite: a probe that timed out left ``stdout`` unbound,
+        ``probe_write_boundary`` raised ``UnboundLocalError``, and the launch reported
+        a failed *start* instead of the honest ``probe_error: probe_timeout``.
+        """
+
+        if os.name != "nt":  # pragma: no cover - the probe is Windows-only
+            self.skipTest("the write-boundary probe is Windows-only")
+        base = SCRATCH / f"probe-timeout-{os.getpid()}-{id(self)}"
+        shutil.rmtree(base, ignore_errors=True)
+        (base / "outside").mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+
+        class _HungProbe:
+            pid = 424242
+
+            def poll(self):
+                return 0
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired("probe", timeout or 0)
+
+        with mock.patch.object(
+            containment_module.subprocess, "Popen", return_value=_HungProbe()
+        ), mock.patch.object(
+            containment_module, "create_process_tree_job", return_value=None
+        ):
+            reply = probe_write_boundary(
+                interpreter="python",
+                cwd=base,
+                environment={},
+                workspace=base,
+                outside_directory=base / "outside",
+                limits=SandboxLimits(memory_mb=0, max_processes=0),
+                drop_integrity=False,
+            )
+        self.assertEqual(reply["probe_error"], "probe_timeout")
+        self.assertEqual(reply["writes_inside"], "unknown")
+        self.assertEqual(reply["writes_outside"], "unknown")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -68,6 +68,7 @@ __all__ = [
     "WindowResult",
     "default_profile_root",
     "detached_flags",
+    "is_loopback_url_with_port",
 ]
 
 #: A Chromium browser in app mode: a standalone window with no address bar.
@@ -192,8 +193,15 @@ def _install_candidates(names: Sequence[str]) -> List[Path]:
     return found
 
 
-def _looks_like_loopback(url: object) -> bool:
-    """True only for a loopback http URL: the one thing this module may open."""
+def is_loopback_url_with_port(url: object) -> bool:
+    """True only for a loopback http URL **with an explicit port**.
+
+    A URL without a port (``http://127.0.0.1/``) points at port 80, where no project
+    of this product can be listening: opening it shows a blank page and teaches the
+    owner nothing. The predicate is public because the launch route checks the same
+    fact before it ever reaches the opener, so "never open a portless URL" is enforced
+    at both ends.
+    """
 
     if not isinstance(url, str):
         return False
@@ -207,6 +215,10 @@ def _looks_like_loopback(url: object) -> bool:
     except ValueError:
         return False
     return 1 <= number <= 65535
+
+
+#: Kept as the module's internal name: the check above is what it always meant.
+_looks_like_loopback = is_loopback_url_with_port
 
 
 class AppWindowOpener:

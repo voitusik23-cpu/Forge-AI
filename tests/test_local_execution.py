@@ -568,7 +568,7 @@ class RunnerTests(_LocalExecutionCase):
             "",
         )
         keys = json.loads(keys_line)
-        expected = ["PATH", "PYTHONIOENCODING"]
+        expected = ["PATH", "PYTHONIOENCODING", "PYTHONUNBUFFERED"]
         if os.name == "nt":
             # TEMP/TMP point inside the project folder when the child's token is
             # lowered: the machine's TEMP is a higher-integrity folder, which a

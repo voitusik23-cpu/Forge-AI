@@ -127,6 +127,11 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _CREATE_SUSPENDED = 0x00000004
 
+#: The probe is a short-lived helper its owner never asked to see. Forge runs under
+#: ``pythonw`` (no console), so without this flag Windows gives the probe a fresh
+#: console window that flashes on screen for every run.
+_CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+
 _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
 
@@ -760,6 +765,11 @@ def probe_write_boundary(
 
     job: Optional[int] = None
     process: Optional["subprocess.Popen[bytes]"] = None
+    #: ``communicate`` is the only assignment below; a probe that times out or fails
+    #: before it answers leaves this at its initial value. Reading it unbound turned a
+    #: timeout into ``UnboundLocalError`` and made the caller report a failed *start*
+    #: instead of the measured "unknown" it promises.
+    stdout: object = b""
     try:
         job = create_process_tree_job()
         if job is not None:
@@ -773,6 +783,8 @@ def probe_write_boundary(
                 close_process_tree_job(job)
                 job = None
         creationflags = _CREATE_SUSPENDED if drop_integrity else 0
+        if os.name == "nt":
+            creationflags |= _CREATE_NO_WINDOW
         process = subprocess.Popen(
             [
                 str(interpreter),

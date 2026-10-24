@@ -516,6 +516,10 @@ def terminate_process_tree(
                         capture_output=True,
                         timeout=5,
                         check=False,
+                        # A cleanup helper must not flash a console window.
+                        creationflags=int(
+                            getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0
+                        ),
                     )
                 except Exception:
                     pass

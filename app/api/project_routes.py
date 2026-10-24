@@ -18,7 +18,7 @@ POST /api/projects/{id}/run/stop                 -> terminate the process tree
 POST /api/projects/{id}/run/restart              -> stop, then start again under a fresh approval
 GET  /api/projects/{id}/run/log                  -> the redacted, bounded log
 POST /api/projects/{id}/open  {target}           -> really open folder / VS Code / terminal
-POST /api/projects/{id}/launch  {confirm, entrypoint_digest}
+POST /api/projects/{id}/launch  {confirm, entrypoint_digest, fallback}
                                                  -> start it and open the result in its own window
 POST /api/projects/{id}/move-to-visible-folder   -> deliver the files to the owner's folder
 DELETE|POST /api/projects/{id}                   -> move the project into projects-deleted
@@ -662,6 +662,12 @@ def register_project_routes(
         a typed ``409`` with one plain sentence (no files, no entry point, no
         approval, the process died without a port, no browser): a launch is never a
         silent no-op.
+
+        A project that did not become a server is **not** replaced by its static page
+        behind the owner's back: the refusal carries ``fallback_available`` and a real
+        ``fallback_url`` when the folder holds a page, and only a second request with
+        ``{"fallback": true}`` serves that page. No browser is opened when no port was
+        observed.
         """
 
         body = dict(payload or {})
@@ -671,6 +677,11 @@ def register_project_routes(
         digest = body.get("entrypoint_digest")
         if digest is not None and not isinstance(digest, str):
             raise body_error_exception("'entrypoint_digest' must be a string")
+        # The explicit request for the project's static page. It is a boolean, and it is
+        # the *only* way the page can be shown for a process that never bound a port.
+        static_fallback = body.get("fallback", False)
+        if not isinstance(static_fallback, bool):
+            raise body_error_exception("'fallback' must be a boolean")
         project = _guard(lambda: projects.open_project(_project_id(project_id)))
         if project.archived:
             raise _refusal(
@@ -690,6 +701,7 @@ def register_project_routes(
                 confirm=confirm,
                 digest=digest,
                 archived=bool(project.archived),
+                static_fallback=static_fallback,
             )
         except LaunchRefusal as exc:
             raise HTTPException(
