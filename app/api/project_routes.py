@@ -18,6 +18,8 @@ POST /api/projects/{id}/run/stop                 -> terminate the process tree
 POST /api/projects/{id}/run/restart              -> stop, then start again under a fresh approval
 GET  /api/projects/{id}/run/log                  -> the redacted, bounded log
 POST /api/projects/{id}/open  {target}           -> really open folder / VS Code / terminal
+POST /api/projects/{id}/launch  {confirm, entrypoint_digest}
+                                                 -> start it and open the result in its own window
 POST /api/projects/{id}/move-to-visible-folder   -> deliver the files to the owner's folder
 DELETE|POST /api/projects/{id}                   -> move the project into projects-deleted
 POST /api/projects/delete-empty                  -> the same move, for empty finished projects
@@ -57,6 +59,7 @@ from app.projects.entrypoint import (
     resolve_entry,
 )
 from app.projects.folders import count_files
+from app.projects.launcher import LaunchRefusal, ProjectLauncher
 from app.projects.opener import OPEN_TARGETS, OpenRefusal, ProjectOpener
 from app.projects.preview import (
     LOCAL_RUN_NOT_WIRED,
@@ -98,6 +101,7 @@ def register_project_routes(
     preview_registry: Any = None,
     runner: Any = None,
     opener: Any = None,
+    window_opener: Any = None,
 ) -> None:
     """Attach the lifecycle routes to ``app`` and publish the service on its state.
 
@@ -126,6 +130,13 @@ def register_project_routes(
     A test supplies one whose ``spawn`` records the argument vector, so the open buttons
     can be proved without a real Explorer window opening on the machine running the
     suite; the composition supplies the real one.
+
+    ``window_opener`` is the OS window integration the launch route uses
+    (:class:`app.projects.app_window.AppWindowOpener`). It is injected for the same
+    reason as ``opener``: the launch is proved by the exact argument vector it would
+    have started, without a browser window opening on the test machine. The launcher
+    itself is always composed here, so it shares this process's one runner and one
+    preview registry.
     """
 
     from fastapi import Body, HTTPException
@@ -152,6 +163,15 @@ def register_project_routes(
         )
     )
     app.state.forge_runner = local_runner
+    # The launch is one request that shows the result: it resolves the entry point,
+    # starts (or reuses) the project through the runner/registry composed above, waits
+    # for the port the runner really observed, and opens the URL in its own window.
+    project_launcher = ProjectLauncher(
+        runner=local_runner,
+        previews=registry,
+        windows=window_opener,
+    )
+    app.state.forge_launcher = project_launcher
 
     def _refusal(exc: Exception) -> "HTTPException":
         if isinstance(exc, (UnknownProject, UnknownProjectVersion)):
@@ -618,6 +638,71 @@ def register_project_routes(
             "project_id": project.project_id,
             "folder": str(project.project_path or ""),
             **result.to_dict(),
+        }
+
+    @app.post("/api/projects/{project_id}/launch")
+    def launch_project(
+        project_id: str,
+        payload: Optional[Dict[str, Any]] = Body(default=None),
+    ) -> Dict[str, Any]:
+        """Start the project and open the **result** in its own window.
+
+        This is the owner's «Запустить приложение»: one click that delivers the
+        running project on the desktop instead of another Forge screen or a URL to
+        copy. The entry point comes from the manifest (via
+        :mod:`app.projects.entrypoint`), a process is started only through the
+        runner's existing approval chain -- ``{"confirm": true}`` plus the
+        ``entrypoint_digest`` the owner was shown -- and a static page is served by
+        the existing read-only preview. The window is
+        :class:`app.projects.app_window.AppWindowOpener`'s: Chrome in app mode,
+        then Edge, then the default browser.
+
+        A running server is **reused** (``reused: true``) and the window is simply
+        opened again, so a second click is the same request. Every impossibility is
+        a typed ``409`` with one plain sentence (no files, no entry point, no
+        approval, the process died without a port, no browser): a launch is never a
+        silent no-op.
+        """
+
+        body = dict(payload or {})
+        confirm = body.get("confirm", False)
+        if not isinstance(confirm, bool):
+            raise body_error_exception("'confirm' must be a boolean")
+        digest = body.get("entrypoint_digest")
+        if digest is not None and not isinstance(digest, str):
+            raise body_error_exception("'entrypoint_digest' must be a string")
+        project = _guard(lambda: projects.open_project(_project_id(project_id)))
+        if project.archived:
+            raise _refusal(
+                IllegalTransition(
+                    "an archived project cannot be launched: restore it first",
+                    status=project.status,
+                    event="launch",
+                )
+            )
+        folder = _folder_facts(project)
+        try:
+            result = project_launcher.launch(
+                project_id=project.project_id,
+                target=_run_target(project),
+                entry=_entry_of(project),
+                files=int(folder["files"]),
+                confirm=confirm,
+                digest=digest,
+                archived=bool(project.archived),
+            )
+        except LaunchRefusal as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    **error_body(error_code=exc.code, code=exc.code),
+                    "error": str(exc),
+                    **dict(exc.facts),
+                },
+            ) from exc
+        return {
+            **result.to_dict(),
+            "stage": _stage_of(project),
         }
 
     @app.post("/api/projects/{project_id}/move-to-visible-folder")

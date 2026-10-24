@@ -189,6 +189,7 @@ def create_api_app(
     project_runner: Optional[object] = None,
     settings_store: Optional[object] = None,
     project_opener: Optional[object] = None,
+    window_opener: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -222,6 +223,12 @@ def create_api_app(
     composed by the launcher with the same settings. A caller that composes its own
     service (a test, a laboratory script) therefore keeps the layout it asked for and
     never writes into the owner's desktop.
+
+    ``window_opener`` is the OS window integration the launch route
+    (``POST /api/projects/{id}/launch``) uses to show a project in its own window. It
+    defaults to the real :class:`app.projects.app_window.AppWindowOpener` and is
+    injectable for the same reason ``project_opener`` is: a test proves the exact
+    argument vector without a browser window opening on the test machine.
     """
 
     from fastapi import FastAPI, HTTPException, Request, Header
@@ -454,6 +461,7 @@ def create_api_app(
         preview_registry=previews,
         runner=runner,
         opener=project_opener,
+        window_opener=window_opener,
         environment_facts=lambda: {
             "provider_registry_ids": _provider_registry_ids(api_service),
             "api_routes": sorted(

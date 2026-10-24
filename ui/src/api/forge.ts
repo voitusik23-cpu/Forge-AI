@@ -1027,6 +1027,29 @@ export type LifecycleOpenResult = {
 };
 
 /**
+ * The answer of `POST /api/projects/{id}/launch`: the window that now shows the project.
+ *
+ * `window` is the one that really opened (`chrome_app`, `edge_app` or
+ * `default_browser`), `pid` is its process id (0 for the default browser, which reports
+ * none), and `reused` says whether the running server was kept instead of restarted.
+ * `notice` appears only when a dead process fell back to the project's static page: the
+ * sentence names the failure, so the fallback is never a silent success.
+ */
+export type LifecycleLaunch = {
+  launched?: boolean;
+  url?: string;
+  /** `chrome_app` | `edge_app` | `default_browser` */
+  window?: string;
+  pid?: number;
+  reused?: boolean;
+  project_id?: string;
+  entry_kind?: string;
+  notice?: string;
+  fallback?: boolean;
+  stage?: string;
+};
+
+/**
  * The one entry point detected from the manifest (`app/projects/entrypoint.py`).
  *
  * `path` and `location` are workspace- and repository-relative: an absolute path is never
@@ -1382,6 +1405,25 @@ export const openProject = (
   target: "folder" | "editor" | "terminal"
 ): Promise<Result<LifecycleOpenResult>> =>
   postJson<LifecycleOpenResult>(projectPath(projectId, "/open"), { target });
+
+/**
+ * `POST /api/projects/{id}/launch` — run the project and show it in its own window.
+ *
+ * One request, one result: the backend resolves the entry point from the manifest,
+ * starts the project (or reuses the server that is already up) and opens the URL in a
+ * standalone window with no address bar. `confirm` plus `entrypoint_digest` is the same
+ * approval `POST /run` needs; a static page needs neither, so the digest is omitted when
+ * the card has none. A refusal is a `409` with one plain sentence
+ * (`project_launch_refused`), which the card prints verbatim.
+ */
+export const launchProject = (
+  projectId: string,
+  digest?: string
+): Promise<Result<LifecycleLaunch>> =>
+  postJson<LifecycleLaunch>(projectPath(projectId, "/launch"), {
+    confirm: true,
+    ...(digest ? { entrypoint_digest: digest } : {}),
+  });
 
 /**
  * `POST /api/projects/{id}/move-to-visible-folder` — deliver an existing project.

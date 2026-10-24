@@ -50,6 +50,7 @@ import {
   loadProjectHistory,
   loadProjectLifecycle,
   loadProjectRun,
+  launchProject,
   loadRunRecord,
   moveProjectToVisibleFolder,
   openProject as openProjectTarget,
@@ -68,6 +69,7 @@ import {
   type LifecycleEntryPoint,
   type LifecycleFolder,
   type LifecycleHistory,
+  type LifecycleLaunch,
   type LifecycleNewVersion,
   type LifecycleOpen,
   type LifecyclePreview,
@@ -99,6 +101,22 @@ const bytesLabel = (size: unknown): string => {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
+};
+
+/**
+ * The sentence a successful launch prints: the URL that is now open in its own window,
+ * plus the backend's own note when it had to fall back to the project's static page.
+ *
+ * The note is never dropped: a fallback means the process failed, and the owner has to
+ * learn that from the same block that says a window opened.
+ */
+const launchSentence = (lang: Lang, value: LifecycleLaunch): string => {
+  const url = String(value.url ?? "");
+  const extra = String(value.notice ?? "");
+  const base = t(lang, "projects.launch.success").replace("{url}", url);
+  // A fallback is a second fact ("the process died, here is the page instead"), so it is
+  // printed on its own line and never glued onto the URL.
+  return extra === "" ? base : `${base}\n${extra}`;
 };
 
 /**
@@ -183,7 +201,9 @@ const Refusal = ({ lang, failure, onRetry }: { lang: Lang; failure: Failure; onR
             ? t(lang, "projects.err.illegal_transition")
             : code === "project_not_completable"
               ? t(lang, "projects.err.not_completable")
-              : `${t(lang, "projects.err.generic")}: HTTP ${failure.status}`;
+              : code === "project_launch_refused"
+                ? t(lang, "projects.err.launch")
+                : `${t(lang, "projects.err.generic")}: HTTP ${failure.status}`;
   return (
     <div className={`notice ${offline || signedOut ? "danger" : "warn"}`}>
       <div>{headline}</div>
@@ -642,6 +662,10 @@ const ProjectCard = ({
   onRunStart,
   onRunStop,
   onRunRestart,
+  onLaunch,
+  launchBusy,
+  launchNotice,
+  launchFailure,
   onDelete,
   open,
   folder,
@@ -715,6 +739,20 @@ const ProjectCard = ({
   onRunStart: (digest: string) => void;
   onRunStop: () => void;
   onRunRestart: (digest: string) => void;
+  /**
+   * «Запустить приложение»: the one obvious button.
+   *
+   * It runs the project and opens **the result** in its own window; the second click
+   * reuses the running server and only opens the window again. It is not the same
+   * meaning as the old «Открыть проект», which only showed this card: that action is
+   * now called «Подробнее».
+   */
+  onLaunch: () => void;
+  launchBusy: boolean;
+  /** The sentence a successful launch printed: the URL that is now open. */
+  launchNotice: string;
+  /** The backend's refusal verbatim, when the launch could not show anything. */
+  launchFailure: Failure | null;
   /**
    * Delete this project: the parent asks the backend, which *moves* the folder into
    * `.forge/projects-deleted`. The click is refused until it is confirmed inside the card,
@@ -1111,6 +1149,64 @@ const ProjectCard = ({
             {line}
           </div>
         ))}
+
+        {/* ---------------------------------------------------------- the launch */}
+        {/* THE ONE OBVIOUS BUTTON. The owner's words: «Если написано открыть проект, я
+            так понял, что я открою работающий проект и он у меня развернётся на рабочем
+            столе. Я хочу видеть результат, а не вечное меню Forge.» One click resolves
+            the entry point, starts the project if it is not already running, and opens
+            the result in its own OS window. The backend owns every word below: the URL
+            is the one the process bound or the preview serves, and a refusal is printed
+            verbatim instead of being softened into a success. */}
+        <div data-testid="project-launch">
+          <div className="label">{t(lang, "projects.launch.title")}</div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+            <span data-testid="project-launch-button">
+              <Button
+                size="small"
+                tone="primary"
+                disabled={launchBusy || archived || fileTotal === 0}
+                disabledReason={
+                  archived
+                    ? t(lang, "projects.badge.archived")
+                    : fileTotal === 0
+                      ? t(lang, "projects.empty.title")
+                      : undefined
+                }
+                onClick={onLaunch}
+              >
+                {launchBusy ? t(lang, "projects.launch.running") : t(lang, "projects.action.launch")}
+              </Button>
+            </span>
+            {fileTotal === 0 ? (
+              <span className="small muted">{t(lang, "projects.empty.title")}</span>
+            ) : null}
+          </div>
+          <div className="small muted" style={{ marginTop: 6 }}>
+            {t(lang, "projects.launch.hint")}
+          </div>
+          {/* The refusal is the backend's own sentence, with its own facts (run state,
+              exit code, the redacted log tail) printed as they arrived. */}
+          {launchFailure !== null ? (
+            <div style={{ marginTop: 8 }} data-testid="project-launch-failure">
+              <Refusal lang={lang} failure={launchFailure} />
+            </div>
+          ) : null}
+          {launchNotice !== "" ? (
+            <div className="notice" style={{ marginTop: 8 }} data-testid="project-launch-notice">
+              <div style={{ whiteSpace: "pre-wrap" }}>{launchNotice}</div>
+              {/* «Открыть ещё раз» performs the same request: a running server is
+                  reused, and the project's own app profile restores the same window. */}
+              <div className="row" style={{ gap: 8, marginTop: 6 }}>
+                <span data-testid="project-launch-again">
+                  <Button size="small" tone="ghost" disabled={launchBusy} onClick={onLaunch}>
+                    {t(lang, "projects.action.launch_again")}
+                  </Button>
+                </span>
+              </div>
+            </div>
+          ) : null}
+        </div>
 
         {/* ----------------------------------------------------- the project on disk */}
         {/* THE ENTRANCE INTO THE PROJECT. The folder is shown here, next to the three
@@ -1806,6 +1902,19 @@ export const Projects = ({
   const [diskNotice, setDiskNotice] = useState("");
   const [diskFailure, setDiskFailure] = useState<Failure | null>(null);
   const [movingToVisible, setMovingToVisible] = useState(false);
+  // The one-click launch. Its answer is a *window*, so the card keeps three facts: the
+  // request is in flight, the URL that is now open in its own window, and the backend's
+  // refusal verbatim when nothing could be shown.
+  const [launchBusy, setLaunchBusy] = useState(false);
+  const [launchNotice, setLaunchNotice] = useState("");
+  const [launchFailure, setLaunchFailure] = useState<Failure | null>(null);
+  // The row's own launch: same route, same answer, printed under exactly the row that
+  // was clicked. The list summary carries no entry point, so the row reads the project's
+  // detail first and names the digest the backend itself published -- the approval keeps
+  // naming a value the owner was shown, even from the list.
+  const [rowLaunching, setRowLaunching] = useState("");
+  const [rowLaunchNotice, setRowLaunchNotice] = useState<{ projectId: string; text: string } | null>(null);
+  const [rowLaunchFailure, setRowLaunchFailure] = useState<{ projectId: string; failure: Failure } | null>(null);
   // The row's own entrance. «Открыть папку» on a row acts without leaving the list, so
   // its answer is printed under exactly the row that was clicked: the program and its
   // pid when Explorer started, the backend's refusal sentence when it did not.
@@ -1835,12 +1944,49 @@ export const Projects = ({
     });
   };
 
-  const loadDetail = useCallback(async (projectId: string): Promise<LifecycleDetail | null> => {
+  /**
+   * «Запустить приложение» on a row: run the project and show it in its own window.
+   *
+   * The list carries no entry point, so this reads the project's own detail route -- the
+   * route that already publishes the digest the backend compares -- and then launches
+   * with exactly that digest. A refusal is printed under the row, never swallowed.
+   */
+  const launchRow = async (projectId: string) => {
+    if (projectId === "") return;
+    setRowLaunching(projectId);
+    setRowLaunchNotice(null);
+    setRowLaunchFailure(null);
+    setRowNotice(null);
+    setRowFailure(null);
+    const detailOutcome = await loadProjectDetail(projectId);
+    if (!detailOutcome.ok) {
+      setRowLaunching("");
+      setRowLaunchFailure({ projectId, failure: detailOutcome.failure });
+      return;
+    }
+    const digest = String(
+      detailOutcome.value.entrypoint?.digest ?? detailOutcome.value.run?.entrypoint_digest ?? ""
+    );
+    const outcome = await launchProject(projectId, digest === "" ? undefined : digest);
+    setRowLaunching("");
+    if (!outcome.ok) {
+      setRowLaunchFailure({ projectId, failure: outcome.failure });
+      return;
+    }
+    setRowLaunchNotice({ projectId, text: launchSentence(lang, outcome.value) });
+    await loadList();
+  };
+
+  const loadDetail = useCallback(async (projectId: string, options?: { quiet?: boolean }): Promise<LifecycleDetail | null> => {
     if (projectId === "") {
       setDetail(null);
       return null;
     }
-    setDetail({ status: "loading" });
+    // A **quiet** refresh keeps the rendered card on screen while the same record is
+    // fetched again. The launch needs it: the notice that says where the project
+    // opened lives inside the card, and replacing the card with «Загрузка…» would hide
+    // the very answer the click produced.
+    if (options?.quiet !== true) setDetail({ status: "loading" });
     const outcome = await loadProjectDetail(projectId);
     setDetail(outcome.ok ? { status: "ready", value: outcome.value } : { status: "failed", failure: outcome.failure });
     // The loaded record is returned: a caller that has just changed the project (a
@@ -1974,6 +2120,35 @@ export const Projects = ({
         : t(lang, "projects.disk.moved").replace("{n}", String(count)).replace("{folder}", folder)
     );
     await loadDetail(selectedId);
+    await loadList();
+  };
+
+  // ------------------------------------------------------------ the launch
+  //
+  // One click, one request: the backend resolves the entry point, starts (or reuses) the
+  // project and opens the result in its own window. The digest is the one the card was
+  // already shown for this entry point, so the runner's approval keeps naming the exact
+  // command; a static page needs none. The answer is printed as it arrived: the URL that
+  // is open in its own window, or the backend's refusal verbatim.
+  const launchSelected = async () => {
+    if (selectedId === "") return;
+    const digest = String(entrypoint?.digest ?? "");
+    setLaunchBusy(true);
+    setActionFailure(null);
+    setActionNotice("");
+    setLaunchFailure(null);
+    setLaunchNotice("");
+    const outcome = await launchProject(selectedId, digest === "" ? undefined : digest);
+    setLaunchBusy(false);
+    if (!outcome.ok) {
+      setLaunchFailure(outcome.failure);
+      return;
+    }
+    setLaunchNotice(launchSentence(lang, outcome.value));
+    // The backend may have started the project's process or its preview: refresh the card
+    // so its runtime blocks agree with the window that just opened. The refresh is quiet,
+    // so the notice stays on screen while the record is read again.
+    await loadDetail(selectedId, { quiet: true });
     await loadList();
   };
 
@@ -2284,6 +2459,9 @@ export const Projects = ({
     setActionNotice("");
     setDiskNotice("");
     setDiskFailure(null);
+    setLaunchBusy(false);
+    setLaunchNotice("");
+    setLaunchFailure(null);
     setStaged(null);
     setDispatched(null);
     setChangeOutcome(null);
@@ -2545,6 +2723,14 @@ export const Projects = ({
                   id !== "" && typeof project.file_count === "number" && project.file_count > 0;
                 const folderReason =
                   id === "" ? t(lang, "projects.delete.no_id") : t(lang, "projects.row.no_files");
+                // A launch needs one file on disk and a record that is not archived. The
+                // list cannot know the entry point, so a click on a launchable row may
+                // still be refused *by the backend* -- and that sentence is printed under
+                // the row. What the row can know, it refuses here.
+                const canLaunch = canOpenFolder && !archived;
+                const launchReason = archived
+                  ? t(lang, "projects.badge.archived")
+                  : folderReason;
                 return (
                   <Fragment key={id}>
                   <tr
@@ -2575,18 +2761,34 @@ export const Projects = ({
                       {archived ? <div className="small muted">{t(lang, "projects.badge.archived")}</div> : null}
                     </td>
                     <td>
-                      {/* The two entrances, both real. The primary one navigates to the
-                          project's own screen; the second really opens the folder through
-                          POST /api/projects/{id}/open and prints the backend's answer
-                          ("explorer.EXE · PID …") right under this row. The wrapping span
-                          stops these clicks from also firing the row's navigation. */}
+                      {/* The three entrances, all real. «Запустить приложение» is the
+                          primary one: it runs the project and opens the result in its own
+                          window. «Подробнее» is the old «Открыть проект» and now says what
+                          it does -- it shows this card. «Открыть папку» really opens the
+                          folder through POST /api/projects/{id}/open and prints the
+                          backend's answer ("explorer.EXE · PID …") right under this row.
+                          The wrapping span stops these clicks from also firing the row's
+                          navigation. */}
                       <span
                         className="row"
                         style={{ gap: 6, flexWrap: "wrap" }}
                         onClick={(event) => event.stopPropagation()}
                       >
+                        <span data-testid="project-row-launch">
+                          <Button
+                            size="small"
+                            tone="primary"
+                            disabled={!canLaunch || rowLaunching === id}
+                            disabledReason={canLaunch ? undefined : launchReason}
+                            onClick={() => void launchRow(id)}
+                          >
+                            {rowLaunching === id
+                              ? t(lang, "state.loading")
+                              : t(lang, "projects.action.launch")}
+                          </Button>
+                        </span>
                         <span data-testid="project-row-open">
-                          <Button size="small" tone="primary" onClick={() => openProject(id)}>
+                          <Button size="small" tone="ghost" onClick={() => openProject(id)}>
                             {t(lang, "projects.action.open")}
                           </Button>
                         </span>
@@ -2607,6 +2809,11 @@ export const Projects = ({
                       {/* The visible half of a disabled control's reason: the tooltip
                           carries the same sentence, but a screenshot has to show why the
                           button is off, exactly as the card's disk block does. */}
+                      {!canLaunch ? (
+                        <div className="small muted" data-testid="project-row-launch-why">
+                          {t(lang, "projects.action.launch")}: {launchReason}
+                        </div>
+                      ) : null}
                       {!canOpenFolder ? (
                         <div className="small muted" data-testid="project-row-open-folder-why">
                           {t(lang, "projects.action.open_folder")}: {folderReason}
@@ -2625,6 +2832,34 @@ export const Projects = ({
                     <tr data-testid="project-row-open-failure">
                       <td colSpan={7}>
                         <Refusal lang={lang} failure={rowFailure.failure} />
+                      </td>
+                    </tr>
+                  ) : null}
+                  {rowLaunchNotice !== null && rowLaunchNotice.projectId === id ? (
+                    <tr data-testid="project-row-launch-notice">
+                      <td colSpan={7}>
+                        <div className="notice">
+                          <div style={{ whiteSpace: "pre-wrap" }}>{rowLaunchNotice.text}</div>
+                          <div className="row" style={{ gap: 8, marginTop: 6 }}>
+                            <span data-testid="project-row-launch-again">
+                              <Button
+                                size="small"
+                                tone="ghost"
+                                disabled={rowLaunching === id}
+                                onClick={() => void launchRow(id)}
+                              >
+                                {t(lang, "projects.action.launch_again")}
+                              </Button>
+                            </span>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : null}
+                  {rowLaunchFailure !== null && rowLaunchFailure.projectId === id ? (
+                    <tr data-testid="project-row-launch-failure">
+                      <td colSpan={7}>
+                        <Refusal lang={lang} failure={rowLaunchFailure.failure} />
                       </td>
                     </tr>
                   ) : null}
@@ -2942,6 +3177,10 @@ export const Projects = ({
           onRunStart={(digest) => void runStart(digest)}
           onRunStop={() => void runStop()}
           onRunRestart={(digest) => void runRestart(digest)}
+          onLaunch={() => void launchSelected()}
+          launchBusy={launchBusy}
+          launchNotice={launchNotice}
+          launchFailure={launchFailure}
           onDelete={() => void deleteSelected()}
           open={openBlock}
           folder={folderBlock}
