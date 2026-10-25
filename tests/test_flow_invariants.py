@@ -85,6 +85,7 @@ UI_SOURCE = REPOSITORY / "ui" / "src"
 APP_TSX = UI_SOURCE / "App.tsx"
 FORGE_TSX = UI_SOURCE / "screens" / "Forge.tsx"
 PROJECTS_TSX = UI_SOURCE / "screens" / "Projects.tsx"
+I18N = UI_SOURCE / "i18n.ts"
 FORGE_CLIENT = UI_SOURCE / "api" / "forge.ts"
 #: The `POST /api/tasks/run` body is composed here and `dispatchTask` calls it, so a
 #: target the client "calls" may be named in either module. Both are searched, and the
@@ -751,15 +752,37 @@ class NoDeadActionTests(unittest.TestCase):
         """«Что поправить?» is rendered above the run/facts blocks, not buried below.
 
         It is the default way to edit a project, so its position is part of the promise:
-        a textarea and one «Исправить проект» button, before the technical blocks, whose
-        result names the new version and what it changed.
+        a textarea and exactly ONE button -- «Внести изменения в проект» -- before the
+        technical blocks, whose result names the new version and what it changed.
+
+        THE DEFECT THIS PINS. The card used to offer two primary buttons for one change
+        («Начать изменения» and «Исправить проект»): the owner pressed one, then the other,
+        and could not tell whether anything had started. The second label must not come
+        back, and the click must produce a status strip that names the run.
         """
 
         source = PROJECTS_TSX.read_text(encoding="utf-8")
+        i18n = I18N.read_text(encoding="utf-8")
         self.assertIn('t(lang, "projects.newversion.title")', source)
         self.assertIn("const changeBlock = (", source)
         self.assertIn("{changeBlock}", source)
-        self.assertIn('t(lang, "projects.newversion.submit")', source)
+        # ONE action, and its label is the owner's word for it.
+        self.assertIn('t(lang, "projects.newversion.start")', source)
+        self.assertIn('"Внести изменения в проект"', i18n)
+        for duplicate in (
+            "projects.newversion.submit",
+            "projects.newversion.submitting",
+            "projects.newversion.staged",
+        ):
+            self.assertNotIn(duplicate, source, f"the second change control is back: {duplicate}")
+            self.assertNotIn(duplicate, i18n, f"the second change control is back: {duplicate}")
+        # The status strip: the run id, the live stage, the honest end.
+        self.assertIn('data-testid="change-status"', source)
+        self.assertIn('data-testid="change-status-line"', source)
+        self.assertIn('data-testid="change-stage-line"', source)
+        self.assertIn('t(lang, "projects.change.launched")', source)
+        self.assertIn('t(lang, "projects.change.done")', source)
+        self.assertIn("isTerminalRecord", source)
         self.assertIn('data-testid="change-outcome"', source)
         self.assertIn('data-testid="change-files"', source)
         self.assertIn('t(lang, "projects.newversion.changed")', source)
@@ -775,6 +798,56 @@ class NoDeadActionTests(unittest.TestCase):
                       't(lang, "projects.preview.title")',
                       't(lang, "projects.artifacts.title")'):
             self.assertLess(rendered_at, source.index(later), later)
+
+    def test_08b_the_noise_is_collapsed_and_the_actions_are_one_row(self) -> None:
+        """Second complaint: too much on the card. The blocks stay, collapsed.
+
+        Below the primary block the card shows the strip, the folder, one row of secondary
+        actions and the versions. The launch, the preview, the local run, the save facts,
+        the facts, the specification, the artifact table and the technical details are
+        behind one summary -- reachable (nothing was deleted) but not in the way.
+        """
+
+        source = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn('t(lang, "projects.card.details")', source)
+        self.assertIn('data-testid="project-details"', source)
+        # One compact row carries the whole existing action vocabulary.
+        self.assertIn('data-testid="project-secondary"', source)
+        for action in (
+            "project-secondary-open",
+            "project-secondary-launch",
+            "project-secondary-verify",
+            "project-secondary-archive",
+            "project-secondary-restore",
+            "project-secondary-delete",
+        ):
+            self.assertIn(action, source, action)
+        # Each of those handlers is still wired to a real call, not to a sentence.
+        for call in ("onLaunch", "onOpenTarget", "onVerify", "onArchive", "onRestore", "onDelete"):
+            self.assertIn(call, source, call)
+        # The visible part of the card is exactly: change block, folder, row, versions.
+        # (Their JSX is defined once, as values, and rendered in this order.)
+        visible = source[source.index("{changeBlock}"): source.index('data-testid="project-details"')]
+        for kept in ("{diskVisible}", "{secondaryRow}", "{versionsBlock}"):
+            self.assertIn(kept, visible, kept)
+        # Each of those values is a real definition, not a dangling name.
+        for defined in (
+            'data-testid="project-disk"',
+            'data-testid="project-secondary"',
+            "const versionsBlock = (",
+        ):
+            self.assertIn(defined, source, defined)
+        # The collapsed part holds the blocks that used to fill the card.
+        collapsed = source[source.index('data-testid="project-details"'):]
+        for folded in (
+            'data-testid="project-launch"',
+            'id="project-artifacts"',
+            "<RunPanel",
+            't(lang, "projects.preview.title")',
+            't(lang, "projects.spec.title")',
+            't(lang, "projects.artifacts.title")',
+        ):
+            self.assertIn(folded, collapsed, folded)
 
     def test_09_the_absolute_folder_is_diagnostics_only(self) -> None:
         """The card prints the relative folder above the fold and the absolute one below.

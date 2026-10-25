@@ -8046,3 +8046,130 @@ toggle instead of disappearing.
 глагол в первом лице, переживший ведущие филлеры, мог бы быть переписан; такие глаголы
 для того и внесены в список. `in_visible_root` вычисляется на каждый запрос, поэтому
 запись, чья папка исчезла, сообщает `false` и остаётся за переключателем, а не пропадает.
+
+## 2026-10-25 — One change action, a status strip, and provider keys the owner can add
+
+**Decision.** The «Проекты» card offers exactly **one** primary action for a change
+request — «Внести изменения в проект» — directly under the textarea. It performs both
+requests that used to be two buttons (`POST /api/projects/{id}/versions`, then
+`POST /api/tasks/run` with `lifecycle_project_id` and `write_mode: true`), and it prints a
+status strip immediately above itself: `Запущено: run-… · <stage>` while the run is
+followed through the existing `GET /api/runs/{run_id}`, ending in «Готово: vN записана»
+only when the project's own `current_version` moved, otherwise in the backend's sentence
+and error text, verbatim. Everything the card used to show below that block — launch,
+preview, local run, save facts, facts, specification, artifact table, backend action
+vocabulary, technical details — stays available inside one collapsed
+«Показать подробности». The visible card is: status block, the change block with its
+strip, the project's folder, one compact row of secondary actions (open folder, launch,
+verify, archive, restore, delete), and the versions.
+
+Providers and their API keys are added in «Настройки → Провайдеры и ключи». The non-secret
+half of an entry (provider id, base URL, default model, secret variable name) is stored in
+`.forge/settings.json` under `providers`; the key is written to **Windows Credential
+Manager** under `ForgeAI/provider/<SECRET_ENV_NAME>` and never to a file, a log, an event,
+a response or the interface. `app/config/secrets.py::SecretStore` reads that vault as its
+third source (after the process environment and `.env`), uncached, so a provider added this
+way is visible to the *existing* provider layer on the next request — no restart, no second
+registry. The routes are `GET/POST /api/settings/providers` and
+`DELETE /api/settings/providers/{id}`, loopback-only, and they publish `has_key` (a
+boolean) and `key_source` (`environment` / `vault` / empty) and nothing that could
+reconstruct a key.
+
+**Why.** Three measured complaints on one card. Two buttons for one action meant the owner
+pressed one, then the other, and could not tell whether anything had started; the card was
+so tall he had to read technical blocks to use it; and there was no place to add a provider
+with a key, because providers came from `.env`, which he is not supposed to edit.
+
+**Rejected alternatives.** A progress bar or a percentage (the record publishes an event
+count, not a plan); polling a not-yet-written run (the dispatch route is synchronous, so
+the run id exists only when it answers — the strip therefore appears on the click with
+«Запускаю», and names the run as soon as the dispatch answers); a second provider registry
+(the vault is reached through the one `SecretStore` every provider already uses); storing
+the key in `.forge/settings.json` (a JSON file is not a credential store); reporting
+«готов» from a probe (that is `GET /api/models`' question — this section answers the key
+question, and says «отключён» when the composition does not enable the provider).
+
+**Evidence.** `tests/test_provider_keys.py` (18 tests, in-memory vault: add → ready and the
+existing secret path sees the key, delete → not ready, an empty/invalid key refused without
+echoing it, the key absent from the settings file and from every payload and log record,
+the two writers of the settings file not erasing each other, a non-loopback peer refused),
+`tests/test_flow_invariants.py` (one button, the strip, the collapsed details, the single
+secondary row), `tests/test_projects_change_run.py`, `tests/test_beta_ui_actions.py`,
+`tests/test_secrets.py`, `tests/test_project_delete.py` (the provider DELETE route is the
+second DELETE, and it names no project), `tests/test_together_provider.py` (the preset
+catalogue is not a routing integration point), plus the CDP evidence in
+`.forge/screenshots/one-*.png` against the running application with the offline provider.
+
+**Consequences and open limits.** A run's stage word can only be printed once the run record
+exists; the dispatch route is synchronous, so for a long real run the strip shows
+«выполняю запуск…» until the answer arrives, and the recorded stage afterwards. A provider
+the composition does not enable is reported «отключён» with the honest sentence «выберите
+его явно в задаче», not as ready. The base URL and default model of an entry are stored and
+shown, but the transport of each provider still owns its endpoint constant; wiring an
+arbitrary base URL into a provider's transport is separate work.
+
+## 2026-10-25 — Одно действие изменения, полоса состояния и ключи провайдеров, которые владелец добавляет сам
+
+**Решение.** Карточка «Проекты» предлагает ровно **одно** основное действие для просьбы об
+изменении — «Внести изменения в проект» — прямо под полем ввода. Оно выполняет оба запроса,
+которые раньше были двумя кнопками (`POST /api/projects/{id}/versions`, затем
+`POST /api/tasks/run` с `lifecycle_project_id` и `write_mode: true`), и сразу над собой
+печатает полосу состояния: `Запущено: run-… · <этап>` пока запуск отслеживается через
+существующий `GET /api/runs/{run_id}`, заканчиваясь «Готово: vN записана» только если
+`current_version` проекта действительно вырос, иначе — предложением бэкенда и его текстом
+ошибки дословно. Всё, что раньше было ниже этого блока — запуск, предпросмотр, локальный
+запуск, факты сохранения, факты, спецификация, таблица файлов, словарь действий бэкенда,
+технические детали — остаётся доступным внутри одного свёрнутого «Показать подробности».
+Видимая карточка: блок статуса, блок изменения с полосой, папка проекта, одна компактная
+строка второстепенных действий (открыть папку, запустить, проверить, архивировать,
+восстановить, удалить) и версии.
+
+Провайдеры и их API-ключи добавляются в «Настройки → Провайдеры и ключи». Несекретная
+половина записи (идентификатор провайдера, базовый URL, модель по умолчанию, имя переменной
+секрета) хранится в `.forge/settings.json` в разделе `providers`; ключ пишется в
+**хранилище учётных данных Windows** под именем `ForgeAI/provider/<ИМЯ_ПЕРЕМЕННОЙ_СЕКРЕТА>`
+и никогда — в файл, журнал, событие, ответ или интерфейс.
+`app/config/secrets.py::SecretStore` читает это хранилище третьим источником (после
+окружения процесса и `.env`), без кеша, поэтому добавленный так провайдер виден
+*существующему* слою провайдеров на следующем запросе — без перезапуска и без второго
+реестра. Маршруты: `GET/POST /api/settings/providers` и
+`DELETE /api/settings/providers/{id}`, только с этого компьютера; они публикуют `has_key`
+(булево) и `key_source` (`environment` / `vault` / пусто) и ничего, по чему ключ можно
+восстановить.
+
+**Почему.** Три измеренные жалобы на одну карточку. Две кнопки для одного действия: владелец
+нажимал одну, потом другую и не мог понять, началось ли что-нибудь; карточка была такой
+длинной, что для работы её приходилось читать как технический документ; и не было места,
+где добавить провайдера с ключом, потому что провайдеры брались из `.env`, который ему
+редактировать не следует.
+
+**Отклонённые альтернативы.** Индикатор прогресса или проценты (запись публикует число
+событий, а не план); опрос ещё не записанного запуска (маршрут отправки синхронный, поэтому
+идентификатор запуска существует только когда он ответил — полоса появляется по нажатию с
+«Запускаю» и называет запуск сразу, как только отправка ответила); второй реестр
+провайдеров (хранилище достигается через единственный `SecretStore`, которым уже
+пользуется каждый провайдер); хранение ключа в `.forge/settings.json` (JSON-файл не является
+хранилищем секретов); вывод «готов» из проверки провайдера (это вопрос `GET /api/models`;
+этот раздел отвечает на вопрос о ключе и говорит «отключён», когда состав Forge провайдера
+не включает).
+
+**Доказательство.** `tests/test_provider_keys.py` (18 тестов, хранилище в памяти: добавили →
+«готов», и существующий путь секрета видит ключ; удалили → не готов; пустой или негодный
+ключ отклонён без эха значения; ключа нет ни в файле настроек, ни в одном ответе, ни в
+записи журнала; два писателя одного файла настроек не стирают друг друга; запрос не с этого
+компьютера отклонён), `tests/test_flow_invariants.py` (одна кнопка, полоса, свёрнутые
+подробности, одна строка второстепенных действий), `tests/test_projects_change_run.py`,
+`tests/test_beta_ui_actions.py`, `tests/test_secrets.py`, `tests/test_project_delete.py`
+(DELETE провайдера — второй DELETE на поверхности, и он не называет проект),
+`tests/test_together_provider.py` (каталог пресетов не является точкой интеграции
+маршрутизации), плюс CDP-доказательство в `.forge/screenshots/one-*.png` на работающем
+приложении с офлайн-провайдером.
+
+**Следствия и открытые ограничения.** Слово этапа запуска можно напечатать только когда
+запись запуска существует; маршрут отправки синхронный, поэтому для долгого настоящего
+запуска полоса показывает «выполняю запуск…» до ответа, а записанный этап — после. Провайдер,
+которого состав Forge не включает, показывается как «отключён» с честным предложением
+«выберите его явно в задаче», а не как готовый. Базовый URL и модель по умолчанию
+записываются и показываются, но транспортом каждого провайдера по-прежнему владеет его
+собственная константа адреса; подключение произвольного базового URL к транспорту — отдельная
+работа.

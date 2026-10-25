@@ -132,6 +132,54 @@ def is_loopback_host(host: str) -> bool:
     return str(host).strip().lower() in _LOOPBACK_HOSTS
 
 
+def _compose_provider_key_service(api_service: object, settings: object) -> object:
+    """Build the «Провайдеры и ключи» service over *this* composition's facts.
+
+    Three read-only inputs, all from the existing runtime -- never a copy of them:
+
+    * the model registry's providers, so the section lists what this build knows and
+      each entry's secret variable is the one its provider really reads;
+    * the composition's ``enabled_providers``, so an entry can honestly be reported as
+      «отключён» rather than «готов»;
+    * the owner's settings file, shared with the projects-folder setting.
+
+    The vault is not resolved here: the service resolves it per call, which is what lets
+    a test (and the owner) see a key change without a restart.
+    """
+
+    from app.config.provider_keys import ProviderKeyService, ProviderKeyStore
+
+    def _registry_providers() -> tuple:
+        registry = getattr(api_service, "_model_registry", None)
+        if registry is None:
+            runtime = getattr(api_service, "_runtime", None)
+            registry = getattr(runtime, "model_registry", None) if runtime is not None else None
+        if registry is None:
+            try:
+                from app.agents.providers.model_registry import create_default_registry
+
+                registry = create_default_registry()
+            except Exception:  # noqa: BLE001 - an absent registry is reported, not faked
+                registry = None
+        if registry is None:
+            return ()
+        try:
+            return tuple(registry.list_providers())
+        except Exception:  # noqa: BLE001 - an unreadable registry lists nothing
+            return ()
+
+    def _enabled_providers():
+        from app.api.service import _enabled_provider_names
+
+        return _enabled_provider_names(getattr(api_service, "_runtime", None))
+
+    return ProviderKeyService(
+        store=ProviderKeyStore(settings),
+        registry_providers=_registry_providers,
+        enabled_providers=_enabled_providers,
+    )
+
+
 def resolve_cors_origins(
     raw: Optional[str] = None, *, environ: Optional[dict[str, str]] = None
 ) -> tuple[str, ...]:
@@ -190,6 +238,7 @@ def create_api_app(
     settings_store: Optional[object] = None,
     project_opener: Optional[object] = None,
     window_opener: Optional[object] = None,
+    provider_key_service: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -229,6 +278,14 @@ def create_api_app(
     defaults to the real :class:`app.projects.app_window.AppWindowOpener` and is
     injectable for the same reason ``project_opener`` is: a test proves the exact
     argument vector without a browser window opening on the test machine.
+
+    ``provider_key_service`` is the «Провайдеры и ключи» behaviour
+    (:class:`app.config.provider_keys.ProviderKeyService`): it stores a provider's
+    non-secret metadata in the owner's settings file and its key in the operating
+    system's credential vault. It defaults to a service over the same settings store,
+    this runtime's provider registry and this runtime's enabled set, so a provider added
+    through the routes is visible to the existing provider layer on the next request. A
+    test supplies its own with an in-memory vault, so no real credential is written.
     """
 
     from fastapi import FastAPI, HTTPException, Request, Header
@@ -488,9 +545,22 @@ def create_api_app(
     # The owner's settings, composed once for this process. The routes are read/write;
     # the value they hold is consumed by the launcher (``app/api/main.py``), which builds
     # the project store with it, so «Настройки» and where a project lands cannot disagree.
-    register_settings_routes(
+    owner_settings = settings_store if settings_store is not None else AppSettingsStore()
+    register_settings_routes(app, owner_settings)
+
+    # «Провайдеры и ключи»: the place the owner could not find. The non-secret half of an
+    # entry is written to the *same* settings file as the projects folder; the API key goes
+    # to the operating system's credential vault and never to a file, a log or a response.
+    # The registry and the enabled set come from this runtime, so a provider added here is
+    # resolvable by the existing provider layer on the very next request -- no restart, no
+    # second registry.
+    from app.api.provider_key_routes import register_provider_key_routes
+
+    register_provider_key_routes(
         app,
-        settings_store if settings_store is not None else AppSettingsStore(),
+        provider_key_service
+        if provider_key_service is not None
+        else _compose_provider_key_service(api_service, owner_settings),
     )
 
     def _require_run_target(project_id: str) -> str:

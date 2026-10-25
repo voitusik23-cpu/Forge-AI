@@ -49,6 +49,7 @@ __all__ = [
     "PROJECT_ROOT_FALLBACK_KEY",
     "PROJECT_ROOT_KEY",
     "PROJECT_ROOTS_KNOWN_KEY",
+    "PROVIDERS_KEY",
     "SETTINGS_ENV_VAR",
     "SETTINGS_SCHEMA_VERSION",
     "AppSettingsError",
@@ -56,7 +57,9 @@ __all__ = [
     "default_project_root",
     "default_settings_path",
     "normalise_project_root",
+    "read_settings_document",
     "repository_root",
+    "write_settings_document",
 ]
 
 #: The file a test (or a laboratory run) may redirect the settings to.
@@ -68,9 +71,26 @@ SETTINGS_SCHEMA_VERSION = "forge.settings.v1"
 PROJECT_ROOT_KEY = "project_root"
 PROJECT_ROOTS_KNOWN_KEY = "project_roots_known"
 
+#: The non-secret half of a provider entry the owner added in «Провайдеры и ключи».
+#: The key itself is **never** here: it lives in the operating system's credential vault
+#: (:mod:`app.config.windows_creds`). This list holds which provider, its base URL, its
+#: default model -- facts that are not secrets.
+PROVIDERS_KEY = "providers"
+
 #: The root actually used when the configured one was not writable. Separate from
 #: ``project_root`` on purpose: the owner's choice is not overwritten by a fallback.
 PROJECT_ROOT_FALLBACK_KEY = "project_root_fallback"
+
+#: Every key this store owns. Everything else in the file is preserved verbatim, so a
+#: setting written by another module (the provider entries above) is not erased the next
+#: time the owner changes his projects folder.
+_OWNED_KEYS = (
+    "schema",
+    "updated_at",
+    PROJECT_ROOT_KEY,
+    PROJECT_ROOTS_KNOWN_KEY,
+    PROJECT_ROOT_FALLBACK_KEY,
+)
 
 #: The folder created on the owner's desktop by default.
 DEFAULT_PROJECT_ROOT_NAME = "Forge Projects"
@@ -109,6 +129,43 @@ def default_settings_path() -> Path:
     if configured and configured.strip():
         return Path(configured).expanduser()
     return repository_root() / ".forge" / "settings.json"
+
+
+def read_settings_document(path: object) -> dict:
+    """The whole settings document as it is on disk, or ``{}`` when unreadable.
+
+    Deliberately unnormalised: it is what :func:`write_settings_document` writes back, so
+    a module that owns one key (the provider entries) can change only that key and leave
+    every other value exactly as another writer left it.
+    """
+
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def write_settings_document(path: object, document: object) -> Path:
+    """Persist one settings document atomically, replacing the file in one step.
+
+    A temporary file beside the target plus ``os.replace``: a half-written settings file
+    would decide a folder (or a provider list) from a fragment.
+    """
+
+    target = Path(path)
+    payload = dict(document) if isinstance(document, dict) else {}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    os.replace(temporary, target)
+    return target
 
 
 def _user_home() -> Path:
@@ -204,18 +261,18 @@ class AppSettingsStore:
         """The stored document, or an empty one when it is missing or unreadable.
 
         A corrupt file is reported as empty rather than partially trusted: half a
-        settings document would decide a folder from a fragment.
+        settings document would decide a folder from a fragment. Entries this store does
+        not own (the provider list) are passed through unchanged, so a reader sees the
+        file's real content and a writer never drops them.
         """
 
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return {}
-        if not isinstance(data, dict):
+        data = read_settings_document(self._path)
+        if not data:
             return {}
         root = data.get(PROJECT_ROOT_KEY)
         known = data.get(PROJECT_ROOTS_KNOWN_KEY)
         fallback = data.get(PROJECT_ROOT_FALLBACK_KEY)
+        providers = data.get(PROVIDERS_KEY)
         return {
             "schema": str(data.get("schema", "") or ""),
             PROJECT_ROOT_KEY: root if isinstance(root, str) else "",
@@ -225,37 +282,44 @@ class AppSettingsStore:
             if isinstance(known, list)
             else [],
             PROJECT_ROOT_FALLBACK_KEY: fallback if isinstance(fallback, str) else "",
+            PROVIDERS_KEY: [
+                dict(item) for item in (providers or ()) if isinstance(item, dict)
+            ]
+            if isinstance(providers, list)
+            else [],
             "updated_at": str(data.get("updated_at", "") or ""),
         }
 
     def _write(
         self, root: Path, known: Iterable[object], *, fallback: str = ""
     ) -> Path:
-        """Atomically persist ``root``, the fallback root and the known roots."""
+        """Atomically persist ``root``, the fallback root and the known roots.
+
+        Every key this store does not own survives the write. That is not politeness: the
+        provider entries live in the same file, and a «Сменить папку» that silently erased
+        them would delete the owner's provider configuration.
+        """
 
         entries: List[str] = []
         for item in (str(root), str(fallback or ""), *[str(value) for value in known]):
             if item and item not in entries:
                 entries.append(item)
-        payload = {
-            "schema": SETTINGS_SCHEMA_VERSION,
-            PROJECT_ROOT_KEY: str(root),
-            PROJECT_ROOTS_KNOWN_KEY: entries[:MAX_KNOWN_ROOTS],
-            "updated_at": _now_iso(),
+        payload: Dict[str, object] = {
+            key: value
+            for key, value in read_settings_document(self._path).items()
+            if key not in _OWNED_KEYS
         }
+        payload.update(
+            {
+                "schema": SETTINGS_SCHEMA_VERSION,
+                PROJECT_ROOT_KEY: str(root),
+                PROJECT_ROOTS_KNOWN_KEY: entries[:MAX_KNOWN_ROOTS],
+                "updated_at": _now_iso(),
+            }
+        )
         if str(fallback or ""):
             payload[PROJECT_ROOT_FALLBACK_KEY] = str(fallback)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                pass
-        os.replace(temporary, self._path)
-        return self._path
+        return write_settings_document(self._path, payload)
 
     # ---------------------------------------------------------------- values
     def project_root(self) -> Path:

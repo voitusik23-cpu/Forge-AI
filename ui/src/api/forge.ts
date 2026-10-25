@@ -1499,6 +1499,105 @@ export const saveProjectRoot = (
   body: { project_root: string } | { use_desktop: true }
 ): Promise<Result<ForgeSettings>> => postJson<ForgeSettings>("/api/settings", body);
 
+// --------------------------------------------------------------- providers and keys
+//
+// The section the owner could not find: where a provider with an API key is added.
+// The key travels **into** these calls and never comes back: every payload below
+// carries `has_key` (a boolean) and `key_source` (a fixed word), and the backend stores
+// the value in the Windows Credential Manager -- not in `.env`, not in the settings file.
+
+/** One preset from the backend's own catalogue (label, registry id, default URL/model). */
+export type ProviderPreset = {
+  preset?: string;
+  label?: string;
+  provider_id?: string;
+  secret_name?: string;
+  base_url?: string;
+  model?: string;
+};
+
+/** One configured provider, as the interface may see it: facts, never the key. */
+export type ProviderKeyEntry = {
+  provider_id?: string;
+  label?: string;
+  preset?: string;
+  base_url?: string;
+  model?: string;
+  /** The *name* of the secret variable (`DEEPSEEK_API_KEY`), never its value. */
+  secret_name?: string;
+  has_key?: boolean;
+  /** `environment` (process env or `.env`) or `vault` (the credential vault) or empty. */
+  key_source?: string;
+  /** Whether this build's provider registry knows the id at all. */
+  registered?: boolean;
+  state?: "ready" | "no_key" | "disabled" | "unsupported";
+  state_reason?: string;
+  added_at?: string;
+};
+
+export type ProviderKeySection = {
+  ok?: boolean;
+  providers?: ProviderKeyEntry[];
+  presets?: ProviderPreset[];
+  settings_path?: string;
+  credential_store?: string;
+  counts?: { providers?: number; ready?: number; with_key?: number };
+  note?: string;
+};
+
+export type ProviderKeyResult = {
+  ok?: boolean;
+  saved?: boolean;
+  provider?: ProviderKeyEntry;
+  warning?: string;
+  section?: ProviderKeySection;
+};
+
+export type ProviderKeyDeletion = {
+  ok?: boolean;
+  deleted?: boolean;
+  provider_id?: string;
+  removed_from_vault?: boolean;
+  /** A plain sentence when the key also lives in the environment or `.env`. */
+  notice?: string;
+  section?: ProviderKeySection;
+};
+
+/** `GET /api/settings/providers` — the configured providers, the presets, the storage facts. */
+export const loadProviderKeys = (): Promise<Result<ProviderKeySection>> =>
+  readJson<ProviderKeySection>("/api/settings/providers");
+
+/**
+ * `POST /api/settings/providers` — add one provider.
+ *
+ * `api_key` is the only secret in this file, and it only ever travels *out*: the body is
+ * sent once, the response describes the provider by `has_key`. A refusal is a `400` with
+ * a plain sentence (an empty key, a bad URL, an unknown provider) that never echoes the
+ * value that was refused.
+ */
+export const addProviderKey = (body: {
+  preset: string;
+  provider_id?: string;
+  base_url?: string;
+  model?: string;
+  api_key: string;
+}): Promise<Result<ProviderKeyResult>> =>
+  postJson<ProviderKeyResult>("/api/settings/providers", body);
+
+/**
+ * `DELETE /api/settings/providers/{id}` — remove that provider's key and its entry.
+ *
+ * The key is removed from the Windows Credential Manager; the stored non-secret entry is
+ * dropped too, so nothing on the screen claims a key that is not there. When the same
+ * secret is also set in the environment or `.env`, the answer says so (`notice`) instead
+ * of pretending the provider is gone.
+ */
+export const deleteProviderKey = (providerId: string): Promise<Result<ProviderKeyDeletion>> =>
+  sendJson<ProviderKeyDeletion>(
+    "DELETE",
+    `/api/settings/providers/${encodeURIComponent(providerId)}`
+  );
+
 /** `GET /api/projects/{id}/entrypoint` — the one entry point the manifest supports. */
 export const loadProjectEntryPoint = (
   projectId: string

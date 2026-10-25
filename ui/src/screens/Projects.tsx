@@ -52,6 +52,7 @@ import {
   loadProjectRun,
   launchProject,
   loadRunRecord,
+  isTerminalRecord,
   moveProjectToVisibleFolder,
   openProject as openProjectTarget,
   restartProjectRun,
@@ -70,7 +71,6 @@ import {
   type LifecycleFolder,
   type LifecycleHistory,
   type LifecycleLaunch,
-  type LifecycleNewVersion,
   type LifecycleOpen,
   type LifecyclePreview,
   type LifecycleProject,
@@ -158,6 +158,29 @@ type ChangeOutcome = {
    * a path, whether it was created or updated, and its size. Empty when the run wrote
    * nothing, which is exactly the case the card must not dress up as a new version.
    */
+  files: LifecycleArtifact[];
+};
+
+/**
+ * THE STATUS STRIP: "did the run start?", answered in one glance.
+ *
+ * Measured complaint: the owner pressed one button, then the other, and could not tell
+ * whether anything had begun. The strip is built from two facts the backend already
+ * publishes -- the run id the dispatch returned and the run record polled while it is not
+ * terminal -- and it never invents a stage:
+ *
+ * * `title` names the run (`Запущено: run-…`) and the stage word the record proves;
+ * * `stage` is that word alone, so the live line can pulse on its own;
+ * * `final` is the honest end: «Готово: v3 записана» only when the project's own
+ *   `current_version` really moved, otherwise the backend's sentence;
+ * * `refusal` is the backend's own error text, verbatim, when the run wrote nothing.
+ */
+type ChangeStrip = {
+  title: string;
+  stage: string;
+  tone: "info" | "ok" | "warn";
+  final: string;
+  refusal: string;
   files: LifecycleArtifact[];
 };
 
@@ -711,21 +734,16 @@ const ProjectCard = ({
   change,
   onChange,
   changeError,
-  onNewVersion,
+  onStartChange,
   changeFailure,
-  staged,
-  onDispatch,
-  dispatching,
+  changeStrip,
   dispatched,
-  changeOutcome,
   dispatchFailure,
   provider,
   onProvider,
   model,
   onModel,
   modelChoices,
-  writeMode,
-  onWriteMode,
   mockSelected,
   actionFailure,
   actionNotice,
@@ -778,7 +796,8 @@ const ProjectCard = ({
   change: string;
   onChange: (value: string) => void;
   changeError: string;
-  onNewVersion: () => void;
+  /** THE one action of this screen: stage the change and run it. */
+  onStartChange: () => void;
   /**
    * The backend's refusal of this change request, printed beside the button that made it.
    *
@@ -787,27 +806,19 @@ const ProjectCard = ({
    * same silent no-op the button itself used to be.
    */
   changeFailure: Failure | null;
-  staged: LifecycleNewVersion | null;
-  onDispatch: () => void;
-  dispatching: boolean;
-  dispatched: DispatchResult | null;
   /**
-   * What the change run did to the project, read back from the refreshed record.
-   *
-   * It exists because the response alone cannot answer the question the card is
-   * asked: a run that finished is not a new version. `fromVersion`/`toVersion` come
-   * from the project record itself, so «новая версия v3» can only be printed when
-   * `current_version` really moved.
+   * THE STATUS STRIP: what the click started, in the owner's words, printed directly above
+   * the button. `null` before the first click -- a strip that says "nothing happened yet"
+   * would be another block to read.
    */
-  changeOutcome: ChangeOutcome | null;
+  changeStrip: ChangeStrip | null;
+  dispatched: DispatchResult | null;
   dispatchFailure: Failure | null;
   provider: string;
   onProvider: (value: string) => void;
   model: string;
   onModel: (value: string) => void;
   modelChoices: string[];
-  writeMode: boolean;
-  onWriteMode: (value: boolean) => void;
   mockSelected: boolean;
   actionFailure: Failure | null;
   actionNotice: string;
@@ -979,6 +990,16 @@ const ProjectCard = ({
   // disabled control without a visible reason only moves the question one step further.
   const changeEmpty = change.trim() === "";
   const changeBusy = busy === "version";
+  // «Проверить» is offered in the compact row only when the backend's own facts make it
+  // applicable, and the reason it is off is a sentence, not a hover-only tooltip.
+  const verifyBlocked = busy === "verify" || archived || fileTotal === 0 || !hasRun;
+  const verifyBlockedReason = archived
+    ? t(lang, "projects.badge.archived")
+    : fileTotal === 0
+      ? t(lang, "projects.empty.title")
+      : !hasRun
+        ? t(lang, "projects.verify.hint")
+        : undefined;
 
   // One handler for the whole action vocabulary: the card offers what the backend
   // allows and nothing else, so an unknown id can only be a client/server mismatch.
@@ -989,7 +1010,9 @@ const ProjectCard = ({
       return;
     }
     if (id === "new_version") {
-      onNewVersion();
+      // The one change action lives in the change block above; this vocabulary entry
+      // moves the cursor there instead of opening a second way to start the same thing.
+      changeRef.current?.focus();
       return;
     }
     if (id === "view_files") {
@@ -1039,186 +1062,429 @@ const ProjectCard = ({
                 data-testid="change-textarea"
               />
             </Field>
-            {/* THE ACTION OF THIS SCREEN, directly under the text it acts on.
-                It used to be a small default-tone button next to the model select, which
-                read as a caption: the owner asked «где кнопка, которая подтверждает
-                ввод?» while it was on screen the whole time. A full-width primary button
-                cannot be read as anything else, and it is off -- with the reason printed,
-                not hovered -- until there is a sentence to send. */}
-            <div className="stack" style={{ gap: 8 }} data-testid="change-actions">
-              <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-                <span style={{ flex: "1 1 320px", minWidth: 0 }} data-testid="change-start">
-                  <Button
-                    tone="primary"
-                    wide
-                    disabled={changeBusy || changeEmpty}
-                    disabledReason={changeEmpty ? t(lang, "projects.newversion.start.reason") : undefined}
-                    onClick={onNewVersion}
-                  >
-                    {changeBusy
-                      ? t(lang, "projects.newversion.sending")
-                      : t(lang, "projects.newversion.start")}
-                  </Button>
-                </span>
-                {/* The switch is available for every routable provider, `mock` included:
-                    the Core's MOCK_DETERMINISTIC mode writes the deterministic scaffold
-                    when the run belongs to a lifecycle project, and honestly reports
-                    `no_changes` when it does not. That is the only free path that can
-                    create (or extend) a project at all, and it calls no model. */}
-                <label className="forge-toggle" style={{ flex: "0 0 auto" }}>
-                  <input
-                    type="checkbox"
-                    checked={writeMode}
-                    onChange={(event) => onWriteMode(event.target.checked)}
-                  />
-                  <span>{t(lang, "projects.newversion.write")}</span>
-                </label>
+            {/* THE STATUS STRIP, immediately above the one action.
+                One glance answers «оно вообще началось?»: the run id the dispatch named,
+                the stage word the run record proves, and -- once it ends -- either
+                «Готово: vN записана» or the backend's own refusal, verbatim. It appears on
+                the click, not after the first refresh. */}
+            {changeStrip !== null ? (
+              <div
+                className="notice"
+                data-testid="change-status"
+                aria-live="polite"
+                style={
+                  changeStrip.tone === "warn"
+                    ? { borderColor: "var(--warn-text)" }
+                    : undefined
+                }
+              >
+                <div
+                  className="mono small"
+                  data-testid="change-status-line"
+                  style={{ overflowWrap: "anywhere" }}
+                >
+                  {changeStrip.title}
+                </div>
+                <div className="small muted" style={{ marginTop: 4 }} data-testid="change-stage-line">
+                  {changeStrip.stage}
+                </div>
+                {changeStrip.final !== "" ? (
+                  <div data-testid="change-outcome" style={{ marginTop: 8 }}>
+                    <Badge tone={changeStrip.tone === "ok" ? "ok" : "warn"}>
+                      {t(lang, "projects.newversion.outcome.title")}
+                    </Badge>
+                    <div style={{ marginTop: 6 }}>{changeStrip.final}</div>
+                    {/* The backend's own error text, verbatim and unreworded: a run that
+                        refused says why, and the card does not soften it. */}
+                    {changeStrip.refusal !== "" ? (
+                      <div
+                        className="small mono"
+                        data-testid="change-refusal"
+                        style={{ marginTop: 6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                      >
+                        {changeStrip.refusal}
+                      </div>
+                    ) : null}
+                    {/* WHAT CHANGED, from the new version's own manifest. A run that
+                        wrote nothing has no entry here and the strip says exactly that,
+                        instead of showing an empty list that reads as "nothing to report". */}
+                    <div className="small" style={{ marginTop: 8 }} data-testid="change-files">
+                      <div className="label">{t(lang, "projects.newversion.changed")}</div>
+                      {changeStrip.files.length === 0 ? (
+                        <div className="muted" style={{ marginTop: 4 }}>
+                          {t(lang, "projects.newversion.changed.none")}
+                        </div>
+                      ) : (
+                        <div className="stack" style={{ gap: 2, marginTop: 4 }}>
+                          {changeStrip.files.map((item) => (
+                            <div
+                              className="mono small"
+                              key={String(item.path ?? "")}
+                              style={{ overflowWrap: "anywhere" }}
+                            >
+                              {t(lang, "projects.newversion.changed.line")
+                                .replace("{path}", text(item.path))
+                                .replace("{change}", changeWord(lang, item.change))
+                                .replace("{size}", bytesLabel(item.size))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : null}
               </div>
-              {/* The two states of the gate, as sentences: why the button is off, and what
-                  the switch beside it will do. Neither is a tooltip only. */}
+            ) : null}
+
+            {/* THE ONE ACTION OF THIS SCREEN, directly under the text it acts on and under
+                the strip that reports on it. There used to be TWO primary buttons for one
+                change -- «Начать изменения» and «Исправить проект» -- and the owner
+                pressed both, unsure whether either had started anything. There is now one
+                button, one promise, one state: it is off (with the reason printed, not
+                hovered) until there is a sentence to send, it says «Отправляю…» while the
+                request travels, and the strip above it says what the run did. */}
+            <div className="stack" style={{ gap: 8 }} data-testid="change-actions">
+              <span data-testid="change-start">
+                <Button
+                  tone="primary"
+                  wide
+                  disabled={changeBusy || changeEmpty}
+                  disabledReason={changeEmpty ? t(lang, "projects.newversion.start.reason") : undefined}
+                  onClick={onStartChange}
+                >
+                  {changeBusy
+                    ? t(lang, "projects.newversion.sending")
+                    : t(lang, "projects.newversion.start")}
+                </Button>
+              </span>
               {changeEmpty && !changeBusy ? (
                 <div className="small muted" data-testid="change-start-reason">
                   {t(lang, "projects.newversion.start.reason")}
                 </div>
               ) : null}
-              <div className="small muted" data-testid="change-write-note">
-                {t(lang, "projects.newversion.write.note")}
-              </div>
               {/* The backend's refusal, verbatim, next to the control that produced it. */}
               {changeFailure !== null ? <Refusal lang={lang} failure={changeFailure} /> : null}
+              {dispatchFailure !== null ? <Refusal lang={lang} failure={dispatchFailure} /> : null}
             </div>
-            <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-              <label className="field" style={{ flex: "0 1 190px" }}>
-                <span className="label">{t(lang, "projects.col.provider")}</span>
-                <select
-                  className="input"
-                  value={provider}
-                  onChange={(event) => onProvider(event.target.value)}
-                  disabled={backend.status !== "live"}
-                >
-                  <option value="">{t(lang, "projects.newversion.provider.auto")}</option>
-                  {providerOptions(backend).map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="field" style={{ flex: "0 1 240px" }}>
-                <span className="label">{t(lang, "projects.col.model")}</span>
-                {modelChoices.length > 0 ? (
-                  <select className="input" value={model} onChange={(event) => onModel(event.target.value)}>
-                    {modelChoices.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    className="input"
-                    type="text"
-                    value={model}
-                    onChange={(event) => onModel(event.target.value)}
-                    placeholder={t(lang, "forge.task.model.placeholder")}
-                  />
-                )}
-              </label>
-            </div>
-            {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
-            <div className="small muted">{t(lang, "projects.newversion.session.note")}</div>
-
-            {staged !== null ? (
-              <div className="stack" style={{ gap: 8 }} data-testid="change-staged">
-                <div className="label">
-                  {t(lang, "projects.newversion.staged").replace("{version}", `v${text(staged.version)}`)}
-                </div>
-                <pre className="forge-output mono small">{text(staged.task_text)}</pre>
-                {/* The second step of the same action, dressed like the first: the button
-                    that really runs the change is the strongest control of its block. */}
-                <div className="stack" style={{ gap: 6 }}>
-                  <span data-testid="change-dispatch">
-                    <Button tone="primary" wide disabled={dispatching} onClick={onDispatch}>
-                      {dispatching
-                        ? t(lang, "projects.newversion.submitting")
-                        : t(lang, "projects.newversion.submit")}
-                    </Button>
-                  </span>
-                  <span className="small muted">{t(lang, "projects.newversion.submit.hint")}</span>
-                </div>
-              </div>
-            ) : null}
-
-            {dispatchFailure !== null ? <Refusal lang={lang} failure={dispatchFailure} /> : null}
-
-            {/* THE HONEST RESULT OF A CHANGE. A finished run is not a new version: the
-                card says a new version exists only when the refreshed record's
-                `current_version` really moved, and otherwise prints the same sentence
-                the backend's own presentation uses. The run id is always named, so the
-                owner can open exactly that run. */}
-            {changeOutcome !== null ? (
-              <div
-                className={`notice ${changeOutcome.toVersion > changeOutcome.fromVersion ? "" : "warn"}`}
-                data-testid="change-outcome"
-              >
-                <div className="label">{t(lang, "projects.newversion.outcome.title")}</div>
-                <div style={{ marginTop: 6 }}>
-                  {!changeOutcome.attached
-                    ? t(lang, "projects.newversion.outcome.unattached")
-                    : changeOutcome.toVersion > changeOutcome.fromVersion
-                      ? t(lang, "projects.newversion.outcome.advanced")
-                          .replace("{version}", `v${changeOutcome.toVersion}`)
-                          .replace("{run}", changeOutcome.runId)
-                      : t(lang, "projects.newversion.outcome.not_written")}
-                </div>
-                <div className="small mono" style={{ marginTop: 6, wordBreak: "break-word" }}>
-                  {`${changeOutcome.attached ? "v" + changeOutcome.toVersion : "—"} · run ${changeOutcome.runId} · ${t(lang, "projects.col.files")}: ${changeOutcome.filesCreated}`}
-                </div>
-                {/* WHAT CHANGED, from the new version's own manifest. A run that wrote
-                    nothing has no entry here and the card says exactly that, instead of
-                    showing an empty list that would read as "nothing to report". */}
-                <div className="small" style={{ marginTop: 8 }} data-testid="change-files">
-                  <div className="label">{t(lang, "projects.newversion.changed")}</div>
-                  {changeOutcome.files.length === 0 ? (
-                    <div className="muted" style={{ marginTop: 4 }}>
-                      {t(lang, "projects.newversion.changed.none")}
-                    </div>
-                  ) : (
-                    <div className="stack" style={{ gap: 2, marginTop: 4 }}>
-                      {changeOutcome.files.map((item) => (
-                        <div className="mono small" key={String(item.path ?? "")} style={{ overflowWrap: "anywhere" }}>
-                          {t(lang, "projects.newversion.changed.line")
-                            .replace("{path}", text(item.path))
-                            .replace("{change}", changeWord(lang, item.change))
-                            .replace("{size}", bytesLabel(item.size))}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ) : null}
-
-            {dispatched !== null ? (
-              <Facts
-                items={[
-                  [t(lang, "projects.col.run"), text(dispatched.response.run_id)],
-                  [t(lang, "projects.col.status"), text(dispatched.response.state, t(lang, "runs.unknown"))],
-                  [t(lang, "projects.outcome.route"), `${text(dispatched.response.provider_used)} · ${text(dispatched.response.model_used)}`],
-                  [
-                    t(lang, "projects.outcome.duration"),
-                    typeof dispatched.response.duration_seconds === "number"
-                      ? `${dispatched.response.duration_seconds.toFixed(3)} s`
-                      : t(lang, "runs.unknown"),
-                  ],
-                  [t(lang, "runs.result.tokens"), dispatched.response.tokens === null || dispatched.response.tokens === undefined ? t(lang, "runs.unknown") : String(dispatched.response.tokens)],
-                ]}
-              />
-            ) : null}
           </div>
         </div>
 
     </>
+  );
+
+  /* The provider and the model a change runs on. They are real controls, so they must stay
+   * reachable -- but they are not what the owner reads to press one button, so they live in
+   * the collapsed «Показать подробности» block instead of above the action. */
+  const changeOptions = (
+    <div className="stack" style={{ gap: 10 }} data-testid="change-options">
+      <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+        <label className="field" style={{ flex: "0 1 190px" }}>
+          <span className="label">{t(lang, "projects.col.provider")}</span>
+          <select
+            className="input"
+            value={provider}
+            onChange={(event) => onProvider(event.target.value)}
+            disabled={backend.status !== "live"}
+          >
+            <option value="">{t(lang, "projects.newversion.provider.auto")}</option>
+            {providerOptions(backend).map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field" style={{ flex: "0 1 240px" }}>
+          <span className="label">{t(lang, "projects.col.model")}</span>
+          {modelChoices.length > 0 ? (
+            <select className="input" value={model} onChange={(event) => onModel(event.target.value)}>
+              {modelChoices.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="input"
+              type="text"
+              value={model}
+              onChange={(event) => onModel(event.target.value)}
+              placeholder={t(lang, "forge.task.model.placeholder")}
+            />
+          )}
+        </label>
+      </div>
+      {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
+      {dispatched !== null ? (
+        <Facts
+          items={[
+            [t(lang, "projects.col.run"), text(dispatched.response.run_id)],
+            [t(lang, "projects.col.status"), text(dispatched.response.state, t(lang, "runs.unknown"))],
+            [t(lang, "projects.outcome.route"), `${text(dispatched.response.provider_used)} · ${text(dispatched.response.model_used)}`],
+            [
+              t(lang, "projects.outcome.duration"),
+              typeof dispatched.response.duration_seconds === "number"
+                ? `${dispatched.response.duration_seconds.toFixed(3)} s`
+                : t(lang, "runs.unknown"),
+            ],
+            [
+              t(lang, "runs.result.tokens"),
+              dispatched.response.tokens === null || dispatched.response.tokens === undefined
+                ? t(lang, "runs.unknown")
+                : String(dispatched.response.tokens),
+            ],
+          ]}
+        />
+      ) : null}
+    </div>
+  );
+
+  /* THE DEFAULT READING, and nothing else: the change block above, the project's folder,
+   * one row of secondary actions, and the versions. Everything a reader only sometimes
+   * needs (launch, preview, the local run, the save facts, the facts, the specification,
+   * the artifact table, the backend's action set and the technical details) sits inside
+   * «Показать подробности» below -- reachable, never in the way. Measured complaint: the
+   * card was so tall that the owner could not tell which of its buttons was the one that
+   * changes the project. */
+  const diskVisible = (
+    <div data-testid="project-disk">
+      <div className="label">{t(lang, "projects.disk.title")}</div>
+      <div className="row between" style={{ gap: 10, flexWrap: "wrap", marginTop: 4 }}>
+        <span className="small mono" style={{ overflowWrap: "anywhere" }} data-testid="project-folder-path">
+          {folderPath}
+        </span>
+        <span className="small muted">
+          {t(lang, "projects.disk.files")}: {String(diskFiles)}
+        </span>
+      </div>
+      {diskNotice !== "" ? (
+        <div className="notice" style={{ marginTop: 8 }} data-testid="project-disk-notice">
+          {diskNotice}
+        </div>
+      ) : null}
+      {diskFailure !== null ? <Refusal lang={lang} failure={diskFailure} /> : null}
+    </div>
+  );
+
+  /* The three open buttons and the move: real actions, kept reachable in the details. */
+  const diskButtons = (
+    <div className="stack" style={{ gap: 6 }} data-testid="project-open-buttons">
+      <div className="label">{t(lang, "projects.disk.open_folder")}</div>
+      <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        {(["folder", "editor", "terminal"] as const).map((target) => {
+          const line = openTargets[target] ?? {};
+          const available = line.available === true;
+          const label =
+            target === "folder"
+              ? t(lang, "projects.disk.open_folder")
+              : target === "editor"
+                ? t(lang, "projects.disk.open_editor")
+                : t(lang, "projects.disk.open_terminal");
+          return (
+            <span key={target} data-testid={`project-open-${target}`}>
+              <Button
+                size="small"
+                tone={target === "folder" ? "primary" : "ghost"}
+                disabled={!available || openingTarget !== ""}
+                disabledReason={available ? undefined : text(line.reason, t(lang, "projects.facts.none"))}
+                onClick={() => onOpenTarget(target)}
+              >
+                {openingTarget === target ? t(lang, "state.loading") : label}
+              </Button>
+            </span>
+          );
+        })}
+        <span data-testid="project-move-visible">
+          <Button
+            size="small"
+            tone="ghost"
+            disabled={movingToVisible || archived}
+            onClick={onMoveToVisible}
+          >
+            {movingToVisible ? t(lang, "projects.disk.moving") : t(lang, "projects.disk.move")}
+          </Button>
+        </span>
+      </div>
+      <div className="stack" style={{ gap: 2, marginTop: 8 }}>
+        {(["folder", "editor", "terminal"] as const)
+          .filter((target) => (openTargets[target] ?? {}).available !== true)
+          .map((target) => (
+            <div className="small muted" key={`why-open-${target}`} data-testid={`project-open-why-${target}`}>
+              {text((openTargets[target] ?? {}).label, target)}: {text((openTargets[target] ?? {}).reason)}
+            </div>
+          ))}
+      </div>
+      {/* The absolute path is deliberately NOT printed here: this block shows the
+          root-relative folder beside the buttons, and the host path lives in the
+          collapsed «Технические детали» block (presentation.technical.folder_absolute). */}
+      <div className="small muted" style={{ marginTop: 6 }}>
+        {t(lang, "projects.disk.hint")}
+      </div>
+    </div>
+  );
+
+  /* EVERY EXISTING ACTION, in one compact row of secondary buttons. None of them is the
+   * action of the screen any more -- the change button above is -- but none of them was
+   * removed either: run, open the folder, verify, archive, restore and delete all stay one
+   * click away, in the same place, in the same order. */
+  const secondaryRow = (
+    <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }} data-testid="project-secondary">
+      <span data-testid="project-secondary-open">
+        <Button
+          size="small"
+          tone="ghost"
+          disabled={(openTargets.folder ?? {}).available !== true || openingTarget !== ""}
+          disabledReason={
+            (openTargets.folder ?? {}).available === true
+              ? undefined
+              : text((openTargets.folder ?? {}).reason, t(lang, "projects.facts.none"))
+          }
+          onClick={() => onOpenTarget("folder")}
+        >
+          {t(lang, "projects.disk.open_folder")}
+        </Button>
+      </span>
+      <span data-testid="project-secondary-launch">
+        <Button
+          size="small"
+          tone="ghost"
+          disabled={launchBusy || archived || fileTotal === 0}
+          disabledReason={
+            archived
+              ? t(lang, "projects.badge.archived")
+              : fileTotal === 0
+                ? t(lang, "projects.empty.title")
+                : undefined
+          }
+          onClick={onLaunch}
+        >
+          {launchBusy ? t(lang, "projects.launch.running") : t(lang, "projects.action.launch")}
+        </Button>
+      </span>
+      <span data-testid="project-secondary-verify">
+        <Button
+          size="small"
+          tone="ghost"
+          disabled={busy === "verify" || verifyBlocked}
+          disabledReason={verifyBlockedReason}
+          onClick={onVerify}
+        >
+          {busy === "verify" ? t(lang, "projects.verify.running") : t(lang, "projects.preview.reverify")}
+        </Button>
+      </span>
+      <span data-testid="project-secondary-archive">
+        <Button
+          size="small"
+          tone="ghost"
+          disabled={busy === "archive"}
+          onClick={onArchive}
+        >
+          {busy === "archive" ? t(lang, "projects.archive.running") : t(lang, "projects.action.archive")}
+        </Button>
+      </span>
+      <span data-testid="project-secondary-restore">
+        <Button
+          size="small"
+          tone="ghost"
+          disabled={busy === "restore"}
+          onClick={onRestore}
+        >
+          {busy === "restore" ? t(lang, "projects.restore.running") : t(lang, "projects.action.restore")}
+        </Button>
+      </span>
+      <span data-testid="project-secondary-delete">
+        <Button
+          size="small"
+          tone="danger"
+          disabled={!canDelete || busy === "delete"}
+          disabledReason={canDelete ? undefined : t(lang, "projects.delete.no_id")}
+          onClick={() => setConfirmDelete(true)}
+        >
+          {busy === "delete" ? t(lang, "projects.delete.running") : t(lang, "projects.action.delete")}
+        </Button>
+      </span>
+      <span className="small muted">{t(lang, "projects.card.secondary")}</span>
+    </div>
+  );
+
+  /* THE VERSIONS, kept on the card: they are the project's own history and the one place
+   * «v2 записана» becomes something the owner can see for himself. */
+  const versionsBlock = (
+    <div>
+      <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+        <div className="label">{t(lang, "projects.versions.title")}</div>
+        <Button size="small" tone="ghost" onClick={onHistory}>
+          {t(lang, "projects.action.history")}
+        </Button>
+      </div>
+      {versions.length === 0 ? (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          {t(lang, "projects.versions.empty")}
+        </div>
+      ) : (
+        <table className="table" style={{ marginTop: 8 }}>
+          <thead>
+            <tr>
+              <th>{t(lang, "projects.col.version")}</th>
+              <th>{t(lang, "projects.col.created")}</th>
+              <th>{t(lang, "projects.col.run")}</th>
+              <th>{t(lang, "projects.col.verify")}</th>
+              <th>{t(lang, "projects.col.accept")}</th>
+              <th>{t(lang, "projects.col.provider")}</th>
+              <th>{t(lang, "projects.col.files")}</th>
+              <th>{t(lang, "projects.col.change")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {versions.map((version) => {
+              const number = typeof version.version === "number" ? version.version : 0;
+              const mock = String(version.provider ?? "") === OFFLINE_PROVIDER;
+              return (
+                <tr
+                  key={number}
+                  className={number === selectedVersion ? "selected" : ""}
+                  style={{ cursor: "pointer" }}
+                  onClick={() => onSelectVersion(number)}
+                >
+                  <td className="mono small">v{number}</td>
+                  <td className="mono small">{text(version.created_at)}</td>
+                  <td className="mono small" style={{ maxWidth: 220, overflowWrap: "anywhere" }}>
+                    {version.pending === true ? t(lang, "projects.version.pending") : text(version.run_id)}
+                  </td>
+                  <td>
+                    <Badge tone={version.verification === "passed" ? "ok" : version.verification === "failed" ? "danger" : "neutral"}>
+                      {verificationLabel(lang, version.verification)}
+                    </Badge>
+                  </td>
+                  <td>
+                    <Badge tone={version.acceptance === "passed" ? "ok" : version.acceptance === "failed" ? "danger" : "neutral"}>
+                      {acceptanceLabel(lang, version.acceptance)}
+                    </Badge>
+                  </td>
+                  <td className="small">
+                    {text(version.provider)}
+                    <span className="muted"> · {text(version.model)}</span>
+                    {mock ? (
+                      <div className="small muted">{t(lang, "projects.version.mock")}</div>
+                    ) : null}
+                  </td>
+                  <td className="mono small">{typeof version.file_count === "number" ? version.file_count : "—"}</td>
+                  <td className="small" style={{ maxWidth: 260, overflowWrap: "anywhere" }}>
+                    {version.change_request && typeof version.change_request.text === "string"
+                      ? version.change_request.text
+                      : t(lang, "projects.version.first")}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      <div className="small muted" style={{ marginTop: 6 }}>
+        {t(lang, "projects.versions.hint")}
+      </div>
+    </div>
   );
 
   return (
@@ -1281,13 +1547,59 @@ const ProjectCard = ({
           </div>
         </div>
 
-        {notices.map((line) => (
+        {/* THE RECORD'S OWN NOTICES. While a change is in flight they describe the *pending*
+            version («Изменения не записаны: новой версии нет») and would contradict the strip
+            that says the run has just started; the run's own outcome replaces them the moment
+            it finishes, and a notice that is still true then is still printed. */}
+        {(changeStrip !== null && changeStrip.final === "" ? [] : notices).map((line) => (
           <div className="notice warn" key={line}>
             {line}
           </div>
         ))}
 
-        {/* ---------------------------------------------------------- the launch */}
+        {/* ================================================== what the owner reads */}
+        {/* Four things and nothing else: the change block (its strip is the answer to
+            «оно началось?»), the folder, one row of secondary actions, the versions.
+            Everything below this block is collapsed on purpose -- it is still there. */}
+        {changeBlock}
+        {diskVisible}
+        {secondaryRow}
+        {versionsBlock}
+        {fileTotal === 0 ? (
+          /* The only creation actions that exist when there is nothing to act on. They are
+             the same ids the backend offers in `presentation.actions`. */
+          <div className="notice warn">
+            <div className="label">{t(lang, "projects.empty.title")}</div>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+              <Button
+                size="small"
+                tone="primary"
+                onClick={() => runAction("continue_creation")}
+                disabled={archived}
+              >
+                {t(lang, "projects.empty.continue")}
+              </Button>
+              <Button size="small" onClick={() => runAction("answer_questions")} disabled={archived}>
+                {t(lang, "projects.empty.answer")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* ============================================ Показать подробности */}
+        {/* The launch, the preview, the local run, the save facts, the facts, the
+            specification, the artifact table, the backend's action vocabulary and the
+            technical details. Nothing was deleted: every block that used to fill the card
+            is one click away, under a summary that says so. */}
+        <details className="tech-details" data-testid="project-details">
+          <summary>{t(lang, "projects.card.details")}</summary>
+          <div className="small muted" style={{ marginTop: 4 }}>
+            {t(lang, "projects.card.details.hint")}
+          </div>
+          <div className="stack" style={{ gap: 16, marginTop: 10 }}>
+        {changeOptions}
+        {diskButtons}
+        {/* ------------------------------------------------------- the launch */}
         {/* THE ONE OBVIOUS BUTTON. The owner's words: «Если написано открыть проект, я
             так понял, что я открою работающий проект и он у меня развернётся на рабочем
             столе. Я хочу видеть результат, а не вечное меню Forge.» One click resolves
@@ -1352,102 +1664,14 @@ const ProjectCard = ({
         </div>
 
         {/* ----------------------------------------------------- the project on disk */}
-        {/* THE ENTRANCE INTO THE PROJECT. The folder is shown here, next to the three
-            buttons that really open it on this machine, because a path on its own was
-            never an entrance. Each button is disabled with the backend's own sentence
-            when the action cannot be performed, so nothing on the card promises a click
-            that would do nothing. */}
-        <div data-testid="project-disk">
-          <div className="label">{t(lang, "projects.disk.title")}</div>
-          <div className="row between" style={{ gap: 10, flexWrap: "wrap", marginTop: 4 }}>
-            <span className="small mono" style={{ overflowWrap: "anywhere" }} data-testid="project-folder-path">
-              {folderPath}
-            </span>
-            <span className="small muted">
-              {t(lang, "projects.disk.files")}: {String(diskFiles)}
-            </span>
-          </div>
-          <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
-            {(["folder", "editor", "terminal"] as const).map((target) => {
-              const line = openTargets[target] ?? {};
-              const available = line.available === true;
-              const label =
-                target === "folder"
-                  ? t(lang, "projects.disk.open_folder")
-                  : target === "editor"
-                    ? t(lang, "projects.disk.open_editor")
-                    : t(lang, "projects.disk.open_terminal");
-              return (
-                <span key={target} data-testid={`project-open-${target}`}>
-                  <Button
-                    size="small"
-                    tone={target === "folder" ? "primary" : "ghost"}
-                    disabled={!available || openingTarget !== ""}
-                    disabledReason={available ? undefined : text(line.reason, t(lang, "projects.facts.none"))}
-                    onClick={() => onOpenTarget(target)}
-                  >
-                    {openingTarget === target ? t(lang, "state.loading") : label}
-                  </Button>
-                </span>
-              );
-            })}
-            <span data-testid="project-move-visible">
-              <Button
-                size="small"
-                tone="ghost"
-                disabled={movingToVisible || archived}
-                onClick={onMoveToVisible}
-              >
-                {movingToVisible ? t(lang, "projects.disk.moving") : t(lang, "projects.disk.move")}
-              </Button>
-            </span>
-          </div>
-          <div className="stack" style={{ gap: 2, marginTop: 8 }}>
-            {(["folder", "editor", "terminal"] as const)
-              .filter((target) => (openTargets[target] ?? {}).available !== true)
-              .map((target) => (
-                <div className="small muted" key={`why-open-${target}`} data-testid={`project-open-why-${target}`}>
-                  {text((openTargets[target] ?? {}).label, target)}: {text((openTargets[target] ?? {}).reason)}
-                </div>
-              ))}
-          </div>
-          {/* The absolute path is deliberately NOT printed here: this block shows the
-              root-relative folder beside the buttons, and the host path lives in the
-              collapsed «Технические детали» block (presentation.technical.folder_absolute). */}
-          <div className="small muted" style={{ marginTop: 6 }}>
-            {t(lang, "projects.disk.hint")}
-          </div>
-          {diskNotice !== "" ? (
-            <div className="notice" style={{ marginTop: 8 }} data-testid="project-disk-notice">
-              {diskNotice}
-            </div>
-          ) : null}
-          {diskFailure !== null ? <Refusal lang={lang} failure={diskFailure} /> : null}
-        </div>
+        {/* THE ENTRANCE INTO THE PROJECT, in two halves.
+            The folder itself -- its relative path and how many files it holds -- stays on
+            the card: it is the one "where is my project" fact the owner reads without
+            opening anything. The buttons that open it, and «Переместить в видимую папку»,
+            are actions, so they render from `diskButtons` below, inside the collapsed
+            «Показать подробности» block. Each button keeps the backend's own sentence as
+            its disabled reason, so nothing promises a click that would do nothing. */}
 
-        {/* --------------------------------------------------- no project yet */}
-        {/* The only creation actions that exist when there is nothing to act on. They are
-            the same ids the backend offers in `presentation.actions`. */}
-        {fileTotal === 0 ? (
-          <div className="notice warn">
-            <div className="label">{t(lang, "projects.empty.title")}</div>
-            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 8 }}>
-              <Button
-                size="small"
-                tone="primary"
-                onClick={() => runAction("continue_creation")}
-                disabled={archived}
-              >
-                {t(lang, "projects.empty.continue")}
-              </Button>
-              <Button size="small" onClick={() => runAction("answer_questions")} disabled={archived}>
-                {t(lang, "projects.empty.answer")}
-              </Button>
-            </div>
-          </div>
-        ) : null}
-
-        {changeBlock}
 
         {/* ---------------------------------------------------------- the preview */}
         {/* Project folder · files created · entry point · verification command · run
@@ -1619,82 +1843,6 @@ const ProjectCard = ({
           </div>
         </div>
 
-        {/* --------------------------------------------------------------- versions */}
-        <div>
-          <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
-            <div className="label">{t(lang, "projects.versions.title")}</div>
-            <Button size="small" tone="ghost" onClick={onHistory}>
-              {t(lang, "projects.action.history")}
-            </Button>
-          </div>
-          {versions.length === 0 ? (
-            <div className="small muted" style={{ marginTop: 6 }}>
-              {t(lang, "projects.versions.empty")}
-            </div>
-          ) : (
-            <table className="table" style={{ marginTop: 8 }}>
-              <thead>
-                <tr>
-                  <th>{t(lang, "projects.col.version")}</th>
-                  <th>{t(lang, "projects.col.created")}</th>
-                  <th>{t(lang, "projects.col.run")}</th>
-                  <th>{t(lang, "projects.col.verify")}</th>
-                  <th>{t(lang, "projects.col.accept")}</th>
-                  <th>{t(lang, "projects.col.provider")}</th>
-                  <th>{t(lang, "projects.col.files")}</th>
-                  <th>{t(lang, "projects.col.change")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {versions.map((version) => {
-                  const number = typeof version.version === "number" ? version.version : 0;
-                  const mock = String(version.provider ?? "") === OFFLINE_PROVIDER;
-                  return (
-                    <tr
-                      key={number}
-                      className={number === selectedVersion ? "selected" : ""}
-                      style={{ cursor: "pointer" }}
-                      onClick={() => onSelectVersion(number)}
-                    >
-                      <td className="mono small">v{number}</td>
-                      <td className="mono small">{text(version.created_at)}</td>
-                      <td className="mono small" style={{ maxWidth: 220, overflowWrap: "anywhere" }}>
-                        {version.pending === true ? t(lang, "projects.version.pending") : text(version.run_id)}
-                      </td>
-                      <td>
-                        <Badge tone={version.verification === "passed" ? "ok" : version.verification === "failed" ? "danger" : "neutral"}>
-                          {verificationLabel(lang, version.verification)}
-                        </Badge>
-                      </td>
-                      <td>
-                        <Badge tone={version.acceptance === "passed" ? "ok" : version.acceptance === "failed" ? "danger" : "neutral"}>
-                          {acceptanceLabel(lang, version.acceptance)}
-                        </Badge>
-                      </td>
-                      <td className="small">
-                        {text(version.provider)}
-                        <span className="muted"> · {text(version.model)}</span>
-                        {mock ? (
-                          <div className="small muted">{t(lang, "projects.version.mock")}</div>
-                        ) : null}
-                      </td>
-                      <td className="mono small">{typeof version.file_count === "number" ? version.file_count : "—"}</td>
-                      <td className="small" style={{ maxWidth: 260, overflowWrap: "anywhere" }}>
-                        {version.change_request && typeof version.change_request.text === "string"
-                          ? version.change_request.text
-                          : t(lang, "projects.version.first")}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-          <div className="small muted" style={{ marginTop: 6 }}>
-            {t(lang, "projects.versions.hint")}
-          </div>
-        </div>
-
         {/* -------------------------------------------------------------- artifacts */}
         <div id="project-artifacts">
           <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
@@ -1764,32 +1912,11 @@ const ProjectCard = ({
           ) : null}
         </div>
 
-        {/* The record operations. They are not part of the creation action set: they
-            act on the record itself and stay available whatever it contains. */}
-        <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <Button size="small" tone="ghost" onClick={onArchive}>
-            {busy === "archive" ? t(lang, "projects.archive.running") : t(lang, "projects.action.archive")}
-          </Button>
-          <Button size="small" tone="ghost" onClick={onRestore}>
-            {busy === "restore" ? t(lang, "projects.restore.running") : t(lang, "projects.action.restore")}
-          </Button>
-          <Button size="small" tone="ghost" onClick={onHistory}>
-            {t(lang, "projects.action.history")}
-          </Button>
-          {/* Deleting is a *move* into `.forge/projects-deleted`, so the confirmation says
-              exactly that before the second click. A record without an id gets a visibly
-              disabled button and the reason, never a click that does nothing. */}
-          <Button
-            size="small"
-            tone="danger"
-            disabled={!canDelete || busy === "delete"}
-            disabledReason={canDelete ? undefined : t(lang, "projects.delete.no_id")}
-            onClick={() => setConfirmDelete(true)}
-          >
-            {busy === "delete" ? t(lang, "projects.delete.running") : t(lang, "projects.action.delete")}
-          </Button>
-          {!canDelete ? <span className="small muted">{t(lang, "projects.delete.no_id")}</span> : null}
+        {/* The record operations are in the compact row above the details block: archive,
+            restore and delete appear exactly once on the card, so no two controls can be
+            mistaken for the same action. */}
         </div>
+        </details>
 
         {confirmDelete ? (
           <div className="notice danger" data-testid="project-delete-confirm">
@@ -2585,15 +2712,29 @@ export const Projects = ({
   const [change, setChange] = useState("");
   const [changeError, setChangeError] = useState("");
   const [changeFailure, setChangeFailure] = useState<Failure | null>(null);
-  const [staged, setStaged] = useState<LifecycleNewVersion | null>(null);
-  const [dispatching, setDispatching] = useState(false);
   const [dispatched, setDispatched] = useState<DispatchResult | null>(null);
   const [changeOutcome, setChangeOutcome] = useState<ChangeOutcome | null>(null);
   const [dispatchFailure, setDispatchFailure] = useState<Failure | null>(null);
+  /**
+   * THE ONE ACTION'S OWN STATE.
+   *
+   * `starting` is true from the click until the dispatch answers -- the button reads
+   * «Отправляю…» and the strip is already on screen, so the owner never has to guess
+   * whether the click was registered. `runId` is the run the dispatch named; it stays set
+   * after the run ends, because "which run was that?" is a question the strip answers
+   * forever, not only while the request is in flight.
+   */
+  const [changeStarting, setChangeStarting] = useState(false);
+  const [changeRunId, setChangeRunId] = useState("");
+  /**
+   * The run record, polled through the *existing* `GET /api/runs/{run_id}` while the run
+   * is not terminal. Its `event_count` and `state` are what the stage word is derived
+   * from: nothing here invents a stage the record does not prove.
+   */
+  const [changeRecord, setChangeRecord] = useState<RunRecord | null>(null);
 
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
-  const [writeMode, setWriteMode] = useState(false);
 
   // One selection resets every per-project answer, so a card never mixes two projects: the staged
   // version, the dispatch result, the artifact manifest, the history, the selected version and the
@@ -2606,11 +2747,13 @@ export const Projects = ({
     setLaunchBusy(false);
     setLaunchNotice("");
     setLaunchFailure(null);
-    setStaged(null);
     setDispatched(null);
     setChangeOutcome(null);
     setDispatchFailure(null);
     setChangeFailure(null);
+    setChangeStarting(false);
+    setChangeRunId("");
+    setChangeRecord(null);
     setFiles(null);
     setHistory(null);
     setSelectedVersion(0);
@@ -2641,7 +2784,22 @@ export const Projects = ({
 
   const mockSelected = provider === OFFLINE_PROVIDER;
 
-  const submitVersion = async () => {
+  /**
+   * THE ONE ACTION: stage the change and run it, in one click.
+   *
+   * It used to take two buttons («Начать изменения» then «Исправить проект»), and the
+   * owner pressed both without being able to tell whether anything had started. The two
+   * requests are still two requests -- `POST /api/projects/{id}/versions` stages the
+   * change, `POST /api/tasks/run` executes it -- but they are one action now, in one
+   * order, with one state on screen:
+   *
+   * * `changeStarting` is true from the click, so the button says «Отправляю…» and the
+   *   strip is already visible;
+   * * a refusal from either step is printed beside the button and clears the strip: no
+   *   run started, and the card must not suggest one did;
+   * * a run sets `changeRunId`, which the strip prints and the poller follows.
+   */
+  const startChange = async () => {
     if (selectedId === "") return;
     const trimmed = change.trim();
     if (trimmed === "") {
@@ -2650,39 +2808,46 @@ export const Projects = ({
     }
     setChangeError("");
     setChangeFailure(null);
-    setBusy("version");
-    setActionFailure(null);
-    setActionNotice("");
+    setDispatchFailure(null);
     setDispatched(null);
     setChangeOutcome(null);
-    setDispatchFailure(null);
-    const outcome = await createProjectVersion(selectedId, trimmed);
-    setBusy("");
-    if (!outcome.ok) {
-      setStaged(null);
-      // The refusal belongs to the button that was pressed, so it is printed beside it
-      // instead of at the top of a card the owner would have to scan for an answer.
-      setChangeFailure(outcome.failure);
+    setChangeRecord(null);
+    setChangeRunId("");
+    setActionFailure(null);
+    setActionNotice("");
+    setChangeStarting(true);
+    setBusy("version");
+    const fromVersion = currentVersionNumber;
+    const stagedOutcome = await createProjectVersion(selectedId, trimmed);
+    if (!stagedOutcome.ok) {
+      setBusy("");
+      setChangeStarting(false);
+      setChangeFailure(stagedOutcome.failure);
       return;
     }
-    setStaged(outcome.value);
+    const taskText = String(stagedOutcome.value.task_text ?? "");
+    if (taskText === "") {
+      setBusy("");
+      setChangeStarting(false);
+      setChangeFailure({
+        kind: "error",
+        status: 200,
+        path: `/api/projects/${selectedId}/versions`,
+        detail: t(lang, "projects.newversion.error"),
+      });
+      return;
+    }
+    // The staged version is a real fact (the record now carries a pending version), so the
+    // card refreshes it before the run starts.
     await loadDetail(selectedId);
-    await loadList();
-  };
-
-  const submitTask = async () => {
-    if (staged === null || typeof staged.task_text !== "string" || staged.task_text === "") return;
-    if (selectedId === "") return;
-    const fromVersion = currentVersionNumber;
-    setDispatching(true);
-    setDispatchFailure(null);
-    setChangeOutcome(null);
     const outcome = await dispatchTask({
-      description: staged.task_text,
+      description: taskText,
       category: "code",
       providerName: options.includes(provider) ? provider : undefined,
       modelName: model !== "" ? model : undefined,
-      writeMode,
+      // THE LABEL PROMISES WRITING, so the run writes. The old toggle made "write" a
+      // separate decision and the primary button could start a run that changed nothing.
+      writeMode: true,
       // THE ASSOCIATION. The run that executes this staged change text belongs to the
       // project the card is showing, so the project's own `proj-…` id travels with it.
       // The Core then (a) targets the project's controlled workspace with a write-mode
@@ -2691,12 +2856,14 @@ export const Projects = ({
       // record named and the card promised a version that never appeared.
       lifecycleProjectId: selectedId,
     });
-    setDispatching(false);
+    setBusy("");
+    setChangeStarting(false);
     if (!outcome.ok) {
       setDispatchFailure(outcome.failure);
       return;
     }
     setDispatched(outcome.value);
+    setChangeRunId(String(outcome.value.response.run_id ?? ""));
     // Read the record *after* the run: a new version exists only if `current_version`
     // really moved. The response alone cannot answer that question.
     const refreshed = await loadDetail(selectedId);
@@ -2723,6 +2890,102 @@ export const Projects = ({
     await loadList();
     onRefresh();
   };
+
+  /**
+   * Follow the change run through the existing run record while it is not terminal.
+   *
+   * The route is the one the card already uses (`GET /api/runs/{run_id}`); the interval is
+   * the project-run poller's own (1.5 s). It stops on a terminal record or on unmount, so a
+   * finished run costs no further requests, and a stage word is only ever derived from the
+   * record's own `event_count`/`state`.
+   */
+  useEffect(() => {
+    if (changeRunId === "") {
+      setChangeRecord(null);
+      return;
+    }
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      const outcome = await loadRunRecord(changeRunId);
+      if (cancelled) return;
+      if (outcome.ok) {
+        setChangeRecord(outcome.value);
+        if (isTerminalRecord(outcome.value)) return;
+      }
+      timer = window.setTimeout(() => void poll(), 1500);
+    };
+    timer = window.setTimeout(() => void poll(), 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [changeRunId]);
+
+  /**
+   * The strip the card renders, derived from the facts above and nothing else.
+   *
+   * The words, in order: the click puts «Запускаю · выполняю запуск…» on screen at once; a
+   * run id replaces it with «Запущено: run-… · <stage>»; the record's own `event_count`
+   * moves the stage word («пишу файлы…» before the fourth recorded event, «проверяю…»
+   * after it, the same rule `RunProgress` uses); a terminal record or a finished outcome
+   * ends the line and the final sentence states what really happened.
+   */
+  const changeStrip = useMemo<ChangeStrip | null>(() => {
+    const finished = changeOutcome !== null;
+    if (!changeStarting && changeRunId === "" && !finished) return null;
+    const record = changeRecord;
+    const events =
+      record !== null && typeof record.event_count === "number" && Number.isFinite(record.event_count)
+        ? record.event_count
+        : 0;
+    const terminal = record !== null && isTerminalRecord(record);
+    let stage = t(lang, "projects.change.working");
+    if (finished || terminal) stage = t(lang, "projects.change.finished");
+    else if (changeRunId !== "" && events >= 4) stage = t(lang, "projects.change.checking");
+    else if (changeRunId !== "" && events > 0) stage = t(lang, "projects.change.writing");
+    else if (changeStarting) stage = t(lang, "projects.change.starting");
+    const title =
+      changeRunId !== ""
+        ? t(lang, "projects.change.launched")
+            .replace("{run}", changeRunId)
+            .replace("{stage}", stage)
+        : t(lang, "projects.change.starting.line").replace("{stage}", stage);
+    let final = "";
+    let refusal = "";
+    let tone: ChangeStrip["tone"] = "info";
+    if (changeOutcome !== null) {
+      const advanced = changeOutcome.toVersion > changeOutcome.fromVersion;
+      final = !changeOutcome.attached
+        ? t(lang, "projects.newversion.outcome.unattached")
+        : advanced
+          ? t(lang, "projects.change.done").replace("{version}", `v${changeOutcome.toVersion}`)
+          : t(lang, "projects.newversion.outcome.not_written");
+      if (!advanced) {
+        // The backend's own error text, verbatim: the card never softens a refusal.
+        const error = String(dispatched?.response.error ?? "");
+        if (error !== "") refusal = error;
+        tone = "warn";
+      } else {
+        tone = "ok";
+      }
+    }
+    return {
+      title,
+      stage,
+      tone,
+      final,
+      refusal,
+      files: changeOutcome?.files ?? [],
+    };
+  }, [
+    changeStarting,
+    changeRunId,
+    changeRecord,
+    changeOutcome,
+    dispatched,
+    lang,
+  ]);
 
   return (
     <div className="content">
@@ -3295,21 +3558,16 @@ export const Projects = ({
           change={change}
           onChange={setChange}
           changeError={changeError}
-          onNewVersion={() => void submitVersion()}
+          onStartChange={() => void startChange()}
           changeFailure={changeFailure}
-          staged={staged}
-          onDispatch={() => void submitTask()}
-          dispatching={dispatching}
+          changeStrip={changeStrip}
           dispatched={dispatched}
-          changeOutcome={changeOutcome}
           dispatchFailure={dispatchFailure}
           provider={provider}
           onProvider={setProvider}
           model={model}
           onModel={setModel}
           modelChoices={modelChoices}
-          writeMode={writeMode}
-          onWriteMode={setWriteMode}
           mockSelected={mockSelected}
           actionFailure={actionFailure}
           actionNotice={actionNotice}

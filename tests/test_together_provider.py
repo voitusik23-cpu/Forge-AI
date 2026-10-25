@@ -447,6 +447,13 @@ class TogetherArchitectureInvariantTests(unittest.TestCase):
                 "app/agents/providers/capabilities.py",
                 "app/agents/providers/factory.py",
                 "app/agents/providers/model_registry.py",
+                # The «Провайдеры и ключи» form's own catalogue: a label, a base URL, a
+                # default model and the secret's variable name per provider. It constructs
+                # nothing, routes nothing and is never consulted by a run -- it exists so
+                # the owner can add a key for a provider without editing `.env`. Adding a
+                # provider there is not an integration point; adding it to the registry
+                # rows above still is.
+                "app/config/provider_keys.py",
             ],
             f"unexpected integration points: {mentions}",
         )

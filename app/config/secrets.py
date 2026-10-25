@@ -5,21 +5,31 @@ import re
 from pathlib import Path
 from typing import Mapping, Optional
 
+from app.config.windows_creds import CredentialBackend, default_credential_backend
 
 _SECRET_NAME = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 
 
 class SecretStore:
-    """Resolve secrets from process environment, then the repo-root ``.env``.
+    """Resolve secrets from process environment, then the repo-root ``.env``, then the vault.
 
     Values are read only when requested. They are never added to RuntimeSettings
     or ProviderConfig, and this class deliberately has no value-bearing repr.
+
+    The third source -- the operating system's credential vault
+    (:mod:`app.config.windows_creds`) -- is what makes a key the owner added in
+    «Настройки → Провайдеры и ключи» visible to the *existing* provider layer without a
+    restart: every provider and every availability derivation resolves its key through
+    this one method, so a new vault entry is found on the next call, and no second
+    provider registry exists. The lookup is uncached and ordered, so a deployment's
+    ``.env`` still wins over a key typed into the interface.
     """
 
     def __init__(
         self,
         env_file: Optional[Path] = None,
         environ: Optional[Mapping[str, str]] = None,
+        credential_backend: Optional[CredentialBackend] = None,
     ) -> None:
         self._env_file = (
             Path(env_file)
@@ -28,6 +38,21 @@ class SecretStore:
         )
         self._environ = os.environ if environ is None else environ
         self._file_values: Optional[dict[str, str]] = None
+        # Injected by a test; otherwise resolved per call, never cached across calls: a
+        # cached backend would hide the key the owner (or a test) just added.
+        self._credential_backend = credential_backend
+
+    def _vault(self) -> CredentialBackend:
+        """The credential vault for this call, or a backend that holds nothing."""
+
+        if self._credential_backend is not None:
+            return self._credential_backend
+        try:
+            return default_credential_backend()
+        except Exception:  # noqa: BLE001 - an unusable vault means "no key", never a crash
+            from app.config.windows_creds import UnavailableCredentialBackend
+
+            return UnavailableCredentialBackend()
 
     def get_secret(self, name: str) -> Optional[str]:
         """Return a non-empty secret by variable name, preferring process env."""
@@ -41,7 +66,46 @@ class SecretStore:
         if self._file_values is None:
             self._file_values = self._read_env_file()
         value = self._file_values.get(name)
-        return value if value and value.strip() else None
+        if value and value.strip():
+            return value
+
+        # THE KEY THE OWNER ADDED IN THE INTERFACE, read on every call. Any failure is
+        # "no key here", which the availability derivation already reports honestly as
+        # ``NO_CREDENTIALS``; a read must never raise into a status payload.
+        try:
+            stored = self._vault().get_secret(name)
+        except Exception:  # noqa: BLE001 - see above
+            return None
+        return stored if isinstance(stored, str) and stored.strip() else None
+
+    def secret_source(self, name: str) -> str:
+        """Where :meth:`get_secret` finds ``name``: ``environment``, ``vault`` or ``""``.
+
+        A fixed word, never a value or a part of one. It exists so the interface can tell
+        the owner *where* his key comes from without any payload carrying it.
+        """
+
+        if not isinstance(name, str) or not _SECRET_NAME.fullmatch(name):
+            raise ValueError("Secret name must be an uppercase environment variable name")
+
+        value = self._environ.get(name)
+        if isinstance(value, str) and value.strip():
+            return "environment"
+        if self._file_values is None:
+            self._file_values = self._read_env_file()
+        value = self._file_values.get(name)
+        if value and value.strip():
+            return "environment"
+        try:
+            stored = self._vault().get_secret(name)
+        except Exception:  # noqa: BLE001 - an unreadable vault is "no source"
+            return ""
+        return "vault" if isinstance(stored, str) and stored.strip() else ""
+
+    def has_secret(self, name: str) -> bool:
+        """Presence only: one boolean, never the value."""
+
+        return self.get_secret(name) is not None
 
     def secret_names(self) -> tuple[str, ...]:
         """Every secret *name* this store can resolve, sorted, and no value.
@@ -59,6 +123,17 @@ class SecretStore:
         if self._file_values is None:
             self._file_values = self._read_env_file()
         names.update(self._file_values)
+        # The vault's *names* only, through the same rule as every other source: a
+        # numbered family (``RADOX_API_KEY_1``) added in the interface is enumerable
+        # without the store ever handing out a value here.
+        try:
+            names.update(
+                name
+                for name in self._vault().list_secret_names()
+                if _SECRET_NAME.fullmatch(str(name))
+            )
+        except Exception:  # noqa: BLE001 - an unreadable vault contributes no names
+            pass
         return tuple(sorted(names))
 
     def _read_env_file(self) -> dict[str, str]:

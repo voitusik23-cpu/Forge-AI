@@ -666,7 +666,18 @@ class DeleteEdgeTests(_DeleteTestCase):
             for route in self.app.routes
             if "DELETE" in (getattr(route, "methods", ()) or ())
         }
-        self.assertEqual(delete_routes, {("/api/projects/{project_id}", ("DELETE",))})
+        # Two DELETE routes exist, and neither erases a project:
+        #   * `/api/projects/{id}` moves the record and its files into the trash;
+        #   * `/api/settings/providers/{id}` removes a provider's API key from the
+        #     operating system's credential vault and drops its stored entry. It names no
+        #     project, touches no project folder and cannot restore or erase one.
+        self.assertEqual(
+            delete_routes,
+            {
+                ("/api/projects/{project_id}", ("DELETE",)),
+                ("/api/settings/providers/{provider_id}", ("DELETE",)),
+            },
+        )
         for path, _methods in delete_routes:
             lowered = path.lower()
             for word in ("permanent", "purge", "hard", "erase", "destroy"):
