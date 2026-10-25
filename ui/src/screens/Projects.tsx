@@ -2838,8 +2838,10 @@ export const Projects = ({
       return;
     }
     // The staged version is a real fact (the record now carries a pending version), so the
-    // card refreshes it before the run starts.
-    await loadDetail(selectedId);
+    // card refreshes it before the run starts -- QUIETLY. A non-quiet refresh replaces the
+    // card with «Загрузка…», which would hide the status strip at the exact moment it is the
+    // answer to «оно началось?» (measured over CDP: a blank card under the strip).
+    await loadDetail(selectedId, { quiet: true });
     const outcome = await dispatchTask({
       description: taskText,
       category: "code",
@@ -2865,8 +2867,9 @@ export const Projects = ({
     setDispatched(outcome.value);
     setChangeRunId(String(outcome.value.response.run_id ?? ""));
     // Read the record *after* the run: a new version exists only if `current_version`
-    // really moved. The response alone cannot answer that question.
-    const refreshed = await loadDetail(selectedId);
+    // really moved. The response alone cannot answer that question. Quietly again, so the
+    // strip that reports the run is never taken off the screen by its own refresh.
+    const refreshed = await loadDetail(selectedId, { quiet: true });
     const toVersion =
       refreshed !== null && typeof refreshed.project?.current_version === "number"
         ? refreshed.project.current_version
