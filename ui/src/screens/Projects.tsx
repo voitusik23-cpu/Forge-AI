@@ -712,6 +712,7 @@ const ProjectCard = ({
   onChange,
   changeError,
   onNewVersion,
+  changeFailure,
   staged,
   onDispatch,
   dispatching,
@@ -778,6 +779,14 @@ const ProjectCard = ({
   onChange: (value: string) => void;
   changeError: string;
   onNewVersion: () => void;
+  /**
+   * The backend's refusal of this change request, printed beside the button that made it.
+   *
+   * It is its own slot (not the card's shared `actionFailure`) because the refusal belongs
+   * to the control the owner pressed: «Запрос отклонён» at the top of a long card was the
+   * same silent no-op the button itself used to be.
+   */
+  changeFailure: Failure | null;
   staged: LifecycleNewVersion | null;
   onDispatch: () => void;
   dispatching: boolean;
@@ -964,6 +973,12 @@ const ProjectCard = ({
   const projectId = String(project.project_id ?? "");
   const canDelete = projectId !== "";
   const changeRef = useRef<HTMLTextAreaElement | null>(null);
+  // The primary action of this screen is gated by the text it acts on, and the reason it
+  // is off is printed as a sentence: the owner's words were «где кнопка, которая
+  // подтверждает ввод?» -- a control that looks like a caption cannot answer that, and a
+  // disabled control without a visible reason only moves the question one step further.
+  const changeEmpty = change.trim() === "";
+  const changeBusy = busy === "version";
 
   // One handler for the whole action vocabulary: the card offers what the backend
   // allows and nothing else, so an unknown id can only be a client/server mismatch.
@@ -1006,7 +1021,7 @@ const ProjectCard = ({
   const changeBlock = (
     <>
         {/* ----------------------------------------------------------- new version */}
-        <div>
+        <div data-testid="project-change">
           <div className="label">{t(lang, "projects.newversion.title")}</div>
           <div className="stack" style={{ gap: 10, marginTop: 8 }}>
             <Field
@@ -1021,8 +1036,57 @@ const ProjectCard = ({
                 value={change}
                 onChange={(event) => onChange(event.target.value)}
                 placeholder={t(lang, "projects.newversion.placeholder")}
+                data-testid="change-textarea"
               />
             </Field>
+            {/* THE ACTION OF THIS SCREEN, directly under the text it acts on.
+                It used to be a small default-tone button next to the model select, which
+                read as a caption: the owner asked «где кнопка, которая подтверждает
+                ввод?» while it was on screen the whole time. A full-width primary button
+                cannot be read as anything else, and it is off -- with the reason printed,
+                not hovered -- until there is a sentence to send. */}
+            <div className="stack" style={{ gap: 8 }} data-testid="change-actions">
+              <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ flex: "1 1 320px", minWidth: 0 }} data-testid="change-start">
+                  <Button
+                    tone="primary"
+                    wide
+                    disabled={changeBusy || changeEmpty}
+                    disabledReason={changeEmpty ? t(lang, "projects.newversion.start.reason") : undefined}
+                    onClick={onNewVersion}
+                  >
+                    {changeBusy
+                      ? t(lang, "projects.newversion.sending")
+                      : t(lang, "projects.newversion.start")}
+                  </Button>
+                </span>
+                {/* The switch is available for every routable provider, `mock` included:
+                    the Core's MOCK_DETERMINISTIC mode writes the deterministic scaffold
+                    when the run belongs to a lifecycle project, and honestly reports
+                    `no_changes` when it does not. That is the only free path that can
+                    create (or extend) a project at all, and it calls no model. */}
+                <label className="forge-toggle" style={{ flex: "0 0 auto" }}>
+                  <input
+                    type="checkbox"
+                    checked={writeMode}
+                    onChange={(event) => onWriteMode(event.target.checked)}
+                  />
+                  <span>{t(lang, "projects.newversion.write")}</span>
+                </label>
+              </div>
+              {/* The two states of the gate, as sentences: why the button is off, and what
+                  the switch beside it will do. Neither is a tooltip only. */}
+              {changeEmpty && !changeBusy ? (
+                <div className="small muted" data-testid="change-start-reason">
+                  {t(lang, "projects.newversion.start.reason")}
+                </div>
+              ) : null}
+              <div className="small muted" data-testid="change-write-note">
+                {t(lang, "projects.newversion.write.note")}
+              </div>
+              {/* The backend's refusal, verbatim, next to the control that produced it. */}
+              {changeFailure !== null ? <Refusal lang={lang} failure={changeFailure} /> : null}
+            </div>
             <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
               <label className="field" style={{ flex: "0 1 190px" }}>
                 <span className="label">{t(lang, "projects.col.provider")}</span>
@@ -1061,37 +1125,25 @@ const ProjectCard = ({
                 )}
               </label>
             </div>
-            <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-              <Button size="small" disabled={busy === "version"} onClick={onNewVersion}>
-                {busy === "version" ? t(lang, "projects.newversion.running") : t(lang, "projects.newversion.create")}
-              </Button>
-              {/* The switch is available for every routable provider, `mock` included:
-                  the Core's MOCK_DETERMINISTIC mode writes the deterministic scaffold
-                  when the run belongs to a lifecycle project, and honestly reports
-                  `no_changes` when it does not. That is the only free path that can
-                  create (or extend) a project at all, and it calls no model. */}
-              <label className="forge-toggle">
-                <input
-                  type="checkbox"
-                  checked={writeMode}
-                  onChange={(event) => onWriteMode(event.target.checked)}
-                />
-                <span>{t(lang, "projects.newversion.write")}</span>
-              </label>
-            </div>
             {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
             <div className="small muted">{t(lang, "projects.newversion.session.note")}</div>
 
             {staged !== null ? (
-              <div className="stack" style={{ gap: 8 }}>
+              <div className="stack" style={{ gap: 8 }} data-testid="change-staged">
                 <div className="label">
                   {t(lang, "projects.newversion.staged").replace("{version}", `v${text(staged.version)}`)}
                 </div>
                 <pre className="forge-output mono small">{text(staged.task_text)}</pre>
-                <div className="row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-                  <Button size="small" tone="primary" disabled={dispatching} onClick={onDispatch}>
-                    {dispatching ? t(lang, "projects.newversion.submitting") : t(lang, "projects.newversion.submit")}
-                  </Button>
+                {/* The second step of the same action, dressed like the first: the button
+                    that really runs the change is the strongest control of its block. */}
+                <div className="stack" style={{ gap: 6 }}>
+                  <span data-testid="change-dispatch">
+                    <Button tone="primary" wide disabled={dispatching} onClick={onDispatch}>
+                      {dispatching
+                        ? t(lang, "projects.newversion.submitting")
+                        : t(lang, "projects.newversion.submit")}
+                    </Button>
+                  </span>
                   <span className="small muted">{t(lang, "projects.newversion.submit.hint")}</span>
                 </div>
               </div>
@@ -2532,6 +2584,7 @@ export const Projects = ({
 
   const [change, setChange] = useState("");
   const [changeError, setChangeError] = useState("");
+  const [changeFailure, setChangeFailure] = useState<Failure | null>(null);
   const [staged, setStaged] = useState<LifecycleNewVersion | null>(null);
   const [dispatching, setDispatching] = useState(false);
   const [dispatched, setDispatched] = useState<DispatchResult | null>(null);
@@ -2557,6 +2610,7 @@ export const Projects = ({
     setDispatched(null);
     setChangeOutcome(null);
     setDispatchFailure(null);
+    setChangeFailure(null);
     setFiles(null);
     setHistory(null);
     setSelectedVersion(0);
@@ -2595,6 +2649,7 @@ export const Projects = ({
       return;
     }
     setChangeError("");
+    setChangeFailure(null);
     setBusy("version");
     setActionFailure(null);
     setActionNotice("");
@@ -2605,7 +2660,9 @@ export const Projects = ({
     setBusy("");
     if (!outcome.ok) {
       setStaged(null);
-      setActionFailure(outcome.failure);
+      // The refusal belongs to the button that was pressed, so it is printed beside it
+      // instead of at the top of a card the owner would have to scan for an answer.
+      setChangeFailure(outcome.failure);
       return;
     }
     setStaged(outcome.value);
@@ -3239,6 +3296,7 @@ export const Projects = ({
           onChange={setChange}
           changeError={changeError}
           onNewVersion={() => void submitVersion()}
+          changeFailure={changeFailure}
           staged={staged}
           onDispatch={() => void submitTask()}
           dispatching={dispatching}
