@@ -24,6 +24,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
 import { IconRefresh } from "../components/Icons";
+import { RouteLine } from "../components/RouteLine";
 import { t, type Lang } from "../i18n";
 import { PROJECT_LIST_PAGE_SIZE, projectListRows } from "../project-list.js";
 import {
@@ -1269,25 +1270,30 @@ const ProjectCard = ({
       </div>
       {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
       {dispatched !== null ? (
-        <Facts
-          items={[
-            [t(lang, "projects.col.run"), text(dispatched.response.run_id)],
-            [t(lang, "projects.col.status"), text(dispatched.response.state, t(lang, "runs.unknown"))],
-            [t(lang, "projects.outcome.route"), `${text(dispatched.response.provider_used)} · ${text(dispatched.response.model_used)}`],
-            [
-              t(lang, "projects.outcome.duration"),
-              typeof dispatched.response.duration_seconds === "number"
-                ? `${dispatched.response.duration_seconds.toFixed(3)} s`
-                : t(lang, "runs.unknown"),
-            ],
-            [
-              t(lang, "runs.result.tokens"),
-              dispatched.response.tokens === null || dispatched.response.tokens === undefined
-                ? t(lang, "runs.unknown")
-                : String(dispatched.response.tokens),
-            ],
-          ]}
-        />
+        <div className="stack" style={{ gap: 6 }}>
+          {/* The project card publishes the same «Провайдер · Модель · тариф · почему» the run
+              response carries: what really ran, and the reasons the route was chosen. */}
+          <RouteLine lang={lang} choice={dispatched.response.model_choice} testId="project-route-line" />
+          <Facts
+            items={[
+              [t(lang, "projects.col.run"), text(dispatched.response.run_id)],
+              [t(lang, "projects.col.status"), text(dispatched.response.state, t(lang, "runs.unknown"))],
+              [t(lang, "projects.outcome.route"), `${text(dispatched.response.provider_used)} · ${text(dispatched.response.model_used)}`],
+              [
+                t(lang, "projects.outcome.duration"),
+                typeof dispatched.response.duration_seconds === "number"
+                  ? `${dispatched.response.duration_seconds.toFixed(3)} s`
+                  : t(lang, "runs.unknown"),
+              ],
+              [
+                t(lang, "runs.result.tokens"),
+                dispatched.response.tokens === null || dispatched.response.tokens === undefined
+                  ? t(lang, "runs.unknown")
+                  : String(dispatched.response.tokens),
+              ],
+            ]}
+          />
+        </div>
       ) : null}
     </div>
   );

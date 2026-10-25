@@ -84,6 +84,12 @@ from app.agent_runtime.offline_task import (
     render_offline_task_report,
 )
 from app.agent_runtime.policy import AgentHarnessPolicy
+from app.agent_runtime.routing import (
+    COMPLEXITY_LEVELS,
+    TIER_FOR_COMPLEXITY,
+    ModelChoice,
+    choose_model,
+)
 from app.config.settings import OFFLINE_PROVIDER_NAME
 from app.execution.capabilities import ExecutionCapability
 from app.execution.declaration import (
@@ -1250,6 +1256,15 @@ class ForgeApiService:
             details={
                 "enabled_providers": list(self._runtime.settings.enabled_providers),
                 "default_provider": self._runtime.settings.default_provider,
+                # WHAT AUTOMATIC ROUTING READS. The settings panel documents the rule the
+                # code really applies, so it reads the policy from the router instead of
+                # repeating it in the interface: which tier each complexity level gets,
+                # and whether paid models are permitted at all.
+                "default_model": self._runtime.settings.default_model,
+                "allow_paid_providers": self._allow_paid_providers(),
+                "routing_policy": {
+                    level: TIER_FOR_COMPLEXITY[level] for level in COMPLEXITY_LEVELS
+                },
                 # The build identity travels beside the provider facts, so an operator
                 # can tell which build answered without a second request.
                 **self.get_version_info(),
@@ -2874,7 +2889,13 @@ class ForgeApiService:
             ),
         )
 
-    def _replay_response(self, record, req: "TaskRunRequest", project_id: str) -> "TaskRunResponse":
+    def _replay_response(
+        self,
+        record,
+        req: "TaskRunRequest",
+        project_id: str,
+        route: Optional[ModelChoice] = None,
+    ) -> "TaskRunResponse":
         """Answer a replay with the original identity, and start nothing."""
 
         run_id = getattr(record, "run_id", "") or ""
@@ -2982,6 +3003,12 @@ class ForgeApiService:
                 and not isinstance(recorded_round, bool)
                 else 0
             ),
+            # The same decision this request would make, with the recorded pair as the
+            # one that really served it. The choice is a pure function of the request,
+            # so a replay cannot disagree with the original about *why*.
+            model_choice=self._published_choice(
+                route, provider_used=provider, model_used=model
+            ),
         )
 
     def bind_authorized_project(self, project_id: str) -> None:
@@ -3010,21 +3037,25 @@ class ForgeApiService:
         return self.run_task_detailed(req).response
 
     # ---------------------------------------------------------------- provider
-    def _selected_provider_name(self, req: TaskRunRequest) -> str:
+    def _selected_provider_name(
+        self, req: TaskRunRequest, route: Optional[ModelChoice] = None
+    ) -> str:
         """The provider this task will actually run on.
 
         The selection is the same one the dispatcher makes: an explicitly named
-        provider wins, otherwise the composition's configured default is used.
-        Reading it here - rather than re-deriving a routing policy - is what keeps
-        "the offline provider was selected" and "the offline path ran" the same
-        fact. It is read from the runtime the dispatcher itself holds, so a
-        service whose runtime was supplied by a caller resolves it that caller's
-        way.
+        provider wins, then an automatic choice made for this run, otherwise the
+        composition's configured default is used. Reading it here - rather than
+        re-deriving a routing policy - is what keeps "the offline provider was
+        selected" and "the offline path ran" the same fact. It is read from the
+        runtime the dispatcher itself holds, so a service whose runtime was
+        supplied by a caller resolves it that caller's way.
         """
 
         requested = (req.provider_name or "").strip()
         if requested:
             return requested
+        if route is not None and route.provider:
+            return route.provider
         # The configured default decides. It is read from the runtime settings first, because those are
         # the values the operator wrote (``FORGE_DEFAULT_PROVIDER`` in the repository ``.env``); the
         # dispatcher's own copy is a fallback for a runtime whose settings were supplied without one.
@@ -3041,6 +3072,159 @@ class ForgeApiService:
         if isinstance(configured, str) and configured.strip():
             return configured.strip()
         return ""
+
+    # ------------------------------------------------------------ auto routing
+    def _routing_settings(self) -> Dict[str, Any]:
+        """The settings the automatic chooser reads, and nothing else.
+
+        ``allow_paid_providers`` is the dispatcher's own value (the one routing honours),
+        the defaults are the operator's configuration, and the enabled set is the
+        composition's own narrow list. No credential and no environment value is read.
+        """
+
+        settings = getattr(self._runtime, "settings", None)
+        enabled = getattr(settings, "enabled_providers", None)
+        return {
+            "default_provider": str(getattr(settings, "default_provider", "") or ""),
+            "default_model": str(getattr(settings, "default_model", "") or ""),
+            "allow_paid_providers": self._allow_paid_providers(),
+            "enabled_providers": (
+                tuple(str(name) for name in enabled)
+                if isinstance(enabled, (tuple, list))
+                else ()
+            ),
+        }
+
+    def choose_route(
+        self,
+        task_text: str,
+        category: object = "code",
+        *,
+        provider_name: object = None,
+        model_name: object = None,
+        write_mode: bool = False,
+        existing_project: bool = False,
+    ) -> ModelChoice:
+        """The automatic provider/model choice for one task.
+
+        It is the pure function ``app.agent_runtime.routing.choose_model`` over the
+        catalogue this service already publishes (``GET /api/models``): the same rows, the
+        same provider states and the same settings the interface shows. It performs no
+        provider call, so asking for it can never spend anything - which is what makes the
+        launch step's live preview honest.
+
+        ``provider_name``/``model_name`` are the caller's explicit choice; when both are
+        named that pair always wins (the manual path stays available), otherwise the
+        decision is made by complexity alone.
+        """
+
+        override = None
+        named_provider = str(provider_name or "").strip()
+        named_model = str(model_name or "").strip()
+        if named_provider and named_model:
+            override = {"provider": named_provider, "model": named_model}
+        return choose_model(
+            task_text,
+            str(getattr(category, "value", category) or "code"),
+            catalogue=self.list_models_catalogue(),
+            settings=self._routing_settings(),
+            override=override,
+            write_mode=bool(write_mode),
+            existing_project=bool(existing_project),
+        )
+
+    def estimate_route(
+        self,
+        *,
+        description: str,
+        category: object = "code",
+        provider_name: object = None,
+        model_name: object = None,
+        write_mode: bool = False,
+        existing_project: bool = False,
+    ) -> Dict[str, Any]:
+        """The dry run behind ``POST /api/tasks/run`` with ``estimate: true``.
+
+        It answers the decision the same request *would* make and dispatches nothing: no
+        provider is called, no run is created, no idempotency key is claimed and no money
+        can be spent.
+        """
+
+        choice = self.choose_route(
+            description,
+            category,
+            provider_name=provider_name,
+            model_name=model_name,
+            write_mode=write_mode,
+            existing_project=existing_project,
+        )
+        return {"estimate": True, "model_choice": self._runnable_choice(choice).to_dict()}
+
+    @staticmethod
+    def _runnable_choice(choice: ModelChoice) -> ModelChoice:
+        """The choice as it will really run.
+
+        The offline provider answers with the deterministic engine rather than any model
+        row, so a prediction that lands on it must say the same word the run's own response
+        reports — otherwise the preview would promise `mock-v1` and the response would
+        report `deterministic-offline`.
+        """
+
+        if (
+            choice.provider.strip().lower() == OFFLINE_PROVIDER_NAME
+            and choice.model
+            and choice.model != "deterministic-offline"
+        ):
+            return replace(choice, model="deterministic-offline")
+        return choice
+
+    @staticmethod
+    def _published_choice(
+        route: Optional[ModelChoice],
+        *,
+        provider_used: str = "",
+        model_used: str = "",
+        tier: str = "",
+    ) -> Dict[str, Any]:
+        """The «provider · model · tier · why» block a run response publishes.
+
+        The pair that *ran* wins over the pair that was predicted: a fallback provider or
+        the offline engine may have served the run, and the line has to name what the
+        owner is paying for. ``tier`` is the actual pair's tier from ``cost_tier`` when the
+        caller passes one, so the line cannot say "free" about a cheap model. The reasons
+        stay the decision's own: they explain *why* this route was chosen.
+        """
+
+        if route is None:
+            return {}
+        payload = route.to_dict()
+        if provider_used:
+            payload["provider"] = str(provider_used)
+        if model_used:
+            payload["model"] = str(model_used)
+        if tier:
+            payload["tier"] = str(tier)
+        return payload
+
+    @staticmethod
+    def _request_with_route(
+        req: TaskRunRequest, route: Optional[ModelChoice]
+    ) -> TaskRunRequest:
+        """The request the run resolves its provider and model from.
+
+        An automatic choice becomes the run's pair exactly like a caller's own choice:
+        the pair is named, so every downstream decision (write mode included) judges the
+        route that will really run instead of a default that would not. ``None`` returns
+        the request unchanged, which keeps the manual path byte-for-byte.
+        """
+
+        if route is None or not route.provider:
+            return req
+        return replace(
+            req,
+            provider_name=route.provider,
+            model_name=(route.model or None),
+        )
 
     # ------------------------------------------------------------ cost policy
     def _resolved_model_registry(self) -> object:
@@ -3158,7 +3342,9 @@ class ForgeApiService:
                     tier_word = raw_tier.strip().upper()
         return tier_word, unit_price
 
-    def _enforce_paid_policy(self, req: TaskRunRequest) -> dict:
+    def _enforce_paid_policy(
+        self, req: TaskRunRequest, *, route: Optional[ModelChoice] = None
+    ) -> dict:
         """Refuse a paid provider/model the caller did not explicitly choose.
 
         Three facts decide, and all three are read from the composition rather than
@@ -3169,13 +3355,27 @@ class ForgeApiService:
         * whether the operator enabled paid providers.
 
         A ``PAID`` pair runs only when the caller named **both** the provider and the
-        model *and* the operator enabled paid providers. Everything else is refused
-        with :class:`PaidModelRequiresConfirmation` before any dispatch, so no
-        request can be billed without an explicit, deliberate choice.
+        model *and* the operator enabled paid providers, or when automatic routing chose
+        it and the operator enabled paid providers. Those are the same permission read
+        two ways: the deployment has already said "paid calls are allowed", and the
+        automatic choice records which paid pair it is on the response. Everything else
+        is refused with :class:`PaidModelRequiresConfirmation` before any dispatch, so no
+        request can be billed without a deliberate choice somewhere.
         """
 
-        provider = self._selected_provider_name(req).strip().lower()
-        model = self._run_model_name(provider, getattr(req, "model_name", None))
+        named_provider = str(getattr(req, "provider_name", "") or "").strip()
+        named_model = str(getattr(req, "model_name", "") or "").strip()
+        automatic = bool((route is not None and route.provider) and not named_provider)
+        if automatic:
+            # The pair the run would use is the automatic one, even though the request
+            # itself names nothing: the gate has to judge what will really run.
+            pair_provider = route.provider
+            pair_model = route.model or ""
+        else:
+            pair_provider = self._selected_provider_name(req)
+            pair_model = named_model
+        provider = pair_provider.strip().lower()
+        model = self._run_model_name(provider, pair_model)
         tier, unit_price = self._model_cost_facts(provider, model)
         facts = {
             "cost_tier": tier,
@@ -3186,9 +3386,14 @@ class ForgeApiService:
         if tier != "PAID":
             return facts
 
-        named_provider = str(getattr(req, "provider_name", "") or "").strip()
-        named_model = str(getattr(req, "model_name", "") or "").strip()
-        if named_provider and named_model and self._allow_paid_providers():
+        allow_paid = self._allow_paid_providers()
+        # A full pair was declared -- by the caller, or by the automatic router -- and the
+        # operator enabled paid providers. A pair the run merely inherited (the provider's
+        # configured model) is not a declaration and stays refused.
+        declared_pair = bool(pair_provider) and (
+            bool(named_model) if not automatic else bool(pair_model)
+        )
+        if declared_pair and allow_paid:
             return facts
 
         price = (
@@ -3196,11 +3401,16 @@ class ForgeApiService:
             if unit_price is not None
             else ""
         )
-        reason = (
-            "the request did not name both the provider and the model"
-            if not (named_provider and named_model)
-            else "paid providers are disabled for this deployment"
-        )
+        if automatic:
+            reason = (
+                "no free or cheap model was available for automatic routing"
+                if not allow_paid
+                else "automatic routing was not permitted to use it"
+            )
+        elif not (named_provider and named_model):
+            reason = "the request did not name both the provider and the model"
+        else:
+            reason = "paid providers are disabled for this deployment"
         raise PaidModelRequiresConfirmation(
             "paid_model_requires_confirmation: this run would use the paid model "
             f"'{model or 'unknown'}' on provider '{provider or 'unknown'}', and "
@@ -3929,6 +4139,7 @@ class ForgeApiService:
         project_path: str = "",
         clarification: Optional[Mapping[str, Any]] = None,
         clarification_answers: Sequence[ClarificationAnswer] = (),
+        route: Optional[ModelChoice] = None,
     ) -> "RunDispatchResult":
         """Execute one submitted task with the deterministic offline run loop.
 
@@ -4263,6 +4474,14 @@ class ForgeApiService:
                 # unknown. Unknown is reported as None elsewhere.
                 estimated_cost=0.0,
                 clarification_round=int(offline_round),
+                # The route that led here, with the deterministic engine named as what
+                # really produced the answer: no model was called on this path.
+                model_choice=self._published_choice(
+                    route,
+                    provider_used=OFFLINE_PROVIDER_NAME,
+                    model_used="deterministic-offline",
+                    tier=str(cost_facts.get("cost_tier") or ""),
+                ),
             ),
             idempotent_replay=False,
             history_recorded=history_recorded,
@@ -4355,12 +4574,36 @@ class ForgeApiService:
         except ValueError:
             category = TaskCategory.CODE
 
+        # THE AUTOMATIC CHOICE. A request that names no provider is routed here, before
+        # the paid gate, because that gate has to judge the pair that will really run.
+        # The classifier reads the caller's own text (with the confirmed discovery
+        # specification already prepended at the HTTP boundary) and the facts this layer
+        # holds: the category, the write flag, and whether the run belongs to an existing
+        # project. It is a pure function of the catalogue, so this costs nothing and can
+        # be shown before pressing anything.
+        named_provider = str(getattr(req, "provider_name", "") or "").strip()
+        route = self.choose_route(
+            req.description,
+            category,
+            provider_name=named_provider,
+            model_name=getattr(req, "model_name", None),
+            write_mode=bool(getattr(req, "write_mode", False)),
+            existing_project=bool(lifecycle_project_id),
+        )
+        # The decision is only *applied* when the caller named no provider: an explicit
+        # choice always wins, and a named provider keeps the model resolution it had.
+        active_route = route if not named_provider and route.provider else None
+        # EVERYTHING BELOW JUDGES THE ROUTE THAT WILL RUN. The automatic pair is applied to
+        # a derived request, so "which provider was selected", "is this write allowed" and
+        # "who served the run" cannot disagree about a route nobody chose.
+        routed = self._request_with_route(req, active_route)
+
         # THE PAID GATE comes before everything, including the idempotency claim: a
         # refusal must spend nothing and claim nothing. It reads the pair this run
         # would actually use and refuses a PAID one the request did not name. When
         # the pair is free or cheap the same call returns its tier, which is
         # published on the response.
-        cost_facts = self._enforce_paid_policy(req)
+        cost_facts = self._enforce_paid_policy(req, route=active_route)
 
         # Idempotency is decided before anything is dispatched, so a replay cannot start a
         # second execution even in principle.
@@ -4404,7 +4647,9 @@ class ForgeApiService:
                         "idempotency_key was already used for a different request"
                     )
                 return RunDispatchResult(
-                    response=self._replay_response(record, req, project_id),
+                    response=self._replay_response(
+                        record, req, project_id, route=active_route
+                    ),
                     idempotent_replay=True,
                     history_recorded=True,
                     history_error="",
@@ -4425,7 +4670,12 @@ class ForgeApiService:
         # owner answered a clarification request, the canonical block is appended to
         # the description here -- one place, both modes -- and
         # ``_write_task_description`` still appends the output contract last.
-        write_mode = self._resolve_write_mode(req, category)
+        #
+        # Write mode is resolved against the route that will run (``routed``): an
+        # automatic choice names its pair before dispatch exactly like a caller's own
+        # choice does, so a run that will write is never refused because the pair came
+        # from the router instead of the form.
+        write_mode = self._resolve_write_mode(routed, category)
         described = self._clarified_description(
             req.description, clarification, answers=clarification_answers_tuple
         )
@@ -4464,9 +4714,9 @@ class ForgeApiService:
         # cannot be replaced afterwards. It executes no command and invokes no
         # tool, so it authorises neither, and it is still an ordinary frozen
         # `RunScope` over this service's own workspace.
-        if self._selected_provider_name(req).strip().lower() == OFFLINE_PROVIDER_NAME:
+        if self._selected_provider_name(routed).strip().lower() == OFFLINE_PROVIDER_NAME:
             return self._run_offline_task(
-                req,
+                routed,
                 task=task,
                 run_id=run_id,
                 task_id=task_id,
@@ -4480,14 +4730,15 @@ class ForgeApiService:
                 project_path=lifecycle_project_path,
                 clarification=clarification,
                 clarification_answers=clarification_answers_tuple,
+                route=route,
             )
 
         # A model named in the request selects the provider model for THIS run. The dispatcher
         # already honours ``task.parameters["model"]`` as a per-run override; without this bridge a
         # caller's model was silently ignored and every non-default model failed as
         # "<provider> model is not configured" (measured with deepseek and radox).
-        if getattr(req, "model_name", None) and isinstance(getattr(task, "parameters", None), dict):
-            task.parameters["model"] = str(req.model_name)
+        if getattr(routed, "model_name", None) and isinstance(getattr(task, "parameters", None), dict):
+            task.parameters["model"] = str(routed.model_name)
 
         scope = self._build_run_scope(run_id, task)
         effective_tool_ids = scope.allowed_tool_ids
@@ -4504,7 +4755,7 @@ class ForgeApiService:
         # ended the run with "Provider fallback chain exhausted" and openrouter was never tried,
         # even though FORGE_PROVIDER_FALLBACK_CHAIN listed it. A run that names a provider itself
         # stays pinned: the caller asked for that provider.
-        provider_for_run = self._selected_provider_name(req) or None
+        provider_for_run = self._selected_provider_name(routed) or None
         allow_fallback = not (req.provider_name or "").strip()
 
         def dispatch_once(
@@ -4902,6 +5153,15 @@ class ForgeApiService:
             estimated_cost=estimated_cost,
             model_intent=model_intent.response_payload(),
             clarification_round=int(published_round),
+            # «Провайдер · Модель · тариф · почему», on every run, without a dropdown:
+            # the pair that really served it plus the reasons the route was chosen. The
+            # tier is the actual pair's, exactly like ``cost_tier`` above.
+            model_choice=self._published_choice(
+                route,
+                provider_used=provider_used,
+                model_used=model_used,
+                tier=str(actual_tier or cost_facts.get("cost_tier") or ""),
+            ),
         )
         return RunDispatchResult(
             response=response,

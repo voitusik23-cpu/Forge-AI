@@ -596,6 +596,84 @@ const ProviderKeysCard = ({ lang }: { lang: Lang }) => {
   );
 };
 
+/**
+ * «Как выбирается модель» — the automatic routing rule, and the setting in force now.
+ *
+ * The three lines are the policy `app/agent_runtime/routing.py` applies, and they are read
+ * from the Core's own `status.details.routing_policy` rather than repeated here, so the
+ * panel cannot describe a rule the code does not use. The «сейчас действует» block names
+ * the configured default provider/model and whether paid models are permitted at all —
+ * the one flag that decides whether `COMPLEX` work may ever reach a paid model.
+ *
+ * When the Core answered no policy (an old build, or a disconnected backend) the panel says
+ * so instead of inventing the three rows.
+ */
+const RoutingPolicyCard = ({ lang, status }: { lang: Lang; status: Status | null }) => {
+  const details = (status?.details ?? {}) as Record<string, unknown>;
+  const policy =
+    details.routing_policy && typeof details.routing_policy === "object"
+      ? (details.routing_policy as Record<string, unknown>)
+      : null;
+  const defaultProvider = String(details.default_provider ?? "").trim();
+  const defaultModel = String(details.default_model ?? "").trim();
+  const paid = details.allow_paid_providers;
+
+  const rows: Array<[string, string, string]> = [
+    ["SIMPLE", t(lang, "settings.routing.simple"), "route.tier.free"],
+    ["MEDIUM", t(lang, "settings.routing.medium"), "route.tier.cheap"],
+    ["COMPLEX", t(lang, "settings.routing.complex"), "route.tier.paid"],
+  ];
+
+  return (
+    <Card className="rise d1">
+      <CardHead
+        title={t(lang, "settings.routing.title")}
+        hint={t(lang, "settings.routing.hint")}
+        action={<Badge tone={paid === true ? "warn" : "ok"}>allow_paid_providers</Badge>}
+      />
+      <div className="stack" style={{ gap: 10 }}>
+        {policy === null ? (
+          <div className="small muted">{t(lang, "settings.routing.missing")}</div>
+        ) : (
+          rows.map(([level, sentence, tierKey]) => (
+            <div className="row between" key={level} style={{ gap: 10, flexWrap: "wrap" }}>
+              <span className="small">{sentence}</span>
+              <span className="mono small muted">
+                {String(policy[level] ?? "")}
+                {` · ${t(lang, tierKey)}`}
+              </span>
+            </div>
+          ))
+        )}
+
+        <div style={{ marginTop: 4 }}>
+          <div className="label">{t(lang, "settings.routing.current")}</div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 6 }}>
+            <Badge tone="neutral">
+              {`${t(lang, "settings.routing.default_provider")}: ${defaultProvider === "" ? t(lang, "runs.unknown") : defaultProvider}`}
+            </Badge>
+            <Badge tone="neutral">
+              {`${t(lang, "settings.routing.default_model")}: ${defaultModel === "" ? t(lang, "runs.unknown") : defaultModel}`}
+            </Badge>
+            <Badge tone={paid === true ? "warn" : paid === false ? "ok" : "neutral"}>
+              {paid === true
+                ? t(lang, "settings.routing.paid.allowed")
+                : paid === false
+                  ? t(lang, "settings.routing.paid.blocked")
+                  : t(lang, "runs.unknown")}
+            </Badge>
+          </div>
+        </div>
+        <div className="small muted">
+          {lang === "ru"
+            ? "Простая задача уходит на бесплатную модель, средняя — на дешёвую, сложная — на платную и только при разрешённых платных моделях. Выбирать модель вручную не нужно; это остаётся возможным в шаге запуска."
+            : "A simple task goes to a free model, a medium one to a cheap model, and a complex one to a paid model — only when paid models are permitted. There is nothing to pick by hand; naming a pair remains possible in the launch step."}
+        </div>
+      </div>
+    </Card>
+  );
+};
+
 export const Settings = ({
   lang,
   appearance,
@@ -720,6 +798,11 @@ export const Settings = ({
       </Card>
 
       <ProjectRootCard lang={lang} />
+
+      {/* «Как выбирается модель»: the rule automatic routing applies, with the setting that
+          is in force right now. A reader who wonders «где выбрать модель?» finds the answer
+          here in four lines instead of hunting for a dropdown. */}
+      <RoutingPolicyCard lang={lang} status={status} />
 
       {/* «Провайдеры и ключи»: the answer to "where do I add a provider with a key?" */}
       <ProviderKeysCard lang={lang} />

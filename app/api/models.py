@@ -167,6 +167,16 @@ class TaskRunResponse:
     #: round from the words of an answer. Additive and last: ``2`` means "no further
     #: «Ответить» is possible for this context" and nothing else.
     clarification_round: int = 0
+    #: «Провайдер · Модель · тариф · почему», on every run: the automatic (or manual)
+    #: route this run used, as ``app.agent_runtime.routing.ModelChoice.to_dict()`` —
+    #: ``provider``, ``model``, ``tier`` (FREE/CHEAP/PAID), ``complexity``
+    #: (SIMPLE/MEDIUM/COMPLEX), ``reasons`` (short lines, complexity signals first) and
+    #: ``estimated_cost`` (0.0 for a free row, null when the run's cost is unknown before
+    #: it runs). ``provider``/``model`` are the pair that really served the run, so a
+    #: fallback or the offline engine is named honestly. An empty mapping means this
+    #: entry point made no routing decision. Additive and last, exactly like the two
+    #: fields above: a client that knows nothing about routing is unaffected.
+    model_choice: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -198,6 +208,8 @@ class TaskRunResponse:
             "lifecycle_project_id": self.lifecycle_project_id,
             # The clarification round (0 = no context, 1 = may ask, 2 = forced final).
             "clarification_round": int(self.clarification_round or 0),
+            # The automatic routing decision: provider · model · tier · why.
+            "model_choice": dict(self.model_choice),
         }
 
 

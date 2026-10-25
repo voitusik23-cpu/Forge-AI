@@ -841,6 +841,10 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 # final). Additive: the backend's own count, so a client never
                 # infers a round from the words of an answer.
                 "clarification_round",
+                # The automatic routing decision (provider · model · tier · why).
+                # Additive and last, like every field above it: an empty mapping means
+                # this entry point made no decision.
+                "model_choice",
             },
         )
 

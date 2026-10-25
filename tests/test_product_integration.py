@@ -3584,6 +3584,10 @@ class CompatibilityTests(Block8Case):
                 # final). Additive: the backend's own count, published so a client
                 # never infers a round from the wording of an answer.
                 "clarification_round",
+                # The automatic routing decision (provider · model · tier · why). Additive
+                # and last: an empty mapping means this entry point made no decision, and
+                # no field that existed before it changed.
+                "model_choice",
             },
         )
         status = SystemStatusResponse("c", "a", "READY", 1, 1).to_dict()

@@ -105,7 +105,35 @@ export type TaskRunResponse = {
    * round from the wording of an answer.
    */
   clarification_round?: number;
+  /**
+   * `model_choice`: the automatic routing decision for this run —
+   * `app/agent_runtime/routing.py`'s `ModelChoice.to_dict()`. `provider`/`model` are the
+   * pair that really served the run (a fallback or the offline engine is named as such),
+   * `tier` is `FREE`/`CHEAP`/`PAID`, `complexity` is `SIMPLE`/`MEDIUM`/`COMPLEX`, and
+   * `reasons` are the short lines that explain the choice. An empty object means the
+   * entry point made no routing decision — never that the run was free.
+   */
+  model_choice?: ModelChoice;
 };
+
+/**
+ * One automatic routing decision (`app/agent_runtime/routing.py::ModelChoice`).
+ *
+ * The six facts are the ones the backend guarantees; `automatic` says whether the router
+ * chose the pair or the caller named it. `estimated_cost` is `0` for a free row and
+ * `null` otherwise, because a run's cost is unknown before it runs — a unit price is not a
+ * forecast and this type never invents one.
+ */
+export type ModelChoice = {
+  provider?: string;
+  model?: string;
+  tier?: string;
+  complexity?: string;
+  reasons?: string[];
+  estimated_cost?: number | null;
+  automatic?: boolean;
+};
+
 
 /**
  * The dispatch facts the Core reports as response headers, not in the body.
@@ -603,6 +631,66 @@ export const dispatchTask = async (input: {
       },
     },
   };
+};
+
+/**
+ * Ask the Core which provider/model a task *would* run on, without running it.
+ *
+ * It posts the same body the launch step sends with `estimate: true`, which the route
+ * answers from the pure routing function and nothing else: no provider is called, no run
+ * is created and no idempotency key is claimed. That is what makes the launch step's live
+ * preview honest — it is the decision the real press would make, not a second opinion.
+ *
+ * The preview is debounced by the caller; this function performs one request and never
+ * retries, so typing cannot turn into a request storm.
+ */
+export const estimateRoute = async (input: {
+  description: string;
+  category: TaskCategoryValue;
+  writeMode?: boolean;
+  discoverySessionId?: string;
+  lifecycleProjectId?: string;
+  signal?: AbortSignal;
+}): Promise<Result<ModelChoice>> => {
+  const path = "/api/tasks/run";
+  const body = taskRunBody({
+    description: input.description,
+    category: input.category,
+    writeMode: input.writeMode,
+    discoverySessionId: input.discoverySessionId,
+    lifecycleProjectId: input.lifecycleProjectId,
+    estimate: true,
+  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(body),
+      signal: input.signal,
+    });
+  } catch (error) {
+    return { ok: false, failure: disconnected(path, error) };
+  }
+  if (!response.ok) return { ok: false, failure: await failureOf(path, response) };
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    return {
+      ok: false,
+      failure: { kind: "error", status: response.status, path, detail: detailOf(null, String(error)) },
+    };
+  }
+  const choice =
+    payload && typeof payload === "object" ? (payload as { model_choice?: unknown }).model_choice : null;
+  if (!choice || typeof choice !== "object") {
+    return {
+      ok: false,
+      failure: { kind: "error", status: response.status, path, detail: "the estimate carries no decision" },
+    };
+  }
+  return { ok: true, value: choice as ModelChoice };
 };
 
 /** Read one persisted run record, exactly as `GET /api/runs/{run_id}` answers it. */

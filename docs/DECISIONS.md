@@ -8376,3 +8376,135 @@ that one line runs from a normal (medium-integrity) shell.
 `icacls` → `Access is denied`), поэтому честный результат там — запасной вариант плюс команда в
 уведомлении: папка становится доступной в тот момент, когда эта одна строка выполняется из обычной
 оболочки (средней целостности).
+
+## 2026-10-27 — The model is chosen by task complexity, by default and visibly
+
+**Decision.** A request that names no provider/model is routed by a new pure module,
+`app/agent_runtime/routing.py`: `choose_model(task_text, category, *, catalogue, settings,
+override=None, write_mode, existing_project)`. It classifies the task into `SIMPLE`,
+`MEDIUM` or `COMPLEX` from explicit, testable signals — length (`LONG_TASK_CHARS = 240`),
+clause count (`MANY_CLAUSES = 4`, `VERY_MANY_CLAUSES = 8`), the weighted `SCALE_SIGNALS`
+table («создай приложение» 4, сервер/база данных/авторизация/интеграция 2 each,
+тесты/рефактор/миграция 1 each, capped at `SCALE_SCORE_CAP = 6`, any signal flooring the
+task at `MEDIUM`), `code` + write mode (2), an existing project (1), more than
+`MANY_FEATURES = 3` requested features (1) and a confirmed specification with
+`MANY_SPECIFICATION_FIELDS = 5` filled fields (1) — and maps the level to a tier
+(`TIER_FOR_COMPLEXITY`: `SIMPLE → FREE`, `MEDIUM → CHEAP`, `COMPLEX → PAID`). The paid tier
+is reachable only for `COMPLEX` work **and** only when `allow_paid_providers` is true;
+otherwise the best cheap/free row is chosen and a reason says so. Within a tier the
+configured `default_provider` wins when its tier matches, otherwise a provider that needs
+**no account** (the offline, deterministic engine) comes first and only then the
+highest-quality row (published price, then capability count, then context window): a free
+*gateway* route is still a real network call and a rate limit, while `SIMPLE` work that
+opens no socket cannot fail, cannot be billed and cannot change model id underneath the
+owner. Only providers the catalogue
+reports `READY` or `NOT_CHECKED` are routable, so automatic routing cannot pick a disabled
+or key-less provider. The decision is applied to a derived `TaskRunRequest`, so provider
+selection, write mode and the paid gate all judge the pair that will really run — an
+automatic route names its pair before dispatch exactly like a caller's own choice, which
+keeps the owner's own "write the files" checkbox working in the default mode instead of
+silently disabling it — and the
+same decision is published on every response as `model_choice` (provider · model · tier ·
+complexity · reasons · estimated_cost). `POST /api/tasks/run` accepts `estimate: true`,
+which answers that decision and dispatches nothing — no provider call, no run, no
+idempotency claim — and the Кузница launch step defaults to «Авто (по сложности задачи)»
+and previews the same decision, debounced, as the task is typed.
+
+**Why.** The owner asked «где мне выбрать модель которая будет работать? … Там у меня даже
+нет возможности что-то выбирать.» His own rule was already automatic — free models for
+simple work, paid ones for complex work — but nothing implemented or showed it. A hidden
+default is not a policy: he could not see what would run, and the form preselected a
+provider, which read as "the choice is yours and it is unavailable". Classifying with
+explicit rules rather than an LLM keeps the decision free, deterministic, unit-testable, and
+explainable in the reasons the response carries.
+
+**Rejected alternatives.** Asking a model to judge complexity (a second call to pay for, and
+a decision that cannot be asserted in a test); a per-point scoring model with no floor (a
+single «тесты» would have stayed `SIMPLE`); two scale signals meaning `COMPLEX` (a refactor
+with tests was classified as a paid project); keeping the manual picker as the default and
+merely adding the classifier behind it (that leaves the owner hunting for a dropdown);
+routing by provider cost tier alone without a catalogue state filter (it picked providers
+with no credentials); letting the preview compute its own answer in TypeScript (a second
+source of truth that could disagree with the run).
+
+**Evidence.** `tests/test_model_routing.py` — classification of ten realistic tasks
+including the owner's mail-centre idea (`COMPLEX`, reasons naming «создание приложения,
+база данных, авторизация, интеграция»), the tier mapping, the paid refusal when not
+permitted, the override winning, provider-state filtering, determinism, and the run path
+(the decision reaches the provider call site; `estimate: true` calls nothing). The response
+key set is pinned deliberately in `tests/test_run_project_id.py`,
+`tests/test_product_integration.py` and `tests/test_project_workflow_production.py` with the
+new `model_choice` key.
+
+**Limits.** The classifier is keyword- and shape-based, so a task written in unusual words
+can be mis-tiered; the reasons name the signals so a wrong call is visible rather than
+silent. The paid tier is only reachable when the deployment already permits paid providers —
+there is no per-run paid confirmation for an automatic choice (that permission is the
+confirmation), while a manual pair keeps its own checkbox. The reason lines are Russian, the
+owner's language, and are shown verbatim in both interface languages.
+
+## 2026-10-27 — Модель выбирается по сложности задачи, по умолчанию и на виду
+
+**Решение.** Запрос без указанных провайдера и модели направляется новым чистым модулем
+`app/agent_runtime/routing.py`: `choose_model(task_text, category, *, catalogue, settings,
+override=None, write_mode, existing_project)`. Он относит задачу к `SIMPLE`, `MEDIUM` или
+`COMPLEX` по явным, проверяемым признакам — длина (`LONG_TASK_CHARS = 240`), число частей
+(`MANY_CLAUSES = 4`, `VERY_MANY_CLAUSES = 8`), взвешенная таблица `SCALE_SIGNALS` («создай
+приложение» 4, сервер/база данных/авторизация/интеграция по 2, тесты/рефактор/миграция по
+1, с потолком `SCALE_SCORE_CAP = 6` и полом `MEDIUM` при любом признаке), `code` + запись
+файлов (2), существующий проект (1), больше `MANY_FEATURES = 3` запрошенных функций (1) и
+подтверждённая спецификация с `MANY_SPECIFICATION_FIELDS = 5` заполненными полями (1) — и
+переводит уровень в тариф (`TIER_FOR_COMPLEXITY`: `SIMPLE → FREE`, `MEDIUM → CHEAP`,
+`COMPLEX → PAID`). Платный тариф достижим только для `COMPLEX` и только при
+`allow_paid_providers = true`; иначе выбирается лучшая дешёвая или бесплатная модель, и
+причина это называет. Внутри тарифа настроенный `default_provider` побеждает, если его
+тариф совпадает, иначе первым идёт провайдер, которому **не нужен аккаунт** (офлайн-движок,
+детерминированный), и только затем лучшая по качеству строка (опубликованная цена, затем
+число возможностей, затем окно контекста): бесплатный **шлюзовой** маршрут — это всё ещё
+настоящий сетевой вызов и лимит частоты, а `SIMPLE`-работа, не открывающая сокет, не может
+ни упасть, ни списаться, ни сменить идентификатор модели под владельцем. Маршрутизируются
+только провайдеры в состоянии
+`READY` или `NOT_CHECKED`, поэтому автоматический выбор не может взять выключенного
+провайдера или провайдера без ключа. Решение применяется к производному
+`TaskRunRequest`, поэтому выбор провайдера, режим записи и платный шлюз судят ту пару,
+которая действительно выполнится — автоматический маршрут называет пару до отправки так
+же, как собственный выбор вызывающего, и это сохраняет его галочку «записать файлы» в
+режиме по умолчанию вместо молчаливого отключения, — а само решение публикуется в каждом
+ответе как `model_choice` (провайдер · модель · тариф · сложность · причины ·
+estimated_cost).
+`POST /api/tasks/run` принимает `estimate: true`, который отвечает этим решением и ничего не
+запускает — ни вызова провайдера, ни запуска, ни заявки идемпотентности — а шаг запуска
+Кузницы по умолчанию стоит на «Авто (по сложности задачи)» и показывает то же решение с
+задержкой ввода, пока задача печатается.
+
+**Почему.** Владелец спросил: «где мне выбрать модель которая будет работать? … Там у меня
+даже нет возможности что-то выбирать.» Его собственное правило уже было автоматическим —
+бесплатные модели для простого, платные для сложного — но ничего его не реализовывало и не
+показывало. Скрытое умолчание — не политика: он не видел, что выполнится, а форма
+предвыбирала провайдера, что читалось как «выбор за вами, и он недоступен». Классификация
+по явным правилам, а не моделью, делает решение бесплатным, детерминированным, проверяемым
+тестами и объяснимым — в причинах, которые несёт ответ.
+
+**Отклонённые альтернативы.** Спрашивать модель о сложности (второй платный вызов и
+решение, которое нельзя утверждать в тесте); балльная модель без пола (одни «тесты»
+остались бы `SIMPLE`); два признака масштаба = `COMPLEX` (рефакторинг с тестами
+классифицировался как платный проект); оставить ручной выбор по умолчанию и лишь добавить
+классификатор за ним (владелец так и искал бы список); маршрутизация только по тарифу
+провайдера без фильтра состояния каталога (выбирались провайдеры без ключей); считать
+предпросмотр в TypeScript (второй источник истины, который мог бы расходиться с запуском).
+
+**Доказательство.** `tests/test_model_routing.py` — классификация десяти реалистичных
+задач, включая идею центра почты владельца (`COMPLEX`, причины называют «создание
+приложения, база данных, авторизация, интеграция»), отображение тарифов, отказ от платного
+без разрешения, победа ручного выбора, фильтр состояния провайдеров, детерминизм и путь
+запуска (решение доходит до места вызова провайдера; `estimate: true` ничего не вызывает).
+Набор ключей ответа намеренно закреплён в `tests/test_run_project_id.py`,
+`tests/test_product_integration.py` и `tests/test_project_workflow_production.py` с новым
+ключом `model_choice`.
+
+**Ограничения.** Классификатор основан на ключевых словах и форме текста, поэтому необычно
+сформулированная задача может попасть в другой уровень; причины называют признаки, поэтому
+ошибка видна, а не молчит. Платный тариф достижим только когда развёртывание уже разрешает
+платные модели — отдельного подтверждения на каждый автоматический платный запуск нет (это
+разрешение и есть подтверждение), а ручная пара сохраняет свою галочку. Строки причин —
+русские, на языке владельца, и показываются дословно в обоих языках интерфейса.

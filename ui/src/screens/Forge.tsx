@@ -32,6 +32,7 @@ import {
 } from "../components/ClarificationCard";
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { RunProgress } from "../components/RunProgress";
+import { RouteLine, complexityWord, tierWord } from "../components/RouteLine";
 import { t, type Lang } from "../i18n";
 import { selectRunProject } from "../project-selection.js";
 import { deriveRunHeadline, answerAskedQuestions, type ResultActionId, type ResultHeadline } from "../forge-result";
@@ -44,6 +45,7 @@ import {
   codeWriteOf,
   confirmDiscovery,
   dispatchTask,
+  estimateRoute,
   isTerminalRecord,
   loadDiscoverySpecification,
   loadProjectLifecycle,
@@ -59,6 +61,7 @@ import {
   type DiscoverySpecificationPayload,
   type DispatchResult,
   type Failure,
+  type ModelChoice,
   type ProjectInfo,
   type RunRecord,
   type TaskCategoryValue,
@@ -67,6 +70,24 @@ import {
 // Faster than the 15 s backend poll: a run's own state is what the user watches here.
 const POLL_INTERVAL_MS = 1750;
 const POLL_INTERVAL_LABEL = (POLL_INTERVAL_MS / 1000).toFixed(2).replace(/0$/, "");
+
+/**
+ * The provider select's own value for "nothing is chosen, Forge decides".
+ *
+ * It is not `""`: an empty string is what the request omits, and the form needs a value it
+ * can display. `__auto__` can never collide with a provider id (ids are `[a-z0-9_-]`).
+ */
+const AUTO_ROUTE = "__auto__";
+
+//: The preview is debounced so typing is not a request per keystroke. Nothing is
+//: dispatched by it: the route answers the classification from the pure routing function.
+const ROUTE_PREVIEW_DELAY_MS = 350;
+
+type RoutePreview =
+  | { status: "empty" }
+  | { status: "pending" }
+  | { status: "ready"; choice: ModelChoice }
+  | { status: "failed" };
 
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
@@ -550,12 +571,19 @@ export const Forge = ({
     return { list, fallback };
   }, [backend]);
 
-  const [provider, setProvider] = useState("");
+  // «Авто (по сложности задачи)» is the DEFAULT and the state a fresh form is in: the
+  // owner should never have to hunt for a model. Naming a provider is the exception, kept
+  // behind «Выбрать вручную», and it always wins over the automatic choice.
+  const [provider, setProvider] = useState(AUTO_ROUTE);
+  const [manualRoute, setManualRoute] = useState(false);
 
   useEffect(() => {
     // Nothing reported means nothing to choose from: keep whatever the user had instead of
     // silently clearing the selection while a backend poll is in flight.
     if (providerChoice.list.length === 0) return;
+    // The automatic value is always a valid choice and must never be overwritten by the
+    // configured default, which is what made the form look like a manual picker.
+    if (provider === AUTO_ROUTE) return;
     if (provider !== "" && providerChoice.list.includes(provider)) return;
     const next =
       providerChoice.fallback !== "" && providerChoice.list.includes(providerChoice.fallback)
@@ -1111,13 +1139,22 @@ export const Forge = ({
   // to a lifecycle project, and honestly reports `no_changes` when it does not; the
   // old blanket "mock cannot write" disabled the only free path that creates a
   // project at all. A non-code category or no provider still disables it.
+  // «Авто» is the default: no provider is named, so the Core chooses by complexity.
+  const autoRoute = !manualRoute || provider === AUTO_ROUTE;
   const mockSelected = provider === "mock";
+  // The write switch is available whenever a run can write at all: a `code` category and a
+  // route. In «Авто» mode the route is the one the Core will choose, so there is nothing to
+  // check here; the per-run choice is the checkbox below, not a provider name.
   const writeUnavailable =
     category !== "code"
       ? t(lang, "forge.task.write.noncode")
-      : !providerChoice.list.includes(provider)
-        ? t(lang, "forge.task.write.noprovider")
-        : "";
+      : autoRoute
+        ? providerChoice.list.length === 0
+          ? t(lang, "forge.task.write.noprovider")
+          : ""
+        : !providerChoice.list.includes(provider)
+          ? t(lang, "forge.task.write.noprovider")
+          : "";
   const writeSupported = writeUnavailable === "";
   const effectiveWriteMode = writeMode && writeSupported;
 
@@ -1134,7 +1171,62 @@ export const Forge = ({
   useEffect(() => {
     setPaidConfirmed(false);
   }, [provider, selectedModel]);
-  const runBlocked = paidModel && !paidConfirmed;
+  // THE AUTOMATIC PREVIEW. When no provider is named, what will run is decided by task
+  // complexity, and the owner must SEE it before pressing. This is the same pure chooser
+  // the run uses (`POST /api/tasks/run` with `estimate: true`), debounced and local: no
+  // provider is called, no run is created and nothing can be spent.
+  const [routePreview, setRoutePreview] = useState<RoutePreview>({ status: "empty" });
+  useEffect(() => {
+    if (!autoRoute || backend.status !== "live") {
+      setRoutePreview({ status: "empty" });
+      return;
+    }
+    const taskText = description.trim();
+    if (taskText === "") {
+      setRoutePreview({ status: "empty" });
+      return;
+    }
+    const controller = new AbortController();
+    setRoutePreview({ status: "pending" });
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const outcome = await estimateRoute({
+          description: taskText,
+          category,
+          writeMode: writeMode && category === "code",
+          // A confirmed session contributes its specification, exactly as the real run
+          // will; an unconfirmed one contributes nothing here.
+          discoverySessionId: confirmed ? sessionId : undefined,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        setRoutePreview(
+          outcome.ok ? { status: "ready", choice: outcome.value } : { status: "failed" }
+        );
+      })();
+    }, ROUTE_PREVIEW_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    autoRoute,
+    backend.status,
+    description,
+    category,
+    writeMode,
+    confirmed,
+    sessionId,
+  ]);
+  const autoChoice = routePreview.status === "ready" ? routePreview.choice : null;
+  // The tier the run will really use. In automatic mode it comes from the preview, because
+  // the pair is not on screen to look up in the catalogue.
+  const effectiveTier = autoRoute ? String(autoChoice?.tier ?? "") : costTier;
+  const effectivePaid = effectiveTier === "PAID";
+  // The automatic path never asks for a second confirmation: the deployment's
+  // `allow_paid_providers` is the permission, and routing only reaches PAID because of it.
+  // A manual choice keeps the deliberate per-run box it always had.
+  const runBlocked = !autoRoute && paidModel && !paidConfirmed;
 
   const costLine = [
     provider === "" ? t(lang, "forge.task.route.auto") : provider,
@@ -1147,6 +1239,12 @@ export const Forge = ({
         )
       : t(lang, "forge.launch.cost.notlisted"),
   ].join(" · ");
+
+  // Which write mode this request will carry. In «Авто» mode the mock case is the preview's
+  // own provider: the offline engine is what writes the deterministic scaffold.
+  const effectiveMockProvider = autoRoute
+    ? String(autoChoice?.provider ?? "") === "mock"
+    : mockSelected;
 
   const submit = async (clarification?: ClarificationDispatch) => {
     // The button stays live for every honest reason a run cannot start (a disabled button with no
@@ -1179,8 +1277,11 @@ export const Forge = ({
     const controller = new AbortController();
     inFlight.current = controller;
     // Only a provider the Core itself reported is sent; an empty or stale selection leaves the
-    // routing to the backend instead of naming a provider that is not in the list.
-    const providerToSend = providerChoice.list.includes(provider) ? provider : undefined;
+    // routing to the backend instead of naming a provider that is not in the list. In the
+    // default «Авто» mode NOTHING is named, so the Core classifies the task and chooses —
+    // that is the whole point of the automatic route.
+    const providerToSend =
+      manualRoute && providerChoice.list.includes(provider) ? provider : undefined;
     // The model rides with the provider it was chosen for: sending an id from another provider
     // would be a route nobody chose, and an empty id leaves the Core's own default in force.
     const modelToSend = providerToSend !== undefined && selectedModel !== "" ? selectedModel : undefined;
@@ -1275,78 +1376,42 @@ export const Forge = ({
     dispatched !== null && dispatched.facts.usage_basis !== "" && dispatched.facts.cost_basis !== "";
 
   // The exact provider · model pair the submit button will send, or the honest "the backend
-  // chooses" when the Core reported nothing to choose from.
+  // chooses" when the Core reported nothing to choose from. It is only a *named* pair in
+  // «Выбрать вручную» mode; in «Авто» the route is the preview below.
   const routeLabel =
     [
-      providerChoice.list.includes(provider) ? provider : "",
-      providerChoice.list.includes(provider) ? selectedModel : "",
+      manualRoute && providerChoice.list.includes(provider) ? provider : "",
+      manualRoute && providerChoice.list.includes(provider) ? selectedModel : "",
     ]
       .filter((part) => part !== "")
       .join(" · ") || t(lang, "forge.task.route.auto");
 
+  // What the automatic route will use, one line plus up to three reasons — the line the
+  // owner reads BEFORE pressing, and the same «provider · model · tier · why» the response
+  // publishes afterwards.
+  const previewPair =
+    autoChoice === null
+      ? ""
+      : [autoChoice.provider ?? "—", autoChoice.model === "" ? "—" : (autoChoice.model ?? "—"), tierWord(lang, autoChoice.tier)].join(
+          " · "
+        );
+  const previewReasons = (autoChoice?.reasons ?? [])
+    .map((reason) => String(reason ?? "").trim())
+    .filter((reason) => reason !== "")
+    .slice(0, 3);
+
   /**
-   * The launch step: provider, model, category, the cost facts of that pair, the write switch and
-   * the submit itself.
+   * The launch step: the route, the category, the cost facts, the write switch and the
+   * submit itself.
    *
-   * It is drawn on step 4 only. The questions and the specification come first, so the owner is
-   * never asked to pick a model before the Core has said what the project is.
+   * It is drawn on step 4 only. The questions and the specification come first, so the
+   * owner is never asked to pick a model before the Core has said what the project is —
+   * and by default he is never asked to pick one at all: «Авто (по сложности задачи)» is
+   * the state a fresh form is in, and the decision is previewed as the task is typed.
    */
   const runControls = (
     <div className="stack" style={{ gap: 14 }}>
       <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-        <label className="field" style={{ flex: "0 1 190px" }}>
-          <span className="label">{t(lang, "forge.task.provider")}</span>
-          <select
-            className="input"
-            value={provider}
-            onChange={(event) => setProvider(event.target.value)}
-            disabled={providerChoice.list.length === 0}
-          >
-            {providerChoice.list.length === 0 ? (
-              <option value="">{t(lang, "forge.settings.none")}</option>
-            ) : (
-              providerChoice.list.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))
-            )}
-          </select>
-        </label>
-        <label className="field" style={{ flex: "0 1 240px" }}>
-          <span className="label">{t(lang, "forge.task.model")}</span>
-          {modelChoice.length > 0 ? (
-            <select
-              className="input"
-              value={selectedModel}
-              onChange={(event) => {
-                setModelPicked(true);
-                setModel(event.target.value);
-              }}
-              disabled={provider === ""}
-            >
-              {modelChoice.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          ) : (
-            // The catalogue lists no model for this provider: free text keeps the field
-            // usable instead of offering an empty select nobody can submit.
-            <input
-              className="input"
-              type="text"
-              value={model}
-              onChange={(event) => {
-                setModelPicked(true);
-                setModel(event.target.value);
-              }}
-              placeholder={t(lang, "forge.task.model.placeholder")}
-              disabled={provider === ""}
-            />
-          )}
-        </label>
         <label className="field" style={{ flex: "0 1 190px" }}>
           <span className="label">{t(lang, "runs.form.category")}</span>
           <select
@@ -1361,54 +1426,197 @@ export const Forge = ({
             ))}
           </select>
         </label>
+        <label className="field" style={{ flex: "0 1 260px" }}>
+          <span className="label">{t(lang, "forge.task.route")}</span>
+          <label className="forge-toggle" style={{ marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={manualRoute}
+              onChange={(event) => {
+                const next = event.target.checked;
+                setManualRoute(next);
+                // Turning the manual mode on starts from the configured default, so the
+                // first thing the owner sees is a real pair and not an empty select.
+                if (next) {
+                  setProvider(
+                    providerChoice.fallback !== "" &&
+                      providerChoice.list.includes(providerChoice.fallback)
+                      ? providerChoice.fallback
+                      : (providerChoice.list[0] ?? AUTO_ROUTE)
+                  );
+                }
+              }}
+            />
+            <span>{t(lang, "forge.launch.route.manual")}</span>
+          </label>
+        </label>
       </div>
 
-      <div className="small muted">
-        {providerChoice.list.length === 0
-          ? t(lang, "forge.task.provider.empty")
-          : t(lang, "forge.task.provider.note")}
-      </div>
-
-      {/* The catalogue note is drawn only when the Core actually reported providers: with
-          no answer at all the honest statement is the provider note above, not a claim
-          that the registry holds no model for this provider. */}
-      {providerChoice.list.length > 0 ? (
-        <div className="small muted">
-          {modelChoice.length === 0
-            ? t(lang, "forge.task.model.free")
-            : t(lang, "forge.task.model.note")}
+      {/* The manual pair, collapsed by default: it exists for whoever wants to name it,
+          and the automatic route needs nothing here at all. */}
+      {manualRoute ? (
+        <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+          <label className="field" style={{ flex: "0 1 190px" }}>
+            <span className="label">{t(lang, "forge.task.provider")}</span>
+            <select
+              className="input"
+              value={provider}
+              onChange={(event) => setProvider(event.target.value)}
+              disabled={providerChoice.list.length === 0}
+            >
+              {providerChoice.list.length === 0 ? (
+                <option value={AUTO_ROUTE}>{t(lang, "forge.settings.none")}</option>
+              ) : (
+                providerChoice.list.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))
+              )}
+            </select>
+          </label>
+          <label className="field" style={{ flex: "0 1 240px" }}>
+            <span className="label">{t(lang, "forge.task.model")}</span>
+            {modelChoice.length > 0 ? (
+              <select
+                className="input"
+                value={selectedModel}
+                onChange={(event) => {
+                  setModelPicked(true);
+                  setModel(event.target.value);
+                }}
+                disabled={provider === ""}
+              >
+                {modelChoice.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              // The catalogue lists no model for this provider: free text keeps the field
+              // usable instead of offering an empty select nobody can submit.
+              <input
+                className="input"
+                type="text"
+                value={model}
+                onChange={(event) => {
+                  setModelPicked(true);
+                  setModel(event.target.value);
+                }}
+                placeholder={t(lang, "forge.task.model.placeholder")}
+                disabled={provider === ""}
+              />
+            )}
+          </label>
         </div>
       ) : null}
 
-      {/* What the next submit will actually name, so the owner sees the model that runs. */}
-      <div className="small row" style={{ gap: 6, flexWrap: "wrap" }}>
-        <span className="muted">{t(lang, "forge.task.route")}</span>
-        <span className="mono">{routeLabel}</span>
-      </div>
-
-      {/* provider · model · cost_tier · estimated_cost, all four read from the /api/models row. */}
-      <div className="forge-cost">
-        <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
-          <span className="label">{t(lang, "forge.launch.cost")}</span>
-          <Badge
-            tone={costTier === "FREE" ? "ok" : costTier === "CHEAP" ? "info" : costTier === "PAID" ? "warn" : "neutral"}
-          >
-            {costTier === "" ? t(lang, "forge.launch.cost.unknown") : costTier}
-          </Badge>
+      {/* THE AUTOMATIC DECISION, before pressing: «будет: mock · … · бесплатно — простая
+          задача», then up to three reasons. It is the same decision the run makes, not a
+          second opinion: the route answers it with the pure chooser and dispatches nothing. */}
+      {autoRoute ? (
+        <div className="forge-cost" data-testid="route-preview">
+          <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+            <span className="label">{t(lang, "forge.launch.route.title")}</span>
+            <Badge
+              tone={
+                effectiveTier === "FREE"
+                  ? "ok"
+                  : effectiveTier === "CHEAP"
+                    ? "info"
+                    : effectiveTier === "PAID"
+                      ? "warn"
+                      : "neutral"
+              }
+            >
+              {effectiveTier === ""
+                ? t(lang, "forge.launch.cost.unknown")
+                : tierWord(lang, effectiveTier)}
+            </Badge>
+          </div>
+          <div className="mono small" style={{ marginTop: 6, wordBreak: "break-word" }}>
+            {routePreview.status === "pending"
+              ? t(lang, "forge.launch.route.preview.pending")
+              : routePreview.status === "empty"
+                ? t(lang, "forge.launch.route.preview.empty")
+                : routePreview.status === "failed"
+                  ? t(lang, "forge.launch.route.preview.failed")
+                  : `${t(lang, "forge.launch.route.preview")}: ${previewPair}${
+                      autoChoice?.complexity
+                        ? ` — ${complexityWord(lang, autoChoice.complexity)}`
+                        : ""
+                    }`}
+          </div>
+          {previewReasons.map((reason) => (
+            <div className="small muted" data-testid="route-preview-reason" key={reason} style={{ marginTop: 2 }}>
+              {reason}
+            </div>
+          ))}
+          <div className="small muted" style={{ marginTop: 6 }}>
+            {t(lang, "forge.launch.route.auto.note")}
+          </div>
         </div>
-        <div className="mono small" style={{ marginTop: 6, wordBreak: "break-word" }}>
-          {costLine}
-        </div>
-        <div className="small muted" style={{ marginTop: 6 }}>
-          {t(lang, "forge.launch.cost.note")}
-        </div>
-      </div>
+      ) : null}
 
-      {/* The offline executor is labelled as what it is: an answer without a file change. */}
-      {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
+      {autoRoute ? null : (
+        <>
+          <div className="small muted">
+            {providerChoice.list.length === 0
+              ? t(lang, "forge.task.provider.empty")
+              : t(lang, "forge.task.provider.note")}
+          </div>
 
-      {/* A paid pair runs only after a deliberate confirmation; free and cheap need none. */}
-      {paidModel ? (
+          {/* The catalogue note is drawn only when the Core actually reported providers: with
+              no answer at all the honest statement is the provider note above, not a claim
+              that the registry holds no model for this provider. */}
+          {providerChoice.list.length > 0 ? (
+            <div className="small muted">
+              {modelChoice.length === 0
+                ? t(lang, "forge.task.model.free")
+                : t(lang, "forge.task.model.note")}
+            </div>
+          ) : null}
+
+          {/* What the next submit will actually name, so the owner sees the model that runs. */}
+          <div className="small row" style={{ gap: 6, flexWrap: "wrap" }}>
+            <span className="muted">{t(lang, "forge.task.route")}</span>
+            <span className="mono">{routeLabel}</span>
+          </div>
+
+          {/* provider · model · cost_tier · estimated_cost, all four read from the /api/models row. */}
+          <div className="forge-cost">
+            <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
+              <span className="label">{t(lang, "forge.launch.cost")}</span>
+              <Badge
+                tone={costTier === "FREE" ? "ok" : costTier === "CHEAP" ? "info" : costTier === "PAID" ? "warn" : "neutral"}
+              >
+                {costTier === "" ? t(lang, "forge.launch.cost.unknown") : costTier}
+              </Badge>
+            </div>
+            <div className="mono small" style={{ marginTop: 6, wordBreak: "break-word" }}>
+              {costLine}
+            </div>
+            <div className="small muted" style={{ marginTop: 6 }}>
+              {t(lang, "forge.launch.cost.note")}
+            </div>
+          </div>
+
+          {/* The offline executor is labelled as what it is: an answer without a file change. */}
+          {mockSelected ? <div className="notice">{t(lang, "forge.discovery.mock.note")}</div> : null}
+        </>
+      )}
+
+      {/* A paid pair runs only after a deliberate confirmation; free and cheap need none. In
+          «Авто» mode the confirmation is the deployment's `allow_paid_providers` — routing
+          only reaches a paid model because that permission exists — and the preview says so. */}
+      {autoRoute ? (
+        effectivePaid ? (
+          <div className="notice warn">{t(lang, "forge.launch.route.paid.allowed")}</div>
+        ) : effectiveTier !== "" ? (
+          <div className="small muted">{t(lang, "forge.launch.free.note")}</div>
+        ) : null
+      ) : paidModel ? (
         <div className="notice warn">
           <label className="forge-toggle">
             <input
@@ -1465,7 +1673,7 @@ export const Forge = ({
         <span className="muted">{t(lang, "forge.launch.write.mode")}</span>
         <span className="mono">
           {effectiveWriteMode
-            ? mockSelected
+            ? effectiveMockProvider
               ? "MOCK_DETERMINISTIC"
               : "REAL_PROVIDER_EXPLICIT"
             : t(lang, "forge.launch.write.none")}
@@ -1897,6 +2105,11 @@ export const Forge = ({
                     ) : null}
                   </div>
                 </div>
+
+                {/* «Провайдер · Модель · тариф · почему»: the routing decision this run
+                    made, above the fold and always visible — the owner never has to open a
+                    dropdown or a technical block to learn what ran and why. */}
+                <RouteLine lang={lang} choice={dispatched.response.model_choice} testId="forge-route-line" />
 
                 {/* The new run the answers started. Naming its id is the proof the click moved the
                     flow forward instead of re-opening the same card: the record card below then

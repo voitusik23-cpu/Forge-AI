@@ -832,6 +832,41 @@ def create_api_app(
         # description and the run continues on the existing path -- same Planner, same
         # Dispatcher, same routing/fallback/cost policy, same provider selection.
         description = payload["description"]
+
+        # THE DRY RUN. ``estimate: true`` answers the automatic routing decision for this
+        # text and dispatches nothing: no provider is called, no run is created, no
+        # idempotency key is claimed and nothing can be spent. It runs the same pure
+        # chooser over the same catalogue the interface reads, which is what lets the
+        # launch step preview the decision while the owner types instead of after pressing.
+        # A confirmed discovery session contributes its specification when one is named,
+        # exactly as the real run would see it; an unconfirmed or unknown session simply
+        # contributes nothing here (the hard refusal belongs to the dispatching path).
+        if payload.get("estimate") is True:
+            estimate_text = str(description)
+            preview_session = payload.get("discovery_session_id")
+            if isinstance(preview_session, str) and preview_session.strip():
+                try:
+                    preview_specification = discovery.require_confirmed(
+                        preview_session.strip()
+                    )
+                except DiscoveryError:
+                    preview_specification = None
+                if preview_specification is not None:
+                    estimate_text = apply_specification(
+                        preview_specification, estimate_text
+                    )
+            return JSONResponse(
+                api_service.estimate_route(
+                    description=estimate_text,
+                    category=payload.get("category", "code"),
+                    provider_name=payload.get("provider_name"),
+                    model_name=payload.get("model_name"),
+                    write_mode=bool(payload.get("write_mode", False)),
+                    existing_project=bool(
+                        str(payload.get("lifecycle_project_id") or "").strip()
+                    ),
+                )
+            )
         discovery_session_id = payload.get("discovery_session_id")
         if discovery_session_id is not None:
             if not isinstance(discovery_session_id, str) or not discovery_session_id.strip():

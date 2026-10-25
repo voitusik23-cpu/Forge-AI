@@ -35,6 +35,14 @@ export type TaskRunBodyInput = {
   lifecycleProjectId?: string;
   clarificationAnswers?: Array<{ question: string; answer: string }>;
   clarificationRunId?: string;
+  /**
+   * `estimate: true` asks the route for the automatic routing decision and nothing else.
+   *
+   * It dispatches no provider call and creates no run; the launch step uses it to preview
+   * «Провайдер · Модель · тариф · почему» while the owner types. It is sent only when it
+   * is exactly `true`, so a real dispatch never carries it.
+   */
+  estimate?: boolean;
 };
 
 /**
@@ -70,5 +78,8 @@ export const taskRunBody = (input: TaskRunBodyInput): Record<string, unknown> =>
   if (clarificationAnswers.length > 0) {
     body.clarification_answers = clarificationAnswers;
   }
+  // A dry run is never a dispatch: the flag is sent only when it is literally true, and
+  // the route answers it before any provider, idempotency claim or run record exists.
+  if (input.estimate === true) body.estimate = true;
   return body;
 };

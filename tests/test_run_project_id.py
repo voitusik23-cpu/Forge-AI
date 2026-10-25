@@ -82,6 +82,10 @@ CONTRACT_KEYS = [
     # final). Additive and last, exactly like the lifecycle id above: it states the
     # backend's own count, so a client never infers a round from prose.
     "clarification_round",
+    # The automatic routing decision («Провайдер · Модель · тариф · почему»): the pair
+    # that really served the run, its tier, the complexity behind it and the reasons.
+    # Additive and last: an empty mapping means this entry point made no decision.
+    "model_choice",
 ]
 
 #: The workspace/Core project this test server is composed for. It is deliberately
