@@ -124,12 +124,72 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ),
 )
 
-#: A single long, unbroken, machine-looking run of characters: the shape of a generated
-#: key. It must be *credential-shaped* -- mixed upper and lower case plus digits -- because
-#: a lowercase hex digest is an identifier, not a secret: the product emits workspace
-#: fingerprints and snapshot ids of exactly that shape, and flagging those failed every
-#: run that assembled an understanding snapshot.
-_RANDOM_LOOKING_CANDIDATE = re.compile(r"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b")
+#: The alphabet a generated key is drawn from: ASCII letters, digits and the four symbols
+#: base64 / url-safe base64 add. **Nothing else can be part of a high-entropy candidate.**
+#:
+#: MEASURED DEFECT (the owner's own change request). A normal Russian sentence --
+#: «я хочу добавить в проект еще пароль от почты и если возможно что б была возможность
+#: выбирать …» -- was refused as ``security_forbidden_content:secret`` with
+#: ``rule=high_entropy`` and the run never reached a provider. The rule was a bare
+#: "a long run of token characters" regex over the whole value, so any text the regex
+#: happened to find a long run in could be read as a key.
+#:
+#: The rule is therefore **token-scoped**: a candidate is one *whitespace-free run* whose
+#: characters are all from this alphabet. A sentence can never produce one -- its words are
+#: separated by spaces, and Russian words are not in this alphabet at all -- while a real
+#: key is exactly one such run, even when it sits inside a sentence.
+TOKEN_ALPHABET: frozenset[str] = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-"
+)
+
+#: The shortest run that can be a generated key. Shorter runs are identifiers, field names
+#: and words; a generated key is at least this long.
+_HIGH_ENTROPY_MIN_LENGTH = 32
+
+#: Characters that may *wrap* a token in ordinary text but are not part of it. They are
+#: trimmed from both ends of a run before the alphabet test, so «ключ», ``(token)`` and
+#: ``key,`` still count as a standalone token, while a run whose *middle* is not token
+#: alphabet (Cyrillic prose, a Windows path, a quoted phrase) never does.
+_RUN_TRIM_CHARACTERS = (
+    " \t\r\n\f\v"
+    "«»\"'“”„‘’….,;:!?()[]{}<>|\\`~*#@$%^&"
+)
+
+
+def is_prose(value: str) -> bool:
+    """Whether a value reads as human text rather than as a single token.
+
+    Prose is the shape this rule must never refuse: two or more words, or a sentence with
+    punctuation. The high-entropy rule itself is *run-scoped* (see
+    :data:`TOKEN_ALPHABET`), so prose produces no candidate at all; this predicate names
+    the invariant and is what the regression tests assert against.
+    """
+
+    words = value.split()
+    if len(words) >= 2:
+        return True
+    return any(character in value for character in "«»…")
+
+
+def _token_candidates(value: str) -> list[str]:
+    """Every whitespace-free run of ``value`` that could be a generated key.
+
+    A run qualifies only when it is at least :data:`_HIGH_ENTROPY_MIN_LENGTH` characters
+    long and **every** character is from :data:`TOKEN_ALPHABET` after trimming the
+    punctuation that may wrap it. Prose yields nothing: its words are separate runs, and a
+    Russian word is not in the alphabet at all.
+    """
+
+    candidates: list[str] = []
+    for run in value.split():
+        candidate = run.strip(_RUN_TRIM_CHARACTERS)
+        if len(candidate) < _HIGH_ENTROPY_MIN_LENGTH:
+            continue
+        if any(character not in TOKEN_ALPHABET for character in candidate):
+            continue
+        candidates.append(candidate)
+    return candidates
+
 
 #: A value that names no secret at all: an angle/quoted placeholder, a repeat of one
 #: character, an ellipsis, or a word that says "put your own value here". Such a value is
@@ -176,9 +236,16 @@ def _has_bare_token(text_lower: str) -> bool:
 
 
 def _random_match(value: str) -> str | None:
-    """The credential-shaped random run inside ``value``, or ``None``."""
+    """The credential-shaped random run inside ``value``, or ``None``.
 
-    for candidate in _RANDOM_LOOKING_CANDIDATE.findall(value):
+    Only a *token-shaped* run can qualify (see :func:`_token_candidates`), and it must be
+    machine-made: mixed upper and lower case plus at least four digits. A lowercase hex
+    digest is an identifier, not a secret -- the product emits workspace fingerprints and
+    snapshot ids of exactly that shape, and flagging those failed every run that assembled
+    an understanding snapshot.
+    """
+
+    for candidate in _token_candidates(value):
         digits = sum(character.isdigit() for character in candidate)
         if digits < 4:
             continue
@@ -285,6 +352,11 @@ def scan_value_content(value: object) -> SecretFinding | None:
     still refused, with the reason word it always had. What changed is the opposite
     direction -- a word that merely *names* a credential is not a credential, so prose,
     documentation and an ``.env.example`` with empty values are admissible.
+
+    The ``high_entropy`` rule is **token-scoped**: it fires on a single whitespace-free run
+    of :data:`TOKEN_ALPHABET` characters that is machine-made, never on a sentence. The
+    owner's own change request is prose and carries no material, so it produces no finding
+    at all (see the measured defect beside :data:`TOKEN_ALPHABET`).
     """
 
     if not isinstance(value, str) or not value:

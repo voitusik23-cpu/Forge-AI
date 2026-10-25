@@ -1091,5 +1091,149 @@ class ProgressMonotonicityTests(unittest.TestCase):
         self.assertNotEqual(stage, STAGE_COMPLETED)
 
 
+class OnePressChangeTests(unittest.TestCase):
+    """Invariant 6: one press, one dispatch, one plain-language end.
+
+    Measured defect: the owner pressed «Внести изменения в проект», saw nothing that said
+    anything had started, and pressed again. TWO versions (v4, v5) were created with zero
+    files each, and the run that failed had refused his sentence as a «secret».
+
+    The rules live in ``ui/src/change-flight.ts``, which imports nothing, so they are
+    executed here from their own source with Node -- not re-implemented in Python.
+    """
+
+    @staticmethod
+    def _flight_import() -> str:
+        return f"import * as f from {json.dumps((UI_SOURCE / 'change-flight.ts').as_uri())};"
+
+    @staticmethod
+    def _flight(facts: str) -> str:
+        """Evaluate one expression from change-flight.ts and return its JSON answer."""
+
+        script = (
+            OnePressChangeTests._flight_import()
+            + f"process.stdout.write(JSON.stringify({facts}));"
+        )
+        return _node(script).strip()
+
+    # ----------------------------------------------------------- one dispatch
+    def test_01_a_double_click_produces_exactly_one_dispatch(self) -> None:
+        """The guard is synchronous: the second click of a double click is dropped."""
+
+        script = (
+            self._flight_import()
+            + "const g = f.createChangeGuard();"
+            + "const calls = [];"
+            + "const press = () => { if (g.tryAcquire()) calls.push('dispatch'); };"
+            + "press(); press();"  # a double click delivers both clicks in one tick
+            + "process.stdout.write(JSON.stringify({calls, held: g.held()}));"
+        )
+        answer = json.loads(_node(script))
+        self.assertEqual(answer["calls"], ["dispatch"], "a double click dispatched twice")
+        self.assertTrue(answer["held"])
+        # After the dispatch answers the guard is free again -- the next real change must be
+        # dispatchable, so the guard cannot latch.
+        script = (
+            self._flight_import()
+            + "const g = f.createChangeGuard();"
+            + "const calls = [];"
+            + "const press = () => { if (g.tryAcquire()) calls.push('dispatch'); };"
+            + "press(); g.release(); press();"
+            + "process.stdout.write(JSON.stringify({calls}));"
+        )
+        self.assertEqual(json.loads(_node(script))["calls"], ["dispatch", "dispatch"])
+
+    def test_02_the_button_is_off_while_the_run_is_in_flight(self) -> None:
+        """From the click to the terminal state, and not a moment less."""
+
+        cases = (
+            # starting, runId, finished, expected
+            ("true", '""', "false", True),      # the click, before the dispatch answers
+            ('false', '"run-1"', "false", True),  # the run exists and has not ended
+            ('false', '"run-1"', "true", False),  # it ended: the button comes back
+            ('false', '""', "false", False),      # nothing started
+            ('true', '""', "true", False),        # a refusal came back while sending
+        )
+        for starting, run_id, finished, expected in cases:
+            with self.subTest(starting=starting, runId=run_id, finished=finished):
+                answer = json.loads(
+                    self._flight(
+                        "f.changeInFlight({starting: %s, runId: %s, finished: %s})"
+                        % (starting, run_id, finished)
+                    )
+                )
+                self.assertIs(answer, expected)
+
+    def test_03_the_screen_wires_the_guard_and_the_lock(self) -> None:
+        """The rules above are used by the real screen, in the right order."""
+
+        source = PROJECTS_TSX.read_text(encoding="utf-8")
+        # The button is off for the whole flight, not only while the request travels.
+        self.assertIn("const changeBusy = busy === \"version\" || changeLocked;", source)
+        self.assertIn("disabled={changeBusy || changeEmpty}", source)
+        self.assertIn("changeLocked: boolean;", source)
+        self.assertIn("changeLocked={changeLocked}", source)
+        self.assertIn("from \"../change-flight\"", source)
+        # The guard is taken synchronously, BEFORE the first await of the handler.
+        handler = source[source.index("const startChange = async () => {"):]
+        handler = handler[: handler.index("\n  };")]
+        acquired = handler.index("changeGuardRef.current.tryAcquire()")
+        first_await = handler.index("await ")
+        self.assertLess(
+            acquired,
+            first_await,
+            "the guard must be acquired before the first await, or a double click wins",
+        )
+        self.assertIn("changeGuardRef.current.release()", handler)
+        self.assertIn("useRef(createChangeGuard())", source)
+        # The strip appears at once, on the click, with the words the owner asked for.
+        self.assertIn('data-testid="change-status"', source)
+        self.assertIn('t(lang, "projects.change.starting")', source)
+        self.assertIn('t(lang, "projects.change.launched")', source)
+        self.assertIn('data-testid="change-start-busy"', source)
+
+    # ------------------------------------------------------- the plain refusal
+    def test_04_the_refusal_wording_is_the_plain_one(self) -> None:
+        """The owner's own failure is reworded, and the rule id survives it."""
+
+        raw = (
+            "Critical Tier 1 context item 'task:task-9c1f' cannot fit into available "
+            "budget (128000 tokens, max_items=16). Reason: "
+            "security_forbidden_content:secret. Текст содержит значение, похожее на "
+            "секрет (rule=high_entropy, length_bucket=40-64, "
+            "location=task_description)"
+        )
+        answer = json.loads(
+            self._flight(f"f.classifyChangeRefusal({json.dumps(raw)})")
+        )
+        self.assertEqual(answer["kind"], "context_refused")
+        self.assertEqual(answer["rule"], "high_entropy")
+        # A real refusal keeps its own rule id, and an unrelated failure stays unknown.
+        for text, rule in (
+            ("… Rule: security_forbidden_content:api_key … (rule=provider_key_prefix)",
+             "provider_key_prefix"),
+            ("Timeout while calling the provider", ""),
+        ):
+            with self.subTest(text=text[:20]):
+                classified = json.loads(
+                    self._flight(f"f.classifyChangeRefusal({json.dumps(text)})")
+                )
+                self.assertEqual(classified["rule"], rule)
+        self.assertEqual(
+            json.loads(self._flight('f.classifyChangeRefusal("boom")'))["kind"], "unknown"
+        )
+        # The wording is the owner's, in both languages, and the raw text is folded away.
+        i18n = I18N.read_text(encoding="utf-8")
+        self.assertIn("Текст изменения отклонён проверкой контекста", i18n)
+        self.assertIn("(rule={rule})", i18n)
+        self.assertIn('"projects.change.technical": "Технические детали"', i18n)
+        source = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn('t(lang, "projects.change.refused.context")', source)
+        self.assertIn('changeStrip.refusalRule', source)
+        self.assertIn('data-testid="change-refusal"', source)
+        self.assertIn('data-testid="change-refusal-detail"', source)
+        self.assertIn('t(lang, "projects.change.technical")', source)
+
+
 if __name__ == "__main__":
     unittest.main()

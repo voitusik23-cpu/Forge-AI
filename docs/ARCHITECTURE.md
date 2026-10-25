@@ -3535,6 +3535,7 @@ Structured Run State (ProjectState, TaskSpecification, AcceptanceResult, Verific
   - Enforces strict upper bounds: `MAX_CONTEXT_ITEMS = 64`, `MAX_METADATA_ITEMS = 32`, `MAX_STRING_LENGTH = 4096`.
   - Validates run binding, rejects negative attempt numbers, empty `run_id`, duplicate item IDs, oversized strings, and cross-run references.
   - Strictly rejects or sanitizes forbidden sensitive keys (`stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, `file_content`).
+  - The `high_entropy` rule is **token-scoped**: a candidate is one whitespace-free run of at least 32 characters drawn from `A-Za-z0-9+/=_-` whose alphabet is the whole run, and it must be machine-made (mixed case plus four digits). Prose therefore never produces a finding — a sentence is not a token, and the credential *nouns* inside it (`пароль`, `password`, `secret`) are not material. Measured: the owner's own change request («я хочу добавить в проект еще пароль от почты …») was refused as `security_forbidden_content:secret` with `rule=high_entropy`, so no run reached a provider and two versions stayed at zero files. A real token is still refused, alone or inside a sentence, and every prefixed shape (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, `Bearer …`, JWT, `API_KEY=<value>`, a password assignment) keeps its rule.
 - **Deterministic Assembly (`app/context/assembler.py`):**
   - `DecisionContextAssembler`: Pure in-memory assembler that projects structured run artifacts into bounded context items and summaries without any network or filesystem I/O.
   - Enforces budgets and runs validation before returning the envelope; raises `ContextBudgetExceededError` or `ContextAssemblyError` on boundary violations.
@@ -3583,6 +3584,7 @@ Structured Run State (ProjectState, TaskSpecification, AcceptanceResult, Verific
   - Задаёт строгие лимиты объема: `MAX_CONTEXT_ITEMS = 64`, `MAX_METADATA_ITEMS = 32`, `MAX_STRING_LENGTH = 4096`.
   - Проверяет привязку к запуску, отклоняет отрицательные номера попыток, пустой `run_id`, дублирующиеся ID элементов, превышение длины строк и перекрёстные ссылки между запусками.
   - Категорически отклоняет или очищает запрещённые конфиденциальные ключи (`stdout`, `stderr`, `raw_output`, `prompt`, `chain_of_thought`, `secret`, `token`, `password`, `api_key`, `credential`, `source_code`, `file_content`).
+  - Правило `high_entropy` **ограничено токенами**: кандидат — это один непрерывный (без пробелов) отрезок не короче 32 символов из алфавита `A-Za-z0-9+/=_-`, причём алфавит должен покрывать отрезок целиком, и значение должно быть машинным (смешанный регистр и не менее четырёх цифр). Поэтому обычный текст никогда не даёт срабатывания: предложение — не токен, а слова-названия учётных данных внутри него (`пароль`, `password`, `secret`) не являются материалом. Измерено: собственный запрос на изменение владельца («я хочу добавить в проект еще пароль от почты …») был отклонён как `security_forbidden_content:secret` с `rule=high_entropy`, из-за чего ни один запуск не дошёл до провайдера, а две версии остались с нулём файлов. Настоящий токен по-прежнему отклоняется — и отдельно, и внутри предложения, — а все формы с префиксом (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, `Bearer …`, JWT, `API_KEY=<значение>`, присваивание пароля) сохраняют своё правило.
 - **Детерминированная сборка (`app/context/assembler.py`):**
   - `DecisionContextAssembler`: Чистый сборщик в памяти, проецирующий структурированные артефакты запуска в ограниченные элементы контекста и сводки без сетевого ввода-вывода или обращений к файловой системе.
   - Контролирует бюджеты и проводит валидацию перед возвратом конверта; при нарушении границ генерирует `ContextBudgetExceededError` или `ContextAssemblyError`.
@@ -5790,6 +5792,18 @@ the preference changes; `GET /api/settings` reports `project_root_effective`, `p
 open-folder/editor/terminal actions, deletion and restore. «Настройки» shows the folder really used and
 offers «Сменить папку».
 
+**The low-integrity desktop folder gets one label grant.** The interpreters Forge runs on carry a low
+mandatory label (`S-1-16-4096`, no-write-up), so a low-integrity Forge may not create or write anything in a
+medium folder such as the owner's `Desktop`: his `Forge Projects` answered `PermissionError (WinError 5)` and
+every project was silently delivered to `.forge/projects-visible` instead. When the probe of the **preferred**
+folder fails with *access denied*, `resolve_writable_root` therefore runs one `icacls "<folder>"
+/setintegritylevel (OI)(CI)L` (`shell=False`, no console window, at most once per resolve, never for a
+remembered fallback) and probes the folder again. Success means the configured folder is the root with
+`fallback=False` and `label_granted=True`; failure keeps the honest fallback and the notice now says what is
+wrong — a folder that refuses a low-integrity process, whether the label moved — and names the one command
+the owner can run plus «Сменить папку». `GET /api/settings` publishes `project_root_label_grant_attempted`,
+`project_root_label_granted`, `project_root_label_grant_reason` and `project_root_label_grant_command`.
+
 **A failed confirm leaves the session usable.** `discovery.confirm` is idempotent and the record is created
 only after the workspace exists, so a refused confirm changes nothing and the same session can be confirmed
 again once the permission is fixed (`tests/test_project_open_actions.py` proves both halves).
@@ -5950,6 +5964,20 @@ C:\Users\<owner>\Desktop\Forge Projects\Создай локальное прил
 использован. Разрешённый корень без изменений попадает в `project_path`, действия «Открыть папку»,
 «Открыть в VS Code», «Открыть терминал», удаление и восстановление. «Настройки» показывают реально
 используемую папку и предлагают «Сменить папку».
+
+**Папка Рабочего стола получает одно понижение метки.** Интерпретаторы, на которых работает Forge, несут
+низкую обязательную метку (`S-1-16-4096`, без права записи вверх), поэтому процесс Forge с пониженной
+целостностью не может ни создать, ни записать ничего в папку среднего уровня, например в `Desktop`
+владельца: его `Forge Projects` отвечала `PermissionError (WinError 5)`, и каждый проект молча уходил в
+`.forge/projects-visible`. Поэтому, когда проба **предпочтительной** папки завершается отказом доступа,
+`resolve_writable_root` выполняет ровно одну команду `icacls "<папка>" /setintegritylevel (OI)(CI)L`
+(`shell=False`, без окна консоли, не более одного раза за разрешение корня и никогда для запомненного
+запасного варианта) и пробует папку заново. Успех означает, что настроенная папка и есть корень, с
+`fallback=False` и `label_granted=True`; неудача оставляет честный запасной вариант, и уведомление теперь
+говорит, что именно не так — папка не принимает запись от процесса с пониженной целостностью и понижена ли
+метка, — и называет одну команду, которую владелец может выполнить, плюс «Сменить папку».
+`GET /api/settings` публикует `project_root_label_grant_attempted`, `project_root_label_granted`,
+`project_root_label_grant_reason` и `project_root_label_grant_command`.
 
 **Неудавшееся подтверждение оставляет сессию пригодной.** `discovery.confirm` идемпотентен, а запись
 создаётся только после того, как папка проекта существует, поэтому отказ ничего не меняет и ту же

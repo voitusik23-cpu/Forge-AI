@@ -46,6 +46,7 @@ from app.context.selector import (
 )
 from app.context.validation import (
     find_forbidden_value_content,
+    is_prose,
     scan_value_content,
 )
 from app.config.settings import RuntimeSettings
@@ -88,6 +89,20 @@ PLACEHOLDER_ENV_EXAMPLE = (
     "PASSWORD=your-password-here\n"
     "SECRET_KEY=<вставьте свой ключ>\n"
     "AUTH_TOKEN=${AUTH_TOKEN}\n"
+)
+
+#: THE OWNER'S OWN CHANGE REQUEST, COPIED VERBATIM (defect 1).
+#:
+#: He typed this into «Что поправить?» and the change flow refused it with
+#: ``security_forbidden_content:secret`` / ``rule=high_entropy``, so no run ever reached a
+#: provider and TWO versions were left at zero files. It is an ordinary Russian sentence
+#: about adding a mail password and a password vault: it names credentials and carries
+#: none. The high-entropy rule is now token-scoped, so this is prose and produces nothing.
+OWNER_CHANGE_REQUEST = (
+    "я хочу добавить в проект еще пароль от почты и если возможно что б была возможность "
+    "выбирать или через такой сложный пароль заходить в почту или через обычный и этот "
+    "пароль у меня там будет также находится как хв хранилище аккаунтов с паролем что б "
+    "можно было скопировать и вставить в гугл при необходимости"
 )
 
 _DIGITS = string.digits
@@ -183,9 +198,100 @@ class SafeTextIsAdmissibleTests(unittest.TestCase):
         self.assertEqual(report.dropped_reasons, {})
 
 
+class OwnersProseIsNotASecretTests(_RefusedValueMixin, unittest.TestCase):
+    """Defect 1: the owner's own change request is prose, so it is never a finding.
+
+    The high-entropy rule is token-scoped (one whitespace-free run of the token alphabet),
+    so a sentence -- Russian, spaced, punctuated -- can never produce a candidate. Naming a
+    password inside that sentence is not material either: the credential *nouns* stopped
+    being findings before, and this pins the *entropy* rule to the same standard.
+    """
+
+    def test_01_his_exact_sentence_passes_the_scanner(self) -> None:
+        self.assertIsNone(scan_value_content(OWNER_CHANGE_REQUEST))
+        self.assertIsNone(find_forbidden_value_content(OWNER_CHANGE_REQUEST))
+        # It really is a sentence, and the rule's own vocabulary says so.
+        self.assertTrue(is_prose(OWNER_CHANGE_REQUEST))
+
+    def test_02_the_sentence_is_never_reported_as_the_secret_reason(self) -> None:
+        """The refusal vocabulary must never claim material here.
+
+        This is the exact symptom the owner saw: ``security_forbidden_content:secret`` with
+        ``rule=high_entropy`` on a normal change request. Neither the reason word nor the
+        entropy rule may be produced for prose.
+        """
+
+        context = ContextAssembler().assemble(
+            Task(id="owner-change", description=OWNER_CHANGE_REQUEST),
+            "run-owner-change",
+        )
+        self.assertEqual(len(context.items), 1)
+        self.assertEqual(context.items[0].value, OWNER_CHANGE_REQUEST)
+        # …and the selector, which is where the reason word is published, agrees.
+        selector = ContextSelector(
+            policy=ContextBudgetPolicy(
+                total_context_window=128_000,
+                max_output_tokens=4_096,
+                safety_headroom_tokens=2_048,
+                max_items=16,
+            )
+        )
+        item = ContextItem(
+            item_id="task:owner-change",
+            item_type="user_task",
+            source_type=ContextSourceType.USER_TASK,
+            value=OWNER_CHANGE_REQUEST,
+        )
+        selected, report = selector.select([item])
+        self.assertEqual([entry.item_id for entry in selected], ["task:owner-change"])
+        self.assertNotIn("task:owner-change", report.dropped_reasons)
+        self.assertNotIn(
+            "security_forbidden_content:secret",
+            json.dumps(report.dropped_reasons, ensure_ascii=False),
+        )
+
+    def test_03_the_same_sentence_with_a_fake_provider_key_is_still_refused(self) -> None:
+        """Prose immunity must not blind the rules that really see material."""
+
+        value = _random_run(40)
+        text = OWNER_CHANGE_REQUEST + " sk-" + value
+
+        finding = scan_value_content(text)
+
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding.reason, "api_key")
+        self.assertEqual(finding.rule, "provider_key_prefix")
+        self.assert_no_echo(value, finding.describe("task_description"))
+        with self.assertRaises(CriticalContextUnfitError) as raised:
+            ContextAssembler().assemble(Task(id="leak", description=text), "run-leak")
+        self.assertIn("security_forbidden_content:api_key", str(raised.exception))
+
+    def test_04_a_real_token_is_still_refused_alone_and_inside_prose(self) -> None:
+        value = _random_run(40)
+
+        for text in (value, "добавь " + value + " в проект", "blob " + value):
+            with self.subTest(shape="token"):
+                finding = scan_value_content(text)
+                self.assertIsNotNone(finding, "a generated token was not refused")
+                self.assertEqual(finding.rule, "high_entropy")
+                self.assertEqual(finding.reason, "secret")
+                self.assert_no_echo(value, finding.describe("task_description"))
+
+    def test_05_text_that_only_looks_long_is_not_a_token(self) -> None:
+        """A path, a long Russian word and a URL are not token runs."""
+
+        for text in (
+            r"C:\Users\User\Desktop\Forge Projects\Почтовый центр (proj-fce53337245f)",
+            "оченьдлинноесловобезпробеловкотороеявляетсятекстом",
+            "https://example.test/путь/к/файлу?идентификатор=значение",
+            "Проект: «Почтовый центр», версия 4, файлов 0.",
+        ):
+            with self.subTest(text=text[:24]):
+                self.assertIsNone(scan_value_content(text), text)
+
+
 class SecretMaterialIsStillRefusedTests(_RefusedValueMixin, unittest.TestCase):
     """Every secret-shaped VALUE keeps its refusal and its existing reason word."""
-
     def test_01_a_generated_provider_token_is_refused(self) -> None:
         value = _random_run(40)
         finding = scan_value_content("ключ sk-" + value)
@@ -422,6 +528,17 @@ class ASafeTaskReachesTheProviderTests(_ServiceCase, _RefusedValueMixin):
         self.assertIn("rule=provider_key_prefix", error)
         self.assertIn("location=task_description", error)
         self.assert_no_echo(value, error)
+
+    def test_04_his_own_change_request_reaches_the_provider(self) -> None:
+        """Defect 1, measured end to end: prose must not stop the run before dispatch."""
+
+        response = self._run(OWNER_CHANGE_REQUEST).response
+
+        self.assertEqual(len(self.provider.requests), 1, response.error)
+        self.assertNotIn("security_forbidden_content", str(response.error or ""))
+        self.assertNotIn("high_entropy", str(response.error or ""))
+        # The provider saw the owner's own words, not a redacted copy.
+        self.assertIn("пароль от почты", self.provider.requests[0].prompt)
 
 
 if __name__ == "__main__":

@@ -8285,3 +8285,94 @@ loopback-сервера, путь pid-сокетов на поддельной �
 `reused: true`, поэтому payload честен. Переиспользованный сервер не регистрируется как
 сессия предпросмотра (снять её было бы некому), поэтому блок предпросмотра в карточке говорит
 «предпросмотра нет», а адрес несут `notice` запуска и блок прогона.
+
+## 2026-10-25 — Prose is not a secret, and the desktop folder gets one label grant
+
+**Decision.** (1) The `high_entropy` rule of `app/context/validation.py` applies to **token-shaped values
+only**: a candidate is one whitespace-free run of at least 32 characters whose every character is from
+`A-Za-z0-9+/=_-`, and it must be machine-made (mixed case, four digits). A sentence can never produce one,
+so prose is never a finding — while a real token is still refused, alone or as its own word inside a
+sentence, and every prefixed shape keeps its rule. (2) When the probe of the owner's **preferred** project
+folder fails with *access denied*, `resolve_writable_root` runs one `icacls "<folder>"
+/setintegritylevel (OI)(CI)L` (`shell=False`, no console window, at most once per resolve, never for a
+remembered fallback), re-probes, and uses the folder when it now works (`label_granted=True`). A failed
+grant keeps the honest fallback and produces an actionable notice: what is wrong, whether the label moved,
+the one command the owner can run, and «Сменить папку».
+
+**Why.** Two measured defects from the owner's screenshots. His normal change request («я хочу добавить в
+проект еще пароль от почты …») was refused as `security_forbidden_content:secret` with
+`rule=high_entropy`: a heuristic meant for generated keys read a Russian sentence, no run reached a
+provider, and two versions stayed at zero files. And his projects could not be delivered to
+`Desktop\Forge Projects` at all, because the interpreters Forge runs on carry a low mandatory label
+(`S-1-16-4096`, no-write-up): a low-integrity process may not create or write in a medium folder, so every
+project landed in `.forge/projects-visible`. A fallback is a fact, not a fix, and the owner asked for his
+projects on his desktop.
+
+**Rejected alternatives.** Keeping the entropy rule value-wide and only excluding Cyrillic (a Latin sentence
+would still be refused, and the rule would still be guessing); refusing only when the value *is* one token
+(a real key inside a sentence would pass unwatched); treating every `PermissionError` as a label problem (a
+path whose parent is a file has a different reason and keeps the generic sentence); granting the label
+silently for a remembered fallback (that is not the owner's choice); granting before probing (a writable
+folder must never be relabelled); running `icacls` through a shell (quoting, and a console window on the
+owner's screen).
+
+**Evidence.** `tests/test_secret_filter_classification.py` — `OwnersProseIsNotASecretTests` (his verbatim
+sentence passes the scanner and never reports `secret`/`high_entropy`; the same sentence plus a fake `sk-`
+token is still refused; a real 40-character token is refused alone and inside prose; a path, a long Russian
+word and a URL are not tokens) and `ASafeTaskReachesTheProviderTests.test_04` (his sentence reaches the
+provider). `tests/test_project_visible_root.py` — `LabelGrantTests` (grant attempted once then the folder is
+used with `label_granted=True`; a failed grant keeps the fallback and the actionable notice names the exact
+command and «Сменить папку»; a writable root never runs the grant; a non-permission failure is not a label
+problem; the settings report publishes the grant).
+
+**Limits.** The grant needs the right to rewrite that folder's label. A Forge that itself runs at low
+integrity cannot relabel a medium folder (measured on this host: `icacls` → `Access is denied`), so the
+honest outcome there is the fallback plus the command in the notice — the folder becomes usable the moment
+that one line runs from a normal (medium-integrity) shell.
+
+## 2026-10-25 — Обычный текст — не секрет, а папка Рабочего стола получает одно понижение метки
+
+**Решение.** (1) Правило `high_entropy` в `app/context/validation.py` применяется **только к токенам**:
+кандидат — это один непрерывный (без пробелов) отрезок не короче 32 символов, каждый символ которого из
+`A-Za-z0-9+/=_-`, и значение должно быть машинным (смешанный регистр, четыре цифры). Предложение такого
+отрезка дать не может, поэтому обычный текст никогда не становится находкой — при этом настоящий токен
+по-прежнему отклоняется, и отдельно, и как отдельное слово внутри предложения, а все формы с префиксом
+сохраняют своё правило. (2) Когда проба **предпочтительной** папки владельца завершается отказом доступа,
+`resolve_writable_root` выполняет одну команду `icacls "<папка>" /setintegritylevel (OI)(CI)L`
+(`shell=False`, без окна консоли, не более одного раза за разрешение корня и никогда для запомненного
+запасного варианта), пробует заново и использует папку, если запись теперь проходит (`label_granted=True`).
+Неудачное понижение оставляет честный запасной вариант и даёт действующее уведомление: что именно не так,
+понижена ли метка, одна команда, которую владелец может выполнить, и «Сменить папку».
+
+**Почему.** Два измеренных дефекта из скриншотов владельца. Его обычный запрос на изменение («я хочу
+добавить в проект еще пароль от почты …») был отклонён как `security_forbidden_content:secret` с
+`rule=high_entropy`: эвристика для сгенерированных ключей прочитала русское предложение, ни один запуск не
+дошёл до провайдера, и две версии остались с нулём файлов. А проекты вообще не попадали в
+`Desktop\Forge Projects`, потому что интерпретаторы, на которых работает Forge, несут низкую обязательную
+метку (`S-1-16-4096`, без права записи вверх): процесс с пониженной целостностью не может ни создать, ни
+записать в папку среднего уровня, поэтому каждый проект оказывался в `.forge/projects-visible`. Запасной
+вариант — это факт, а не исправление, и владелец просил проекты на Рабочем столе.
+
+**Отклонённые альтернативы.** Оставить правило по всему значению и исключить только кириллицу (латинское
+предложение всё равно отклонялось бы, а правило продолжало бы угадывать); отклонять только когда значение
+*целиком* один токен (настоящий ключ внутри предложения прошёл бы незамеченным); считать любую
+`PermissionError` проблемой метки (у пути, чей родитель — файл, другая причина, и он сохраняет общую
+фразу); понижать метку молча для запомненного запасного варианта (это не выбор владельца); понижать метку
+до пробы (папку, доступную для записи, нельзя перемаркировать); запускать `icacls` через оболочку
+(кавычки и окно консоли на экране владельца).
+
+**Доказательство.** `tests/test_secret_filter_classification.py` — `OwnersProseIsNotASecretTests` (его
+дословное предложение проходит сканер и никогда не сообщает `secret`/`high_entropy`; то же предложение с
+поддельным токеном `sk-` по-прежнему отклоняется; настоящий токен из 40 символов отклоняется и отдельно, и
+внутри текста; путь, длинное русское слово и URL токенами не являются) и
+`ASafeTaskReachesTheProviderTests.test_04` (его предложение доходит до провайдера).
+`tests/test_project_visible_root.py` — `LabelGrantTests` (понижение выполняется один раз, затем папка
+используется с `label_granted=True`; неудачное понижение оставляет запасной вариант, а действующее
+уведомление называет точную команду и «Сменить папку»; доступная для записи папка не перемаркируется;
+неразрешение-по-правам не считается проблемой метки; отчёт настроек публикует результат понижения).
+
+**Ограничения.** Понижение требует права переписать метку этой папки. Forge, который сам работает с
+пониженной целостностью, не может перемаркировать папку среднего уровня (измерено на этом хосте:
+`icacls` → `Access is denied`), поэтому честный результат там — запасной вариант плюс команда в
+уведомлении: папка становится доступной в тот момент, когда эта одна строка выполняется из обычной
+оболочки (средней целостности).

@@ -33,8 +33,10 @@ downstream re-decides where a project lives.
 from __future__ import annotations
 
 import itertools
+import locale
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Tuple
@@ -43,11 +45,14 @@ from app.projects.models import ProjectError
 
 __all__ = [
     "FALLBACK_ROOT_NAME",
+    "LOW_INTEGRITY_LABEL",
     "ProjectRootDecision",
     "ProjectRootPolicy",
     "ProjectRootUnavailable",
     "RootAttempt",
     "candidate_roots",
+    "grant_low_integrity_label",
+    "label_grant_command",
     "probe_writable",
     "resolve_writable_root",
 ]
@@ -60,6 +65,21 @@ FALLBACK_ROOT_NAME = "Forge Projects"
 #: the process that is running the application -- if it is not, nothing is, and the typed
 #: refusal is the only honest answer.
 VISIBLE_PROJECTS_DIRECTORY = ("projects-visible",)
+
+#: The mandatory label a selected folder needs before a **low-integrity** Forge can write
+#: into it: ``L`` = Low, ``(OI)(CI)`` = inherited by files and folders created inside.
+#:
+#: MEASURED on this host: the interpreters Forge runs on carry a low mandatory label
+#: (``S-1-16-4096``, "Низкий обязательный уровень", no-write-up), so the whole application
+#: runs at low integrity. A low-integrity process may not create or write anything in a
+#: **medium** folder such as ``C:\Users\<owner>\Desktop``, and the owner's project root
+#: lived exactly there: ``PermissionError (WinError 5)`` on ``Forge Projects`` and every
+#: project silently delivered to ``.forge/projects-visible`` instead of his desktop.
+LOW_INTEGRITY_LABEL = "(OI)(CI)L"
+
+#: How long the one-time label grant may take. ``icacls`` answers in milliseconds; a bound
+#: keeps a settings screen from waiting on a shell that never returns.
+_GRANT_TIMEOUT_SECONDS = 20.0
 
 #: The probe's own name counter. Plain ``mkdir`` with a unique name, because
 #: ``tempfile.mkdtemp`` retries a denied folder ten thousand times on Windows (measured);
@@ -90,17 +110,25 @@ class ProjectRootUnavailable(ProjectError):
 
 @dataclass(frozen=True)
 class RootAttempt:
-    """One probed candidate: the path, whether it can hold a project, and the OS reason."""
+    """One probed candidate: the path, whether it can hold a project, and the OS reason.
+
+    ``denied`` is the one distinction the caller needs beyond "it failed": a folder the OS
+    refused with an *access denied* is the shape the label grant can address, while a
+    folder whose parent is a file (or whose name is invalid) is not. It is published so a
+    reader sees the classification the code acted on, not a guess about the text.
+    """
 
     path: Path
     writable: bool
     reason: str = ""
+    denied: bool = False
 
     def to_dict(self) -> dict:
         return {
             "path": str(self.path),
             "writable": bool(self.writable),
             "reason": self.reason,
+            "denied": bool(self.denied),
         }
 
 
@@ -111,6 +139,11 @@ class ProjectRootDecision:
     ``fallback`` is the fact the owner is told about: it is ``True`` exactly when the
     configured root could not be used. ``notice`` is the plain-language sentence built
     from that fact -- never a stack trace, never a bare path without a reason.
+
+    ``label_granted`` is the one-time mandatory-label grant: ``label_grant_attempted`` says
+    ``icacls`` really ran, ``label_granted`` says it worked and the folder is now usable by
+    a low-integrity process, ``label_grant_reason`` carries the OS's own refusal when it
+    did not. A granted label means the *preferred* folder is used and there is no fallback.
     """
 
     root: Path
@@ -118,6 +151,9 @@ class ProjectRootDecision:
     attempts: Tuple[RootAttempt, ...] = field(default_factory=tuple)
     fallback: bool = False
     notice: str = ""
+    label_grant_attempted: bool = False
+    label_granted: bool = False
+    label_grant_reason: str = ""
 
     def to_dict(self) -> dict:
         """The additive ``project_root`` block of a confirm/settings payload."""
@@ -127,6 +163,14 @@ class ProjectRootDecision:
             "preferred": str(self.preferred),
             "fallback": bool(self.fallback),
             "notice": self.notice,
+            "label_grant_attempted": bool(self.label_grant_attempted),
+            "label_granted": bool(self.label_granted),
+            "label_grant_reason": self.label_grant_reason,
+            "label_grant_command": (
+                label_grant_command(self.preferred)
+                if self.label_grant_attempted or self.fallback
+                else ""
+            ),
             "attempted": [attempt.to_dict() for attempt in self.attempts],
         }
 
@@ -139,6 +183,79 @@ def _reason_of(exc: BaseException) -> str:
     win = getattr(exc, "winerror", None)
     prefix = f"{name} (WinError {win})" if win else name
     return f"{prefix}: {text}" if text else prefix
+
+
+def _is_access_denied(exc: BaseException) -> bool:
+    """Whether the OS refused for lack of permission (the label-grant case).
+
+    ``WinError 5`` is ``ERROR_ACCESS_DENIED`` and Python raises it as
+    :class:`PermissionError`. Nothing else is treated as a label problem: a path whose
+    parent is a file, an invalid name or a missing drive are different facts and must keep
+    the generic sentence.
+    """
+
+    if isinstance(exc, PermissionError):
+        return True
+    return getattr(exc, "winerror", None) == 5
+
+
+def _decode_console(data: bytes) -> str:
+    """Decode ``icacls`` output without assuming this console's code page."""
+
+    for encoding in ("utf-8", "cp866", locale.getpreferredencoding(False) or "utf-8"):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def label_grant_command(path: object) -> str:
+    """The exact ``icacls`` command that lowers one folder's mandatory label to Low.
+
+    Published verbatim in the settings notice when Forge cannot run it itself, so the
+    owner can fix the folder with one line from his own (medium-integrity) shell.
+    """
+
+    return f'icacls "{path}" /setintegritylevel {LOW_INTEGRITY_LABEL}'
+
+
+def grant_low_integrity_label(path: object) -> Tuple[bool, str]:
+    """Run the one-time label grant on ``path``. Returns ``(granted, reason)``; never raises.
+
+    The command is ``icacls "<path>" /setintegritylevel (OI)(CI)L``: it lowers the folder's
+    mandatory label to Low (inheritable), which is exactly what a low-integrity Forge needs
+    in order to create projects inside it. It needs **no administrator rights** -- it only
+    needs the right to write that folder's security descriptor, which the owner has on his
+    own desktop.
+
+    It is run with ``shell=False`` (no shell, no command string to quote) and with
+    ``CREATE_NO_WINDOW`` (no console flashes on the owner's screen). A refusal comes back
+    as a *reason sentence*, never as an exception: the caller keeps its honest fallback and
+    turns the reason into the notice the owner reads.
+    """
+
+    command = ["icacls", str(path), "/setintegritylevel", LOW_INTEGRITY_LABEL]
+    try:
+        completed = subprocess.run(
+            command,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_GRANT_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, _reason_of(exc)
+    if completed.returncode == 0:
+        return True, ""
+    output = _decode_console(completed.stderr or b"") or _decode_console(
+        completed.stdout or b""
+    )
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    detail = lines[0] if lines else f"icacls вернул код {completed.returncode}"
+    return False, detail
 
 
 def probe_writable(path: object) -> RootAttempt:
@@ -168,7 +285,12 @@ def probe_writable(path: object) -> RootAttempt:
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        return RootAttempt(path=root, writable=False, reason=_reason_of(exc))
+        return RootAttempt(
+            path=root,
+            writable=False,
+            reason=_reason_of(exc),
+            denied=_is_access_denied(exc),
+        )
     if not root.is_dir():
         return RootAttempt(path=root, writable=False, reason="NotADirectoryError: это не папка")
     probe: Optional[Path] = None
@@ -179,7 +301,12 @@ def probe_writable(path: object) -> RootAttempt:
         except FileExistsError:  # pragma: no cover - a fresh random name is never taken
             continue
         except OSError as exc:
-            return RootAttempt(path=root, writable=False, reason=_reason_of(exc))
+            return RootAttempt(
+                path=root,
+                writable=False,
+                reason=_reason_of(exc),
+                denied=_is_access_denied(exc),
+            )
         probe = candidate
         break
     if probe is None:  # pragma: no cover - eight collisions in a row is not a case
@@ -195,7 +322,12 @@ def probe_writable(path: object) -> RootAttempt:
             )
         marker.unlink()
     except OSError as exc:
-        return RootAttempt(path=root, writable=False, reason=_reason_of(exc))
+        return RootAttempt(
+            path=root,
+            writable=False,
+            reason=_reason_of(exc),
+            denied=_is_access_denied(exc),
+        )
     finally:
         shutil.rmtree(probe, ignore_errors=True)
     return RootAttempt(path=root, writable=True)
@@ -277,8 +409,26 @@ def candidate_roots(
     return tuple(roots)
 
 
-def _notice(root: Path, preferred: Path, attempts: Sequence[RootAttempt]) -> str:
-    """The sentence the owner reads: which folder is used, and why not the other one."""
+def _notice(
+    root: Path,
+    preferred: Path,
+    attempts: Sequence[RootAttempt],
+    *,
+    label_grant_attempted: bool = False,
+    label_granted: bool = False,
+    label_grant_reason: str = "",
+) -> str:
+    """The sentence the owner reads: which folder is used, and why not the other one.
+
+    Two shapes, and the difference matters:
+
+    * the OS refused for **lack of permission** -- the low-integrity case. The sentence
+      says what is really wrong (a low-integrity process cannot write a medium folder),
+      whether the mandatory label was lowered, and names the *one command* that fixes it
+      plus the «Сменить папку» button. An owner must be able to act, not just read;
+    * anything else (a path whose parent is a file, an invalid name): the generic sentence
+      naming the OS's own reason, unchanged.
+    """
 
     from app.config.app_settings import default_project_root
 
@@ -289,16 +439,38 @@ def _notice(root: Path, preferred: Path, attempts: Sequence[RootAttempt]) -> str
     except (OSError, ValueError):  # pragma: no cover - defensive
         is_desktop_default = False
     label = "Папка на Рабочем столе" if is_desktop_default else f"Папка {preferred}"
-    reason = next(
+    failed = next(
         (
-            attempt.reason
+            attempt
             for attempt in attempts
             if Path(os.path.normcase(str(attempt.path)))
             == Path(os.path.normcase(str(preferred)))
-            and attempt.reason
+            and not attempt.writable
         ),
-        "",
+        None,
     )
+    reason = failed.reason if failed is not None else ""
+    if failed is not None and failed.denied:
+        if label_granted:
+            # The label was lowered, and the folder still refuses: say both facts.
+            state = "метка понижена, но запись всё равно отклоняется"
+            detail = f" ({reason})" if reason else ""
+        elif label_grant_attempted:
+            state = "метку понизить не удалось"
+            if label_grant_reason:
+                state = f"{state} ({label_grant_reason})"
+            # The probe's own OS reason is already published in `project_root_attempted`;
+            # the grant's refusal is the one that explains this sentence.
+            detail = ""
+        else:  # pragma: no cover - a denied preferred root always gets its one attempt
+            state = "метка не понижена"
+            detail = f" ({reason})" if reason else ""
+        return (
+            f"{label} не принимает запись от процесса с пониженной целостностью: "
+            f"{state}{detail}. Проекты сохраняются в {root}. "
+            f"Вернуть Рабочий стол можно одной командой — "
+            f"{label_grant_command(preferred)} — или кнопкой «Сменить папку»."
+        )
     if reason:
         return (
             f"{label} недоступна для записи ({reason}) — "
@@ -307,16 +479,73 @@ def _notice(root: Path, preferred: Path, attempts: Sequence[RootAttempt]) -> str
     return f"{label} недоступна для записи — проекты сохраняются в {root}."
 
 
+def _same_path(left: object, right: object) -> bool:
+    """Whether two folder values name the same folder, case-insensitively."""
+
+    return Path(os.path.normcase(str(left))) == Path(os.path.normcase(str(right)))
+
+
+def _probe_with(probe: Callable[[object], RootAttempt], path: object) -> RootAttempt:
+    """Probe one folder, turning an escaping OS error into the attempt it describes.
+
+    :func:`probe_writable` already reports a refusal as a value, but a caller may supply
+    its own probe (a test, a deployment), and a probe that raises must not turn a folder
+    decision into a crash.
+    """
+
+    try:
+        attempt = probe(path)
+    except OSError as exc:
+        return RootAttempt(
+            path=Path(str(path)),
+            writable=False,
+            reason=_reason_of(exc),
+            denied=_is_access_denied(exc),
+        )
+    if not isinstance(attempt, RootAttempt):  # pragma: no cover - a broken custom probe
+        return RootAttempt(
+            path=Path(str(path)),
+            writable=False,
+            reason="проба вернула не результат проверки",
+        )
+    return attempt
+
+
+def _grant_with(
+    grant: Callable[[object], Tuple[bool, str]], path: object
+) -> Tuple[bool, str]:
+    """Run the label grant, turning a broken granter into a refusal, never a crash."""
+
+    try:
+        granted, reason = grant(path)
+    except Exception as exc:  # noqa: BLE001 - a failed grant is a reported fact
+        return False, _reason_of(exc)
+    return bool(granted), str(reason or "")
+
+
 def resolve_writable_root(
     preferred: object,
     *,
     remembered: object = None,
     candidates: Optional[Iterable[object]] = None,
+    probe: Optional[Callable[[object], RootAttempt]] = None,
+    grant: Optional[Callable[[object], Tuple[bool, str]]] = None,
 ) -> ProjectRootDecision:
     """The first candidate that can really hold a project, or a typed refusal.
 
     ``candidates`` overrides the ordered list (a test, or a deployment with its own
     list); when it is omitted :func:`candidate_roots` builds the documented order.
+    ``probe`` and ``grant`` override the two side effects, so a test can describe a refused
+    folder and a label grant without touching the host's real ACLs.
+
+    **The one-time label grant.** When the owner's own folder is refused with *access
+    denied* -- the measured case: a low-integrity Forge against a medium-integrity desktop
+    -- the folder's mandatory label is lowered once and the folder is probed again. A
+    folder that accepts writes after the grant is the root, with ``fallback=False``: the
+    owner gets his desktop. A grant that fails (a folder protected by policy, or a process
+    that may not rewrite that folder's label) leaves the honest fallback in place and turns
+    the failure into an actionable notice. The grant is attempted **at most once per
+    resolve**, only for the preferred folder, and never for a remembered fallback.
     """
 
     preferred_path = Path(str(preferred))
@@ -325,23 +554,59 @@ def resolve_writable_root(
         if candidates is not None
         else candidate_roots(preferred_path, remembered=remembered)
     )
+    probe_one = probe if probe is not None else probe_writable
+    grant_one = grant if grant is not None else grant_low_integrity_label
     attempts: list[RootAttempt] = []
+    grant_attempted = False
+    granted = False
+    grant_reason = ""
+
+    def decided(root: Path, *, fallback: bool, notice: str) -> ProjectRootDecision:
+        return ProjectRootDecision(
+            root=root,
+            preferred=preferred_path,
+            attempts=tuple(attempts),
+            fallback=fallback,
+            notice=notice,
+            label_grant_attempted=grant_attempted,
+            label_granted=granted,
+            label_grant_reason=grant_reason,
+        )
+
+    def notice_for(root: Path) -> str:
+        return _notice(
+            root,
+            preferred_path,
+            attempts,
+            label_grant_attempted=grant_attempted,
+            label_granted=granted,
+            label_grant_reason=grant_reason,
+        )
+
     for candidate in ordered:
-        attempt = probe_writable(candidate)
+        attempt = _probe_with(probe_one, candidate)
         attempts.append(attempt)
         if attempt.writable:
-            fallback = Path(os.path.normcase(str(attempt.path))) != Path(
-                os.path.normcase(str(preferred_path))
-            )
-            return ProjectRootDecision(
-                root=attempt.path,
-                preferred=preferred_path,
-                attempts=tuple(attempts),
+            fallback = not _same_path(attempt.path, preferred_path)
+            return decided(
+                attempt.path,
                 fallback=fallback,
-                notice=(
-                    _notice(attempt.path, preferred_path, attempts) if fallback else ""
-                ),
+                notice=notice_for(attempt.path) if fallback else "",
             )
+        if grant_attempted or not attempt.denied:
+            continue
+        if not _same_path(attempt.path, preferred_path):
+            continue
+        # THE ONE ATTEMPT: the owner's folder, an access denial, once per resolve.
+        grant_attempted = True
+        granted, grant_reason = _grant_with(grant_one, attempt.path)
+        if not granted:
+            continue
+        retry = _probe_with(probe_one, attempt.path)
+        attempts[-1] = retry
+        if retry.writable:
+            # The grant worked: his folder is the root, and there is no fallback at all.
+            return decided(retry.path, fallback=False, notice="")
     listed = "; ".join(
         f"{attempt.path} — {attempt.reason or 'недоступна'}" for attempt in attempts
     )

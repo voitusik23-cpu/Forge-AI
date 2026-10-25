@@ -80,6 +80,15 @@ import {
   type ProjectPresentation,
   type RunRecord,
 } from "../api/forge";
+// THE ONE ACTION'S RULES live in their own module: the in-flight predicate, the
+// synchronous double-click guard and the plain-language refusal classification. They
+// import nothing, so `tests/test_flow_invariants.py` executes them directly from Node.
+import {
+  changeInFlight,
+  classifyChangeRefusal,
+  createChangeGuard,
+  refusalDetail,
+} from "../change-flight";
 
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
@@ -173,7 +182,10 @@ type ChangeOutcome = {
  * * `stage` is that word alone, so the live line can pulse on its own;
  * * `final` is the honest end: «Готово: v3 записана» only when the project's own
  *   `current_version` really moved, otherwise the backend's sentence;
- * * `refusal` is the backend's own error text, verbatim, when the run wrote nothing.
+ * * `refusal` is the **plain-language** reason, and `refusalRule` the safe rule id the
+ *   context check published; `refusalDetail` keeps the backend's own sentence verbatim
+ *   under «Технические детали». A refusal the owner cannot read is the same silent no-op
+ *   as a button that does nothing.
  */
 type ChangeStrip = {
   title: string;
@@ -181,6 +193,8 @@ type ChangeStrip = {
   tone: "info" | "ok" | "warn";
   final: string;
   refusal: string;
+  refusalRule: string;
+  refusalDetail: string;
   files: LifecycleArtifact[];
 };
 
@@ -736,6 +750,7 @@ const ProjectCard = ({
   changeError,
   onStartChange,
   changeFailure,
+  changeLocked,
   changeStrip,
   dispatched,
   dispatchFailure,
@@ -806,6 +821,12 @@ const ProjectCard = ({
    * same silent no-op the button itself used to be.
    */
   changeFailure: Failure | null;
+  /**
+   * True while a change is **in flight**: from the click until the run reaches a terminal
+   * state or a refusal comes back. It keeps the one action off, so a second press cannot
+   * create a second version (measured: two versions at zero files from one double press).
+   */
+  changeLocked: boolean;
   /**
    * THE STATUS STRIP: what the click started, in the owner's words, printed directly above
    * the button. `null` before the first click -- a strip that says "nothing happened yet"
@@ -989,7 +1010,9 @@ const ProjectCard = ({
   // подтверждает ввод?» -- a control that looks like a caption cannot answer that, and a
   // disabled control without a visible reason only moves the question one step further.
   const changeEmpty = change.trim() === "";
-  const changeBusy = busy === "version";
+  // THE ONE ACTION IS OFF FOR THE WHOLE RUN, not only while the request travels: `busy`
+  // covers the dispatch, `changeLocked` covers the run it started (see change-flight.ts).
+  const changeBusy = busy === "version" || changeLocked;
   // «Проверить» is offered in the compact row only when the backend's own facts make it
   // applicable, and the reason it is off is a sentence, not a hover-only tooltip.
   const verifyBlocked = busy === "verify" || archived || fileTotal === 0 || !hasRun;
@@ -1094,15 +1117,31 @@ const ProjectCard = ({
                       {t(lang, "projects.newversion.outcome.title")}
                     </Badge>
                     <div style={{ marginTop: 6 }}>{changeStrip.final}</div>
-                    {/* The backend's own error text, verbatim and unreworded: a run that
-                        refused says why, and the card does not soften it. */}
+                    {/* THE REFUSAL, in words the owner can act on. The context check's own
+                        sentence («Critical Tier 1 context item … Reason:
+                        security_forbidden_content:…») is a diagnostic, not an answer, so
+                        the strip prints the plain reason plus the rule id and keeps the
+                        raw line folded under «Технические детали». */}
                     {changeStrip.refusal !== "" ? (
-                      <div
-                        className="small mono"
-                        data-testid="change-refusal"
-                        style={{ marginTop: 6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                      >
-                        {changeStrip.refusal}
+                      <div style={{ marginTop: 6 }} data-testid="change-refusal">
+                        <div className="small" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                          {changeStrip.refusal}
+                          {changeStrip.refusalRule !== "" ? (
+                            <span className="mono"> · rule={changeStrip.refusalRule}</span>
+                          ) : null}
+                        </div>
+                        {changeStrip.refusalDetail !== "" ? (
+                          <details className="tech-details" style={{ marginTop: 6 }}>
+                            <summary>{t(lang, "projects.change.technical")}</summary>
+                            <div
+                              className="small mono"
+                              data-testid="change-refusal-detail"
+                              style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                            >
+                              {changeStrip.refusalDetail}
+                            </div>
+                          </details>
+                        ) : null}
                       </div>
                     ) : null}
                     {/* WHAT CHANGED, from the new version's own manifest. A run that
@@ -1149,7 +1188,13 @@ const ProjectCard = ({
                   tone="primary"
                   wide
                   disabled={changeBusy || changeEmpty}
-                  disabledReason={changeEmpty ? t(lang, "projects.newversion.start.reason") : undefined}
+                  disabledReason={
+                    changeEmpty
+                      ? t(lang, "projects.newversion.start.reason")
+                      : changeBusy
+                        ? t(lang, "projects.newversion.start.busy")
+                        : undefined
+                  }
                   onClick={onStartChange}
                 >
                   {changeBusy
@@ -1157,6 +1202,13 @@ const ProjectCard = ({
                     : t(lang, "projects.newversion.start")}
                 </Button>
               </span>
+              {/* WHILE THE RUN IS IN FLIGHT the button stays off and the reason is printed
+                  beside it, so a second press cannot create a second version. */}
+              {changeBusy ? (
+                <div className="small muted" data-testid="change-start-busy">
+                  {t(lang, "projects.newversion.start.busy")}
+                </div>
+              ) : null}
               {changeEmpty && !changeBusy ? (
                 <div className="small muted" data-testid="change-start-reason">
                   {t(lang, "projects.newversion.start.reason")}
@@ -2727,6 +2779,15 @@ export const Projects = ({
   const [changeStarting, setChangeStarting] = useState(false);
   const [changeRunId, setChangeRunId] = useState("");
   /**
+   * THE SYNCHRONOUS GUARD behind the one button.
+   *
+   * A double click delivers two `onClick`s before React re-renders, so a `useState` flag
+   * cannot stop the second one: by the time it is read the state is unchanged. The guard
+   * is acquired before the first `await` and released when the dispatch answers, so the
+   * second press is dropped instead of starting a second version.
+   */
+  const changeGuardRef = useRef(createChangeGuard());
+  /**
    * The run record, polled through the *existing* `GET /api/runs/{run_id}` while the run
    * is not terminal. Its `event_count` and `state` are what the stage word is derived
    * from: nothing here invents a stage the record does not prove.
@@ -2806,92 +2867,101 @@ export const Projects = ({
       setChangeError(t(lang, "projects.newversion.error"));
       return;
     }
-    setChangeError("");
-    setChangeFailure(null);
-    setDispatchFailure(null);
-    setDispatched(null);
-    setChangeOutcome(null);
-    setChangeRecord(null);
-    setChangeRunId("");
-    setActionFailure(null);
-    setActionNotice("");
-    setChangeStarting(true);
-    setBusy("version");
-    const fromVersion = currentVersionNumber;
-    const stagedOutcome = await createProjectVersion(selectedId, trimmed);
-    if (!stagedOutcome.ok) {
-      setBusy("");
-      setChangeStarting(false);
-      setChangeFailure(stagedOutcome.failure);
-      return;
-    }
-    const taskText = String(stagedOutcome.value.task_text ?? "");
-    if (taskText === "") {
-      setBusy("");
-      setChangeStarting(false);
-      setChangeFailure({
-        kind: "error",
-        status: 200,
-        path: `/api/projects/${selectedId}/versions`,
-        detail: t(lang, "projects.newversion.error"),
+    // ONE PRESS, ONE DISPATCH. The guard is taken synchronously: a second click of a
+    // double click finds it held and does nothing, so no second version is created.
+    if (!changeGuardRef.current.tryAcquire()) return;
+    try {
+      setChangeError("");
+      setChangeFailure(null);
+      setDispatchFailure(null);
+      setDispatched(null);
+      setChangeOutcome(null);
+      setChangeRecord(null);
+      setChangeRunId("");
+      setActionFailure(null);
+      setActionNotice("");
+      setChangeStarting(true);
+      setBusy("version");
+      const fromVersion = currentVersionNumber;
+      const stagedOutcome = await createProjectVersion(selectedId, trimmed);
+      if (!stagedOutcome.ok) {
+        setBusy("");
+        setChangeStarting(false);
+        setChangeFailure(stagedOutcome.failure);
+        return;
+      }
+      const taskText = String(stagedOutcome.value.task_text ?? "");
+      if (taskText === "") {
+        setBusy("");
+        setChangeStarting(false);
+        setChangeFailure({
+          kind: "error",
+          status: 200,
+          path: `/api/projects/${selectedId}/versions`,
+          detail: t(lang, "projects.newversion.error"),
+        });
+        return;
+      }
+      // The staged version is a real fact (the record now carries a pending version), so the
+      // card refreshes it before the run starts -- QUIETLY. A non-quiet refresh replaces the
+      // card with «Загрузка…», which would hide the status strip at the exact moment it is the
+      // answer to «оно началось?» (measured over CDP: a blank card under the strip).
+      await loadDetail(selectedId, { quiet: true });
+      const outcome = await dispatchTask({
+        description: taskText,
+        category: "code",
+        providerName: options.includes(provider) ? provider : undefined,
+        modelName: model !== "" ? model : undefined,
+        // THE LABEL PROMISES WRITING, so the run writes. The old toggle made "write" a
+        // separate decision and the primary button could start a run that changed nothing.
+        writeMode: true,
+        // THE ASSOCIATION. The run that executes this staged change text belongs to the
+        // project the card is showing, so the project's own `proj-…` id travels with it.
+        // The Core then (a) targets the project's controlled workspace with a write-mode
+        // answer and (b) records the run as the project's next version through the
+        // existing `attach_run` path. Without it the run finished into a workspace no
+        // record named and the card promised a version that never appeared.
+        lifecycleProjectId: selectedId,
       });
-      return;
+      setBusy("");
+      setChangeStarting(false);
+      if (!outcome.ok) {
+        setDispatchFailure(outcome.failure);
+        return;
+      }
+      setDispatched(outcome.value);
+      setChangeRunId(String(outcome.value.response.run_id ?? ""));
+      // Read the record *after* the run: a new version exists only if `current_version`
+      // really moved. The response alone cannot answer that question. Quietly again, so the
+      // strip that reports the run is never taken off the screen by its own refresh.
+      const refreshed = await loadDetail(selectedId, { quiet: true });
+      const toVersion =
+        refreshed !== null && typeof refreshed.project?.current_version === "number"
+          ? refreshed.project.current_version
+          : fromVersion;
+      // WHAT CHANGED, from the new version's own manifest: the paths, whether each was
+      // created or updated, and its size. A version that did not advance reports no files,
+      // which is exactly what the card prints («Изменения не записаны»).
+      let changed: LifecycleArtifact[] = [];
+      if (toVersion > fromVersion) {
+        const manifest = await loadProjectFiles(selectedId, toVersion);
+        if (manifest.ok) changed = manifest.value.files ?? [];
+      }
+      setChangeOutcome({
+        runId: String(outcome.value.response.run_id ?? ""),
+        filesCreated: Number(outcome.value.response.files_created ?? 0),
+        attached: String(outcome.value.response.lifecycle_project_id ?? "") === selectedId,
+        fromVersion,
+        toVersion,
+        files: changed,
+      });
+      await loadList();
+      onRefresh();
+    } finally {
+      // The request travel is over; the button stays off through `changeLocked` until the
+      // run reaches a terminal state or a refusal is on screen.
+      changeGuardRef.current.release();
     }
-    // The staged version is a real fact (the record now carries a pending version), so the
-    // card refreshes it before the run starts -- QUIETLY. A non-quiet refresh replaces the
-    // card with «Загрузка…», which would hide the status strip at the exact moment it is the
-    // answer to «оно началось?» (measured over CDP: a blank card under the strip).
-    await loadDetail(selectedId, { quiet: true });
-    const outcome = await dispatchTask({
-      description: taskText,
-      category: "code",
-      providerName: options.includes(provider) ? provider : undefined,
-      modelName: model !== "" ? model : undefined,
-      // THE LABEL PROMISES WRITING, so the run writes. The old toggle made "write" a
-      // separate decision and the primary button could start a run that changed nothing.
-      writeMode: true,
-      // THE ASSOCIATION. The run that executes this staged change text belongs to the
-      // project the card is showing, so the project's own `proj-…` id travels with it.
-      // The Core then (a) targets the project's controlled workspace with a write-mode
-      // answer and (b) records the run as the project's next version through the
-      // existing `attach_run` path. Without it the run finished into a workspace no
-      // record named and the card promised a version that never appeared.
-      lifecycleProjectId: selectedId,
-    });
-    setBusy("");
-    setChangeStarting(false);
-    if (!outcome.ok) {
-      setDispatchFailure(outcome.failure);
-      return;
-    }
-    setDispatched(outcome.value);
-    setChangeRunId(String(outcome.value.response.run_id ?? ""));
-    // Read the record *after* the run: a new version exists only if `current_version`
-    // really moved. The response alone cannot answer that question. Quietly again, so the
-    // strip that reports the run is never taken off the screen by its own refresh.
-    const refreshed = await loadDetail(selectedId, { quiet: true });
-    const toVersion =
-      refreshed !== null && typeof refreshed.project?.current_version === "number"
-        ? refreshed.project.current_version
-        : fromVersion;
-    // WHAT CHANGED, from the new version's own manifest: the paths, whether each was
-    // created or updated, and its size. A version that did not advance reports no files,
-    // which is exactly what the card prints («Изменения не записаны»).
-    let changed: LifecycleArtifact[] = [];
-    if (toVersion > fromVersion) {
-      const manifest = await loadProjectFiles(selectedId, toVersion);
-      if (manifest.ok) changed = manifest.value.files ?? [];
-    }
-    setChangeOutcome({
-      runId: String(outcome.value.response.run_id ?? ""),
-      filesCreated: Number(outcome.value.response.files_created ?? 0),
-      attached: String(outcome.value.response.lifecycle_project_id ?? "") === selectedId,
-      fromVersion,
-      toVersion,
-      files: changed,
-    });
-    await loadList();
-    onRefresh();
   };
 
   /**
@@ -2956,6 +3026,8 @@ export const Projects = ({
         : t(lang, "projects.change.starting.line").replace("{stage}", stage);
     let final = "";
     let refusal = "";
+    let refusalRule = "";
+    let refusalDetailText = "";
     let tone: ChangeStrip["tone"] = "info";
     if (changeOutcome !== null) {
       const advanced = changeOutcome.toVersion > changeOutcome.fromVersion;
@@ -2965,9 +3037,24 @@ export const Projects = ({
           ? t(lang, "projects.change.done").replace("{version}", `v${changeOutcome.toVersion}`)
           : t(lang, "projects.newversion.outcome.not_written");
       if (!advanced) {
-        // The backend's own error text, verbatim: the card never softens a refusal.
-        const error = String(dispatched?.response.error ?? "");
-        if (error !== "") refusal = error;
+        // THE PLAIN LANGUAGE FIRST. The backend's refusal is a diagnostic sentence
+        // («Critical Tier 1 context item … security_forbidden_content:secret …»); the owner
+        // needs to know that the *text of his change* was refused by the context check and
+        // which rule fired, so that is what the strip prints. The raw line is kept verbatim
+        // under «Технические детали».
+        const raw = refusalDetail(
+          dispatched?.response.error ??
+            changeRecord?.classification?.detail ??
+            changeRecord?.classification?.reason ??
+            ""
+        );
+        const classified = classifyChangeRefusal(raw);
+        refusal =
+          classified.kind === "context_refused"
+            ? t(lang, "projects.change.refused.context")
+            : t(lang, "projects.change.refused.unknown");
+        refusalRule = classified.rule;
+        refusalDetailText = raw;
         tone = "warn";
       } else {
         tone = "ok";
@@ -2979,6 +3066,8 @@ export const Projects = ({
       tone,
       final,
       refusal,
+      refusalRule,
+      refusalDetail: refusalDetailText,
       files: changeOutcome?.files ?? [],
     };
   }, [
@@ -2989,6 +3078,25 @@ export const Projects = ({
     dispatched,
     lang,
   ]);
+
+  /**
+   * IS THE ONE ACTION STILL RUNNING?
+   *
+   * `finished` is the terminal fact: the outcome block exists, a refusal came back from
+   * either request, or the polled run record says it is terminal. Until then the button
+   * stays off (`changeLocked`), which is what makes a double click produce exactly ONE
+   * dispatch instead of two versions.
+   */
+  const changeFinished =
+    changeOutcome !== null ||
+    dispatchFailure !== null ||
+    changeFailure !== null ||
+    (changeRecord !== null && isTerminalRecord(changeRecord));
+  const changeLocked = changeInFlight({
+    starting: changeStarting,
+    runId: changeRunId,
+    finished: changeFinished,
+  });
 
   return (
     <div className="content">
@@ -3563,6 +3671,7 @@ export const Projects = ({
           changeError={changeError}
           onStartChange={() => void startChange()}
           changeFailure={changeFailure}
+          changeLocked={changeLocked}
           changeStrip={changeStrip}
           dispatched={dispatched}
           dispatchFailure={dispatchFailure}

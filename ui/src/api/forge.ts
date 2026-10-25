@@ -763,6 +763,11 @@ export type ProjectRootAttempt = {
   path?: string;
   writable?: boolean;
   reason?: string;
+  /**
+   * True when the OS refused for lack of permission. That is the *low-integrity* case:
+   * a folder the label grant can address, as opposed to a path whose parent is a file.
+   */
+  denied?: boolean;
 };
 
 /** Where the project's files really went, and why it is not the configured folder. */
@@ -771,6 +776,14 @@ export type ProjectRootChoice = {
   preferred?: string;
   fallback?: boolean;
   notice?: string;
+  /** The one-time mandatory-label grant: tried once, on the owner's own folder. */
+  label_grant_attempted?: boolean;
+  /** True when the grant worked and the configured folder is used after all. */
+  label_granted?: boolean;
+  /** The OS's own refusal when the grant did not work. */
+  label_grant_reason?: string;
+  /** The exact command a person can run to fix that folder, when it was not fixed. */
+  label_grant_command?: string;
   attempted?: ProjectRootAttempt[];
 };
 
@@ -1486,6 +1499,17 @@ export type ForgeSettings = {
   project_root_used_fallback?: boolean;
   /** A plain-language sentence: which folder is used, and why not the configured one. */
   project_root_notice?: string;
+  /**
+   * THE ONE-TIME LABEL GRANT. The interpreters Forge runs on are low integrity, so a
+   * medium-integrity folder (the owner's Desktop) refuses writes until its mandatory label
+   * is lowered once. `project_root_label_granted` says that happened and the configured
+   * folder is used; `project_root_label_grant_command` is the exact command to run when it
+   * could not be done from inside the application.
+   */
+  project_root_label_grant_attempted?: boolean;
+  project_root_label_granted?: boolean;
+  project_root_label_grant_reason?: string;
+  project_root_label_grant_command?: string;
   project_root_attempted?: ProjectRootAttempt[];
   project_roots_known?: string[];
   settings_path?: string;

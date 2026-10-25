@@ -118,6 +118,18 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
   const effective = String(settings?.project_root_effective ?? "");
   const usedFallback = settings?.project_root_used_fallback === true;
   const rootNotice = String(settings?.project_root_notice ?? "");
+  /**
+   * THE LABEL GRANT, as the backend reported it.
+   *
+   * The venv interpreters Forge runs on are low integrity, so the owner's medium-integrity
+   * Desktop folder refuses writes until its mandatory label is lowered **once**. When that
+   * worked, the configured folder is used and the screen says so («Рабочий стол снова
+   * принимает запись»). When it could not be done from inside the application, the exact
+   * command is printed in a field the owner can copy — an actionable refusal, not a
+   * dead end.
+   */
+  const labelGranted = settings?.project_root_label_granted === true;
+  const grantCommand = String(settings?.project_root_label_grant_command ?? "");
 
   return (
     <Card className="rise d2">
@@ -178,6 +190,29 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
                 {rootNotice}
               </div>
             ) : null}
+            {/* THE ONE COMMAND. A fallback caused by the integrity mismatch is fixable
+                with one line, so the screen hands it over in a field the owner can select
+                and copy, next to the «Сменить папку» button that is already above. */}
+            {grantCommand !== "" ? (
+              <div style={{ marginTop: 8 }} data-testid="settings-project-root-label-command">
+                <input
+                  className="input mono"
+                  type="text"
+                  readOnly
+                  value={grantCommand}
+                  onFocus={(event) => event.currentTarget.select()}
+                  spellCheck={false}
+                />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {labelGranted ? (
+          <div className="notice" data-testid="settings-project-root-label">
+            {t(lang, "projects.settings.label_granted").replace(
+              "{path}",
+              effective !== "" ? effective : current
+            )}
           </div>
         ) : null}
         {effective !== "" ? (

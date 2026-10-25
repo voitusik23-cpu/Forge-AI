@@ -36,6 +36,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import unittest
 import unittest.mock
 
@@ -62,6 +63,7 @@ from app.projects.models import is_safe_relative_path
 from app.projects.root_selection import (
     ProjectRootPolicy,
     ProjectRootUnavailable,
+    RootAttempt,
     candidate_roots,
     probe_writable,
     resolve_writable_root,
@@ -970,6 +972,190 @@ class WritableRootTests(_Base):
         self.assertEqual(plain["project_root_notice"], "")
         self.assertEqual(
             plain["project_root_effective"], str(self.base / "writable")
+        )
+
+
+class LabelGrantTests(unittest.TestCase):
+    """Defect 2: a low-integrity Forge must get the desktop folder back, not a fallback.
+
+    Measured: the venv interpreters carry a low mandatory label, so Forge runs at low
+    integrity and cannot create or write anything in the owner's **medium** Desktop folder
+    (``PermissionError (WinError 5)``). Settings then said «Папка … недоступна для записи —
+    проекты сохраняются в …\\.forge\\projects-visible», i.e. his projects were not on his
+    desktop at all.
+
+    The fix is one `icacls` label grant on the chosen folder, attempted once, then a
+    re-probe. These tests describe every branch with a fake probe and a fake grant, so the
+    host's real ACLs are never touched.
+    """
+
+    def setUp(self) -> None:
+        self.base = pathlib.Path(
+            tempfile.mkdtemp(prefix="label-grant-", dir=str(REPOSITORY / ".forge"))
+        )
+        self.addCleanup(lambda: shutil.rmtree(self.base, ignore_errors=True))
+        self.desktop = self.base / "Desktop" / "Forge Projects"
+
+    def _denied(self, path: object) -> RootAttempt:
+        return RootAttempt(
+            path=pathlib.Path(str(path)),
+            writable=False,
+            reason="PermissionError (WinError 5): Отказано в доступе.",
+            denied=True,
+        )
+
+    def test_01_a_denied_preferred_root_is_granted_once_then_used(self) -> None:
+        good = self.base / "profile" / "Forge Projects"
+        probes: list[pathlib.Path] = []
+        granted: list[pathlib.Path] = []
+
+        def probe(path: object) -> RootAttempt:
+            probes.append(pathlib.Path(str(path)))
+            # Denied until the label is granted, then genuinely writable.
+            if not granted:
+                raise PermissionError(13, "Отказано в доступе", str(path))
+            return RootAttempt(path=pathlib.Path(str(path)), writable=True)
+
+        def grant(path: object) -> tuple[bool, str]:
+            granted.append(pathlib.Path(str(path)))
+            return True, ""
+
+        decision = resolve_writable_root(
+            self.desktop, candidates=[self.desktop, good], probe=probe, grant=grant
+        )
+
+        # The grant ran once, only for the owner's own folder.
+        self.assertEqual(granted, [self.desktop])
+        # The folder was probed again after the grant, and the desktop root is used.
+        self.assertEqual(probes, [self.desktop, self.desktop])
+        self.assertEqual(decision.root, self.desktop)
+        self.assertFalse(decision.fallback)
+        self.assertEqual(decision.notice, "")
+        self.assertTrue(decision.label_grant_attempted)
+        self.assertTrue(decision.label_granted)
+        self.assertEqual(decision.label_grant_reason, "")
+        # The fallback was not even probed: the desktop was won back.
+        self.assertEqual([attempt.path for attempt in decision.attempts], [self.desktop])
+        payload = decision.to_dict()
+        self.assertTrue(payload["label_granted"])
+        self.assertIn('icacls "', payload["label_grant_command"])
+        self.assertIn("(OI)(CI)L", payload["label_grant_command"])
+
+    def test_02_a_failed_grant_keeps_the_fallback_and_the_actionable_notice(self) -> None:
+        good = self.base / "profile" / "Forge Projects"
+        grants: list[pathlib.Path] = []
+
+        def probe(path: object) -> RootAttempt:
+            if pathlib.Path(str(path)) == self.desktop:
+                raise PermissionError(13, "Отказано в доступе", str(path))
+            return RootAttempt(path=pathlib.Path(str(path)), writable=True)
+
+        def grant(path: object) -> tuple[bool, str]:
+            grants.append(pathlib.Path(str(path)))
+            return False, "Access is denied."
+
+        decision = resolve_writable_root(
+            self.desktop, candidates=[self.desktop, good], probe=probe, grant=grant
+        )
+
+        self.assertEqual(len(grants), 1, "the grant must be attempted exactly once")
+        self.assertEqual(decision.root, good)
+        self.assertTrue(decision.fallback)
+        self.assertTrue(decision.label_grant_attempted)
+        self.assertFalse(decision.label_granted)
+        self.assertEqual(decision.label_grant_reason, "Access is denied.")
+        notice = decision.notice
+        # It says WHAT is wrong -- the integrity mismatch, and whether the label moved.
+        self.assertIn("пониженной целостностью", notice)
+        self.assertIn("метку понизить не удалось", notice)
+        # …and it is actionable: the one command, and the «Сменить папку» button.
+        self.assertIn(f'icacls "{self.desktop}" /setintegritylevel (OI)(CI)L', notice)
+        self.assertIn("Сменить папку", notice)
+        self.assertIn(str(good), notice)
+        self.assertNotIn("Traceback", notice)
+
+    def test_03_a_writable_root_never_runs_the_grant(self) -> None:
+        grants: list[pathlib.Path] = []
+
+        def grant(path: object) -> tuple[bool, str]:  # pragma: no cover - must not run
+            grants.append(pathlib.Path(str(path)))
+            return True, ""
+
+        decision = resolve_writable_root(
+            self.base / "writable",
+            candidates=[self.base / "writable", self.base / "never"],
+            grant=grant,
+        )
+
+        self.assertEqual(grants, [], "a writable folder must not be relabelled")
+        self.assertFalse(decision.label_grant_attempted)
+        self.assertFalse(decision.label_granted)
+        self.assertEqual(decision.notice, "")
+        self.assertFalse((self.base / "never").exists())
+
+    def test_04_a_non_permission_failure_is_not_a_label_problem(self) -> None:
+        """The generic sentence stays when the OS refused for another reason."""
+
+        blocker = self.base / "not-a-folder"
+        blocker.write_text("x", encoding="utf-8")
+        blocked = blocker / "Forge Projects"
+        good = self.base / "profile" / "Forge Projects"
+        grants: list[pathlib.Path] = []
+
+        def grant(path: object) -> tuple[bool, str]:  # pragma: no cover - must not run
+            grants.append(pathlib.Path(str(path)))
+            return True, ""
+
+        decision = resolve_writable_root(
+            blocked, candidates=[blocked, good], grant=grant
+        )
+
+        self.assertEqual(grants, [])
+        self.assertEqual(decision.root, good)
+        self.assertTrue(decision.fallback)
+        self.assertFalse(decision.label_grant_attempted)
+        self.assertIn("недоступна для записи", decision.notice)
+        self.assertNotIn("пониженной целостностью", decision.notice)
+
+    def test_05_the_settings_report_publishes_the_grant(self) -> None:
+        """«Настройки» shows the grant, and the command when it did not work."""
+
+        good = self.base / "profile" / "Forge Projects"
+        path = self.base / "settings.json"
+        settings = AppSettingsStore(path=path)
+        settings.set_project_root(str(self.desktop))
+
+        def probe(path_value: object) -> RootAttempt:
+            if pathlib.Path(str(path_value)) == self.desktop:
+                raise PermissionError(13, "Отказано в доступе", str(path_value))
+            return RootAttempt(path=pathlib.Path(str(path_value)), writable=True)
+
+        def grant(path_value: object) -> tuple[bool, str]:
+            return False, "Access is denied."
+
+        with unittest.mock.patch(
+            "app.projects.root_selection.probe_writable", side_effect=probe
+        ), unittest.mock.patch(
+            "app.projects.root_selection.grant_low_integrity_label", side_effect=grant
+        ):
+            described = settings.describe(candidates=[self.desktop, good])
+
+        self.assertTrue(described["project_root_label_grant_attempted"])
+        self.assertFalse(described["project_root_label_granted"])
+        self.assertEqual(described["project_root_label_grant_reason"], "Access is denied.")
+        self.assertIn(
+            f'icacls "{self.desktop}"', described["project_root_label_grant_command"]
+        )
+        self.assertIn("пониженной целостностью", described["project_root_notice"])
+        self.assertEqual(described["project_root_effective"], str(good))
+
+    def test_06_the_grant_command_is_the_documented_one(self) -> None:
+        from app.projects.root_selection import LOW_INTEGRITY_LABEL, label_grant_command
+
+        self.assertEqual(LOW_INTEGRITY_LABEL, "(OI)(CI)L")
+        self.assertEqual(
+            label_grant_command(r"C:\Users\User\Desktop\Forge Projects"),
+            'icacls "C:\\Users\\User\\Desktop\\Forge Projects" /setintegritylevel (OI)(CI)L',
         )
 
 

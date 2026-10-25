@@ -431,6 +431,10 @@ class AppSettingsStore:
         notice = ""
         used_fallback = False
         attempted: List[Dict[str, object]] = []
+        label_grant_attempted = False
+        label_granted = False
+        label_grant_reason = ""
+        label_grant_command = ""
         try:
             decision = self.resolve_project_root(candidates=candidates)
         except Exception as exc:  # noqa: BLE001 - a refusal is a fact to report, not a crash
@@ -445,6 +449,17 @@ class AppSettingsStore:
                 used_fallback = bool(decision.fallback)
                 notice = decision.notice
                 attempted = [attempt.to_dict() for attempt in decision.attempts]
+                # THE ONE-TIME LABEL GRANT, as a reported fact. ``label_granted`` says the
+                # desktop folder now accepts a low-integrity write; when it was attempted
+                # and did not work, the command that would fix it is published so «Настройки»
+                # can show the owner exactly what to run.
+                label_grant_attempted = bool(decision.label_grant_attempted)
+                label_granted = bool(decision.label_granted)
+                label_grant_reason = str(decision.label_grant_reason or "")
+                if label_grant_attempted or used_fallback:
+                    from app.projects.root_selection import label_grant_command as _command
+
+                    label_grant_command = _command(decision.preferred)
         return {
             "project_root": str(root),
             "default_project_root": str(default_project_root()),
@@ -454,6 +469,10 @@ class AppSettingsStore:
             "project_root_used_fallback": used_fallback,
             "project_root_notice": notice,
             "project_root_attempted": attempted,
+            "project_root_label_grant_attempted": label_grant_attempted,
+            "project_root_label_granted": label_granted,
+            "project_root_label_grant_reason": label_grant_reason,
+            "project_root_label_grant_command": label_grant_command,
             "project_roots_known": [str(item) for item in self.known_project_roots()],
             "settings_path": str(self._path),
             "schema": SETTINGS_SCHEMA_VERSION,
