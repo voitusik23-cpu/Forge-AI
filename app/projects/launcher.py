@@ -885,7 +885,11 @@ class ProjectLauncher:
         else:
             chosen = sorted(names)[0]
         try:
-            return resolve_entry([{"path": chosen}], workspace=root).entry
+            # The chosen *page* is resolved as a one-entry manifest, deliberately
+            # without the workspace: the fallback is this page, and adding the root's
+            # files here would let the still-present server win and turn the explicit
+            # "show the page" request back into a process launch.
+            return resolve_entry([{"path": chosen}]).entry
         except Exception:  # noqa: BLE001 - detection never breaks the refusal
             return None
 

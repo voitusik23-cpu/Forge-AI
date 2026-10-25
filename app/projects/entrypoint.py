@@ -6,10 +6,15 @@ Why the manifest and not the model's words
 A model answer can *say* "open index.html" while writing nothing, and a plan can
 name ``server.py`` that the run never produced. Launching from prose would therefore
 turn a sentence into an execution decision. This module reads the **manifest** --
-the list of files that really exist with their sizes and digests -- and picks at
-most one entry point from it, with a fixed priority:
+the list of files that really exist with their sizes and digests -- plus, when the
+workspace is supplied, the **names of the files that are really at the project
+root**, and picks at most one entry point with a fixed priority.
 
-1. ``index.html`` at the project root;
+**A project is a program first and a page second.** The order is:
+
+1. an explicitly **declared** entry -- ``forge.json`` at the project root with
+   ``"entry": "<path>"``, or the project specification's ``entry``/``entrypoint``
+   value passed by the caller -- honoured only when it names a file that exists;
 2. ``app.py``, then ``main.py``, then ``server.py`` at the project root
    (``python_script``);
 3. a root package directory that holds ``__main__.py`` (``python_module``);
@@ -17,7 +22,20 @@ most one entry point from it, with a fixed priority:
 5. ``package.json`` at the project root that declares a ``start`` or ``dev``
    script (``node_npm``; only the script *name* is read, only when the workspace
    is supplied);
-6. any other ``*.html`` at the project root.
+6. ``index.html`` at the project root, then any other root ``*.html``
+   (``static_html``).
+
+Ranking ``index.html`` first was the measured defect this order fixes: a project
+that really has a server (``app.py``/``main.py``/``server.py``, or a
+``package.json`` start script) *and* a leftover or stub page was launched as a
+static page, Forge served the HTML with no backend, and the owner saw an empty
+grey window four separate times. Static is now used **only** when no runnable
+entry exists, and the card says so («статическая страница, сервер не требуется»).
+
+Two narrow exceptions keep Forge's own scaffolding from pretending to be a
+program: the deterministic ``MOCK_DETERMINISTIC`` scaffold module (recognised by
+its own banner, bounded read) is not a server entry, and a declared entry is
+honoured only when it names a real file.
 
 Anything else is ``None``: a project with no detected entry point has no entry
 point, and the caller says so instead of guessing. :func:`resolve_entry` returns
@@ -26,9 +44,12 @@ that ``None`` together with the reason word, so a caller never has to invent one
 What it may and may not do
 --------------------------
 
-* It **reads the manifest** and, for one bounded case (``package.json``), one file
-  inside the workspace, with a strict path, a size cap and a symlink check. It never
-  reads a source file's contents to "decide" anything else.
+* It **reads the manifest** and, for bounded cases, files **inside the project
+  workspace**: ``package.json`` (one script name), ``forge.json`` (one declared
+  path), the names of the files at the workspace root, and the first few kilobytes
+  of a root ``*.py`` file to recognise Forge's own deterministic scaffold. Every
+  read has a strict path, a size cap and a symlink check. It never reads a source
+  file's body to "decide" anything else.
 * It **never executes anything** and never starts a process. ``command`` is the
   argv a runner may use -- resolved **here, server-side**, from the interpreter this
   deployment really has -- and ``run_command`` is the same thing as the display
@@ -56,7 +77,9 @@ import os
 from pathlib import Path
 import shutil
 import sys
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from app.projects.mock_answer import MOCK_ANSWER_BANNER
 
 __all__ = [
     "ENTRY_KIND_NODE",
@@ -125,25 +148,42 @@ SERVE_KIND_PROCESS = "process"
 #: argv -- the product's existing read-only preview route serves the file, and that
 #: *is* the launch -- so the card prints this sentence where a process kind prints its
 #: command. Without it the page was reported as "no run command: nothing to start",
-#: while the same preview route answered HTTP 200.
-STATIC_RUN_COMMAND = "открыть в браузере (preview)"
+#: while the same preview route answered HTTP 200. It also says, in the owner's words,
+#: that a server is not required, so a page never looks like a broken program.
+STATIC_RUN_COMMAND = "статическая страница, сервер не требуется"
 
 #: What the project is written in, for the card's «Язык проекта» fact.
 LANGUAGE_HTML = "HTML"
 LANGUAGE_PYTHON = "Python"
 LANGUAGE_NODE = "Node.js"
 
-#: The root-level names in priority order. ``index.html`` is first because it is the
-#: one file a browser can open with no command at all.
+#: The root-level names in priority order. The Python script wins first because a
+#: project that has a server is a program; ``index.html`` is the *last* candidate, so a
+#: leftover page can never hide a backend.
 _ROOT_HTML = "index.html"
 _ROOT_PYTHON = ("app.py", "main.py", "server.py")
 _ROOT_NODE = ("server.js", "app.js")
 _PACKAGE_JSON = "package.json"
 _PACKAGE_MAIN = "__main__.py"
 
+#: The small, optional project manifest a run (or the owner) may write to declare the
+#: entry explicitly. ``{"entry": "index.html"}`` is the documented override.
+_DECLARED_MANIFEST = "forge.json"
+
 #: A ``package.json`` larger than this is not read: the detection needs one script
 #: name, and an unbounded read would make a manifest entry a way to read a payload.
 MAX_PACKAGE_JSON_BYTES = 64 * 1024
+
+#: Same cap for the declared-entry manifest: one short string is all that is read.
+MAX_DECLARED_MANIFEST_BYTES = 64 * 1024
+
+#: How many root directory entries are looked at when the workspace is supplied. A
+#: project root with more entries than this is not a project Forge served a page from;
+#: the cap keeps one manifest lookup from walking an unbounded directory.
+MAX_ROOT_ENTRIES = 512
+
+#: How much of a root ``*.py`` file is read to recognise Forge's own scaffold banner.
+MAX_SCAFFOLD_BYTES = 4096
 
 #: The script names a Node project is startable by, in the order tried.
 _NODE_SCRIPTS = (("start", "npm start"), ("dev", "npm run dev"))
@@ -464,6 +504,137 @@ def _root_package(paths: Sequence[str]) -> Optional[str]:
     return sorted(found)[0]
 
 
+# --------------------------------------------------------------------------- #
+# bounded reads inside the project workspace
+# --------------------------------------------------------------------------- #
+
+
+def _workspace_root(workspace: object) -> Optional[Path]:
+    """The workspace as a path, or ``None`` when it is absent or unusable."""
+
+    if workspace is None:
+        return None
+    try:
+        # ``WindowsPath.root`` is ``"\\"``, so a path object must never be read via
+        # ``getattr(..., "root", ...)``.
+        if isinstance(workspace, (str, os.PathLike)):
+            return Path(workspace)
+        return Path(getattr(workspace, "root", workspace))
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_document(workspace: object, name: str, cap: int) -> Optional[Mapping]:
+    """One small, bounded JSON object from the workspace root, or ``None``."""
+
+    root = _workspace_root(workspace)
+    if root is None:
+        return None
+    target = root / name
+    try:
+        if target.is_symlink() or not target.is_file():
+            return None
+        if target.stat().st_size > cap:
+            return None
+        document = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return document if isinstance(document, Mapping) else None
+
+
+def _root_file_names(workspace: object) -> Tuple[str, ...]:
+    """The names of the regular files at the workspace root, sorted and bounded.
+
+    This is what keeps the entry point from going stale. A version's manifest lists
+    the files *that run* wrote, so after a run that wrote only ``index.html`` a
+    project's still-present ``app.py`` is missing from the new manifest -- while the
+    file is still on disk and the project is still a program. Only file **names** are
+    read: no body, no recursion, no symlink follows, and the listing is capped.
+    """
+
+    root = _workspace_root(workspace)
+    if root is None:
+        return ()
+    names: List[str] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if len(names) >= MAX_ROOT_ENTRIES:
+                    break
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                names.append(entry.name)
+    except OSError:
+        return ()
+    return tuple(sorted(names))
+
+
+def _is_forge_scaffold(workspace: object, name: str) -> bool:
+    """Whether this root file is Forge's own deterministic mock scaffold module.
+
+    ``MOCK_DETERMINISTIC`` writes a page *and* an importable module, and that module
+    is deliberately side-effect free ("no side effect on import"). It must not be
+    treated as the project's server: every offline scaffold would start a process
+    that exits at once, and the owner would lose the page that does work. The banner
+    is Forge's own literal read from at most the first few kilobytes of a root
+    ``*.py`` file, so this can never misfire on the owner's code.
+    """
+
+    if not name.lower().endswith(".py"):
+        return False
+    root = _workspace_root(workspace)
+    if root is None:
+        return False
+    target = root / name
+    try:
+        if target.is_symlink() or not target.is_file():
+            return False
+        if target.stat().st_size > MAX_SCAFFOLD_BYTES:
+            return False
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return MOCK_ANSWER_BANNER in text
+
+
+def _safe_relative(value: object) -> str:
+    """A declared entry, normalized, or ``""`` when it could escape the workspace."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().replace("\\", "/")
+    first = text.split("/")[0]
+    if not text or text.startswith("/") or ":" in first:
+        return ""
+    parts = [part for part in text.split("/") if part]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _declared_entry_name(workspace: object) -> str:
+    """The entry ``forge.json`` declares, or ``""``.
+
+    The override is a *declaration*, not a preference: only a name the ranking below
+    can also recognise is honoured (:func:`_entry_for_name`), so a manifest cannot
+    name a file the project does not have.
+    """
+
+    document = _json_document(
+        workspace, _DECLARED_MANIFEST, MAX_DECLARED_MANIFEST_BYTES
+    )
+    if document is None:
+        return ""
+    for key in ("entry", "entrypoint"):
+        value = _safe_relative(document.get(key))
+        if value:
+            return value
+    return ""
+
+
 def _node_script_name(workspace: object) -> str:
     """The start command of ``package.json``, from its ``scripts`` names only.
 
@@ -473,27 +644,10 @@ def _node_script_name(workspace: object) -> str:
     the caller, so this read cannot leak content into an event or a payload.
     """
 
-    if workspace is None:
+    document = _json_document(workspace, _PACKAGE_JSON, MAX_PACKAGE_JSON_BYTES)
+    if document is None:
         return ""
-    try:
-        # ``WindowsPath.root`` is ``"\\"``, so a path object must never be read via
-        # ``getattr(..., "root", ...)``.
-        if isinstance(workspace, (str, os.PathLike)):
-            root = Path(workspace)
-        else:
-            root = Path(getattr(workspace, "root", workspace))
-    except (TypeError, ValueError):
-        return ""
-    target = root / _PACKAGE_JSON
-    try:
-        if target.is_symlink() or not target.is_file():
-            return ""
-        if target.stat().st_size > MAX_PACKAGE_JSON_BYTES:
-            return ""
-        document = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return ""
-    scripts = document.get("scripts") if isinstance(document, Mapping) else None
+    scripts = document.get("scripts")
     if not isinstance(scripts, Mapping):
         return ""
     for name, _display in _NODE_SCRIPTS:
@@ -501,6 +655,11 @@ def _node_script_name(workspace: object) -> str:
         if isinstance(value, str) and value.strip():
             return name
     return ""
+
+
+# --------------------------------------------------------------------------- #
+# the entry points, built in exactly one place each
+# --------------------------------------------------------------------------- #
 
 
 def _static(path: str) -> EntryPoint:
@@ -514,93 +673,179 @@ def _static(path: str) -> EntryPoint:
     )
 
 
+def _python_script(name: str) -> EntryPoint:
+    python = python_executable()
+    return EntryPoint(
+        kind=ENTRY_KIND_PYTHON_SCRIPT,
+        path=name,
+        run_command=f"python {name}",
+        serve_kind=SERVE_KIND_PROCESS,
+        command=(python, name),
+    )
+
+
+def _python_module(package: str) -> EntryPoint:
+    python = python_executable()
+    return EntryPoint(
+        kind=ENTRY_KIND_PYTHON_MODULE,
+        path=package,
+        run_command=f"python -m {package}",
+        serve_kind=SERVE_KIND_PROCESS,
+        command=(python, "-m", package),
+    )
+
+
+def _node_script(name: str) -> EntryPoint:
+    node = node_executable()
+    if node is None:
+        return EntryPoint(
+            kind=ENTRY_KIND_NODE_SCRIPT,
+            path=name,
+            run_command=f"node {name}",
+            serve_kind=SERVE_KIND_PROCESS,
+            command=(),
+            reason=REASON_NODE_MISSING,
+        )
+    return EntryPoint(
+        kind=ENTRY_KIND_NODE_SCRIPT,
+        path=name,
+        run_command=f"node {name}",
+        serve_kind=SERVE_KIND_PROCESS,
+        command=(node, name),
+    )
+
+
+def _node_npm_entry(workspace: object) -> Optional[EntryPoint]:
+    script = _node_script_name(workspace)
+    if not script:
+        return None
+    display = dict((name, text) for name, text in _NODE_SCRIPTS)[script]
+    command, reason = npm_command(script)
+    return EntryPoint(
+        kind=ENTRY_KIND_NODE_NPM,
+        path=_PACKAGE_JSON,
+        run_command=display,
+        serve_kind=SERVE_KIND_PROCESS,
+        command=() if command is None else command,
+        reason=reason,
+    )
+
+
+def _paths_with_workspace(
+    manifest: Sequence[object], workspace: object
+) -> Tuple[str, ...]:
+    """The manifest's paths plus the root files that really exist right now.
+
+    The union keeps the entry point honest after a run that wrote only part of the
+    project: the manifest is what the run recorded, the workspace is what the project
+    has. When the workspace is unavailable the manifest is all there is.
+    """
+
+    paths = _paths(manifest)
+    names = _root_file_names(workspace)
+    if not names:
+        return paths
+    seen = set(paths)
+    merged = list(paths)
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return tuple(merged)
+
+
+def _entry_for_name(
+    name: str, paths: Sequence[str], workspace: object
+) -> Optional[EntryPoint]:
+    """The recognised entry point for one *declared* name, or ``None``."""
+
+    if name not in paths:
+        return None
+    if "/" not in name:
+        if name in _ROOT_PYTHON:
+            if _is_forge_scaffold(workspace, name):
+                return None
+            return _python_script(name)
+        if name in _ROOT_NODE:
+            return _node_script(name)
+        if name == _PACKAGE_JSON:
+            return _node_npm_entry(workspace)
+        if name.lower().endswith(".html"):
+            return _static(name)
+        return None
+    parts = name.split("/")
+    if (
+        len(parts) == 2
+        and parts[1] == _PACKAGE_MAIN
+        and _root_package((name,)) == parts[0]
+    ):
+        return _python_module(parts[0])
+    return None
+
+
 def resolve_entry(
     manifest: Sequence[object] = (),
     *,
     workspace: Optional[object] = None,
+    declared_entry: object = None,
 ) -> EntryResolution:
-    """The one safe entry point this manifest supports, with its reason word.
+    """The one safe entry point this project supports, with its reason word.
 
     ``manifest`` is the current version's artifact list
     (:class:`app.projects.models.ArtifactRef` records or their ``to_dict()`` shape).
-    ``workspace`` is optional and is used **only** to read a ``package.json`` that is
-    already in the manifest; passing ``None`` simply means a Node project cannot be
-    detected, never that a path is guessed.
+    ``workspace`` is optional: when supplied, the names of the files really at the
+    project root are added to the candidates (so a manifest that lists only the last
+    run's file cannot hide the server that is still there), and ``package.json`` and
+    ``forge.json`` are read with bounded, symlink-checked reads. ``declared_entry`` is
+    the project specification's explicit ``entry`` value; a project's own
+    ``forge.json`` is read as the second declaration.
+
+    **The order is a program first and a page second:** declared entry, ``app.py`` ->
+    ``main.py`` -> ``server.py``, a root ``__main__.py`` package, ``server.js``/
+    ``app.js``, ``package.json`` with ``start``/``dev``, and only then ``index.html``
+    and any other root ``*.html``. Static is the fallback used when no runnable entry
+    exists at all.
     """
 
-    paths = _paths(manifest)
+    paths = _paths_with_workspace(manifest, workspace)
     if not paths:
         return EntryResolution(reason=ENTRY_REASON_NO_ENTRY)
 
-    if _ROOT_HTML in paths:
-        return EntryResolution(entry=_static(_ROOT_HTML))
+    # 1. An explicit declaration wins, the caller's (the project specification) first
+    #    and the project's own forge.json second, but only for a name the ranking can
+    #    recognise. A declaration that names nothing real is ignored, not obeyed.
+    for declared in (declared_entry, _declared_entry_name(workspace)):
+        name = _safe_relative(declared)
+        if not name:
+            continue
+        entry = _entry_for_name(name, paths, workspace)
+        if entry is not None:
+            return EntryResolution(entry=entry)
 
+    # 2. Python scripts: a project that has a server is a program, not a page.
     for name in _ROOT_PYTHON:
-        if name in paths:
-            python = python_executable()
-            return EntryResolution(
-                entry=EntryPoint(
-                    kind=ENTRY_KIND_PYTHON_SCRIPT,
-                    path=name,
-                    run_command=f"python {name}",
-                    serve_kind=SERVE_KIND_PROCESS,
-                    command=(python, name),
-                )
-            )
+        if name in paths and not _is_forge_scaffold(workspace, name):
+            return EntryResolution(entry=_python_script(name))
 
+    # 3. A root package with ``__main__.py``.
     package = _root_package(paths)
     if package is not None:
-        python = python_executable()
-        return EntryResolution(
-            entry=EntryPoint(
-                kind=ENTRY_KIND_PYTHON_MODULE,
-                path=package,
-                run_command=f"python -m {package}",
-                serve_kind=SERVE_KIND_PROCESS,
-                command=(python, "-m", package),
-            )
-        )
+        return EntryResolution(entry=_python_module(package))
 
+    # 4. A Node script.
     for name in _ROOT_NODE:
         if name in paths:
-            node = node_executable()
-            if node is None:
-                return EntryResolution(
-                    entry=EntryPoint(
-                        kind=ENTRY_KIND_NODE_SCRIPT,
-                        path=name,
-                        run_command=f"node {name}",
-                        serve_kind=SERVE_KIND_PROCESS,
-                        command=(),
-                        reason=REASON_NODE_MISSING,
-                    )
-                )
-            return EntryResolution(
-                entry=EntryPoint(
-                    kind=ENTRY_KIND_NODE_SCRIPT,
-                    path=name,
-                    run_command=f"node {name}",
-                    serve_kind=SERVE_KIND_PROCESS,
-                    command=(node, name),
-                )
-            )
+            return EntryResolution(entry=_node_script(name))
 
+    # 5. A Node project whose package.json declares a start/dev script.
     if _PACKAGE_JSON in paths:
-        script = _node_script_name(workspace)
-        if script:
-            display = dict((name, text) for name, text in _NODE_SCRIPTS)[script]
-            command, reason = npm_command(script)
-            return EntryResolution(
-                entry=EntryPoint(
-                    kind=ENTRY_KIND_NODE_NPM,
-                    path=_PACKAGE_JSON,
-                    run_command=display,
-                    serve_kind=SERVE_KIND_PROCESS,
-                    command=() if command is None else command,
-                    reason=reason,
-                )
-            )
+        npm = _node_npm_entry(workspace)
+        if npm is not None:
+            return EntryResolution(entry=npm)
 
+    # 6. A static page: the fallback, and only when nothing runnable exists.
+    if _ROOT_HTML in paths:
+        return EntryResolution(entry=_static(_ROOT_HTML))
     page = _root_html(paths)
     if page is not None:
         return EntryResolution(entry=_static(page))
@@ -611,11 +856,14 @@ def detect_entry_point(
     manifest: Sequence[object] = (),
     *,
     workspace: Optional[object] = None,
+    declared_entry: object = None,
 ) -> Optional[EntryPoint]:
-    """The one safe entry point this manifest supports, or ``None``.
+    """The one safe entry point this project supports, or ``None``.
 
     The unchanged contract every existing caller reads: the entry, or ``None``.
     :func:`resolve_entry` is the same detection with the reason word.
     """
 
-    return resolve_entry(manifest, workspace=workspace).entry
+    return resolve_entry(
+        manifest, workspace=workspace, declared_entry=declared_entry
+    ).entry

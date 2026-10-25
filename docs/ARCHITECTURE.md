@@ -4940,14 +4940,24 @@ server it starts can be previewed. Nothing about that path is a second executor:
 only under a token minted by the existing execution chain, and the command is resolved server-side
 from the artifact manifest.
 
-### The five kinds, from the manifest only
+### The five kinds, a program first and a page second
 
-`app/projects/entrypoint.py` resolves exactly one kind, with a fixed priority: `static_html`
-(`index.html`, then any other root `*.html`), `python_script` (root `app.py`, then `main.py`, then
-`server.py`), `python_module` (a root package directory holding `__main__.py`), `node_script` (root
-`server.js`/`app.js`) and `node_npm` (root `package.json` declaring a `start` or `dev` script — only
-the script *name* is read). Anything else has no entry point, and `identify_entry_point` returns the
-reason word beside it.
+`app/projects/entrypoint.py` resolves exactly one kind, with a fixed priority: an explicitly declared
+entry (`forge.json` `"entry"`, or the project specification's `entry`), then `python_script` (root
+`app.py`, then `main.py`, then `server.py`), `python_module` (a root package directory holding
+`__main__.py`), `node_script` (root `server.js`/`app.js`), `node_npm` (root `package.json` declaring a
+`start` or `dev` script — only the script *name* is read), and only then `static_html` (`index.html`,
+then any other root `*.html`). Ranking `index.html` first was the measured defect: a project that
+really had a server **and** a leftover or stub page was launched as a page, Forge served HTML with no
+backend, and the owner saw an empty window four separate times. The declaration is honoured only when
+it names a file that exists; otherwise the ranking decides. Anything else has no entry point, and
+`identify_entry_point` returns the reason word beside it.
+
+Detection reads the current version's **manifest plus the file names really at the project root** (one
+bounded, symlink-checked directory listing), so a run that wrote only `index.html` cannot demote a
+project that still has `app.py`; the entry point is recomputed on every read and is never stored. The
+one carve-out is Forge's own deterministic `MOCK_DETERMINISTIC` scaffold module, recognised by its
+banner and deliberately not treated as a server.
 
 Every command is built **here, server-side**, and `EntryPoint.to_dict()` never publishes it: it
 publishes `kind`, `path`, `run_command` (a display string), `serve_kind`, `language`, `runnable`, the
@@ -4956,7 +4966,7 @@ payloads outside `diagnostics`:
 
 | kind | argv | display |
 | --- | --- | --- |
-| `static_html` | *(none — the preview route serves it)* | `открыть в браузере (preview)` |
+| `static_html` | *(none — the preview route serves it)* | `статическая страница, сервер не требуется` |
 | `python_script` | `<venv python> <script>` | `python app.py` |
 | `python_module` | `<venv python> -m <package>` | `python -m pkg` |
 | `node_script` | `<node> <script>` | `node server.js` |
@@ -5223,14 +5233,25 @@ no node.
 исполнителя: процесс создаётся только по токену, выданному существующей цепочкой исполнения, а
 команда разрешается на сервере из манифеста артефактов.
 
-### Пять видов, только из манифеста
+### Пять видов: сначала программа, потом страница
 
-`app/projects/entrypoint.py` разрешает ровно один вид с фиксированным приоритетом: `static_html`
-(`index.html`, затем любой другой корневой `*.html`), `python_script` (корневые `app.py`, затем
-`main.py`, затем `server.py`), `python_module` (корневой каталог-пакет с `__main__.py`),
-`node_script` (корневые `server.js`/`app.js`) и `node_npm` (корневой `package.json` с объявленным
-скриптом `start` или `dev` — читается только *имя* скрипта). Всё остальное точки входа не имеет, и
-`identify_entry_point` возвращает рядом слово-причину.
+`app/projects/entrypoint.py` разрешает ровно один вид с фиксированным приоритетом: явно объявленная
+точка входа (`forge.json` `"entry"` или `entry` из спецификации проекта), затем `python_script`
+(корневые `app.py`, затем `main.py`, затем `server.py`), `python_module` (корневой каталог-пакет с
+`__main__.py`), `node_script` (корневые `server.js`/`app.js`), `node_npm` (корневой `package.json` с
+объявленным скриптом `start` или `dev` — читается только *имя* скрипта) и только затем `static_html`
+(`index.html`, затем любой другой корневой `*.html`). Приоритет `index.html` был измеренным
+дефектом: проект, у которого действительно был сервер **и** оставшаяся или заглушечная страница,
+запускался как страница, Forge отдавал HTML без бэкенда, и владелец четыре раза видел пустое окно.
+Объявление учитывается, только если называет существующий файл; иначе решает приоритет. Всё
+остальное точки входа не имеет, и `identify_entry_point` возвращает рядом слово-причину.
+
+Определение читает **манифест текущей версии плюс имена файлов, реально лежащих в корне проекта**
+(одно ограниченное чтение каталога с проверкой симлинков), поэтому запуск, записавший только
+`index.html`, не может понизить проект, в котором всё ещё есть `app.py`; точка входа
+пересчитывается при каждом чтении и никогда не хранится. Единственное исключение — собственный
+детерминированный каркас `MOCK_DETERMINISTIC`, распознаваемый по баннеру и намеренно не считающийся
+сервером.
 
 Каждая команда собирается **здесь, на сервере**, и `EntryPoint.to_dict()` её не публикует: он
 публикует `kind`, `path`, `run_command` (строку для показа), `serve_kind`, `language`, `runnable`,
@@ -5239,7 +5260,7 @@ no node.
 
 | вид | argv | показ |
 | --- | --- | --- |
-| `static_html` | *(нет — страницу отдаёт маршрут предпросмотра)* | `открыть в браузере (preview)` |
+| `static_html` | *(нет — страницу отдаёт маршрут предпросмотра)* | `статическая страница, сервер не требуется` |
 | `python_script` | `<venv python> <script>` | `python app.py` |
 | `python_module` | `<venv python> -m <package>` | `python -m pkg` |
 | `node_script` | `<node> <script>` | `node server.js` |

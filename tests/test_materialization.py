@@ -17,9 +17,10 @@ What is proved here, one rule per test group:
   verification relevance, and **no contents**;
 * **PART 2** exactly two write modes exist, and a run that does not satisfy one
   writes nothing and says so;
-* **PART 3** the entry point comes from the manifest only; a static preview serves
-  the file and refuses traversal; a python/node entry point reports that local run
-  is not wired;
+* **PART 3** the entry point is derived from the manifest plus the files really at
+  the project root (a program first, a page second); a static preview serves the file
+  and refuses traversal; a python/node entry point reports that local run is not
+  wired;
 * **PART 4** a change request that writes nothing does not advance the version, and
   older versions stay byte-identical;
 * no secret-looking value and no file body reaches an event or a project payload.
@@ -395,23 +396,44 @@ class EntryPointTests(_MaterializationCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
 
-    def test_10_index_html_wins(self) -> None:
+    def test_10_a_python_script_wins_over_a_page(self) -> None:
+        # The owner's measured defect: a project with BOTH a server and a page was
+        # launched as the page, so Forge served HTML with no backend and the window was
+        # empty. A project is a program first and a page second.
         result = self.materialise(ANSWER_STATIC_AND_PYTHON)
         entry = detect_entry_point(result.files, workspace=self.workspace())
         self.assertIsNotNone(entry)
-        self.assertEqual(entry.kind, ENTRY_KIND_STATIC_HTML)
-        self.assertEqual(entry.path, "index.html")
-        self.assertEqual(entry.serve_kind, SERVE_KIND_STATIC)
+        self.assertEqual(entry.kind, ENTRY_KIND_PYTHON, entry)
+        self.assertEqual(entry.path, "app.py")
+        self.assertEqual(entry.serve_kind, SERVE_KIND_PROCESS)
+        self.assertTrue(entry.runnable)
+        self.assertEqual(entry.run_command, "python app.py")
+        self.assertEqual(entry.command[1:], ("app.py",))
+        self.assertFalse(entry.reason)
+
+        # The page is still there and is still the fallback: when the process is not
+        # the entry (it was removed), the same manifest resolves to the page.
+        without_python = tuple(
+            item for item in result.files if not item.path.endswith(".py")
+        )
+        (self.workspace() / "app.py").unlink()
+        page = detect_entry_point(without_python, workspace=self.workspace())
+        self.assertIsNotNone(page)
+        self.assertEqual(page.kind, ENTRY_KIND_STATIC_HTML)
+        self.assertEqual(page.path, "index.html")
+        self.assertEqual(page.serve_kind, SERVE_KIND_STATIC)
         # A static page is launched by the existing read-only preview route: no argv,
         # but runnable, and the command the card prints is the fixed sentence. It used
         # to report ``runnable: false`` with an empty command while the same route
         # answered HTTP 200 -- the measured defect this assertion pins.
-        self.assertEqual(entry.command, ())
-        self.assertIs(entry.runnable, True)
-        self.assertEqual(entry.run_command, STATIC_RUN_COMMAND)
-        self.assertEqual(STATIC_RUN_COMMAND, "открыть в браузере (preview)")
-        self.assertEqual(entry.to_dict()["runnable"], True)
-        self.assertFalse(entry.reason)
+        self.assertEqual(page.command, ())
+        self.assertIs(page.runnable, True)
+        self.assertEqual(page.run_command, STATIC_RUN_COMMAND)
+        self.assertEqual(
+            STATIC_RUN_COMMAND, "статическая страница, сервер не требуется"
+        )
+        self.assertEqual(page.to_dict()["runnable"], True)
+        self.assertFalse(page.reason)
 
     def test_11_python_entries_keep_their_priority(self) -> None:
         for path, expected_priority in (("app.py", 0), ("main.py", 1), ("server.py", 2)):
@@ -463,15 +485,34 @@ class EntryPointTests(_MaterializationCase):
         ):
             self.assertIsNone(detect_entry_point(manifest, workspace=self.workspace()))
 
-    def test_16_detection_ignores_a_file_that_is_not_in_the_manifest(self) -> None:
-        # ``index.html`` exists on disk but the manifest does not record it: the
-        # entry point is the recorded one, never a filesystem guess.
+    def test_16_a_root_file_outside_the_manifest_is_still_a_candidate(self) -> None:
+        # A version's manifest lists the files *that run* wrote. A run that writes only
+        # ``index.html`` must not hide the server that is still on disk, so the root's
+        # names are candidates too -- this is the "stale entry" half of the ranking.
         self._write("index.html", "<html></html>")
         entry = detect_entry_point(
-            [ArtifactRef(path="main.py", kind="python")], workspace=self.workspace()
+            [ArtifactRef(path="notes.md", kind="text")], workspace=self.workspace()
         )
         self.assertIsNotNone(entry)
-        self.assertEqual(entry.path, "main.py")
+        self.assertEqual(entry.path, "index.html")
+        self.assertEqual(entry.serve_kind, SERVE_KIND_STATIC)
+
+    def test_16b_detection_never_recurses_to_a_nested_page(self) -> None:
+        # The root is the only place looked at: ``pages/about.html`` is not an entry,
+        # and a manifest path is never invented into a root one.
+        self._write("pages/about.html", "<html></html>")
+        self.assertIsNone(
+            detect_entry_point(
+                [ArtifactRef(path="notes.md", kind="text")],
+                workspace=self.workspace(),
+            )
+        )
+        self.assertIsNone(
+            detect_entry_point(
+                [ArtifactRef(path="pages/about.html", kind="markup")],
+                workspace=self.workspace(),
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1123,8 +1164,11 @@ class NoSecretsInPayloadTests(_MaterializationCase):
             **self.project_workspace_kwargs(),
         )
         attached = self.attach(outcome.response)
-        # Remove the page so the python entry wins, and re-point the version's
-        # manifest at the module only (a hand-made record, no writer involved).
+        # The deterministic scaffold's own module is a page scaffold, not a server (the
+        # detector recognises its banner), so put a real Python program at the root and
+        # re-point the version's manifest at the module only (a hand-made record, no
+        # writer involved).
+        (self.workspace() / "app.py").write_text('print("real program")\n', encoding="utf-8")
         current = attached.current()
         python_only = tuple(item for item in current.files if item.path.endswith(".py"))
         versions = [

@@ -8534,3 +8534,137 @@ estimated_cost).
 платные модели — отдельного подтверждения на каждый автоматический платный запуск нет (это
 разрешение и есть подтверждение), а ручная пара сохраняет свою галочку. Строки причин —
 русские, на языке владельца, и показываются дословно в обоих языках интерфейса.
+
+## 2026-10-25 — A project is launched as its program, not as its page
+
+**Decision.** `app/projects/entrypoint.py` ranks a runnable entry **above** any static page. The
+fixed order is: an explicitly declared entry (`forge.json` at the project root with
+`"entry": "<path>"`, or the project specification's `entry`/`entrypoint`, honoured only when it names
+a file that exists), then `python_script` (root `app.py` → `main.py` → `server.py`), `python_module`
+(a root package with `__main__.py`), `node_script` (root `server.js`/`app.js`), `node_npm` (root
+`package.json` with a declared `start`/`dev` script), and only then `static_html` (`index.html`, then
+any other root `*.html`). Static is the fallback used when no runnable entry exists, and it now says
+so in the card's run-command fact: «статическая страница, сервер не требуется». When the chosen entry
+is a process, the launch starts it through the existing runner and opens the URL its own port
+discovery observed; the card prints the command (`python app.py`, `npm start`, ...). The entry point
+is **derived on every read** from the current version's manifest **plus the file names really at the
+project root** (one bounded, symlink-checked listing), so a run that wrote only `index.html` cannot
+relabel a project that still has `app.py`. Forge's own deterministic `MOCK_DETERMINISTIC` scaffold
+module is recognised by its banner (bounded read of a root `*.py` file) and is deliberately not
+treated as a server, so every offline scaffold keeps its working page.
+
+**Why.** This was the single most damaging defect left: the owner's «Запустить приложение» produced
+an empty grey window at least four times. `index.html` ranked first, so a project that really had a
+server and a leftover/stub page was launched as a static page; Forge served the HTML with no backend
+and the owner concluded nothing worked. Changing the priority fixes the class of defect instead of
+one project. Re-deriving the entry from the manifest alone was the second half of the same bug: a
+version's manifest records what *that run* wrote, so a change run writing one page made the server
+invisible; reading the root's real names keeps the program visible while nothing is guessed. The
+scaffold carve-out exists because `MOCK_DETERMINISTIC` writes a page *and* a side-effect-free module:
+treating that module as a server would start a process that exits at once and take away the page that
+does work.
+
+**Rejected alternatives.** Keeping `index.html` first and adding a warning (the owner would still get
+the empty window); inferring "is this a server?" from source contents by keyword (a project that
+builds its server in a helper module, or uses an unusual framework, would be misclassified -- the
+same class of guess that already failed four times); reading `requirements.txt`/`package.json` and
+assuming that implies a server (dependencies are not an entry point); storing the entry point on the
+version (a stored value goes stale and is exactly what the record-recompute half of this decision
+avoids); launching the static page automatically when the process dies (already rejected: the page is
+offered as an explicit second action, never opened behind the owner's back); rewriting the mock
+scaffold's module name instead of recognising its banner (could not fix projects created before the
+fix, which already have the old `app.py`).
+
+**Evidence.** `tests/test_entry_priority.py` (26 tests, offline): every combination
+(`app.py`+`index.html`, `main.py`+`index.html`, `server.py` alone, `package.json`+`index.html`,
+`index.html` alone, nothing) resolves to the expected kind; the declared override is honoured from
+`forge.json` and from the specification and ignored when it names nothing real or escapes the
+workspace; a page-only materialisation over a project with a server keeps `python_script`; the card
+payload and the presentation's `launch_role`/`launch_path` show the recomputed `app.py`; and the
+launch path is proved to call the runner, open the process port, and never call the preview registry.
+`tests/test_materialization.py` (entry tests updated to the new ranking), `tests/test_local_execution.py`,
+`tests/test_project_launch.py` and `tests/test_project_truth_presentation.py` were kept green. The
+live proof launched a real stdlib `http.server` project with a decoy `index.html` through Forge's
+`POST /api/projects/{id}/launch`: the URL was the process port, `GET` returned the server marker, the
+page's decoy marker never appeared, and the preview registry was not used; a pure static project
+launched through the read-only preview. Screenshots and evidence JSON are in
+`.forge/screenshots/entry-*.png` and `.forge/entry-live-evidence.json`.
+
+**Consequences and open limits.** The priority is by **name**, so a project whose server is only a
+non-standard filename (e.g. `serve.py`) stays a static page unless it declares its entry; a project
+named `app.py` that is not a server will now be started and honestly refused when it exits without a
+port, with the static page offered as the explicit fallback. The declared entry is a declaration, not
+a preference: a value naming no existing file is ignored, and a value that escapes the workspace is
+refused. The root listing is capped at 512 entries and the scaffold read at 4 KiB, so an enormous
+project root is inspected only partially (never truncated silently into a wrong entry: the manifest
+still supplies every recorded path). The root scan reads names only, never bodies, recurses nowhere
+and follows no symlink, so a nested page cannot become an entry.
+
+## 2026-10-25 — Проект запускается как программа, а не как страница
+
+**Решение.** `app/projects/entrypoint.py` ставит запускаемую точку входа **выше** любой статической
+страницы. Фиксированный порядок: явно объявленная точка входа (`forge.json` в корне проекта с
+`"entry": "<путь>"` или `entry`/`entrypoint` из спецификации проекта — учитывается, только если
+называет существующий файл), затем `python_script` (корневые `app.py` → `main.py` → `server.py`),
+`python_module` (корневой пакет с `__main__.py`), `node_script` (корневые `server.js`/`app.js`),
+`node_npm` (корневой `package.json` с объявленным скриптом `start`/`dev`) и только затем
+`static_html` (`index.html`, затем любой другой корневой `*.html`). Статика — запасной вариант,
+когда запускаемой точки входа нет, и теперь она прямо говорит об этом в факте «команда запуска»:
+«статическая страница, сервер не требуется». Когда выбранная точка входа — процесс, запуск
+стартует его через существующий раннер и открывает адрес, порт которого тот обнаружил; карточка
+печатает команду (`python app.py`, `npm start`, ...). Точка входа **пересчитывается при каждом
+чтении** из манифеста текущей версии **плюс имён файлов, реально лежащих в корне проекта** (одно
+ограниченное чтение каталога с проверкой симлинков), поэтому запуск, записавший только
+`index.html`, не может переименовать проект, в котором всё ещё есть `app.py`. Собственный
+детерминированный каркас `MOCK_DETERMINISTIC` распознаётся по баннеру (ограниченное чтение
+корневого `*.py`) и намеренно не считается сервером, чтобы каждый офлайн-каркас сохранял рабочую
+страницу.
+
+**Почему.** Это был самый разрушительный из оставшихся дефектов: «Запустить приложение» давало
+пустое серое окно как минимум четыре раза. `index.html` был первым, поэтому проект, у которого
+действительно был сервер и оставшаяся или заглушечная страница, запускался как статическая
+страница; Forge отдавал HTML без бэкенда, и владелец делал вывод, что ничего не работает. Смена
+приоритета лечит класс дефекта, а не один проект. Повторное определение точки входа только по
+манифесту было второй половиной той же ошибки: манифест версии фиксирует то, что записал *этот*
+запуск, поэтому запуск изменения, записавший одну страницу, делал сервер невидимым; чтение реальных
+имён в корне сохраняет программу видимой и ничего не выдумывает. Исключение для каркаса нужно
+потому, что `MOCK_DETERMINISTIC` пишет страницу *и* модуль без побочных эффектов: если считать этот
+модуль сервером, запустится процесс, который сразу завершится, и рабочая страница пропадёт.
+
+**Отклонённые альтернативы.** Оставить `index.html` первым и добавить предупреждение (владелец
+всё равно получил бы пустое окно); определять «сервер ли это?» по содержимому исходников по
+ключевым словам (проект, собирающий сервер в вспомогательном модуле или на необычном фреймворке,
+был бы классифицирован неверно — тот же класс догадки, который уже подвёл четыре раза); читать
+`requirements.txt`/`package.json` и предполагать, что это подразумевает сервер (зависимости — не
+точка входа); хранить точку входа в версии (сохранённое значение устаревает, и именно этого
+избегает вторая половина решения — пересчёт записи); автоматически открывать статическую страницу,
+когда процесс умер (уже отклонено: страница предлагается как явное второе действие и никогда не
+открывается за спиной владельца); переименовать модуль mock-каркаса вместо распознавания баннера
+(не исправило бы проекты, созданные до исправления, — в них уже есть старый `app.py`).
+
+**Доказательство.** `tests/test_entry_priority.py` (26 тестов, офлайн): каждая комбинация
+(`app.py`+`index.html`, `main.py`+`index.html`, один `server.py`, `package.json`+`index.html`, один
+`index.html`, ничего) даёт ожидаемый вид; объявленное переопределение учитывается из `forge.json` и
+из спецификации и игнорируется, если называет несуществующий файл или выходит за пределы рабочей
+области; материализация только страницы поверх проекта с сервером сохраняет `python_script`;
+полезная нагрузка карточки и `launch_role`/`launch_path` презентации показывают пересчитанный
+`app.py`; путь запуска доказанно вызывает раннер, открывает порт процесса и ни разу не обращается к
+реестру предпросмотра. `tests/test_materialization.py` (тесты точки входа обновлены под новый
+порядок), `tests/test_local_execution.py`, `tests/test_project_launch.py` и
+`tests/test_project_truth_presentation.py` остались зелёными. Живое доказательство запустило через
+`POST /api/projects/{id}/launch` настоящий проект со stdlib `http.server` и обманным `index.html`:
+адресом стал порт процесса, `GET` вернул маркер сервера, маркер страницы-обманки не появился, а
+реестр предпросмотра не использовался; чистый статический проект открылся через предпросмотр только
+для чтения. Скриншоты и JSON доказательств — в `.forge/screenshots/entry-*.png` и
+`.forge/entry-live-evidence.json`.
+
+**Ограничения.** Приоритет определяется **именем**, поэтому проект, у которого сервер называется
+нестандартно (например, `serve.py`), остаётся статической страницей, пока не объявит точку входа;
+проект с именем `app.py`, который не является сервером, теперь будет запущен и честно отклонён,
+когда завершится без порта, а статическая страница будет предложена как явный запасной вариант.
+Объявленная точка входа — это объявление, а не предпочтение: значение, не называющее существующий
+файл, игнорируется, а выходящее за пределы рабочей области отклоняется. Чтение корня ограничено 512
+записями, чтение каркаса — 4 КиБ, поэтому очень большой корень проекта просматривается неполно
+(никогда не усекаясь молча в неверную точку входа: манифест всё равно даёт все записанные пути).
+Сканирование корня читает только имена, никогда тела, не рекурсирует и не следует симлинкам,
+поэтому вложенная страница не может стать точкой входа.

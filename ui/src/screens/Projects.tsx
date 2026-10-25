@@ -1040,6 +1040,13 @@ const ProjectCard = ({
     entrypoint !== null && typeof entrypoint.path === "string" && entrypoint.path !== ""
       ? `${entrypoint.path} (${text(entrypoint.kind, "—")})`
       : t(lang, "projects.facts.none");
+  // The command the entry point really runs, on the card's own first screen: a program
+  // is shown as the command that starts it, and a static page says in words that no
+  // server is required. It is the backend's `run_command`, never composed here.
+  const entryRunCommand =
+    entrypoint !== null && String(entrypoint.run_command ?? "") !== ""
+      ? String(entrypoint.run_command)
+      : t(lang, "projects.facts.none");
   const previewAvailable = preview.available === true;
   const previewRunning = preview.running === true;
   const previewUrl = String(preview.url ?? "");
@@ -1765,6 +1772,7 @@ const ProjectCard = ({
                   currentVersion > 0 ? `v${currentVersion}` : t(lang, "projects.facts.none"),
                 ],
                 [t(lang, "projects.facts.entry"), entryLabel],
+                [t(lang, "projects.facts.run_command"), entryRunCommand],
                 [t(lang, "projects.truth.verification"), text(presentation.verification_line)],
                 [t(lang, "projects.facts.next"), text(presentation.next_step, t(lang, "projects.facts.none"))],
               ] as Array<[string, string]>

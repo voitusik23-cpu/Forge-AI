@@ -517,6 +517,8 @@ def build_project_presentation(
     provider_registry_ids: Sequence[str] = (),
     api_routes: Sequence[str] = (),
     folder_absolute: str = "",
+    entry_kind: str = "",
+    entry_path: str = "",
 ) -> ProjectPresentation:
     """Turn a project's facts into the card the owner reads.
 
@@ -636,7 +638,16 @@ def build_project_presentation(
         notices.append(RUN_NO_CHANGE_NOTICE)
 
     # ------------------------------------------------------------------ the actions
+    # The **recomputed** entry point, when the caller has one, decides which action
+    # this project offers: a process entry is «run», a page is «open». The artifact
+    # scan below is only the fallback for a caller that passes no entry point, so the
+    # card can never say "open index.html" while Forge would really start app.py.
     launch_role, launch_path = _launch_target(artifacts)
+    if entry_kind:
+        launch_path = entry_path or launch_path
+        # ``static_html`` is the only entry kind a browser can open without a
+        # process; every other kind is a program the product starts.
+        launch_role = "open" if entry_kind == "static_html" else "run"
     actions = _actions(
         status=status,
         files_count=files_count,
@@ -999,8 +1010,8 @@ def _actions(
                 label=ACTIONS["launch_local"],
                 enabled=True,
                 reason=(
-                    f"{launch_path} открывается в браузере через локальный "
-                    "предпросмотр (preview)"
+                    f"{launch_path}: статическая страница, сервер не требуется "
+                    "(открывается локальным предпросмотром)"
                 ),
             )
         )

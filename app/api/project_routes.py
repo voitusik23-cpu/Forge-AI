@@ -51,7 +51,7 @@ Four properties are deliberate:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from app.projects.entrypoint import (
     SERVE_KIND_STATIC,
@@ -290,18 +290,46 @@ def register_project_routes(
             "files": int(folder["files"]),
         }
 
+    def _declared_entry(project: Any) -> object:
+        """The entry the project's own specification declares, if it declares one.
+
+        The specification is the owner's/first-run statement about the project; an
+        explicit ``entry`` (or ``entrypoint``) there is the documented override that
+        outranks the ranking in :mod:`app.projects.entrypoint`. It is passed through
+        unchanged and validated there -- a value naming no real file is ignored.
+        """
+
+        specification = getattr(project, "specification", None)
+        if not isinstance(specification, Mapping):
+            return None
+        for key in ("entry", "entrypoint"):
+            value = specification.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
     def _entry_resolution(project: Any) -> Any:
-        """The one entry point of the *current* version, from its manifest only.
+        """The one entry point of the *current* project state, recomputed per read.
 
         Returns :class:`app.projects.entrypoint.EntryResolution`, so the payload can
         say *why* there is no entry point instead of leaving the field empty.
+
+        The entry point is **never stored**: it is derived here, from the current
+        version's manifest *and* the files that are really at the project root. That
+        is what stops a run that wrote only ``index.html`` from re-labelling a
+        project that still has ``app.py`` as a static page -- the card shows the
+        recomputed entry, never the old manifest's one.
         """
 
         current = project.current()
         if current is None or not current.files:
             return resolve_entry(())
         try:
-            return resolve_entry(current.files, workspace=_workspace_of(project))
+            return resolve_entry(
+                current.files,
+                workspace=_workspace_of(project),
+                declared_entry=_declared_entry(project),
+            )
         except Exception:  # noqa: BLE001 - detection never raises into a response
             return resolve_entry(())
 
@@ -428,6 +456,7 @@ def register_project_routes(
         except Exception:  # noqa: BLE001 - an unreadable workspace is an unknown fact
             workspace_exists = None
         status_word = str(getattr(project.status, "value", project.status) or "")
+        entry = _entry_of(project)
         return build_project_presentation(
             project=project.to_dict(),
             versions=[item.summary() for item in reversed(project.versions)],
@@ -443,6 +472,10 @@ def register_project_routes(
             folder_absolute=(
                 str(folder.get("workspace") or "") if folder is not None else ""
             ),
+            # The **recomputed** entry point, so the card's launch action names the
+            # program it will really start (not the page the old manifest named).
+            entry_kind=str(entry.kind) if entry is not None else "",
+            entry_path=str(entry.path) if entry is not None else "",
         ).to_dict()
 
     def _detail(project: Any) -> Dict[str, Any]:

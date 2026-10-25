@@ -490,7 +490,9 @@ class ActionGatingTests(unittest.TestCase):
         self.assertTrue(page.offers("open_app"))
         self.assertTrue(page.offers("launch_local"))
         self.assertTrue(page.action("launch_local").visible)
-        self.assertIn("preview", page.action("launch_local").reason)
+        # The card says exactly what a page is: no server is required for it.
+        self.assertIn("сервер не требуется", page.action("launch_local").reason)
+        self.assertIn("предпросмотр", page.action("launch_local").reason)
         self.assertEqual(page.launch_role, "open")
         self.assertEqual(page.launch_path, "index.html")
 
