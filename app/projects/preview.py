@@ -351,6 +351,9 @@ class PreviewRegistry:
             "source": "process",
             "url": f"http://{PREVIEW_HOST}:{number}/",
             "port": number,
+            # The same number, named for what it is: the port a real ``GET /`` proved.
+            # A project's own claim about itself is never published here.
+            "observed_port": number,
             "entry_path": str(entry_path or ""),
             "entry_kind": str(entry_kind or ""),
             "diagnostics": {

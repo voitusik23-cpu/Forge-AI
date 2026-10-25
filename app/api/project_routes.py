@@ -61,6 +61,7 @@ from app.projects.entrypoint import (
 from app.projects.folders import count_files
 from app.projects.launcher import LaunchRefusal, ProjectLauncher
 from app.projects.opener import OPEN_TARGETS, OpenRefusal, ProjectOpener
+from app.projects.ports import manifest_port_claim
 from app.projects.preview import (
     LOCAL_RUN_NOT_WIRED,
     NO_ENTRY_POINT,
@@ -196,6 +197,32 @@ def register_project_routes(
         if not str(project_id or "").strip():
             raise _refusal(UnknownProject(""))
         return project_id
+
+    def _manifest_port(project: Any) -> int:
+        """The port the project's **manifest** claims, or ``0`` when it claims none.
+
+        The claim lives in the record's own specification -- the text the owner asked
+        for and the project was generated from («ЗАПУСК: ... открывает
+        http://127.0.0.1:8765»). It is read here, at the route, because the record is
+        the manifest; it is used for one thing only: the launch ``notice`` that names
+        both numbers when the port reality chose is a different one. Nothing opens on
+        the claim, and no URL is ever built from it.
+        """
+
+        specification = getattr(project, "specification", None)
+        texts: List[str] = []
+        if isinstance(specification, dict):
+            goal = str(specification.get("goal", "") or "")
+            if goal:
+                texts.append(goal)
+            for name, value in specification.items():
+                if name == "goal":
+                    continue
+                if isinstance(value, str):
+                    texts.append(value)
+                elif isinstance(value, (list, tuple)):
+                    texts.extend(str(item) for item in value if isinstance(item, str))
+        return manifest_port_claim("\n".join(texts))
 
     def _artifact_payload(project: Any, artifact: Any) -> Dict[str, Any]:
         return {
@@ -663,6 +690,15 @@ def register_project_routes(
         approval, the process died without a port, no browser): a launch is never a
         silent no-op.
 
+        The port is **discovered, never assumed**: the supervisor reads the address the
+        child's own output announced and the sockets its pid tree owns, and every
+        candidate must answer a real ``GET /`` (:mod:`app.projects.ports`). The answer
+        carries ``observed_port``. A child that exits 0 while an address it printed
+        already answers is a success with ``reused: true`` -- that is «the application
+        is running» even though Forge started nothing new. When the manifest's own
+        claimed port differs from the observed one, ``notice`` names both («Порт из
+        манифеста 8765, фактический 8790»): the manifest is a claim, reality wins.
+
         A project that did not become a server is **not** replaced by its static page
         behind the owner's back: the refusal carries ``fallback_available`` and a real
         ``fallback_url`` when the folder holds a page, and only a second request with
@@ -702,6 +738,7 @@ def register_project_routes(
                 digest=digest,
                 archived=bool(project.archived),
                 static_fallback=static_fallback,
+                manifest_port=_manifest_port(project),
             )
         except LaunchRefusal as exc:
             raise HTTPException(

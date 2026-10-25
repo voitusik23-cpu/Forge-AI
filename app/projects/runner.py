@@ -113,6 +113,11 @@ from app.projects.entrypoint import (
     npm_command,
     python_executable,
 )
+from app.projects.ports import (
+    first_answering,
+    loopback_url,
+    parse_banner_ports,
+)
 from app.projects.store import (
     ProjectStore,
     default_projects_root,
@@ -391,6 +396,14 @@ class _RunFacts:
     pid: Optional[int] = None
     exit_code: Optional[int] = None
     port: int = 0
+    #: The port a real ``GET /`` really answered on (:mod:`app.projects.ports`). It is
+    #: the same number as ``port`` for a serving child; it is the *observed* fact the
+    #: launch payload publishes, and it can name a server this run did not start.
+    observed_port: int = 0
+    #: True when the port that answers belongs to a server that was **already running**:
+    #: the child printed its address and exited 0 without ever binding it. A reused
+    #: server is a success, not a refusal, and this flag is how the payload says so.
+    reused: bool = False
     url: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -1236,6 +1249,8 @@ class LocalRunner:
             facts.finished_at = 0.0
             facts.exit_code = None
             facts.port = 0
+            facts.observed_port = 0
+            facts.reused = False
             facts.url = ""
             facts.served = False
             facts.reason = ""
@@ -1336,7 +1351,10 @@ class LocalRunner:
             now = time.monotonic()
             if facts.port == 0 and now >= next_probe:
                 next_probe = now + 0.25
-                port = self._discover_port(process.pid)
+                # Two independent sources, one verdict: the ports the child's own output
+                # names (first match first) and the sockets its pid tree owns. Every
+                # candidate is proven with a real ``GET /`` before it is called ready.
+                port = self._discover_port(process.pid, self._output_ports(facts))
                 if port:
                     self._publish_preview(facts, port)
             if self._server_lifetime and facts.port and now - started > self._server_lifetime:
@@ -1408,15 +1426,35 @@ class LocalRunner:
                 pass
         if code is None and not timed_out:
             code = process.poll()
+        # The "already running" case, decided before the URL is cleared: a child that
+        # exits 0 while an address it printed still answers is a *success* -- the
+        # server the owner wants is up, it just belongs to another instance of the
+        # project (or outlived the child). The child is dead at this point and its tree
+        # was just reaped, so an answer cannot be the child's own process. Only a real
+        # ``GET /`` may say so, and only a clean exit qualifies: a crash that happens
+        # to name a busy port is not evidence of a running application.
+        reused_port = 0
+        if not timed_out and not facts.stop_requested and code == 0:
+            reused_port = self._answering_output_port(facts)
         with self._lock:
             # A URL is only ever true while the process is up: the port it bound is
             # remembered as a fact, but nobody can open it after the process ended.
+            # The one exception is proven above: the address still answers.
             facts.url = ""
             if timed_out:
                 # A killed process has no meaningful exit code. Reporting the code a
                 # terminated child happened to leave would invite "exit 0" to be
                 # read as success.
                 code = None
+            if reused_port:
+                # Written before the state on purpose: a concurrent status read sees
+                # ``state`` before ``url``, so a terminal state that carries a reused
+                # address is never observed with an empty URL.
+                facts.reused = True
+                facts.observed_port = int(reused_port)
+                facts.port = int(reused_port)
+                facts.served = True
+                facts.url = loopback_url(reused_port)
             if facts.state == STOPPING and facts.stop_requested:
                 facts.state = STOPPED
                 facts.exit_code = code
@@ -1432,7 +1470,11 @@ class LocalRunner:
                     facts.last_event = "timed out and killed"
                 elif code == 0:
                     facts.state = SUCCEEDED
-                    facts.last_event = "finished with exit code 0"
+                    facts.last_event = (
+                        f"already running on 127.0.0.1:{reused_port}"
+                        if reused_port
+                        else "finished with exit code 0"
+                    )
                 elif self._missing_dependency(facts):
                     facts.state = RUN_BLOCKED
                     facts.blocked_code = "dependencies_missing"
@@ -1494,18 +1536,61 @@ class LocalRunner:
         return False
 
     # ------------------------------------------------------------------- ports
-    def _discover_port(self, root_pid: Optional[int]) -> int:
-        """The first localhost port the child (or a descendant) is listening on."""
+    def _output_ports(self, facts: _RunFacts) -> Tuple[int, ...]:
+        """The ports the child's own output names, in the order it printed them.
 
-        if not isinstance(root_pid, int) or root_pid <= 0:
+        Both streams are read: a runtime prints its address on stdout, but a server
+        that started through a wrapper may announce it on stderr. The parsing rules
+        live in :mod:`app.projects.ports`; this method only feeds them.
+        """
+
+        stdout_lines, _stdout_truncated = facts.stdout_log.snapshot()
+        stderr_lines, _stderr_truncated = facts.stderr_log.snapshot()
+        return parse_banner_ports(tuple(stdout_lines) + tuple(stderr_lines))
+
+    def _discover_port(
+        self,
+        root_pid: Optional[int],
+        candidates: Sequence[int] = (),
+    ) -> int:
+        """The first port that **really answers** among the child's claims and sockets.
+
+        ``candidates`` are the ports the child's own output announced; the sockets the
+        child (and its descendants) listen on are appended after them, because the
+        address a program prints is the one it chose. Each candidate is verified with
+        a real ``GET /`` (:meth:`app.projects.ports.first_answering`): a bound socket
+        that never answers is not a server, and a printed address nobody answers on is
+        not one either. ``0`` means "nothing answered", never "there is no port".
+        """
+
+        socket_ports: Tuple[int, ...] = ()
+        if isinstance(root_pid, int) and root_pid > 0:
+            pids = {root_pid}
+            if os.name == "nt":
+                pids.update(process_tree_pids(root_pid))
+            try:
+                socket_ports = listening_ports(pids)
+            except Exception:  # noqa: BLE001 - an unreadable table is "unknown"
+                socket_ports = ()
+        ordered = _ordered_ports(candidates, socket_ports)
+        if not ordered:
             return 0
-        pids = {root_pid}
-        if os.name == "nt":
-            pids.update(process_tree_pids(root_pid))
-        ports = listening_ports(pids)
-        if not ports:
+        port, _status = first_answering(ordered)
+        return int(port)
+
+    def _answering_output_port(self, facts: _RunFacts) -> int:
+        """The port the child's own output named that still answers after it exited.
+
+        The sockets of a dead pid say nothing, so only the announced addresses are
+        left. An answer here means a server that this run did not start is up -- the
+        "already running" case.
+        """
+
+        candidates = self._output_ports(facts)
+        if not candidates:
             return 0
-        return sorted(ports)[0]
+        port, _status = first_answering(candidates)
+        return int(port)
 
     def _publish_preview(self, facts: _RunFacts, port: int) -> None:
         url = ""
@@ -1522,9 +1607,10 @@ class LocalRunner:
                 url = ""
         with self._lock:
             facts.port = int(port)
+            facts.observed_port = int(port)
             facts.served = True
             facts.state = RUNNING
-            facts.url = url or f"http://127.0.0.1:{int(port)}/"
+            facts.url = url or loopback_url(port)
             facts.last_event = f"listening on 127.0.0.1:{int(port)}"
             facts.updated_at = _utc_now()
         self._persist(facts)
@@ -1717,6 +1803,11 @@ class LocalRunner:
             "pid": facts.pid,
             "exit_code": facts.exit_code,
             "port": facts.port,
+            # The port a real ``GET /`` answered on, and whether that server was
+            # already running before this launch. Both are observations, published so
+            # the launch can open the address it really verified.
+            "observed_port": facts.observed_port,
+            "reused": bool(facts.reused),
             "url": facts.url,
             "started_at": _iso(facts.started_at),
             "finished_at": _iso(facts.finished_at),
@@ -1822,6 +1913,27 @@ def _language_of(kind: str) -> str:
 # --------------------------------------------------------------------------- #
 # port discovery
 # --------------------------------------------------------------------------- #
+
+
+def _ordered_ports(
+    candidates: Sequence[int], socket_ports: Sequence[int]
+) -> Tuple[int, ...]:
+    """The announced ports first (in the child's own order), then the bound sockets.
+
+    A program's printed address is the port it chose; its sockets confirm it. Both are
+    candidates, both are verified, and neither is trusted alone. Duplicates collapse
+    so a port announced *and* bound is probed once.
+    """
+
+    ordered: list[int] = []
+    for value in tuple(candidates or ()) + tuple(socket_ports or ()):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= number <= 65535 and number not in ordered:
+            ordered.append(number)
+    return tuple(ordered)
 
 
 def _netstat_path() -> str:

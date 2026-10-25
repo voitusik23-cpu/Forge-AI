@@ -5004,18 +5004,32 @@ Costs: one extra short-lived probe process per start (bounded at 8 s, and `write
 
 `POST /api/projects/{id}/launch` is one request that resolves the entry point, starts (or reuses) the
 project through the runner's approval chain, waits for the port the supervisor **observed**, and opens
-`http://127.0.0.1:<port>/...` in its own OS window (`app/projects/app_window.py`). Four rules are
+`http://127.0.0.1:<port>/...` in its own OS window (`app/projects/app_window.py`). The rules below are
 invariants, not best effort:
 
 * **No console window, ever.** Forge runs under `pythonw` (no console), so a console-subsystem child
   created without `CREATE_NO_WINDOW` gets a new console from Windows -- the black window the owner saw
   when «Запустить приложение» started a project. The project child and the containment probe both carry
   the flag; the port scan (`netstat`) and the tree-kill fallback (`taskkill`) carry it too.
-* **No portless URL.** A launch opens only a loopback URL with an explicit port, and only the port the
-  supervisor read from the child's own sockets. If no port was observed within the 10 s readiness
-  budget, no browser opens at all: the route answers typed `409 project_launch_refused` with
-  `run_state`, `exit_code`, the redacted 20-line `log_tail`, `log_path` and the sentence «Приложение не
-  стало сервером: порт не открылся».
+* **The port is discovered from reality, never assumed from the manifest.** `app/projects/ports.py`
+  reads the address the child's *own output* announced (`http://127.0.0.1:<port>`, `Адрес: ...:<port>`,
+  `listening on ...:<port>`, `Local: http://localhost:<port>`, `Serving on port <port>`,
+  `Uvicorn running on http://...:<port>`, a bare `:<port>` in a startup banner; the first match wins,
+  ports outside 1024-65535 are ignored, and ports named inside a traceback are not read at all), then
+  appends the listening TCP ports owned by the child pid and its descendants, and finally proves **each**
+  candidate with a real loopback `GET /`: any HTTP answer (200, 302, 401, 404, 500) means a server
+  answers, and a bound socket that never answers is not ready. The record's specification may claim a
+  port; that claim is never used to open anything, and when it differs from the observed one the payload
+  carries `observed_port` plus a `notice` naming both («Порт из манифеста 8765, фактический 8790»).
+* **No portless URL.** A launch opens only a loopback URL with an explicit port, and only the port a
+  real HTTP answer proved. If no candidate answered within the 10 s readiness budget, no browser opens
+  at all: the route answers typed `409 project_launch_refused` with `run_state`, `exit_code`, the
+  redacted 20-line `log_tail`, `log_path` and the sentence «Приложение не стало сервером: порт не
+  открылся».
+* **An application that is already running is a success, not a refusal.** A child that exits 0 while an
+  address it printed still answers never bound anything: another instance of the project is serving. The
+  run block records `reused: true` and the observed port, the launch answers `reused: true`, and the
+  window opens that address. Only when **no** candidate answers is the launch refused.
 * **A blocking application is diagnosed, not shown.** A child whose log holds a prompt-like line (ends
   with `:` or contains `Выбрать`/`Введите`/`Enter`/`input`) is reported with `waiting_for_input: true`
   and «Приложение ждёт ввода в консоли — так запускать нельзя»; nothing is typed into it and its
@@ -5032,16 +5046,31 @@ invariants, not best effort:
 
 `POST /api/projects/{id}/launch` — один запрос: определить точку входа, запустить (или переиспользовать)
 проект через цепочку одобрения раннера, дождаться порта, который супервизор **наблюдал**, и открыть
-`http://127.0.0.1:<порт>/...` в отдельном окне ОС. Пять правил обязательны:
+`http://127.0.0.1:<порт>/...` в отдельном окне ОС. Правила ниже обязательны:
 
 * **Никаких консольных окон.** Forge работает под `pythonw` (консоли нет), поэтому дочерний процесс
   консольной подсистемы без `CREATE_NO_WINDOW` получает от Windows новое консольное окно — то самое
   чёрное окно, которое увидел владелец. Флаг несут и процесс проекта, и probe; `netstat` и `taskkill`
   тоже.
-* **Никаких URL без порта.** Открывается только loopback-URL с явным портом, и только порт, прочитанный
-  из сокетов самого ребёнка. Если за 10 с порт не появился, браузер не открывается вовсе: маршрут
-  отвечает типизированным `409 project_launch_refused` с `run_state`, `exit_code`, очищенным хвостом
-  журнала (20 строк), `log_path` и фразой «Приложение не стало сервером: порт не открылся».
+* **Порт обнаруживается по реальности, а не берётся из манифеста.** `app/projects/ports.py` читает
+  адрес, который объявил **сам процесс** в своём выводе (`http://127.0.0.1:<порт>`, `Адрес: …:<порт>`,
+  `listening on …:<порт>`, `Local: http://localhost:<порт>`, `Serving on port <порт>`,
+  `Uvicorn running on http://…:<порт>`, голый `:<порт>` в стартовом баннере; побеждает первое
+  совпадение, порты вне 1024–65535 игнорируются, порты внутри traceback не читаются вовсе), затем
+  добавляет TCP-порты, которые слушает pid ребёнка и его потомки, и **каждого** кандидата проверяет
+  настоящим loopback-`GET /`: любой HTTP-ответ (200, 302, 401, 404, 500) означает, что сервер отвечает,
+  а занятый сокет без ответа готовым не считается. Спецификация записи может называть порт; эта заявка
+  никогда не используется для открытия, а при расхождении payload несёт `observed_port` и `notice` с
+  обоими числами («Порт из манифеста 8765, фактический 8790»).
+* **Никаких URL без порта.** Открывается только loopback-URL с явным портом, и только порт, который
+  доказан настоящим HTTP-ответом. Если за 10 с ни один кандидат не ответил, браузер не открывается
+  вовсе: маршрут отвечает типизированным `409 project_launch_refused` с `run_state`, `exit_code`,
+  очищенным хвостом журнала (20 строк), `log_path` и фразой «Приложение не стало сервером: порт не
+  открылся».
+* **Уже запущенное приложение — успех, а не отказ.** Ребёнок, который завершился с кодом 0, а
+  объявленный им адрес отвечает, ничего не занимал: служит другой экземпляр проекта. Блок запуска
+  записывает `reused: true` и наблюдаемый порт, запуск отвечает `reused: true`, и окно открывает этот
+  адрес. Отказ звучит только тогда, когда **ни один** кандидат не ответил.
 * **Блокирующее приложение диагностируется, а не показывается.** Если в журнале есть похожая на
   приглашение строка (заканчивается на `:` или содержит `Выбрать`/`Введите`/`Enter`/`input`), ответ
   несёт `waiting_for_input: true` и «Приложение ждёт ввода в консоли — так запускать нельзя»; ввод не

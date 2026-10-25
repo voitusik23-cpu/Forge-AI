@@ -34,10 +34,13 @@ this suite. ``shell=False`` and the exact argv are asserted instead.
 
 from __future__ import annotations
 
+import http.server
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
+import threading
 import time
 import unittest
 from unittest import mock
@@ -48,6 +51,8 @@ from app.api.service import ForgeApiService
 from app.discovery.service import DiscoveryService
 from app.discovery.store import DiscoveryStore
 from app.projects import launcher as launcher_module
+from app.projects import ports as ports_module
+from app.projects import runner as runner_module
 from app.projects.app_window import (
     APP_PROFILE_DIRECTORY,
     APP_WINDOW_SIZE,
@@ -60,12 +65,20 @@ from app.projects.app_window import (
 from app.projects.entrypoint import resolve_entry
 from app.projects.launcher import (
     CONSOLE_INPUT_MESSAGE,
+    MANIFEST_PORT_NOTE,
     NOT_A_SERVER_MESSAGE,
+    REUSED_SERVER_NOTE,
     LaunchRefusal,
     ProjectLauncher,
     looks_like_console_prompt,
 )
-from app.projects.runner import RunTarget
+from app.projects.ports import (
+    first_answering,
+    manifest_port_claim,
+    parse_banner_ports,
+    probe_http,
+)
+from app.projects.runner import LocalRunner, RunTarget
 from app.projects.service import ProjectService
 from app.projects.store import PROJECTS_ROOT_ENV_VAR, ProjectStore
 from app.runtime.run_store import RunStore
@@ -106,6 +119,81 @@ PROMPT_APP = """\
 print("Введите пароль:", flush=True)
 raise SystemExit(3)
 """
+
+#: The owner's real case, end to end: the application finds **another instance** already
+#: serving, prints that instance's address, and exits 0 without ever binding the port
+#: itself. Forge used to scan the child's sockets, see nothing, and refuse with «порт не
+#: открылся» while the application was running on the printed address.
+ALREADY_RUNNING = """\
+print("Мейл АИ уже запущен", flush=True)
+print("Адрес: {url}", flush=True)
+raise SystemExit(0)
+"""
+
+#: A child that announces an address nobody answers on and exits 0. The printed address
+#: is a claim; only a real `GET` may turn it into a server.
+DEAD_ADDRESS = """\
+print("Адрес: http://127.0.0.1:{port}", flush=True)
+raise SystemExit(0)
+"""
+
+#: The port the project's **manifest** claims, in its own specification text. Reality
+#: chooses another one in the launch tests, and both numbers must be named.
+MANIFEST_CLAIM_PORT = 8765
+MANIFEST_GOAL = (
+    f"{GOAL} ЗАПУСК: start.bat запускает python app.py и открывает "
+    f"http://127.0.0.1:{MANIFEST_CLAIM_PORT} в браузере."
+)
+
+
+class _ServingHandler(http.server.BaseHTTPRequestHandler):
+    """One page, for the server this test starts instead of a project's process."""
+
+    def do_GET(self):  # noqa: N802 - the base class names it this way
+        body = bytes(getattr(self.server, "body", b"LAUNCH-APP-OK\n"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # noqa: D401 - keep the test output quiet
+        return
+
+
+class _FakeAppServer:
+    """A real loopback server: the "application that was already running".
+
+    It is a real socket in the test process, so the launch path's HTTP probe meets a
+    real HTTP answer -- no mock of the verification in the proofs that matter.
+    """
+
+    def __init__(self, body: bytes = b"LAUNCH-APP-OK\n") -> None:
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ServingHandler)
+        self._server.body = body
+        self._server.daemon_threads = True
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/"
+
+    def stop(self) -> None:
+        try:
+            self._server.shutdown()
+        finally:
+            self._server.server_close()
+            self._thread.join(timeout=5.0)
+
+
+def _closed_port() -> int:
+    """A port in the usable range with nothing listening on it."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +356,195 @@ def _record(*, run_id: str, files: tuple = (), verification: str = "passed") -> 
         "model_used": "deterministic-offline",
         "updated_at": "2026-01-01T00:00:00Z",
     }
+
+
+# --------------------------------------------------------------------------- #
+# port discovery: the child's own output, then a real GET
+# --------------------------------------------------------------------------- #
+
+
+class PortDiscoveryTests(unittest.TestCase):
+    """A port is read from reality, never assumed from a manifest.
+
+    Three independent facts are proved here: every startup-banner form a real runtime
+    prints is read; a port named inside a traceback is not (a crash is not a server);
+    and no candidate is called ready without a real HTTP answer.
+    """
+
+    def _runner(self) -> LocalRunner:
+        base = REPOSITORY / ".forge" / "test-project-launch-ports" / f"{os.getpid()}-{id(self)}"
+        shutil.rmtree(base, ignore_errors=True)
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        return LocalRunner(store=ProjectStore(root=base / "projects"), previews=None)
+
+    @staticmethod
+    def _answering(*ports: int):
+        allowed = {int(port) for port in ports}
+
+        def probe(port: int) -> int:
+            return 200 if int(port) in allowed else 0
+
+        return probe
+
+    def test_01_every_banner_form_is_read(self) -> None:
+        forms = {
+            "http://127.0.0.1:8790": 8790,
+            "Адрес: http://127.0.0.1:8790": 8790,
+            "Адрес: 127.0.0.1:8790": 8790,
+            "listening on 127.0.0.1:9001": 9001,
+            "listening 12345": 12345,
+            "Local: http://localhost:5173": 5173,
+            "Serving on port 8080": 8080,
+            "Serving HTTP on 127.0.0.1 port 8000 (http://127.0.0.1:8000/) ...": 8000,
+            "INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)": 8000,
+            " * Running on :5000": 5000,
+        }
+        for line, port in forms.items():
+            self.assertEqual(parse_banner_ports([line]), (port,), line)
+
+    def test_02_the_owner_s_own_output_is_read(self) -> None:
+        # The exact lines of the 409 the owner saw: the application *had* a server.
+        lines = [
+            "====================================================",
+            "  Мейл АИ уже запущен",
+            "  Адрес: http://127.0.0.1:8790",
+            "====================================================",
+        ]
+        self.assertEqual(parse_banner_ports(lines), (8790,))
+
+    def test_03_the_first_address_wins_and_duplicates_collapse(self) -> None:
+        self.assertEqual(
+            parse_banner_ports(
+                ["Адрес: http://127.0.0.1:8790", "listening on 127.0.0.1:9000"]
+            ),
+            (8790, 9000),
+            "the address the program chose is the first one it printed",
+        )
+        self.assertEqual(
+            parse_banner_ports(["Local: http://localhost:5173", "http://127.0.0.1:5173"]),
+            (5173,),
+            "one port named twice is one candidate",
+        )
+
+    def test_04_ports_outside_the_usable_range_are_ignored(self) -> None:
+        self.assertEqual(parse_banner_ports(["http://127.0.0.1:80"]), ())
+        self.assertEqual(parse_banner_ports(["http://127.0.0.1:70000"]), ())
+        # A mail server's port is not this application's own port.
+        self.assertEqual(parse_banner_ports(["IMAP port 993 connected"]), ())
+
+    def test_05_a_port_inside_a_traceback_is_ignored(self) -> None:
+        traceback_lines = [
+            "Traceback (most recent call last):",
+            '  File "app.py", line 885, in main',
+            "    server = ThreadingHTTPServer((HOST, PORT), Handler)",
+            "OSError: [WinError 10048] 127.0.0.1:9999 busy",
+        ]
+        self.assertEqual(parse_banner_ports(traceback_lines), ())
+        # ... and the child's next announcement (a real one) is still read.
+        self.assertEqual(
+            parse_banner_ports(traceback_lines + ["listening on 127.0.0.1:9100"]),
+            (9100,),
+        )
+
+    def test_06_the_manifest_claim_is_a_claim(self) -> None:
+        self.assertEqual(
+            manifest_port_claim(
+                "ЗАПУСК: start.bat запускает python app.py и открывает "
+                "http://127.0.0.1:8765 в браузере. порт 993"
+            ),
+            8765,
+            "a full loopback URL is the strongest claim; port 993 is the mail server",
+        )
+        self.assertEqual(manifest_port_claim("сервер на порту 8790"), 8790)
+        self.assertEqual(manifest_port_claim("ничего не сказано"), 0)
+
+    def test_07_only_a_real_answer_makes_a_candidate_ready(self) -> None:
+        self.assertEqual(first_answering([8790], probe=self._answering(8790)), (8790, 200))
+        # 401 and 500 are answers too: a server is there, the page just needs a login.
+        self.assertEqual(first_answering([8790], probe=lambda port: 401), (8790, 401))
+        self.assertEqual(first_answering([8790], probe=lambda port: 500), (8790, 500))
+        self.assertEqual(first_answering([8790], probe=self._answering()), (0, 0))
+        # A port outside the range is not even asked.
+        asked: list[int] = []
+        first_answering(
+            [80, 70000, 8790],
+            probe=lambda port: asked.append(int(port)) or 0,
+        )
+        self.assertEqual(asked, [8790])
+
+        def broken(port: int) -> int:
+            raise RuntimeError("the probe itself failed")
+
+        self.assertEqual(first_answering([8790], probe=broken), (0, 0))
+
+    def test_08_the_real_probe_reads_a_real_loopback_answer(self) -> None:
+        server = _FakeAppServer()
+        self.addCleanup(server.stop)
+        self.assertEqual(probe_http(server.port), 200)
+        self.assertEqual(probe_http(_closed_port()), 0)
+        self.assertEqual(first_answering([_closed_port(), server.port]), (server.port, 200))
+
+    def test_09_the_pid_s_sockets_are_enumerated_and_probed(self) -> None:
+        runner = self._runner()
+        with mock.patch.object(runner_module, "listening_ports", return_value=(9001,)):
+            with mock.patch.object(ports_module, "probe_http", self._answering(9001)):
+                self.assertEqual(runner._discover_port(4242), 9001)
+
+    def test_10_a_descendant_s_socket_is_included(self) -> None:
+        runner = self._runner()
+        asked: list[set] = []
+        with mock.patch.object(runner_module, "process_tree_pids", return_value=(5150,)):
+            with mock.patch.object(
+                runner_module,
+                "listening_ports",
+                side_effect=lambda pids: asked.append(set(pids)) or (9001,),
+            ):
+                with mock.patch.object(ports_module, "probe_http", self._answering(9001)):
+                    self.assertEqual(runner._discover_port(4242), 9001)
+        self.assertTrue(asked, "the socket table was never consulted")
+        self.assertEqual(asked[0], {4242, 5150} if os.name == "nt" else {4242})
+
+    def test_11_a_bound_socket_that_does_not_answer_is_not_ready(self) -> None:
+        runner = self._runner()
+        with mock.patch.object(runner_module, "listening_ports", return_value=(9002,)):
+            with mock.patch.object(ports_module, "probe_http", self._answering()):
+                self.assertEqual(
+                    runner._discover_port(4242),
+                    0,
+                    "a bound socket is not a server until it answers",
+                )
+
+    def test_12_the_announced_port_is_preferred_and_still_verified(self) -> None:
+        runner = self._runner()
+        with mock.patch.object(runner_module, "listening_ports", return_value=(9001,)):
+            with mock.patch.object(
+                ports_module, "probe_http", self._answering(8790, 9001)
+            ):
+                self.assertEqual(
+                    runner._discover_port(4242, (8790,)),
+                    8790,
+                    "the port the child printed is the one it chose",
+                )
+            with mock.patch.object(ports_module, "probe_http", self._answering()):
+                self.assertEqual(
+                    runner._discover_port(4242, (8790,)),
+                    0,
+                    "an announced port that nobody answers is not a server",
+                )
+
+    def test_13_the_already_running_check_reads_the_child_s_own_output(self) -> None:
+        runner = self._runner()
+        facts = runner._empty(PROJECT_ID)
+        facts.stdout_log.feed("Мейл АИ уже запущен\n".encode("utf-8"))
+        facts.stdout_log.feed("Адрес: http://127.0.0.1:8790\n".encode("utf-8"))
+        with mock.patch.object(ports_module, "probe_http", self._answering(8790)):
+            self.assertEqual(runner._answering_output_port(facts), 8790)
+        with mock.patch.object(ports_module, "probe_http", self._answering()):
+            self.assertEqual(
+                runner._answering_output_port(facts),
+                0,
+                "a printed address nobody answers on is not a running application",
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -557,19 +834,54 @@ class LauncherUnitTests(unittest.TestCase):
         )
         self.assertIs(runner.started_calls[0]["confirm"], True)
 
-        second = launcher.launch(
-            project_id=PROJECT_ID,
-            target=self._target(entry),
-            entry=entry,
-            files=1,
-            confirm=True,
-            digest="digest-shown-to-the-owner",
-        )
+        # The remembered address is asked again before it is opened again: this machine
+        # has the server on 5005, so the second click reuses it.
+        with mock.patch.object(launcher_module, "probe_http", lambda port, **kw: 200):
+            second = launcher.launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=1,
+                confirm=True,
+                digest="digest-shown-to-the-owner",
+            )
         self.assertTrue(second.reused)
         self.assertEqual(second.url, first.url)
         self.assertEqual(len(runner.started_calls), 1, "the server was not started again")
         self.assertEqual(len(self.spawn.calls), 2, "the window was opened again")
         self.assertEqual(self.spawn.calls[0]["vector"][1], f"--app={first.url}")
+
+    def test_10b_a_remembered_address_that_stopped_is_started_again(self) -> None:
+        """A terminal run keeps the URL it proved; a later click must re-ask it.
+
+        Without the second question, the first reused address would be reused forever:
+        the window would open on a server that had since stopped, which is exactly the
+        "blank page" this launch path exists to prevent.
+        """
+
+        entry = self._entry()
+        runner = _FakeRunner(
+            status={
+                "state": "SUCCEEDED",
+                "url": "http://127.0.0.1:5006/",
+                "reused": True,
+                "observed_port": 5006,
+            },
+            started={"state": "RUNNING", "url": "http://127.0.0.1:5007/"},
+        )
+        result = self._launcher(runner=runner).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+            confirm=True,
+            digest="d",
+        )
+        self.assertEqual(len(runner.started_calls), 1, "nothing answered on 5006")
+        self.assertFalse(result.reused)
+        self.assertEqual(result.url, "http://127.0.0.1:5007/")
+        self.assertEqual(result.observed_port, 5007)
+        self.assertNotIn("5006", result.notice)
 
     def test_11_a_dead_process_is_refused_and_the_caller_never_sees_a_browser(self) -> None:
         # The old behaviour served the project's static page silently. That is exactly
@@ -761,6 +1073,82 @@ class LauncherUnitTests(unittest.TestCase):
         self.assertEqual(previews.started_calls, [], "the preview was not restarted")
         self.assertEqual(len(self.spawn.calls), 1)
 
+    def test_14_the_notice_names_both_ports_when_the_manifest_differs(self) -> None:
+        # The manifest claims 8765; the application chose 8790 and was already running.
+        # Both facts are said out loud, and the window opens the port that answered.
+        entry = self._entry()
+        runner = _FakeRunner(
+            started={
+                "state": "SUCCEEDED",
+                "url": "http://127.0.0.1:8790/",
+                "observed_port": 8790,
+                "reused": True,
+                "exit_code": 0,
+            },
+        )
+        result = self._launcher(runner=runner).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+            confirm=True,
+            digest="d",
+            manifest_port=8765,
+        )
+        self.assertTrue(result.launched)
+        self.assertTrue(result.reused, "an already-running server is a success")
+        self.assertEqual(result.url, "http://127.0.0.1:8790/")
+        self.assertEqual(result.observed_port, 8790)
+        self.assertIn(REUSED_SERVER_NOTE, result.notice)
+        self.assertIn(
+            MANIFEST_PORT_NOTE.format(manifest=8765, observed=8790), result.notice
+        )
+        self.assertIn("8765", result.notice)
+        self.assertIn("8790", result.notice)
+        payload = result.to_dict()
+        self.assertEqual(payload["observed_port"], 8790)
+        self.assertEqual(payload["notice"], result.notice)
+        self.assertEqual(self.spawn.calls[0]["vector"][1], "--app=http://127.0.0.1:8790/")
+
+    def test_15_the_notice_is_silent_when_the_manifest_and_reality_agree(self) -> None:
+        entry = self._entry()
+        runner = _FakeRunner(
+            started={
+                "state": "RUNNING",
+                "url": "http://127.0.0.1:8765/",
+                "observed_port": 8765,
+                "exit_code": None,
+            },
+        )
+        result = self._launcher(runner=runner).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+            confirm=True,
+            digest="d",
+            manifest_port=8765,
+        )
+        self.assertFalse(result.reused)
+        self.assertEqual(result.observed_port, 8765)
+        self.assertEqual(result.notice, "", "nothing extra to say when the two agree")
+        self.assertNotIn("notice", result.to_dict())
+
+    def test_16_the_observed_port_falls_back_to_the_opened_url(self) -> None:
+        # A supervisor that reports only the URL still yields the port it opened, so
+        # the payload never claims a port it did not open.
+        entry = self._entry()
+        runner = _FakeRunner(started={"state": "RUNNING", "url": "http://127.0.0.1:5007/"})
+        result = self._launcher(runner=runner).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+            confirm=True,
+            digest="d",
+        )
+        self.assertEqual(result.observed_port, 5007)
+
 
 # --------------------------------------------------------------------------- #
 # the route, against the real FastAPI surface
@@ -854,11 +1242,11 @@ class LaunchRouteTests(unittest.TestCase):
         target.write_bytes(data)
         return target
 
-    def _project(self, *, files: dict | None = None):
+    def _project(self, *, files: dict | None = None, goal: str = GOAL):
         files = dict(files or {})
         for relative, data in files.items():
             self._write_run_file(relative, data)
-        project = self.projects.create_from_discovery(_Session())
+        project = self.projects.create_from_discovery(_Session(goal))
         self.projects.confirm(project.project_id)
         return self.projects.attach_run(
             project.project_id,
@@ -984,6 +1372,9 @@ class LaunchRouteTests(unittest.TestCase):
         # The second click: same process, same URL, a new window.
         run = client.get(f"/api/projects/{project.project_id}/run").json()
         pid = int(run["pid"])
+        opened_port = int(url.rsplit(":", 1)[1].split("/", 1)[0])
+        self.assertEqual(run["observed_port"], opened_port, run)
+        self.assertFalse(run["reused"], "this launch started its own server")
         again = self._launch(
             client,
             project.project_id,
@@ -993,6 +1384,7 @@ class LaunchRouteTests(unittest.TestCase):
         again_body = again.json()
         self.assertTrue(again_body["reused"])
         self.assertEqual(again_body["url"], url)
+        self.assertEqual(again_body["observed_port"], opened_port)
         self.assertEqual(
             int(client.get(f"/api/projects/{project.project_id}/run").json()["pid"]),
             pid,
@@ -1201,6 +1593,93 @@ class LaunchRouteTests(unittest.TestCase):
         answer = self._launch(client, project.project_id, {"fallback": "yes"})
         self.assertEqual(answer.status_code, 400, answer.text)
         self.assertEqual(self.spawn.calls, [])
+
+    def test_12_an_already_running_app_is_a_success_with_the_reused_port(self) -> None:
+        """The owner's exact failure: exit 0, no socket of its own, a live server.
+
+        The launched child never binds a port -- another instance answers on it -- so it
+        prints that instance's address and exits 0. Forge used to scan the child's
+        sockets, find nothing and answer ``409 project_launch_refused`` («порт не
+        открылся») while the application was up. Now the port is read from the child's
+        own output, proved with a real ``GET /``, and the window opens.
+
+        The manifest claims 8765 and reality chose another port: both numbers are named.
+        """
+
+        server = _FakeAppServer()
+        self.addCleanup(server.stop)
+        client = self._client()
+        project = self._project(
+            files={"app.py": ALREADY_RUNNING.format(url=server.url).encode("utf-8")},
+            goal=MANIFEST_GOAL,
+        )
+        detail = client.get(f"/api/projects/{project.project_id}").json()
+        self.assertEqual(detail["entrypoint"]["kind"], "python_script")
+        digest = str(detail["entrypoint"]["digest"])
+
+        answer = self._launch(
+            client,
+            project.project_id,
+            {"confirm": True, "entrypoint_digest": digest},
+        )
+        self.assertEqual(answer.status_code, 200, answer.text)
+        body = answer.json()
+        self.assertTrue(body["launched"])
+        self.assertTrue(body["reused"], body)
+        self.assertEqual(body["url"], server.url, body)
+        self.assertEqual(body["observed_port"], server.port, body)
+        # The manifest's claimed port is not the port that answered, and the notice says
+        # both numbers instead of pretending the claim was right.
+        notice = str(body["notice"])
+        self.assertIn(str(MANIFEST_CLAIM_PORT), notice, notice)
+        self.assertIn(str(server.port), notice, notice)
+        self.assertIn(REUSED_SERVER_NOTE, notice, notice)
+        # The opened URL really answers: this is the fact the refusal used to miss.
+        with urllib.request.urlopen(str(body["url"]), timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn(b"LAUNCH-APP-OK", response.read())
+        self.assertEqual(self.spawn.calls[-1]["vector"][1], f"--app={server.url}")
+
+        # The run path agrees with the launch path: the same observed port, the same
+        # reused fact, from the supervisor's own payload.
+        run = client.get(f"/api/projects/{project.project_id}/run").json()
+        self.assertEqual(run["observed_port"], server.port, run)
+        self.assertTrue(run["reused"], run)
+        self.assertEqual(run["state"], "SUCCEEDED", run)
+        self.assertEqual(run["exit_code"], 0, run)
+        self.assertEqual(run["url"], server.url, run)
+
+    def test_13_an_announced_address_nobody_answers_is_still_a_refusal(self) -> None:
+        """A printed address is a claim: only a real answer may become a window."""
+
+        dead_port = _closed_port()
+        client = self._client()
+        project = self._project(
+            files={"app.py": DEAD_ADDRESS.format(port=dead_port).encode("utf-8")},
+            goal=MANIFEST_GOAL,
+        )
+        digest = client.get(f"/api/projects/{project.project_id}").json()["entrypoint"]["digest"]
+
+        answer = self._launch(
+            client,
+            project.project_id,
+            {"confirm": True, "entrypoint_digest": digest},
+        )
+        self.assertEqual(answer.status_code, 409, answer.text)
+        detail = answer.json()["detail"]
+        self.assertEqual(detail["code"], "project_launch_refused", detail)
+        self.assertIn(NOT_A_SERVER_MESSAGE, detail["error"])
+        self.assertEqual(detail["run_state"], "SUCCEEDED", detail)
+        self.assertEqual(detail["exit_code"], 0, detail)
+        self.assertIn(f"Адрес: http://127.0.0.1:{dead_port}", detail["log_tail"])
+        self.assertEqual(
+            self.spawn.calls, [], "a portless claim must open no browser at all"
+        )
+        run = client.get(f"/api/projects/{project.project_id}/run").json()
+        self.assertEqual(run["state"], "SUCCEEDED", run)
+        self.assertFalse(run["reused"], run)
+        self.assertEqual(run["url"], "", run)
+        self.assertEqual(run["observed_port"], 0, run)
 
 
 if __name__ == "__main__":  # pragma: no cover

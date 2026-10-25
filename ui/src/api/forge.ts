@@ -1049,8 +1049,13 @@ export type LifecycleOpenResult = {
  * `window` is the one that really opened (`chrome_app`, `edge_app` or
  * `default_browser`), `pid` is its process id (0 for the default browser, which reports
  * none), and `reused` says whether the running server was kept instead of restarted.
- * `notice` appears only when a dead process fell back to the project's static page: the
- * sentence names the failure, so the fallback is never a silent success.
+ *
+ * `observed_port` is the port a real HTTP answer proved -- read from the application's
+ * own startup output and its sockets, never assumed from the manifest. `notice` appears
+ * only when there is something the URL alone cannot tell: a dead process fell back to
+ * the project's static page, a server was already running, or the manifest's claimed
+ * port is not the port that answered («Порт из манифеста 8765, фактический 8790»). Each
+ * sentence is printed beside the URL, so nothing is a silent success.
  */
 export type LifecycleLaunch = {
   launched?: boolean;
@@ -1064,6 +1069,8 @@ export type LifecycleLaunch = {
   notice?: string;
   fallback?: boolean;
   stage?: string;
+  /** The port that really answered (verified with a GET), never a claim. */
+  observed_port?: number;
 };
 
 /**

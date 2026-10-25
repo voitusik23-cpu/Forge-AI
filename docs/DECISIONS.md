@@ -8173,3 +8173,115 @@ arbitrary base URL into a provider's transport is separate work.
 записываются и показываются, но транспортом каждого провайдера по-прежнему владеет его
 собственная константа адреса; подключение произвольного базового URL к транспорту — отдельная
 работа.
+
+## 2026-10-25 — The project port is discovered from its own output, not taken from the manifest
+
+**Decision.** The launch and the run read the port a project serves on from **reality**, in
+`app/projects/ports.py`: the address the child's own output announced (the first match wins;
+`http://127.0.0.1:<port>`, `Адрес: ...:<port>`, `listening on ...:<port>`,
+`Local: http://localhost:<port>`, `Serving on port <port>`, `Uvicorn running on
+http://...:<port>`, a bare `:<port>` in a startup banner; ports outside 1024-65535 ignored and
+ports named inside a traceback not read at all), then the listening TCP ports owned by the
+child pid and its descendants, and finally a real loopback `GET /` on **every** candidate --
+any HTTP answer (200, 302, 401, 404, 500) proves a server answers, and a bound socket that
+never answers is not ready. The runner publishes `observed_port`, and the preview's process
+session carries it too. A child that exits 0 while an address it printed already answers is
+an **already-running** instance: the run records `reused: true` and the launch answers
+`reused: true` and opens that address, instead of refusing. The manifest keeps its place as a
+*claim*: the record's specification is scanned for a declared loopback port, and when it
+differs from the observed one the launch `notice` names both («Порт из манифеста 8765,
+фактический 8790»).
+
+**Why.** The owner clicked «Запустить приложение» and Forge answered
+`409 project_launch_refused` -- «Приложение не стало сервером: порт не открылся. Процесс
+завершился с кодом 0» -- while the application was running and answering: its own free-port
+logic had found another instance already serving on 8790, printed that address and exited 0
+without binding anything itself. The launch path knew only one source of ports (the child's
+sockets), so a real, answering server was invisible and the wrong sentence was said. The
+manifest's claimed port is what the project *says*; the socket and an HTTP answer are what is
+*true*.
+
+**Rejected alternatives.** Trusting the manifest's port (it named 8765, the application chose
+8790 -- opening a claim is how a browser window ends up on nothing); trusting a printed address
+without an HTTP answer (a crash and a busy-port error both print ports); keeping the socket
+scan as the only source (it cannot see a server the child did not bind); treating a printed
+address as proof of readiness (a process that prints and dies before accepting a request must
+never be called a server); calling exit 0 a failure (the server the owner asked for was up).
+
+**Evidence.** `tests/test_project_launch.py`: `PortDiscoveryTests` (every banner form, the
+owner's own two lines, first-match order, out-of-range and traceback ports ignored, the
+manifest claim, the real probe against a real loopback server, the pid-socket path with a
+fake socket table, a bound socket that never answers, a descendant's socket, the announced
+port preferred and still verified, the already-running check reading the child's output),
+`test_12_an_already_running_app_is_a_success_with_the_reused_port` (a real child, a real
+second server, `200`, `reused: true`, the observed port, the URL answering `200`, and the
+notice naming 8765 and the actual port) and
+`test_13_an_announced_address_nobody_answers_is_still_a_refusal` (`409` with exit code 0 and
+the log tail, no window). The live proof on `proj-fce53337245f` is in
+`.forge/screenshots/port-*.png`.
+
+**Consequences and open limits.** One bounded probe (`PROBE_TIMEOUT_SECONDS = 1.0`) runs per
+candidate while the supervisor waits, so a server that is slow to answer its very first
+request is not mistaken for a dead one; a candidate that never answers costs that second per
+probe tick. A printed address that answers but is not the project's (another service that
+happens to be named in the output) would be opened, because an HTTP answer there is
+indistinguishable from the project's own response -- the notice names the port, and the run
+block says `reused: true`, so the payload is honest about it. A reused server is not
+registered as a preview session (nothing would ever unregister it), so the card's preview
+block says "no preview" while the launch notice and the run block carry the address.
+
+## 2026-10-25 — Порт проекта обнаруживается по его собственному выводу, а не берётся из манифеста
+
+**Решение.** Запуск и прогон читают порт, на котором служит проект, из **реальности** — в
+`app/projects/ports.py`: адрес, объявленный самим процессом в его выводе (побеждает первое
+совпадение; `http://127.0.0.1:<порт>`, `Адрес: …:<порт>`, `listening on …:<порт>`,
+`Local: http://localhost:<порт>`, `Serving on port <порт>`, `Uvicorn running on
+http://…:<порт>`, голый `:<порт>` в стартовом баннере; порты вне 1024–65535 игнорируются, а
+порты внутри traceback не читаются вовсе), затем TCP-порты, которые слушает pid ребёнка и
+его потомки, и наконец настоящий loopback-`GET /` по **каждому** кандидату — любой
+HTTP-ответ (200, 302, 401, 404, 500) доказывает, что сервер отвечает, а занятый сокет без
+ответа готовым не считается. Раннер публикует `observed_port`, и процессная сессия
+предпросмотра несёт его же. Ребёнок, завершившийся с кодом 0, при том что объявленный им
+адрес уже отвечает, — **уже запущенный** экземпляр: прогон записывает `reused: true`, запуск
+отвечает `reused: true` и открывает этот адрес вместо отказа. Манифест остаётся *заявкой*:
+спецификация записи просматривается на объявленный loopback-порт, и при расхождении `notice`
+запуска называет оба числа («Порт из манифеста 8765, фактический 8790»).
+
+**Почему.** Владелец нажал «Запустить приложение», а Forge ответил
+`409 project_launch_refused` — «Приложение не стало сервером: порт не открылся. Процесс
+завершился с кодом 0» — хотя приложение работало и отвечало: его собственная логика
+свободного порта нашла уже служащий экземпляр на 8790, напечатала этот адрес и вышла с кодом
+0, ничего не заняв. Путь запуска знал только один источник портов (сокеты ребёнка), поэтому
+настоящий отвечающий сервер был невидим и была сказана неверная фраза. Порт манифеста — это
+то, что проект *говорит*; сокет и HTTP-ответ — то, что *есть*.
+
+**Отклонённые альтернативы.** Доверять порту манифеста (он называл 8765, приложение выбрало
+8790 — открытие заявки это и есть способ получить окно браузера в пустоту); доверять
+напечатанному адресу без HTTP-ответа (и падение, и ошибка занятого порта печатают порты);
+оставить сканирование сокетов единственным источником (оно не видит сервер, который ребёнок
+не занимал); считать напечатанный адрес доказательством готовности (процесс, который
+печатает и умирает до приёма запроса, нельзя называть сервером); считать код 0 неудачей
+(сервер, который просил владелец, работал).
+
+**Доказательство.** `tests/test_project_launch.py`: `PortDiscoveryTests` (каждая форма
+баннера, две строки самого владельца, порядок «первое совпадение», игнор портов вне
+диапазона и внутри traceback, заявка манифеста, настоящий probe против настоящего
+loopback-сервера, путь pid-сокетов на поддельной таблице сокетов, занятый сокет без ответа,
+сокет потомка, объявленный порт предпочитается и всё равно проверяется, проверка
+«уже запущено» по выводу ребёнка),
+`test_12_an_already_running_app_is_a_success_with_the_reused_port` (настоящий ребёнок,
+настоящий второй сервер, `200`, `reused: true`, наблюдаемый порт, URL отвечает `200`,
+`notice` называет 8765 и фактический порт) и
+`test_13_an_announced_address_nobody_answers_is_still_a_refusal` (`409` с кодом выхода 0 и
+хвостом журнала, окно не открыто). Живое доказательство на `proj-fce53337245f` —
+в `.forge/screenshots/port-*.png`.
+
+**Следствия и открытые ограничения.** Пока супервизор ждёт, на каждого кандидата выполняется
+один ограниченный probe (`PROBE_TIMEOUT_SECONDS = 1.0`), поэтому сервер, медленно отвечающий
+на самый первый запрос, не принимается за мёртвый; кандидат, который не отвечает никогда,
+стоит этой секунды на каждый такт проверки. Напечатанный адрес, который отвечает, но
+принадлежит не проекту (другая служба, случайно названная в выводе), будет открыт: HTTP-ответ
+там неотличим от ответа самого проекта — `notice` называет порт, а блок прогона говорит
+`reused: true`, поэтому payload честен. Переиспользованный сервер не регистрируется как
+сессия предпросмотра (снять её было бы некому), поэтому блок предпросмотра в карточке говорит
+«предпросмотра нет», а адрес несут `notice` запуска и блок прогона.

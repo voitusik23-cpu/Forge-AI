@@ -19,9 +19,25 @@ What is real here and what is reused
   here.
 * **A static page is served by the existing preview.** :class:`app.projects.preview.PreviewRegistry`
   binds the read-only server; no child process is started for such a project.
-* **Readiness is the runner's own port detection.** The supervisor notices the child
-  binding a localhost port; this module only *waits* for that fact (bounded), it does
-  not probe a guessed port.
+* **Readiness is the runner's own port detection.** The supervisor reads the port from
+  two sources -- the address the child's own output announced, and the sockets its pid
+  tree listens on -- and proves each candidate with a real ``GET /`` before it is
+  called ready (:mod:`app.projects.ports`). This module only *waits* for that fact
+  (bounded); it never probes a guessed port, and it never opens a portless URL.
+
+The manifest is a claim, reality wins
+-------------------------------------
+
+The project record's specification is the owner's own plan; it may name a port
+(«ЗАПУСК: ... открывает http://127.0.0.1:8765»). That claim is **never** used to open
+anything: the opened URL is the port a real HTTP answer proved. When the claim and the
+observation disagree the launch says both out loud in its ``notice`` («Порт из
+манифеста 8765, фактический 8790»), so a manifest that drifted cannot quietly decide
+what the owner sees.
+
+An application that exits **0** while an address it printed already answers was not a
+failure: another instance of the project is serving, the launch says ``reused: true``
+and opens that window. Only when *no* candidate answers is the launch refused.
 
 Idempotency
 -----------
@@ -76,6 +92,7 @@ from app.projects.entrypoint import (
     resolve_entry,
 )
 from app.projects.models import ProjectError
+from app.projects.ports import port_from_url, probe_http
 from app.projects.runner import (
     REFUSED,
     RUN_BLOCKED,
@@ -91,13 +108,21 @@ __all__ = [
     "DESKTOP_ENTRY_KINDS",
     "LaunchRefusal",
     "LaunchResult",
+    "MANIFEST_PORT_NOTE",
     "NO_ENTRY_MESSAGE",
     "NO_FILES_MESSAGE",
     "NOT_A_SERVER_MESSAGE",
     "ProjectLauncher",
     "READINESS_TIMEOUT_SECONDS",
+    "REUSED_SERVER_NOTE",
     "looks_like_console_prompt",
 ]
+
+#: The two sentences a successful launch may add beside the URL. Both name a fact the
+#: owner cannot see from the window itself: a server that was already up, and a
+#: manifest whose port is not the port reality chose.
+REUSED_SERVER_NOTE = "Приложение уже было запущено — открыт существующий сервер."
+MANIFEST_PORT_NOTE = "Порт из манифеста {manifest}, фактический {observed}."
 
 #: Entry kinds that need a desktop window this product cannot host yet. The set is
 #: empty today, and the check exists so a future kind is refused with a typed
@@ -216,9 +241,12 @@ class LaunchResult:
     #: sentence names the request, so the fallback is never a silent success.
     notice: str = ""
     fallback: bool = False
+    #: The port that really answered (verified with a ``GET /``), never a claim. ``0``
+    #: only on a payload that opened no window at all.
+    observed_port: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        """The public shape: the eight facts a client needs and nothing else."""
+        """The public shape: the facts a client needs and nothing else."""
 
         payload: Dict[str, Any] = {
             "launched": bool(self.launched),
@@ -228,6 +256,7 @@ class LaunchResult:
             "reused": bool(self.reused),
             "project_id": self.project_id,
             "entry_kind": self.entry_kind,
+            "observed_port": int(self.observed_port),
         }
         if self.fallback:
             payload["fallback"] = True
@@ -275,6 +304,7 @@ class ProjectLauncher:
         digest: object = None,
         archived: bool = False,
         static_fallback: bool = False,
+        manifest_port: int = 0,
     ) -> LaunchResult:
         """Show the project, starting it only when it is not already running.
 
@@ -287,6 +317,10 @@ class ProjectLauncher:
         static page (the choice the refusal offers as ``fallback_available``). It is
         consulted only when the declared process did not become a server; without it a
         dead process is a refusal and no window opens.
+
+        ``manifest_port`` is the port the project's **manifest claims** (its own
+        specification text), and it is used for one thing only: the ``notice`` that
+        names both numbers when reality chose a different one. It never becomes a URL.
         """
 
         key = str(project_id or "")
@@ -335,6 +369,7 @@ class ProjectLauncher:
             confirm=confirm,
             digest=digest,
             static_fallback=bool(static_fallback),
+            manifest_port=int(manifest_port or 0),
         )
 
     # ----------------------------------------------------------- a static page
@@ -402,6 +437,7 @@ class ProjectLauncher:
             entry_kind=str(entry.kind),
             notice=notice,
             fallback=bool(notice),
+            observed_port=port_from_url(url),
         )
 
     # --------------------------------------------------------------- a process
@@ -414,10 +450,11 @@ class ProjectLauncher:
         confirm: object,
         digest: object,
         static_fallback: bool = False,
+        manifest_port: int = 0,
     ) -> LaunchResult:
         """Start (or reuse) the declared process, wait for its port, open the URL.
 
-        A URL is opened only when it carries the port the runner really observed
+        A URL is opened only when it carries a port a real ``GET /`` answered on
         (``http://127.0.0.1:<port>/``). A process that did not become a server is a
         typed refusal -- or, when the caller explicitly asked for it, the project's
         static page -- and never a browser pointed at nothing.
@@ -448,7 +485,13 @@ class ProjectLauncher:
         status = self._safe_status(project_id, target)
         url = str(status.get("url", "") or "")
         state = str(status.get("state", "") or "")
-        reused = url != ""
+        # A remembered address is reused only while it still answers. The "already
+        # running" case leaves a URL in a *terminal* run, so a later click has to ask
+        # that address again: a server that has since stopped means the process must be
+        # started afresh, never a window opened on nothing.
+        reused = url != "" and self._url_answers(url)
+        if url != "" and not reused:
+            url = ""
         if not reused:
             if state in (STARTING, RUNNING, STOPPING):
                 # A process that is already starting is this project's process: the
@@ -460,6 +503,7 @@ class ProjectLauncher:
                 )
                 state = str(started.get("state", "") or "")
                 url = str(started.get("url", "") or "")
+                status = started
                 if state in (REFUSED, RUN_BLOCKED):
                     raise self._start_refusal(project_id, entry, started)
 
@@ -479,6 +523,10 @@ class ProjectLauncher:
                 project_id, target, entry, status, state, url=url
             )
 
+        observed_port = self._observed_port(url, status)
+        # A server that was already up before this click is a success, and the payload
+        # says so instead of pretending a second copy was started.
+        reused = reused or bool(status.get("reused"))
         window = self._open_window(project_id, url)
         return LaunchResult(
             project_id=project_id,
@@ -487,7 +535,59 @@ class ProjectLauncher:
             pid=window.pid,
             reused=reused,
             entry_kind=str(entry.kind),
+            notice=self._launch_notice(
+                manifest_port, observed_port, bool(status.get("reused"))
+            ),
+            observed_port=observed_port,
         )
+
+    # ------------------------------------------------------------- the two numbers
+    @staticmethod
+    def _url_answers(url: str) -> bool:
+        """Whether a loopback URL the runner recorded still answers, right now."""
+
+        port = port_from_url(url)
+        return port > 0 and probe_http(port) > 0
+
+    @staticmethod
+    def _observed_port(url: str, status: Dict[str, Any]) -> int:
+        """The port reality answered on: the supervisor's own fact, else the URL's.
+
+        The runner records ``observed_port`` when a real ``GET /`` succeeded; the run
+        block also keeps ``port``. The URL is the last source, and it is parsed only
+        because it is the address about to be opened -- never used to invent one.
+        """
+
+        for key in ("observed_port", "port"):
+            try:
+                number = int(status.get(key) or 0)
+            except (TypeError, ValueError):
+                number = 0
+            if number > 0:
+                return number
+        return port_from_url(url)
+
+    @staticmethod
+    def _launch_notice(manifest_port: int, observed_port: int, reused: bool) -> str:
+        """What the owner has to read beside the URL, and nothing more.
+
+        Two facts can only be seen from here: that the window shows a server which was
+        already running, and that the manifest's port is not the port that answered.
+        The second sentence is emitted **only** when the two numbers really differ.
+        """
+
+        parts = []
+        if reused:
+            parts.append(REUSED_SERVER_NOTE)
+        try:
+            claimed = int(manifest_port or 0)
+        except (TypeError, ValueError):
+            claimed = 0
+        if claimed > 0 and observed_port > 0 and claimed != observed_port:
+            parts.append(
+                MANIFEST_PORT_NOTE.format(manifest=claimed, observed=observed_port)
+            )
+        return " ".join(parts)
 
     # ------------------------------------------------------------------ pieces
     def _preview_status(self, project_id: str) -> Dict[str, Any]:
