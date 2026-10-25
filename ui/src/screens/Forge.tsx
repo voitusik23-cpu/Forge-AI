@@ -31,10 +31,18 @@ import {
   type AnswerDraft,
 } from "../components/ClarificationCard";
 import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
+import { AliveBar } from "../components/AliveBar";
 import { RunProgress } from "../components/RunProgress";
 import { RouteLine, complexityWord, tierWord } from "../components/RouteLine";
 import { t, type Lang } from "../i18n";
 import { selectRunProject } from "../project-selection.js";
+import {
+  aliveStageKey,
+  stepStates,
+  stampMs,
+  type StepId,
+  type StepState,
+} from "../progress";
 import { deriveRunHeadline, answerAskedQuestions, type ResultActionId, type ResultHeadline } from "../forge-result";
 import type { BackendState } from "../api/client";
 import {
@@ -156,7 +164,7 @@ type DispatchState =
   | { status: "failed"; failure: Failure };
 
 /** The four steps of the Кузница flow. Each one is a real request, not a drawing. */
-type DiscoveryPhase = "idea" | "clarify" | "spec" | "run";
+type DiscoveryPhase = StepId;
 
 const DISCOVERY_STEPS: Array<{ id: DiscoveryPhase; labelKey: string }> = [
   { id: "idea", labelKey: "forge.discovery.step.idea" },
@@ -328,26 +336,40 @@ const FailureNotice = ({
   );
 };
 
-/** The step rail: which step is current, which ones were actually completed. */
-const StepRail = ({ lang, phase }: { lang: Lang; phase: DiscoveryPhase }) => {
-  const current = DISCOVERY_STEPS.findIndex((step) => step.id === phase);
-  return (
-    <ol className="forge-steps">
-      {DISCOVERY_STEPS.map((step, index) => {
-        const state = index < current ? "done" : index === current ? "current" : "next";
-        return (
-          <li className={`forge-step ${state}`} key={step.id}>
-            <span className="forge-step-index">{index + 1}</span>
-            <span>{t(lang, step.labelKey)}</span>
-            {index === current ? (
-              <span className="small muted">· {t(lang, "forge.discovery.step.current")}</span>
-            ) : null}
-          </li>
-        );
-      })}
-    </ol>
-  );
-};
+/**
+ * The step rail: which step is current, which ones are really complete, which one failed.
+ *
+ * The four states come from `stepStates` in `ui/src/progress.ts` — the same module the Node test
+ * executes — so the rail cannot paint a step green from a guess. Steps 1–3 are `done` only when
+ * the Core's session is CONFIRMED (or the owner has already moved past them), step 4 is
+ * `current` while a run is in flight, `done` only for a terminal-success record and `error` (red)
+ * for a terminal failure. The current step carries the accent colour, a pulsing dot and the
+ * moving ribbon that says the application is alive; reduced motion turns the ribbon into a still
+ * bar (the CSS handles both `prefers-reduced-motion` and the `[data-motion="reduced"]` switch).
+ */
+const StepRail = ({ lang, states }: { lang: Lang; states: Record<StepId, StepState> }) => (
+  <ol className="forge-steps">
+    {DISCOVERY_STEPS.map((step, index) => {
+      const state = states[step.id];
+      return (
+        <li
+          className={`forge-step ${state}`}
+          key={step.id}
+          data-testid={`forge-step-${step.id}`}
+          data-state={state}
+        >
+          <span className="forge-step-index" aria-hidden="true">
+            {state === "done" ? "✓" : state === "error" ? "!" : index + 1}
+          </span>
+          <span>{t(lang, step.labelKey)}</span>
+          {state === "current" ? (
+            <span className="small muted">· {t(lang, "forge.discovery.step.current")}</span>
+          ) : null}
+        </li>
+      );
+    })}
+  </ol>
+);
 
 /** One specification value as text: a list joins with `;`, an empty field says so. */
 const specValue = (specification: DiscoverySpecification | undefined, key: SpecKey): string => {
@@ -965,6 +987,15 @@ export const Forge = ({
   const [recordFailure, setRecordFailure] = useState<Failure | null>(null);
   const [recordLoading, setRecordLoading] = useState(false);
   const [pollNonce, setPollNonce] = useState(0);
+  /**
+   * The press that started the current run, in epoch milliseconds.
+   *
+   * It is a real local fact, not a fake timer: the dispatch is synchronous, so the window holds
+   * no run id while the Core works, and `RunRecord` publishes no start of its own (only the
+   * final snapshot's `updated_at`). The clock therefore starts at the press and ends at the
+   * record's own timestamp — which bounds it even when the record arrives late.
+   */
+  const [runObservedAt, setRunObservedAt] = useState(0);
 
   const dispatched = dispatch.status === "sent" ? dispatch.result : null;
   const runId = String(dispatched?.response.run_id ?? "");
@@ -1133,6 +1164,26 @@ export const Forge = ({
 
   const polling = runId !== "" && recordFailure === null && !terminal;
 
+  // ------------------------------------------------------------------ live progress
+  // The rail and the alive bar read only facts that exist: the session's own CONFIRMED state,
+  // the dispatch in flight and the run record. `POST /api/tasks/run` is synchronous, so while
+  // the Core works there is no run id yet — that window is exactly where the owner used to sit
+  // for half a minute without seeing anything move, and it is what the bar now covers.
+  const runEvents = typeof record?.event_count === "number" ? record.event_count : 0;
+  const runInFlight =
+    dispatch.status === "pending" || (runId !== "" && recordFailure === null && !terminal);
+  const runSucceeded = record?.classification?.is_success === true;
+  const steps = stepStates({
+    phase,
+    confirmed,
+    inFlight: runInFlight,
+    terminal,
+    success: runSucceeded,
+  });
+  // The stage word for the bar: the Core is executing the task until a record proves a later
+  // stage (one per four persisted events, the same rule the change strip uses).
+  const aliveStage = t(lang, aliveStageKey(runEvents, record !== null));
+
   // The write switch is available whenever the run can write at all: a `code`
   // category and a routable provider. `mock` is included on purpose -- the Core's
   // `MOCK_DETERMINISTIC` mode writes the deterministic scaffold when the run belongs
@@ -1270,6 +1321,8 @@ export const Forge = ({
     setRecordFailure(null);
     setDispatch({ status: "pending" });
     setRequestedWriteMode(effectiveWriteMode);
+    // The clock of the alive bar starts here: this is the press whose result the owner waits for.
+    setRunObservedAt(Date.now());
     // The same form, the same provider/model/approval rules and the same write decision; only the
     // answers (and the run that asked) are added. A dispatch that carries no answers is a plain
     // run, so the "answers started this run" line is cleared rather than left from an earlier one.
@@ -1784,7 +1837,19 @@ export const Forge = ({
                 }
               />
               <div className="stack" style={{ gap: 14 }}>
-                <StepRail lang={lang} phase={phase} />
+                <StepRail lang={lang} states={steps} />
+                {/* THE ALIVE BAR, directly under the rail: the clock, the moving ribbon and the
+                    stage, so a run that takes half a minute is visibly alive. It stays after the
+                    run ends and says «Готово за …» or the honest failure, with the ribbon stopped. */}
+                <AliveBar
+                  lang={lang}
+                  inFlight={runInFlight}
+                  terminal={terminal}
+                  success={runSucceeded}
+                  observedAt={runObservedAt}
+                  endedAt={stampMs(record?.updated_at)}
+                  stage={aliveStage}
+                />
 
                 {/* The idea stays above everything else, read-only, once it has been submitted. */}
                 {phase !== "idea" ? (

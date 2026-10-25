@@ -23,9 +23,11 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/Primitives";
+import { AliveBar } from "../components/AliveBar";
 import { IconRefresh } from "../components/Icons";
 import { RouteLine } from "../components/RouteLine";
 import { t, type Lang } from "../i18n";
+import { stampMs } from "../progress";
 import { PROJECT_LIST_PAGE_SIZE, projectListRows } from "../project-list.js";
 import {
   createProjectRouter,
@@ -779,6 +781,8 @@ const ProjectCard = ({
   changeFailure,
   changeLocked,
   changeStrip,
+  changeStartedAt,
+  changeEndedAt,
   dispatched,
   dispatchFailure,
   provider,
@@ -864,6 +868,15 @@ const ProjectCard = ({
    * would be another block to read.
    */
   changeStrip: ChangeStrip | null;
+  /**
+   * The press that started this change, in epoch milliseconds, and the run record's own end.
+   *
+   * They feed the same alive bar the Кузница rail uses: the clock starts at the press (the
+   * synchronous dispatch holds no run id while the Core works) and is bounded by the record's
+   * `updated_at`, so a change that used to look frozen for thirty seconds now visibly ticks.
+   */
+  changeStartedAt: number;
+  changeEndedAt: number;
   dispatched: DispatchResult | null;
   dispatchFailure: Failure | null;
   provider: string;
@@ -1266,6 +1279,31 @@ const ProjectCard = ({
                   </div>
                 ) : null}
               </div>
+            ) : null}
+
+            {/* THE SAME ALIVE BAR THE КУЗНИЦА RAIL USES, directly under the strip.
+                The measured complaint was a change that sat for thirty seconds with nothing
+                moving: the strip already named the run, but a still line reads as a hang. The
+                bar ticks from the press, names the stage and keeps a ribbon moving while the
+                dispatch is really in flight; once the change is recorded it stops and prints
+                «Готово за …» (or the honest failure). It only appears when this press really
+                dispatched a run or is still waiting for one -- an `already_applied` answer is
+                not a run and must not be dressed as one. */}
+            {changeBusy || dispatched !== null ? (
+              <AliveBar
+                lang={lang}
+                inFlight={changeBusy}
+                terminal={!changeBusy && changeStrip !== null && changeStrip.final !== ""}
+                success={changeStrip?.tone === "ok"}
+                observedAt={changeStartedAt}
+                endedAt={changeEndedAt}
+                stage={
+                  changeBusy
+                    ? t(lang, "projects.change.working")
+                    : (changeStrip?.stage ?? t(lang, "projects.change.working"))
+                }
+                testId="change-alive"
+              />
             ) : null}
 
             {/* THE ONE ACTION OF THIS SCREEN, directly under the text it acts on and under
@@ -2925,6 +2963,14 @@ export const Projects = ({
   const [changeStarting, setChangeStarting] = useState(false);
   const [changeRunId, setChangeRunId] = useState("");
   /**
+   * The press that started this change, in epoch milliseconds.
+   *
+   * `POST /api/tasks/run` is synchronous, so the run id — and therefore any record — arrives
+   * only after the Core has finished; the clock of the alive bar starts here, at the click,
+   * and is bounded by the record's own `updated_at` when it arrives.
+   */
+  const [changeObservedAt, setChangeObservedAt] = useState(0);
+  /**
    * THE SYNCHRONOUS GUARD behind the one button.
    *
    * A double click delivers two `onClick`s before React re-renders, so a `useState` flag
@@ -3079,6 +3125,7 @@ export const Projects = ({
       setActionFailure(null);
       setActionNotice("");
       setChangeStarting(true);
+      setChangeObservedAt(Date.now());
       setBusy("version");
       setChangeArmed(false);
       const fromVersion = currentVersionNumber;
@@ -3977,6 +4024,8 @@ export const Projects = ({
           changeFailure={changeFailure}
           changeLocked={changeLocked}
           changeStrip={changeStrip}
+          changeStartedAt={changeObservedAt}
+          changeEndedAt={stampMs(changeRecord?.updated_at)}
           dispatched={dispatched}
           dispatchFailure={dispatchFailure}
           provider={provider}

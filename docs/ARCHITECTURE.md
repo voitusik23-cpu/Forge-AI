@@ -4781,6 +4781,17 @@ only (`event_count`, `state`, `classification`): a stage is marked only when the
 a terminal record prints its state and stops the animation, and reduced motion turns the list into
 plain text. No percentage is computed anywhere.
 
+`ui/src/components/AliveBar.tsx` is the live half of that. Under the Кузница step rail — and under
+the change strip in «Проекты» — it prints «Работаю · 00:37 · всё идёт по плану · этап: пишу файлы»
+from the press that started the run and the record's own `updated_at` (a `POST /api/tasks/run` is
+synchronous, so no run id exists while the Core works and the record publishes no start), with an
+indeterminate CSS ribbon that moves only while the run is in flight and stops on a terminal record
+(«Готово за …» or the honest failure). The four-step rail is marked from the discovery session's
+own `CONFIRMED` state and the run record (`done` / `current` / `pending` / `error`), in
+`ui/src/progress.ts`, which `tests/test_progress_state.py` executes with Node. No percentage, no
+ETA and no timer: `prefers-reduced-motion` and `[data-motion="reduced"]` turn the ribbon into a
+still bar and keep the text.
+
 ### Smoke and tests
 
 `python -m app.smoke_project_lifecycle` runs the whole sequence offline — discovery, plan, project,
@@ -4900,6 +4911,18 @@ the confirmation creating the record and the run attaching to it.
 (`event_count`, `state`, `classification`): этап отмечается лишь когда запись это доказывает,
 терминальная запись печатает своё состояние и останавливает анимацию, а уменьшенная анимация
 превращает список в простой текст. Процент не вычисляется нигде.
+
+`ui/src/components/AliveBar.tsx` — живая половина этого. Под рельсом шагов «Кузницы» (и под полосой
+изменений в «Проектах») он печатает «Работаю · 00:37 · всё идёт по плану · этап: пишу файлы» на
+основе нажатия, начавшего запуск, и собственного `updated_at` записи (`POST /api/tasks/run`
+синхронный, поэтому пока Core работает, id запуска ещё нет, а запись не публикует начало), с
+недетерминированной CSS-лентой, которая движется только пока запуск в полёте и останавливается на
+терминальной записи («Готово за …» или честная неудача). Четыре шага рельса отмечаются по
+собственному состоянию `CONFIRMED` сессии уточнений и по записи запуска (`done` / `current` /
+`pending` / `error`), правила живут в `ui/src/progress.ts` и исполняются
+`tests/test_progress_state.py` с помощью Node. Ни процента, ни ETA, ни таймера:
+`prefers-reduced-motion` и `[data-motion="reduced"]` превращают ленту в неподвижную полосу и
+сохраняют текст.
 
 ### Smoke и тесты
 

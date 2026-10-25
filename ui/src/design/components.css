@@ -617,8 +617,11 @@ select.input { cursor: pointer; }
 }
 
 /* ------------------------------------------------------- discovery flow (Кузница)
-   Four steps, each one a real request: the rail only marks which one is current, it never
-   pretends a step was completed. A step number is a count, never a progress bar. */
+   Four steps, each one a real request. A step is painted from the fact that proves it: `done`
+   (green tick, green border/tint) only for a CONFIRMED discovery session or a terminal-success
+   run, `current` (accent colour, a pulsing dot and a moving shimmer ribbon) for the step the
+   owner is on, `error` (red) for a terminal failure, `pending` (muted) otherwise. The ribbon is
+   indeterminate by design: there is no measured total, so there is no percentage anywhere. */
 .forge-steps {
   display: flex;
   flex-wrap: wrap;
@@ -629,6 +632,8 @@ select.input { cursor: pointer; }
 }
 
 .forge-step {
+  position: relative;
+  overflow: hidden;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -647,10 +652,41 @@ select.input { cursor: pointer; }
   color: var(--text);
 }
 
+/* The moving shimmer: clipped to the pill, painted above the tint and under the text. */
+.forge-step.current::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    100deg,
+    transparent 18%,
+    color-mix(in srgb, var(--workbench-accent) 32%, transparent) 50%,
+    transparent 82%
+  );
+  transform: translateX(-100%);
+  animation: forge-step-ribbon 1800ms linear infinite;
+  pointer-events: none;
+}
+
+@keyframes forge-step-ribbon {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
 .forge-step.done {
   color: var(--text-soft);
-  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 9%, transparent);
 }
+
+.forge-step.error {
+  color: var(--danger-text);
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.forge-step.pending { color: var(--text-muted); }
 
 .forge-step-index {
   display: inline-flex;
@@ -670,6 +706,113 @@ select.input { cursor: pointer; }
   color: var(--text);
   border-color: transparent;
   background: color-mix(in srgb, var(--workbench-accent) 30%, transparent);
+  animation: run-stage-pulse 1500ms ease-in-out infinite;
+}
+
+.forge-step.done .forge-step-index {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+
+.forge-step.error .forge-step-index {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+/* ------------------------------------------------------------- the alive bar
+   One line under the rail (and under the change strip): «Работаю · 00:37 · всё идёт по плану ·
+   этап: пишу файлы». The track is an indeterminate ribbon, never a percentage. It moves only
+   while a run is really in flight; on a terminal record it becomes a still full-width bar in the
+   outcome's colour, so a still bar always means "finished". */
+.forge-alive {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid color-mix(in srgb, var(--workbench-accent) 35%, transparent);
+  background: color-mix(in srgb, var(--workbench-accent) 6%, var(--surface-sunken));
+}
+
+.forge-alive.done {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 8%, var(--surface-sunken));
+}
+
+.forge-alive.failed {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface-sunken));
+}
+
+.forge-alive-track {
+  position: relative;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+}
+
+.forge-alive-ribbon {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -40%;
+  width: 40%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--workbench-accent), transparent);
+  animation: forge-alive-ribbon 1500ms linear infinite;
+}
+
+@keyframes forge-alive-ribbon {
+  from { transform: translateX(0); }
+  to { transform: translateX(350%); }
+}
+
+.forge-alive.done .forge-alive-ribbon,
+.forge-alive.failed .forge-alive-ribbon {
+  left: 0;
+  width: 100%;
+  transform: none;
+  animation: none;
+}
+
+.forge-alive.done .forge-alive-ribbon { background: var(--ok); }
+.forge-alive.failed .forge-alive-ribbon { background: var(--danger); }
+
+.forge-alive-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--t-small);
+  color: var(--text);
+}
+
+.forge-alive-clock { font-variant-numeric: tabular-nums; color: var(--text); }
+.forge-alive-sep { color: var(--text-muted); }
+.forge-alive-hint { font-size: var(--t-micro); }
+
+/* Reduced motion: the OS setting and this interface's own `[data-motion="reduced"]` switch.
+   The ribbon becomes a still full-width bar and the step shimmer disappears; every word, the
+   clock included, stays exactly where it was. */
+@media (prefers-reduced-motion: reduce) {
+  .forge-step.current::after { display: none; }
+  .forge-step.current .forge-step-index { animation: none !important; }
+  .forge-alive-ribbon {
+    left: 0;
+    width: 100%;
+    transform: none;
+    animation: none !important;
+  }
+}
+
+:root[data-motion="reduced"] .forge-step.current::after { display: none; }
+:root[data-motion="reduced"] .forge-alive-ribbon {
+  left: 0;
+  width: 100%;
+  transform: none;
 }
 
 .forge-questions {
