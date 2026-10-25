@@ -273,6 +273,8 @@ class ProjectLauncher:
     request can never disagree about whether something is running. ``windows`` is
     the OS-window integration; a test supplies one whose ``spawn`` records the
     argument vector, so no browser opens on the machine running the suite.
+    ``probe`` is the HTTP probe used to re-check a remembered address before a window
+    is opened on it; it is injectable for the same reason as the rest.
     """
 
     def __init__(
@@ -281,6 +283,7 @@ class ProjectLauncher:
         runner: Any = None,
         previews: Any = None,
         windows: Any = None,
+        probe: Any = None,
         readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
         clock: Any = None,
         sleep: Any = None,
@@ -288,6 +291,9 @@ class ProjectLauncher:
         self._runner = runner
         self._previews = previews
         self._windows = windows if windows is not None else AppWindowOpener()
+        #: ``None`` means "the module's real probe", resolved at call time so a test can
+        #: patch :func:`app.projects.ports.probe_http` and still be asked.
+        self._probe = probe
         self._readiness_timeout = float(readiness_timeout)
         self._clock = clock if clock is not None else time.monotonic
         self._sleep = sleep if sleep is not None else time.sleep
@@ -378,8 +384,12 @@ class ProjectLauncher:
     ) -> Tuple[str, bool]:
         """Serve a static page read-only (or reuse its preview) and return its URL.
 
-        The URL is always the preview's own, built from the ephemeral port the server
-        really bound: there is no guessed port and no portless form.
+        The URL is always one a probe has just answered on. A preview the registry
+        still remembers is reused **only while ``GET <url>`` answers right now**: a
+        session whose server stopped answering is a stale address, and opening it is
+        the grey window this rule exists to prevent. Such a session is stopped and the
+        page is served again; a page that still does not answer afterwards is a refusal
+        with the address in it, never a window.
         """
 
         if self._previews is None:
@@ -391,6 +401,13 @@ class ProjectLauncher:
         running = self._preview_status(project_id)
         reused = bool(running.get("running")) and str(running.get("url", "") or "") != ""
         url = str(running.get("url", "") or "") if reused else ""
+        if reused and not self._url_answers(url):
+            # The registry still lists a preview this process started, but nothing
+            # answers on its port any more: that URL is stale, so it is dropped
+            # instead of being opened, and the page is served afresh below.
+            reused = False
+            url = ""
+            self._stop_preview(project_id)
         if not reused:
             try:
                 started = self._previews.start(
@@ -416,6 +433,13 @@ class ProjectLauncher:
             # one is not opened either -- the same rule as a project process.
             raise LaunchRefusal(
                 "У локального предпросмотра нет порта: открывать нечего.",
+                reason_code="preview_failed",
+                facts={"project_id": project_id, "entry_kind": str(entry.kind)},
+            )
+        if not self._url_answers(url):
+            raise LaunchRefusal(
+                "Локальный предпросмотр не отвечает по адресу "
+                f"{url}: окно не открыто.",
                 reason_code="preview_failed",
                 facts={"project_id": project_id, "entry_kind": str(entry.kind)},
             )
@@ -542,12 +566,17 @@ class ProjectLauncher:
         )
 
     # ------------------------------------------------------------- the two numbers
-    @staticmethod
-    def _url_answers(url: str) -> bool:
-        """Whether a loopback URL the runner recorded still answers, right now."""
+    def _url_answers(self, url: str) -> bool:
+        """Whether a loopback URL still answers, right now.
+
+        Called before any remembered address is reused -- a preview the registry still
+        holds or a run that recorded a port. A stale URL is the difference between a
+        window that shows the project and a grey window that shows nothing.
+        """
 
         port = port_from_url(url)
-        return port > 0 and probe_http(port) > 0
+        probe = self._probe if self._probe is not None else probe_http
+        return port > 0 and probe(port) > 0
 
     @staticmethod
     def _observed_port(url: str, status: Dict[str, Any]) -> int:
@@ -603,6 +632,19 @@ class ProjectLauncher:
             return dict(self._runner.status(target) or {})
         except Exception:  # noqa: BLE001 - an unreadable runner is "no live process"
             return {}
+
+    def _stop_preview(self, project_id: str) -> None:
+        """Forget a preview that no longer answers; a failure here is not fatal."""
+
+        if self._previews is None:
+            return
+        stop = getattr(self._previews, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            stop(project_id)
+        except Exception:  # noqa: BLE001 - the restart below is what matters
+            return
 
     def _start(
         self, project_id: str, target: Any, *, confirm: object, digest: object

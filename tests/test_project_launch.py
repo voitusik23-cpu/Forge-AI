@@ -309,6 +309,7 @@ class _FakeRunner:
 class _FakePreviews:
     def __init__(self, *, started: dict | None = None, running: dict | None = None) -> None:
         self.started_calls: list[dict] = []
+        self.stopped_calls: list[str] = []
         self._started = dict(
             started
             or {"running": True, "url": "http://127.0.0.1:5002/index.html", "port": 5002}
@@ -324,6 +325,22 @@ class _FakePreviews:
         )
         self._running = dict(self._started)
         return dict(self._started)
+
+    def stop(self, project_id):
+        self.stopped_calls.append(project_id)
+        self._running = {"running": False, "url": "", "port": 0}
+        return dict(self._running)
+
+
+def _answering(*ports: int):
+    """A probe that answers only on the named ports, like a real loopback probe."""
+
+    allowed = {int(port) for port in ports}
+
+    def probe(port: int) -> int:
+        return 200 if int(port) in allowed else 0
+
+    return probe
 
 
 class _Session:
@@ -747,11 +764,12 @@ class LauncherUnitTests(unittest.TestCase):
         (self.workspace / "app.py").write_text("print('x')\n", encoding="utf-8")
         return resolve_entry([{"path": path} for path in files]).entry
 
-    def _launcher(self, *, runner=None, previews=None):
+    def _launcher(self, *, runner=None, previews=None, probe=None):
         return ProjectLauncher(
             runner=runner,
             previews=previews,
             windows=self.windows,
+            probe=probe,
             readiness_timeout=0.5,
         )
 
@@ -900,7 +918,9 @@ class LauncherUnitTests(unittest.TestCase):
         )
         previews = _FakePreviews()
         with self.assertRaises(LaunchRefusal) as raised:
-            self._launcher(runner=runner, previews=previews).launch(
+            self._launcher(
+                runner=runner, previews=previews, probe=_answering(5002)
+            ).launch(
                 project_id=PROJECT_ID,
                 target=self._target(entry),
                 entry=entry,
@@ -937,7 +957,9 @@ class LauncherUnitTests(unittest.TestCase):
             },
         )
         previews = _FakePreviews()
-        result = self._launcher(runner=runner, previews=previews).launch(
+        result = self._launcher(
+            runner=runner, previews=previews, probe=_answering(5002)
+        ).launch(
             project_id=PROJECT_ID,
             target=self._target(entry),
             entry=entry,
@@ -1062,7 +1084,7 @@ class LauncherUnitTests(unittest.TestCase):
         previews = _FakePreviews(
             running={"running": True, "url": "http://127.0.0.1:5010/index.html"}
         )
-        result = self._launcher(previews=previews).launch(
+        result = self._launcher(previews=previews, probe=_answering(5010)).launch(
             project_id=PROJECT_ID,
             target=self._target(entry),
             entry=entry,
@@ -1072,6 +1094,74 @@ class LauncherUnitTests(unittest.TestCase):
         self.assertEqual(result.url, "http://127.0.0.1:5010/index.html")
         self.assertEqual(previews.started_calls, [], "the preview was not restarted")
         self.assertEqual(len(self.spawn.calls), 1)
+
+    def test_13a_a_preview_url_that_stopped_answering_is_never_opened(self) -> None:
+        # The registry still lists a preview session, but nothing answers on its port
+        # any more: that address is stale. Opening it is the empty grey window the
+        # owner saw, so the launch serves the page again and opens the new address.
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        entry = resolve_entry([{"path": "index.html"}]).entry
+        stale = "http://127.0.0.1:5011/index.html"
+        fresh = "http://127.0.0.1:5012/index.html"
+        previews = _FakePreviews(
+            running={"running": True, "url": stale},
+            started={"running": True, "url": fresh, "port": 5012},
+        )
+        result = self._launcher(previews=previews, probe=_answering(5012)).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+        )
+        self.assertEqual(result.url, fresh)
+        self.assertFalse(result.reused, "a restarted preview is not a reused one")
+        self.assertEqual(previews.stopped_calls, [PROJECT_ID], "the stale session is dropped")
+        self.assertEqual(len(previews.started_calls), 1, "the page is served again")
+        self.assertEqual(
+            [call["vector"][1] for call in self.spawn.calls],
+            ["--app=" + fresh],
+            "only the address that answered is opened",
+        )
+        self.assertNotIn(
+            stale,
+            [call["vector"][1] for call in self.spawn.calls],
+            "the stale URL is not opened",
+        )
+
+    def test_13b_a_preview_that_never_answers_is_a_refusal_not_a_window(self) -> None:
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        entry = resolve_entry([{"path": "index.html"}]).entry
+        previews = _FakePreviews(
+            started={"running": True, "url": "http://127.0.0.1:5013/index.html", "port": 5013}
+        )
+        with self.assertRaises(LaunchRefusal) as raised:
+            self._launcher(previews=previews, probe=_answering()).launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=1,
+            )
+        self.assertEqual(raised.exception.reason_code, "preview_failed")
+        self.assertIn("5013", str(raised.exception))
+        self.assertEqual(self.spawn.calls, [], "no window is opened on nothing")
+
+    def test_13c_a_url_without_a_port_is_never_opened(self) -> None:
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        entry = resolve_entry([{"path": "index.html"}]).entry
+        previews = _FakePreviews(
+            running={"running": True, "url": "http://127.0.0.1/index.html"},
+            started={"running": True, "url": "http://127.0.0.1/index.html"},
+        )
+        with self.assertRaises(LaunchRefusal) as raised:
+            self._launcher(previews=previews, probe=_answering(80)).launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=1,
+            )
+        self.assertEqual(raised.exception.reason_code, "preview_failed")
+        self.assertEqual(self.spawn.calls, [], "a portless URL never becomes a window")
+        self.assertEqual(self.startfile.urls, [], "and not the default browser either")
 
     def test_14_the_notice_names_both_ports_when_the_manifest_differs(self) -> None:
         # The manifest claims 8765; the application chose 8790 and was already running.
