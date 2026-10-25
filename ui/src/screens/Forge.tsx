@@ -1634,6 +1634,17 @@ export const Forge = ({
         <div className="small muted">{t(lang, "forge.launch.free.note")}</div>
       ) : null}
 
+      {/* MOCK IS LOUD, AND IT IS SAID IMMEDIATELY ABOVE THE BUTTON.
+          The offline engine cannot change a file through a model call, and the measured
+          history is a project that "changed" three times with zero files. This line is
+          printed for the provider the run will really use -- the owner's choice, or the
+          one «Авто» resolves to -- and it is never hidden inside the details. */}
+      {effectiveMockProvider ? (
+        <div className="notice warn" data-testid="launch-mock-warning">
+          {t(lang, "forge.mock.warning")}
+        </div>
+      ) : null}
+
       <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <Button tone="primary" disabled={runBlocked} onClick={() => void submit()}>
           <IconPlay size={15} />

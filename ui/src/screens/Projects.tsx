@@ -90,6 +90,19 @@ import {
   createChangeGuard,
   refusalDetail,
 } from "../change-flight";
+// THE CHANGE BLOCK'S HONEST STATES: the mock warning, the one-press-then-a-different-
+// button rule, the zero-file retry and the «Что сделал Forge» block. They import
+// nothing, so `tests/test_flow_invariants.py` executes them directly from Node.
+import {
+  bestRealProvider,
+  changeControls,
+  effectiveProvider,
+  isMockProvider,
+  versionFilesWord,
+  whatForgeDid,
+  type ChangeControls,
+  type ForgeDid,
+} from "../change-state";
 
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
@@ -164,11 +177,24 @@ type ChangeOutcome = {
   fromVersion: number;
   toVersion: number;
   /**
+   * The version the backend **staged** for this change (the number the press created or
+   * re-targeted). It is not `current_version`: a change that wrote no file leaves the
+   * current version alone, and the strip must still name the record it made (measured:
+   * «файлов 0 — код не менялся (v1 …)» for a change recorded as v2).
+   */
+  stagedVersion: number;
+  /**
    * What the new version really changed, read from its own manifest after the run:
    * a path, whether it was created or updated, and its size. Empty when the run wrote
    * nothing, which is exactly the case the card must not dress up as a new version.
    */
   files: LifecycleArtifact[];
+  /**
+   * True when the backend refused to record a second version for the same words:
+   * the change is already in the project, so no run was dispatched and nothing was
+   * created. It is an answer, not a failure, and the card says exactly that.
+   */
+  alreadyApplied?: boolean;
 };
 
 /**
@@ -761,6 +787,10 @@ const ProjectCard = ({
   onModel,
   modelChoices,
   mockSelected,
+  controls,
+  forgeDid,
+  onRearmChange,
+  onRetryWithRealModel,
   actionFailure,
   actionNotice,
   entrypoint,
@@ -842,6 +872,18 @@ const ProjectCard = ({
   onModel: (value: string) => void;
   modelChoices: string[];
   mockSelected: boolean;
+  /**
+   * THE BLOCK'S CONTROLS, decided by `ui/src/change-state.ts` and nothing else: which
+   * action the primary button performs, whether the form is frozen, whether the mock
+   * warning is printed and whether «Внести ещё изменения» is offered.
+   */
+  controls: ChangeControls;
+  /** «Что сделал Forge», from the model's own answer and the files it really wrote. */
+  forgeDid: ForgeDid;
+  /** «Внести ещё изменения»: the only way the form comes back after a change. */
+  onRearmChange: () => void;
+  /** «Повторить с реальной моделью»: switch to the best non-mock provider and re-run. */
+  onRetryWithRealModel: () => void;
   actionFailure: Failure | null;
   actionNotice: string;
   /** The one entry point the backend detected from the manifest, or null. */
@@ -1084,6 +1126,11 @@ const ProjectCard = ({
                 onChange={(event) => onChange(event.target.value)}
                 placeholder={t(lang, "projects.newversion.placeholder")}
                 data-testid="change-textarea"
+                /* ONE PRESS, THEN A DIFFERENT BUTTON: after a change the words it was
+                   made of are frozen on screen until the owner asks for another change,
+                   so the same sentence cannot be sent twice by a second press. */
+                readOnly={controls.formFrozen}
+                disabled={controls.formFrozen}
               />
             </Field>
             {/* THE STATUS STRIP, immediately above the one action.
@@ -1171,6 +1218,51 @@ const ProjectCard = ({
                         </div>
                       )}
                     </div>
+                    {/* «ЧТО СДЕЛАЛ FORGE», from the model's own answer. The summary is
+                        the model's `model_intent.summary`; the files are the ones it
+                        really wrote, with sizes; when it returned no file the block says
+                        so and quotes the first two lines of its answer -- screened by the
+                        backend. Nothing here is advice, and nothing is composed. */}
+                    <div className="small" style={{ marginTop: 10 }} data-testid="change-what-forge-did">
+                      <div className="label">{t(lang, "projects.change.did.title")}</div>
+                      {forgeDid.summary !== "" ? (
+                        <div style={{ marginTop: 4 }} data-testid="change-did-summary">
+                          {forgeDid.summary}
+                        </div>
+                      ) : null}
+                      {forgeDid.noFiles ? (
+                        <div className="muted" style={{ marginTop: 4 }} data-testid="change-did-no-files">
+                          {t(lang, "projects.change.did.no_files")}
+                        </div>
+                      ) : (
+                        <div className="stack" style={{ gap: 2, marginTop: 4 }}>
+                          {forgeDid.files.map((item) => (
+                            <div
+                              className="mono small"
+                              key={`did-${item.path}`}
+                              style={{ overflowWrap: "anywhere" }}
+                            >
+                              {t(lang, "projects.newversion.changed.line")
+                                .replace("{path}", item.path)
+                                .replace("{change}", changeWord(lang, item.change))
+                                .replace("{size}", bytesLabel(item.size))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {forgeDid.noFiles && forgeDid.answerLines.length > 0 ? (
+                        <div
+                          className="small"
+                          style={{ marginTop: 6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                          data-testid="change-did-answer"
+                        >
+                          <span className="muted">
+                            {t(lang, "projects.change.did.answer")}{": "}
+                          </span>
+                          {forgeDid.answerLines.join("\n")}
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -1180,29 +1272,61 @@ const ProjectCard = ({
                 the strip that reports on it. There used to be TWO primary buttons for one
                 change -- «Начать изменения» and «Исправить проект» -- and the owner
                 pressed both, unsure whether either had started anything. There is now one
-                button, one promise, one state: it is off (with the reason printed, not
-                hovered) until there is a sentence to send, it says «Отправляю…» while the
-                request travels, and the strip above it says what the run did. */}
+                button, one promise, one state.
+
+                ONE PRESS, THEN A DIFFERENT BUTTON. After a change that wrote files the
+                button is off and reads «Изменения внесены (vN)»; the smaller
+                «Внести ещё изменения» is the only thing that re-arms the form. After a
+                change that wrote NOTHING the button reads «Повторить с реальной моделью»
+                and switches the provider in one click -- a zero-file run never looks like
+                a success. */}
             <div className="stack" style={{ gap: 8 }} data-testid="change-actions">
+              {/* MOCK IS LOUD: printed above the button, before the press, because the
+                  offline engine cannot change a single file. */}
+              {controls.mockWarning ? (
+                <div className="notice warn" data-testid="change-mock-warning">
+                  {t(lang, "forge.mock.warning")}
+                </div>
+              ) : null}
               <span data-testid="change-start">
                 <Button
                   tone="primary"
                   wide
-                  disabled={changeBusy || changeEmpty}
+                  disabled={controls.primaryDisabled}
                   disabledReason={
-                    changeEmpty
+                    controls.primary === "start" && changeEmpty
                       ? t(lang, "projects.newversion.start.reason")
-                      : changeBusy
+                      : controls.primary === "sending"
                         ? t(lang, "projects.newversion.start.busy")
-                        : undefined
+                        : controls.primary === "retry"
+                          ? t(lang, "projects.change.retry.none")
+                          : undefined
                   }
-                  onClick={onStartChange}
+                  onClick={
+                    controls.primary === "retry" ? onRetryWithRealModel : onStartChange
+                  }
                 >
-                  {changeBusy
+                  {controls.primary === "sending"
                     ? t(lang, "projects.newversion.sending")
-                    : t(lang, "projects.newversion.start")}
+                    : controls.primary === "applied"
+                      ? t(lang, "projects.change.done.button").replace(
+                          "{version}",
+                          `v${controls.primaryVersion}`
+                        )
+                      : controls.primary === "retry"
+                        ? t(lang, "projects.change.retry")
+                        : t(lang, "projects.newversion.start")}
                 </Button>
               </span>
+              {/* THE SMALLER SECOND ACTION: the form comes back only when the owner says
+                  so, so a second press cannot repeat the sentence just sent. */}
+              {controls.secondaryVisible ? (
+                <span data-testid="change-again">
+                  <Button size="small" tone="ghost" onClick={onRearmChange}>
+                    {t(lang, "projects.change.again")}
+                  </Button>
+                </span>
+              ) : null}
               {/* WHILE THE RUN IS IN FLIGHT the button stays off and the reason is printed
                   beside it, so a second press cannot create a second version. */}
               {changeBusy ? (
@@ -1210,7 +1334,7 @@ const ProjectCard = ({
                   {t(lang, "projects.newversion.start.busy")}
                 </div>
               ) : null}
-              {changeEmpty && !changeBusy ? (
+              {controls.primary === "start" && changeEmpty && !changeBusy ? (
                 <div className="small muted" data-testid="change-start-reason">
                   {t(lang, "projects.newversion.start.reason")}
                 </div>
@@ -1237,7 +1361,7 @@ const ProjectCard = ({
             className="input"
             value={provider}
             onChange={(event) => onProvider(event.target.value)}
-            disabled={backend.status !== "live"}
+            disabled={backend.status !== "live" || controls.formFrozen}
           >
             <option value="">{t(lang, "projects.newversion.provider.auto")}</option>
             {providerOptions(backend).map((item) => (
@@ -1250,7 +1374,12 @@ const ProjectCard = ({
         <label className="field" style={{ flex: "0 1 240px" }}>
           <span className="label">{t(lang, "projects.col.model")}</span>
           {modelChoices.length > 0 ? (
-            <select className="input" value={model} onChange={(event) => onModel(event.target.value)}>
+            <select
+              className="input"
+              value={model}
+              onChange={(event) => onModel(event.target.value)}
+              disabled={controls.formFrozen}
+            >
               {modelChoices.map((item) => (
                 <option key={item} value={item}>
                   {item}
@@ -1264,6 +1393,7 @@ const ProjectCard = ({
               value={model}
               onChange={(event) => onModel(event.target.value)}
               placeholder={t(lang, "forge.task.model.placeholder")}
+              disabled={controls.formFrozen}
             />
           )}
         </label>
@@ -1527,7 +1657,17 @@ const ProjectCard = ({
                       <div className="small muted">{t(lang, "projects.version.mock")}</div>
                     ) : null}
                   </td>
-                  <td className="mono small">{typeof version.file_count === "number" ? version.file_count : "—"}</td>
+                  <td className="mono small">
+                    {typeof version.file_count === "number" ? version.file_count : "—"}
+                    {/* AN EMPTY VERSION SAYS SO. Measured: v3, v4 and v5 were recorded
+                        with zero files and the table only showed "0" — which reads like a
+                        count, not like "the code did not change". */}
+                    {versionFilesWord(version.file_count) === "empty" ? (
+                      <div className="small muted" data-testid="version-empty">
+                        {t(lang, "projects.version.empty")}
+                      </div>
+                    ) : null}
+                  </td>
                   <td className="small" style={{ maxWidth: 260, overflowWrap: "anywhere" }}>
                     {version.change_request && typeof version.change_request.text === "string"
                       ? version.change_request.text
@@ -2821,6 +2961,7 @@ export const Projects = ({
     setChangeStarting(false);
     setChangeRunId("");
     setChangeRecord(null);
+    setChangeArmed(false);
     setFiles(null);
     setHistory(null);
     setSelectedVersion(0);
@@ -2852,6 +2993,56 @@ export const Projects = ({
   const mockSelected = provider === OFFLINE_PROVIDER;
 
   /**
+   * THE PROVIDER A PRESS WOULD REALLY USE.
+   *
+   * «Авто» (`provider === ""`) is not "no provider": the Core's own configured default
+   * runs. The change block therefore names it, so the mock warning is printed for the
+   * engine that will really answer rather than only for a name the owner typed.
+   */
+  const defaultProvider =
+    backend.status === "live" ? String(backend.core.details?.default_provider ?? "") : "";
+  const effectiveProviderName = effectiveProvider(provider, defaultProvider);
+  /**
+   * THE LAST PROVIDER LIST THE CORE REALLY PUBLISHED.
+   *
+   * The shell re-probes the Core every few seconds, and one failed probe publishes an
+   * empty provider list for a moment. Deriving the retry from the *current* list alone
+   * meant a blip disabled «Повторить с реальной моделью» on a screen where the Core had
+   * just listed five providers (measured over CDP right after a change run). The last
+   * non-empty list is kept, so a momentary gap cannot take an action away.
+   */
+  const [knownProviders, setKnownProviders] = useState<string[]>([]);
+  useEffect(() => {
+    if (options.length > 0) setKnownProviders(options);
+  }, [options]);
+
+  /**
+   * THE BEST NON-MOCK PROVIDER, or "" when the deployment has none.
+   *
+   * The zero-file button switches to exactly this one, in one click, and is off with a
+   * printed reason when no real provider is configured at all -- never a button that
+   * silently keeps the offline engine.
+   */
+  const realProvider = useMemo(
+    () =>
+      bestRealProvider(
+        options.length > 0 ? options : knownProviders,
+        defaultProvider
+      ),
+    [options, knownProviders, defaultProvider]
+  );
+  /** The effective provider is the offline engine: the press cannot change any file. */
+  const effectiveMock = isMockProvider(effectiveProviderName);
+  /**
+   * «Внести ещё изменения» was pressed: the form is live again *deliberately*.
+   *
+   * One press, then a different button. After a change the form stays frozen (and the
+   * primary button says what was recorded) until the owner asks for another change, so
+   * a second press on the same words cannot produce a second version.
+   */
+  const [changeArmed, setChangeArmed] = useState(false);
+
+  /**
    * THE ONE ACTION: stage the change and run it, in one click.
    *
    * It used to take two buttons («Начать изменения» then «Исправить проект»), and the
@@ -2866,7 +3057,7 @@ export const Projects = ({
    *   run started, and the card must not suggest one did;
    * * a run sets `changeRunId`, which the strip prints and the poller follows.
    */
-  const startChange = async () => {
+  const startChange = async (overrideProvider?: string) => {
     if (selectedId === "") return;
     const trimmed = change.trim();
     if (trimmed === "") {
@@ -2876,6 +3067,7 @@ export const Projects = ({
     // ONE PRESS, ONE DISPATCH. The guard is taken synchronously: a second click of a
     // double click finds it held and does nothing, so no second version is created.
     if (!changeGuardRef.current.tryAcquire()) return;
+    const chosen = overrideProvider !== undefined ? overrideProvider : provider;
     try {
       setChangeError("");
       setChangeFailure(null);
@@ -2888,12 +3080,34 @@ export const Projects = ({
       setActionNotice("");
       setChangeStarting(true);
       setBusy("version");
+      setChangeArmed(false);
       const fromVersion = currentVersionNumber;
       const stagedOutcome = await createProjectVersion(selectedId, trimmed);
       if (!stagedOutcome.ok) {
         setBusy("");
         setChangeStarting(false);
         setChangeFailure(stagedOutcome.failure);
+        return;
+      }
+      // THE SAME WORDS ARE ONE CHANGE. The backend refuses to record a second version
+      // for a sentence it already holds: `already_applied` means the change is in the
+      // project, so dispatching a run would be a second attempt at nothing. The card
+      // says what is true instead of pressing again.
+      if (stagedOutcome.value.already_applied === true) {
+        setBusy("");
+        setChangeStarting(false);
+        setChangeArmed(false);
+        setChangeOutcome({
+          runId: String(stagedOutcome.value.previous_run_id ?? ""),
+          filesCreated: 0,
+          attached: true,
+          fromVersion,
+          toVersion: Number(stagedOutcome.value.version ?? fromVersion),
+          stagedVersion: Number(stagedOutcome.value.version ?? fromVersion),
+          files: [],
+          alreadyApplied: true,
+        });
+        await loadDetail(selectedId, { quiet: true });
         return;
       }
       const taskText = String(stagedOutcome.value.task_text ?? "");
@@ -2916,7 +3130,11 @@ export const Projects = ({
       const outcome = await dispatchTask({
         description: taskText,
         category: "code",
-        providerName: options.includes(provider) ? provider : undefined,
+        // THE PROVIDER THIS PRESS REALLY USES: the owner's choice, or the one the retry
+        // button just switched to. Naming no provider leaves the Core's default in force,
+        // which is exactly what «Авто» means until the owner picks something else.
+        providerName:
+          chosen !== "" && options.includes(chosen) ? chosen : undefined,
         modelName: model !== "" ? model : undefined,
         // THE LABEL PROMISES WRITING, so the run writes. The old toggle made "write" a
         // separate decision and the primary button could start a run that changed nothing.
@@ -2959,6 +3177,7 @@ export const Projects = ({
         attached: String(outcome.value.response.lifecycle_project_id ?? "") === selectedId,
         fromVersion,
         toVersion,
+        stagedVersion: Number(stagedOutcome.value.version ?? toVersion),
         files: changed,
       });
       await loadList();
@@ -3037,12 +3256,27 @@ export const Projects = ({
     let tone: ChangeStrip["tone"] = "info";
     if (changeOutcome !== null) {
       const advanced = changeOutcome.toVersion > changeOutcome.fromVersion;
-      final = !changeOutcome.attached
-        ? t(lang, "projects.newversion.outcome.unattached")
-        : advanced
-          ? t(lang, "projects.change.done").replace("{version}", `v${changeOutcome.toVersion}`)
-          : t(lang, "projects.newversion.outcome.not_written");
-      if (!advanced) {
+      // A CHANGE THAT WROTE NO FILE IS NOT A SUCCESS, and the strip says it in the
+      // owner's own measure: «файлов 0 — код не менялся». The old wording («изменения не
+      // записаны») read like a hiccup instead of the one fact that matters.
+      const wroteFiles =
+        Number(changeOutcome.filesCreated ?? 0) > 0 || changeOutcome.files.length > 0;
+      final = changeOutcome.alreadyApplied === true
+        ? t(lang, "projects.change.already_applied").replace(
+            "{version}",
+            `v${changeOutcome.stagedVersion || changeOutcome.toVersion}`
+          )
+        : !changeOutcome.attached
+          ? t(lang, "projects.newversion.outcome.unattached")
+          : advanced
+            ? t(lang, "projects.change.done").replace("{version}", `v${changeOutcome.toVersion}`)
+            : t(lang, "projects.change.zero_files").replace(
+                "{version}",
+                `v${changeOutcome.stagedVersion || changeOutcome.toVersion}`
+              );
+      if (changeOutcome.alreadyApplied === true) {
+        tone = "info";
+      } else if (!advanced && !wroteFiles) {
         // THE PLAIN LANGUAGE FIRST. The backend's refusal is a diagnostic sentence
         // («Critical Tier 1 context item … security_forbidden_content:secret …»); the owner
         // needs to know that the *text of his change* was refused by the context check and
@@ -3062,8 +3296,10 @@ export const Projects = ({
         refusalRule = classified.rule;
         refusalDetailText = raw;
         tone = "warn";
-      } else {
+      } else if (advanced && wroteFiles) {
         tone = "ok";
+      } else {
+        tone = "warn";
       }
     }
     return {
@@ -3103,6 +3339,68 @@ export const Projects = ({
     runId: changeRunId,
     finished: changeFinished,
   });
+
+  /** Files this change really wrote; 0 stays 0 instead of becoming "unknown". */
+  const changeFilesWritten = changeOutcome === null
+    ? 0
+    : Math.max(Number(changeOutcome.filesCreated ?? 0), changeOutcome.files.length);
+  /**
+   * WHAT THE BLOCK RENDERS: one press, then a different button; a zero-file change is
+   * never a success; mock is loud. The rules live in `ui/src/change-state.ts` and are
+   * executed from Node by `tests/test_flow_invariants.py`.
+   */
+  const controls = changeControls({
+    empty: change.trim() === "",
+    inFlight: changeStarting || changeLocked,
+    finished: changeFinished,
+    filesWritten: changeFilesWritten,
+    version: changeOutcome?.stagedVersion ?? 0,
+    mocked: effectiveMock,
+    realProvider,
+    armed: changeArmed,
+  });
+  /**
+   * «Что сделал Forge», from the model's own answer and the files it really wrote.
+   * The summary is `model_intent.summary`; the files are the version manifest; the two
+   * answer lines come from the backend's screened excerpt. Nothing is invented here.
+   */
+  const forgeDid = useMemo(
+    () =>
+      whatForgeDid({
+        summary:
+          dispatched !== null
+            ? (dispatched.response.model_intent as Record<string, unknown> | undefined)?.summary
+            : undefined,
+        files: changeStrip?.files ?? [],
+        answerExcerpt: dispatched?.response.answer_excerpt,
+      }),
+    [dispatched, changeStrip]
+  );
+  /** «Внести ещё изменения»: the only way the form comes back after a change. */
+  const rearmChange = () => {
+    setChangeArmed(true);
+    setChangeError("");
+    setChangeFailure(null);
+    setDispatchFailure(null);
+  };
+  /**
+   * «Повторить с реальной моделью»: switch to the best available non-mock provider and
+   * dispatch the same words again, in one press. The backend keeps the same version
+   * number (idempotency by change text), so a retry never breeds another version.
+   */
+  const retryWithRealModel = () => {
+    if (realProvider === "") return;
+    setProvider(realProvider);
+    setChangeArmed(true);
+    setChangeError("");
+    setChangeFailure(null);
+    setDispatchFailure(null);
+    setDispatched(null);
+    setChangeOutcome(null);
+    setChangeRunId("");
+    setChangeRecord(null);
+    void startChange(realProvider);
+  };
 
   return (
     <div className="content">
@@ -3687,6 +3985,10 @@ export const Projects = ({
           onModel={setModel}
           modelChoices={modelChoices}
           mockSelected={mockSelected}
+          controls={controls}
+          forgeDid={forgeDid}
+          onRearmChange={rearmChange}
+          onRetryWithRealModel={retryWithRealModel}
           actionFailure={actionFailure}
           actionNotice={actionNotice}
           entrypoint={entrypoint}

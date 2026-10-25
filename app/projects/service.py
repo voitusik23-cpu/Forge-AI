@@ -65,6 +65,7 @@ from app.projects.models import (
     VERIFICATION_NOT_APPLICABLE,
     VERIFICATION_NOT_RUN,
     VERIFICATION_PASSED,
+    VERIFICATION_PENDING,
     is_safe_relative_path,
     kind_for_path,
     utc_now,
@@ -340,12 +341,39 @@ class NewVersionTask:
     ``task_text`` is what the caller submits to the **existing** task route. The
     service does not run it; the existing run path does, and the confirmed
     discovery session's specification is still prepended there.
+
+    Two facts make a repeated press harmless, and both are published so a caller can
+    say them in plain words instead of running a second time:
+
+    ``already_applied``
+        the last version recorded for **these same words** is the current version and
+        it holds files, so there is nothing left to do. ``task_text`` is empty and a
+        caller must not submit anything.
+    ``retargeted``
+        the last version recorded for these same words holds **no files**, so the
+        retry writes into that same version number instead of appending another empty
+        one. ``task_text`` is a real task and may be submitted.
     """
 
     project: LifecycleProject
     version: int
     task_text: str
     change_request: ChangeRequest
+    already_applied: bool = False
+    retargeted: bool = False
+    previous_run_id: str = ""
+
+
+def change_fingerprint(text: object) -> str:
+    """The identity of a change request: its words, ignoring spacing and letter case.
+
+    Measured defect: the owner pressed «Внести изменения» three times on one sentence
+    and each press recorded another version with zero files (v3, v4, v5). The presses
+    differed by nothing at all, so the identity of a change is its text -- collapsed
+    whitespace, case folded -- and never the moment it was typed.
+    """
+
+    return " ".join(str(text or "").split()).casefold()
 
 
 # --------------------------------------------------------------------------- #
@@ -786,6 +814,58 @@ class ProjectService:
             ]
             project = replace(project, versions=versions, updated_at=timestamp)
         else:
+            # IDEMPOTENCY BY (PROJECT, CHANGE TEXT). The last version recorded for the
+            # very same words decides what a repeated press does, and it never appends a
+            # second entry for the same sentence:
+            #
+            # * it holds files and is the current version -> the change is already in the
+            #   project, so nothing is staged and ``task_text`` stays empty (a caller must
+            #   not dispatch a run);
+            # * it holds no files -> the retry writes into that same version number, so a
+            #   failed attempt cannot breed v4 and v5 out of one sentence.
+            #
+            # Only the newest version is compared: when the project moved on with other
+            # words since, asking for the old change again is a genuinely new request.
+            repeated = self._version_for_change_text(project, text)
+            if repeated is not None:
+                if repeated.files and repeated.version == project.current_version:
+                    return NewVersionTask(
+                        project=project,
+                        version=repeated.version,
+                        task_text="",
+                        change_request=repeated.change_request
+                        or ChangeRequest(text=text, version=repeated.version, created_at=timestamp),
+                        already_applied=True,
+                        previous_run_id=repeated.run_id,
+                    )
+                if not repeated.files:
+                    request = ChangeRequest(
+                        text=text, version=repeated.version, created_at=timestamp
+                    )
+                    retry_slot = replace(
+                        repeated,
+                        run_id="",
+                        files=(),
+                        verification=VERIFICATION_PENDING,
+                        acceptance=ACCEPTANCE_PENDING,
+                        provider="",
+                        model="",
+                        change_request=request,
+                    )
+                    versions = [
+                        retry_slot if item.version == repeated.version else item
+                        for item in project.versions
+                    ]
+                    project = replace(project, versions=versions, updated_at=timestamp)
+                    self._store.write(project)
+                    return NewVersionTask(
+                        project=project,
+                        version=repeated.version,
+                        task_text=_version_task_text(project, repeated.version, text),
+                        change_request=request,
+                        retargeted=True,
+                        previous_run_id=repeated.run_id,
+                    )
             number = max(project.version_numbers, default=0) + 1
             request = ChangeRequest(text=text, version=number, created_at=timestamp)
             slot = ProjectVersion(
@@ -804,6 +884,32 @@ class ProjectService:
             task_text=_version_task_text(project, number, text),
             change_request=request,
         )
+
+    def _version_for_change_text(
+        self, project: LifecycleProject, text: str
+    ) -> Optional[ProjectVersion]:
+        """The newest version recorded for the same words, or ``None``.
+
+        A version with no recorded change request (a first creation) never matches, and
+        only the highest version number is considered: once the project has moved on
+        with other words, the old sentence names a new request rather than a repeat.
+        """
+
+        wanted = change_fingerprint(text)
+        if not wanted:
+            return None
+        candidates = [
+            item
+            for item in project.versions
+            if item.change_request is not None
+            and change_fingerprint(item.change_request.text) == wanted
+        ]
+        if not candidates:
+            return None
+        newest = max(candidates, key=lambda item: item.version)
+        if newest.version != max(project.version_numbers, default=0):
+            return None
+        return newest
 
     # -------------------------------------------------------------- archive
     def archive(self, project_id: object) -> LifecycleProject:

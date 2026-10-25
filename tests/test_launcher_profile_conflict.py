@@ -82,7 +82,7 @@ class FakeSelf:
     window_check_line = launcher.Supervisor.window_check_line
     await_windows_closed = launcher.Supervisor.await_windows_closed
 
-    def watch_api(self, stop_event) -> None:  # the real watchdog is irrelevant to these tests
+    def watch_servers(self, stop_event) -> None:  # the real watchdog is irrelevant to these tests
         stop_event.set()
 
 

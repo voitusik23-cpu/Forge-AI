@@ -177,6 +177,13 @@ class TaskRunResponse:
     #: entry point made no routing decision. Additive and last, exactly like the two
     #: fields above: a client that knows nothing about routing is unaffected.
     model_choice: Dict[str, Any] = field(default_factory=dict)
+    #: «Что сделал Forge» -- the first two lines of the model's own answer, collapsed,
+    #: bounded (``app.projects.what_forge_did``) and screened by the repository's
+    #: credential-shape check before it is published. Empty means the run produced no
+    #: answer to quote; nothing is composed in its place. It exists because a change
+    #: that wrote no files used to say nothing at all about what the model had replied.
+    #: Additive and last, exactly like the two fields above.
+    answer_excerpt: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -210,6 +217,8 @@ class TaskRunResponse:
             "clarification_round": int(self.clarification_round or 0),
             # The automatic routing decision: provider · model · tier · why.
             "model_choice": dict(self.model_choice),
+            # The model's own first lines, screened; empty when there is nothing to quote.
+            "answer_excerpt": self.answer_excerpt,
         }
 
 

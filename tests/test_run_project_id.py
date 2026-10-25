@@ -86,6 +86,10 @@ CONTRACT_KEYS = [
     # that really served the run, its tier, the complexity behind it and the reasons.
     # Additive and last: an empty mapping means this entry point made no decision.
     "model_choice",
+    # «Что сделал Forge»: the first two lines of the model's own answer, bounded and
+    # screened by the backend (`app/projects/what_forge_did.py`), so a run that wrote no
+    # file can still say what the model replied. Additive and last, like the two above.
+    "answer_excerpt",
 ]
 
 #: The workspace/Core project this test server is composed for. It is deliberately

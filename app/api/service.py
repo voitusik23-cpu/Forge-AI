@@ -91,6 +91,11 @@ from app.agent_runtime.routing import (
     choose_model,
 )
 from app.config.settings import OFFLINE_PROVIDER_NAME
+#: The offline scaffold's own "would this overwrite the owner's file?" guard
+#: (``app/projects/mock_answer.py``), and the «Что сделал Forge» excerpt. Both are pure:
+#: they read a path or a string and answer without touching settings, network or run state.
+from app.projects.mock_answer import scaffold_conflicts_with
+from app.projects.what_forge_did import answer_excerpt as _answer_excerpt
 from app.execution.capabilities import ExecutionCapability
 from app.execution.declaration import (
     ExecutionDeclaration,
@@ -4329,12 +4334,24 @@ class ForgeApiService:
         # The guard is asked with the *effective* provider name, not with the write
         # mode string alone, and an empty return means "no scaffold": a real
         # provider's answer is never replaced by Forge's own template.
+        #: «Что сделал Forge» is quoted from this text, and only when there is one.
+        offline_answer = ""
         if write_mode:
             answer = ""
-            if (
+            # THE SCAFFOLD FILLS A PROJECT AND NEVER REPLACES THE OWNER'S FILE.
+            # ``MOCK_DETERMINISTIC`` answers with a generic ``index.html`` + ``app.py``.
+            # On a CHANGE of a delivered project those two names are the project's own
+            # code, so applying the scaffold would replace it with a template while the
+            # card said the project had changed. The offline engine therefore answers a
+            # change with the plan text, which names no file: nothing is written, and the
+            # run says so. A project that simply does not have those files yet is still
+            # filled, which is the intended offline behaviour (smoke and tests rely on it).
+            scaffold_allowed = (
                 write_mode == WRITE_MODE_MOCK_DETERMINISTIC
                 and project_workspace is not None
-            ):
+                and not scaffold_conflicts_with(project_workspace)
+            )
+            if scaffold_allowed:
                 from app.projects.mock_answer import deterministic_answer_for_provider
 
                 answer = deterministic_answer_for_provider(
@@ -4342,6 +4359,10 @@ class ForgeApiService:
                 )
             if not answer:
                 answer = self._offline_write_answer(plan)
+            # The text this path really produced, kept for the response's «Что сделал
+            # Forge» excerpt. It is read after the block, so a run that did not write
+            # quotes nothing rather than a variable that never existed.
+            offline_answer = answer
             write_result = self._apply_model_changes(
                 answer=answer,
                 workspace=scope.workspace,
@@ -4482,6 +4503,10 @@ class ForgeApiService:
                     model_used="deterministic-offline",
                     tier=str(cost_facts.get("cost_tier") or ""),
                 ),
+                # «Что сделал Forge»: on this path the "answer" is the deterministic
+                # report/scaffold, and its first lines are quoted under the same screen
+                # a real answer goes through. Nothing is composed here.
+                answer_excerpt=_answer_excerpt(offline_answer),
             ),
             idempotent_replay=False,
             history_recorded=history_recorded,
@@ -5162,6 +5187,10 @@ class ForgeApiService:
                 model_used=model_used,
                 tier=str(actual_tier or cost_facts.get("cost_tier") or ""),
             ),
+            # «Что сделал Forge»: the model's own first lines, screened and bounded. A
+            # run whose answer named no file still shows what the model actually said,
+            # instead of leaving the owner to guess why nothing was written.
+            answer_excerpt=_answer_excerpt(provider_answer),
         )
         return RunDispatchResult(
             response=response,

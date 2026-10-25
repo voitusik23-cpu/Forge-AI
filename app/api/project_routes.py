@@ -572,6 +572,15 @@ def register_project_routes(
             "version": result.version,
             "task_text": result.task_text,
             "change_request": result.change_request.to_dict(),
+            # THE SAME WORDS ARE ONE CHANGE. ``already_applied`` means the last version
+            # recorded for this exact text is current and holds files, so ``task_text``
+            # is empty and no run may be dispatched; ``retargeted`` means the retry
+            # writes into the same version number instead of appending another empty
+            # one. Both are published so a client can say what happened rather than
+            # pressing again.
+            "already_applied": bool(result.already_applied),
+            "retargeted": bool(result.retargeted),
+            "previous_run_id": result.previous_run_id,
         }
 
     @app.post("/api/projects/{project_id}/archive")

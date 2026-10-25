@@ -53,6 +53,27 @@ def ui_url(screen: str) -> str:
     return UI_BASE if screen != "auth" else f"{UI_BASE}?screen=auth"
 READY_TIMEOUT_SECONDS = 45
 
+#: The two servers the window needs, each with everything required to bring it back:
+#: ``(name, readiness url, launch arguments, log file, ownership role)``. Keeping them in
+#: one tuple is what stops a watchdog from covering only one of them -- which is exactly
+#: how 8011 survived and 8020 stayed dead on 2026-10-25.
+SERVER_ROLES = (
+    ("core-api", API_URL, ["-m", "app.api.main"], "api.log", "api"),
+    (
+        "shell-server",
+        UI_BASE,
+        ["tools/ui_preview_server.py", "--port", str(UI_PORT)],
+        "ui.log",
+        "ui",
+    ),
+)
+
+#: How often the two ports are polled while the window is open.
+SERVER_WATCH_SECONDS = 5.0
+
+#: How many consecutive missed answers mean "this port is dead", not "this moment was busy".
+SERVER_WATCH_MISSES = 2
+
 
 class Browser(NamedTuple):
     """A browser executable the application window may be opened with."""
@@ -1743,6 +1764,11 @@ class Supervisor:
         # Servers this launcher did not start but provably inherited from a launcher that is gone.
         # They are stopped by pid, and only while their identity can still be proven.
         self.adopted: list[tuple[str, int, str]] = []
+        #: ``role -> pid`` for servers that were already answering when this launcher
+        #: started. They are reused, not owned, so their death is reported rather than
+        #: reaped -- and a restart of one is always journaled as a restart of a reused
+        #: process (measured: the shell server that died on 2026-10-25 was one of these).
+        self.reused: dict[str, int] = {}
         self.owned_roles: list[str] = []
         # Windows this launcher opened, as ``{"hwnd", "pid", "created", "registered"}`` entries. They are
         # written into the instance record as well, so the close is decided on recorded state and real
@@ -2254,6 +2280,12 @@ class Supervisor:
         role = OWNED_ROLES.get(name)
         if port_is_served(port):
             self.journal.write(f"{name}: port {port} already answers, reusing it")
+            # Written down so a later restart can say *whose* server died: a reused one was
+            # never ours, and its exit code is not ours to read. Measured: 8020 was a reused
+            # pid, it died, and the journal said nothing at all about it.
+            reused = listening_pid(port)
+            if reused is not None:
+                self.reused[role or name] = int(reused)
             if role is not None:
                 self.adopt_owned(name, role, port)
             return True
@@ -2276,29 +2308,129 @@ class Supervisor:
         self.journal.write(f"{name}: see {(LOGS / log_name)}")
         return False
 
-    def watch_api(self, stop_event: threading.Event) -> None:
-        """Keep the API alive while the window is open; one restart, then report."""
+    def watch_servers(self, stop_event: threading.Event) -> None:
+        """Keep BOTH servers alive while the window is open; one restart each, then report.
 
-        restarts = 0
+        Measured defect (2026-10-25): the shell server on 8020 stopped answering while the
+        window was open. This watchdog existed for ``core-api`` only, so 8011 came back and
+        8020 did not -- every request the window made then died, and nothing on screen said
+        why. A port that is down is not a detail: the whole interface is served from it.
+
+        Three facts are written down for every restart, because "it died" is not a reason:
+
+        * which server and which port stopped answering, and how many checks missed it;
+        * the tail of its own log (a traceback, when it left one) -- so the next reader sees
+          the cause in ``launcher.log`` instead of having to reproduce it;
+        * whether this launcher started it (and its exit code) or merely found it already
+          listening (``reused``), because a reused server that dies cannot be stopped by us.
+
+        One restart per server per session: a server that dies twice is a fact about the
+        machine, and a loop of restarts would hide it behind a busy log.
+        """
+
+        restarts = {name: 0 for name, *_ in SERVER_ROLES}
+        misses = {name: 0 for name, *_ in SERVER_ROLES}
         while not stop_event.is_set():
-            if stop_event.wait(5.0):
+            if stop_event.wait(SERVER_WATCH_SECONDS):
                 return
-            if answers(API_URL):
+            for name, url, arguments, log_name, role in SERVER_ROLES:
+                if answers(url, timeout=1.0):
+                    misses[name] = 0
+                    continue
+                misses[name] += 1
+                # One missed answer can be a moment of load; two in a row is a dead port.
+                if misses[name] < SERVER_WATCH_MISSES:
+                    continue
+                if restarts[name] >= 1:
+                    if misses[name] == SERVER_WATCH_MISSES:
+                        self.journal.write(
+                            f"{name} is not answering again on port "
+                            f"{API_PORT if role == 'api' else UI_PORT}; not restarting a "
+                            f"second time (its log: {LOGS / log_name})"
+                        )
+                    continue
+                restarts[name] += 1
+                self.journal.write(
+                    f"{name} stopped answering on port "
+                    f"{API_PORT if role == 'api' else UI_PORT} after "
+                    f"{misses[name]} checks; restarting it once"
+                )
+                self.journal_server_reason(name, log_name, role)
+                process = start_server(arguments, log_name)
+                self.own.append((f"{name} (restarted)", process))
+                self.record_own(f"{name} (restarted)", role, process)
+                deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+                while time.monotonic() < deadline and not answers(url, timeout=1.0):
+                    time.sleep(0.5)
+                if answers(url, timeout=1.0):
+                    self.journal.write(f"{name}: back after restart (pid {process.pid})")
+                    misses[name] = 0
+                    if role == "ui":
+                        # The window was talking to a dead port; once the shell is back the
+                        # page it shows is reloaded, so the owner does not have to do it.
+                        if hard_reload_window("FORGE AI", self.journal):
+                            self.journal.write(
+                                "the window was reloaded after the shell server came back"
+                            )
+                else:
+                    self.journal.write(
+                        f"{name}: did not come back after the restart; its log is "
+                        f"{LOGS / log_name}"
+                    )
+                    self.journal_log_tail(name, log_name)
+
+    def journal_server_reason(self, name: str, log_name: str, role: str) -> None:
+        """Write down what is known about the server that just stopped answering."""
+
+        port = API_PORT if role == "api" else UI_PORT
+        for entry_name, process in self.own:
+            if not entry_name.startswith(name):
                 continue
-            if restarts >= 1:
-                self.journal.write("core-api is not answering again; not restarting a second time")
-                return
-            restarts += 1
-            self.journal.write("core-api stopped answering; restarting it once")
-            process = start_server(["-m", "app.api.main"], "api.log")
-            self.own.append(("core-api (restarted)", process))
-            self.record_own("core-api (restarted)", "api", process)
-            deadline = time.monotonic() + READY_TIMEOUT_SECONDS
-            while time.monotonic() < deadline and not answers(API_URL):
-                time.sleep(0.5)
+            code = process.poll()
+            if code is not None:
+                self.journal.write(
+                    f"{name}: the process this launcher started has exited with code "
+                    f"{code} (pid {process.pid})"
+                )
+            else:
+                self.journal.write(
+                    f"{name}: pid {process.pid} is still running but no longer answers on "
+                    f"port {port}"
+                )
+        reused = getattr(self, "reused", {}).get(role)
+        if reused is not None:
             self.journal.write(
-                "core-api: " + ("back after restart" if answers(API_URL) else "did not come back")
+                f"{name}: it was NOT started by this launcher -- pid {reused} was already "
+                f"listening on port {port} and was reused without ownership, so its exit "
+                f"cannot be stopped or reaped by us; it is started again here"
             )
+        self.journal_log_tail(name, log_name)
+
+    def journal_log_tail(self, name: str, log_name: str) -> None:
+        """Copy the last traceback (or the last lines) of a server's log into the journal."""
+
+        path = LOGS / log_name
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            self.journal.write(f"{name}: its log {path} could not be read")
+            return
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            self.journal.write(f"{name}: its log {path} is empty")
+            return
+        start = None
+        for index, line in enumerate(lines):
+            if line.startswith("Traceback (most recent call last)"):
+                start = index
+        picked = lines[start : start + 24] if start is not None else lines[-8:]
+        self.journal.write(
+            f"{name}: "
+            + ("its last traceback" if start is not None else "the tail of its log")
+            + f" ({path.name}):"
+        )
+        for line in picked:
+            self.journal.write(f"    {line}")
 
     def close_window(self) -> int:
         """Open the application window and wait for the user to close it."""
@@ -2338,7 +2470,7 @@ class Supervisor:
         self.journal.write(f"browser for the window: {browser.name} ({browser.executable})")
         profile = window_profile(REPO, browser)
         stop_event = threading.Event()
-        watchdog = threading.Thread(target=self.watch_api, args=(stop_event,), daemon=True)
+        watchdog = threading.Thread(target=self.watch_servers, args=(stop_event,), daemon=True)
         watchdog.start()
         restored, conflicted = self.open_window_with_profile(profile, browser)
         if not restored and conflicted and browser.name == "chrome":

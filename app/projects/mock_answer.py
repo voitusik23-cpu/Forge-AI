@@ -31,17 +31,25 @@ project must never hold a template the model did not write.
 from __future__ import annotations
 
 import html
+from pathlib import Path
 
 __all__ = [
     "MOCK_ANSWER_BANNER",
     "MOCK_PROVIDER_NAME",
+    "SCAFFOLD_PATHS",
     "deterministic_answer_for_provider",
     "deterministic_project_answer",
+    "scaffold_conflicts_with",
 ]
 
 
 #: The one provider name this scaffold belongs to: the offline ``mock``.
 MOCK_PROVIDER_NAME = "mock"
+
+#: The paths the answer declares, in order. Applying the scaffold writes exactly these,
+#: which is why :func:`scaffold_conflicts_with` can answer "would this overwrite the
+#: owner's own code?" without parsing the answer.
+SCAFFOLD_PATHS = ("index.html", "app.py")
 
 
 #: Printed in the run's output and written into both files, so a reader never
@@ -75,6 +83,28 @@ def deterministic_answer_for_provider(
     if str(provider_name or "").strip().lower() != MOCK_PROVIDER_NAME:
         return ""
     return deterministic_project_answer(task_text)
+
+
+def scaffold_conflicts_with(folder: object) -> bool:
+    """Whether applying the scaffold would overwrite a file the project already has.
+
+    This is the guard that keeps the offline scaffold on the right side of the line: it
+    may **fill** a project (the intended ``MOCK_DETERMINISTIC`` behaviour, used by the
+    smoke and by the tests), and it may never **replace** the owner's own ``index.html``
+    or ``app.py`` with Forge's template. Measured consequence of getting it wrong: a
+    "change" on a delivered project would silently replace the application with the
+    generic scaffold while the card said the project had changed.
+
+    An unreadable folder reports a conflict: refusing to write is the safe direction.
+    """
+
+    try:
+        root = Path(str(folder))
+        if not root.is_dir():
+            return False
+        return any((root / name).is_file() for name in SCAFFOLD_PATHS)
+    except Exception:  # noqa: BLE001 - an unreadable folder is "do not write"
+        return True
 
 
 def deterministic_project_answer(task_text: object = "") -> str:
@@ -128,13 +158,16 @@ def describe() -> str:
     return PROJECT_TITLE
 '''
 
+    # The two fenced headers are exactly :data:`SCAFFOLD_PATHS`, in order: the guard
+    # above answers "would this overwrite the owner's file?" from that tuple, so the two
+    # must stay the same list. `tests/test_materialization.py` writes through this answer.
     return (
         f"{MOCK_ANSWER_BANNER}\n"
         "The answer below is produced by Forge itself, not by a model.\n\n"
-        "```html path=index.html\n"
+        f"```html path={SCAFFOLD_PATHS[0]}\n"
         f"{page}"
         "```\n\n"
-        "```python path=app.py\n"
+        f"```python path={SCAFFOLD_PATHS[1]}\n"
         f"{module}"
         "```\n"
     )

@@ -6549,10 +6549,23 @@ nothing compiled), `VERIFIED` (files, every Python file compiled) or `FAILED`
 **Two write modes, and nothing else.** `MOCK_DETERMINISTIC` is the offline `mock`
 provider's mode: the answer is a deterministic scaffold Forge itself produces
 (`app.projects.mock_answer`), so the whole writer/manifest/preview path runs with no
-model, no socket and no cost. `REAL_PROVIDER_EXPLICIT` applies only when the caller
+model, no socket and no cost. The scaffold fills a project and never replaces one:
+`scaffold_conflicts_with` refuses it when the project already holds `index.html` or
+`app.py`, because on a delivered project those two names are the owner's code, and a
+"change" that replaced them with Forge's template would be reported as a change while
+destroying the work. Such a run writes nothing, fails, and says so.
+`REAL_PROVIDER_EXPLICIT` applies only when the caller
 sets `write_mode` **and** names both the provider and the model. Any other combination
 resolves to the empty mode, writes nothing, and reports the empty mode in the
 response, so "files appeared" is always traceable to one of two facts.
+
+**The same words are one change.** `new_version` is idempotent by (project, change
+text) after normalising whitespace and letter case. The last version recorded for the
+same words is either `already_applied` (it holds files and is current: nothing is
+staged, `task_text` is empty, no run is dispatched) or `retargeted` (it holds no files:
+the retry writes into the same version number). This exists because the owner pressed
+one button on one sentence three times and the record grew v3, v4 and v5, each with
+zero files: a failed run fills its slot, so every later press appended another one.
 
 **Entry point and preview.** The entry point is detected from the artifact manifest
 only, with a fixed priority (`index.html`; `app.py`/`main.py`/`server.py` at the root;
@@ -6598,10 +6611,23 @@ and `verification_command` fields, and `POST /api/tasks/run` reports `write_mode
 **Ровно два режима записи.** `MOCK_DETERMINISTIC` — режим офлайн-провайдера `mock`:
 ответом служит детерминированный каркас, который производит сам Forge
 (`app.projects.mock_answer`), поэтому весь путь писателя, манифеста и предпросмотра
-проходит без модели, сокета и затрат. `REAL_PROVIDER_EXPLICIT` действует только когда
-вызывающий выставил `write_mode` **и** назвал и провайдера, и модель. Любая другая
-комбинация даёт пустой режим, ничего не пишет и сообщает пустой режим в ответе,
-поэтому «файлы появились» всегда объясняется одним из двух фактов.
+проходит без модели, сокета и затрат. Каркас заполняет проект и никогда его не
+заменяет: `scaffold_conflicts_with` отказывает, если в проекте уже есть `index.html`
+или `app.py`, — на готовом проекте эти два имени и есть код владельца, и «изменение»,
+заменившее их шаблоном Forge, было бы отчитано как изменение, разрушая работу. Такой
+запуск ничего не пишет, завершается ошибкой и говорит об этом. `REAL_PROVIDER_EXPLICIT`
+действует только когда вызывающий выставил `write_mode` **и** назвал и провайдера, и
+модель. Любая другая комбинация даёт пустой режим, ничего не пишет и сообщает пустой
+режим в ответе, поэтому «файлы появились» всегда объясняется одним из двух фактов.
+
+**Одни и те же слова — одно изменение.** `new_version` идемпотентен по паре (проект,
+текст изменения) после нормализации пробелов и регистра. Последняя версия, записанная
+для тех же слов, — это либо `already_applied` (в ней есть файлы, и она текущая: ничего
+не ставится в очередь, `task_text` пуст, запуск не отправляется), либо `retargeted`
+(файлов нет: повтор пишет в тот же номер версии). Это существует потому, что владелец
+нажал одну кнопку на одном предложении три раза, и в записи появились v3, v4 и v5,
+каждая с нулём файлов: неудачный запуск заполняет свой слот, поэтому каждое следующее
+нажатие добавляло ещё один.
 
 **Точка входа и предпросмотр.** Точка входа определяется только по манифесту
 артефактов, с фиксированным приоритетом (`index.html`; `app.py`/`main.py`/`server.py`

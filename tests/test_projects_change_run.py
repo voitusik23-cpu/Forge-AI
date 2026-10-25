@@ -642,8 +642,13 @@ class ChangeFromProjectsScreenTests(_Case):
         self.assertEqual(RUN_NO_CHANGE_NOTICE, "Изменения не записаны: новой версии нет")
         # ... and in the interface, which prints that fact for a change run.
         screen = PROJECTS_SCREEN.read_text(encoding="utf-8")
-        self.assertIn("projects.newversion.outcome.not_written", screen)
-        self.assertIn(f'"{RUN_NO_CHANGE_NOTICE}"', I18N.read_text(encoding="utf-8"))
+        # The strip prints the owner's own measure of the same fact: «файлов 0 — код не
+        # менялся». The sentence above stays in the interface's vocabulary for the
+        # refusals that are not about a file count, so both are asserted here.
+        self.assertIn("projects.change.zero_files", screen)
+        i18n = I18N.read_text(encoding="utf-8")
+        self.assertIn(f'"{RUN_NO_CHANGE_NOTICE}"', i18n)
+        self.assertIn("файлов 0 — код не менялся", i18n)
         # The files on disk did not change either: the current version is still the
         # one describing what the workspace holds.
         self.assertEqual(self._workspace_files(project_id), after_files)
@@ -791,6 +796,232 @@ class ChangeRefusalTests(_Case):
             self._delete_quietly(project_id)
             self._delete_quietly(other_project)
         print("\n".join(self.steps))
+
+
+class RepeatedChangeTextTests(_Case):
+    """The same words are one change: a repeated press never records a second version.
+
+    Measured defect: one record held v3, v4 and v5, all with the same change text and
+    **zero files each**, because the failed run filled its slot (so the slot was no
+    longer "pending") and the next press appended v4, then v5. Nothing refused the
+    duplicate and nothing said the model had returned no files.
+
+    Three rules are asserted here, through the real HTTP surface and the real service:
+
+    1. a change that wrote files is ``already_applied`` on the second stage request:
+       no new version, an empty ``task_text``, and no provider call;
+    2. a change that wrote nothing is ``retargeted`` on the second request: the retry
+       writes into the **same** version number instead of appending another empty one;
+    3. every run response publishes a screened ``answer_excerpt`` of the model's own
+       answer, so the card can say what the model said.
+    """
+
+    def _stage_change(self, project_id: str, change: str) -> dict:
+        return self._json(
+            self.client.post(f"/api/projects/{project_id}/versions", {"change": change}),
+            f"stage {change[:24]!r}",
+        )
+
+    def _run_change(self, project_id: str, task_text: str) -> dict:
+        payload = screen_change_payload(
+            description=task_text,
+            category="code",
+            providerName=self.provider or None,
+            modelName=self.model or None,
+            writeMode=(not self.live),
+            lifecycleProjectId=project_id,
+        )
+        return self._json(self.client.post("/api/tasks/run", payload), "run the change")
+
+    def _version_numbers(self, project_id: str) -> list[int]:
+        # The detail publishes versions newest first; the numbers are what matters here.
+        return sorted(
+            int(item["version"]) for item in self._detail(project_id)["versions"]
+        )
+
+    def test_a_repeated_press_does_not_become_another_version(self) -> None:
+        session_id, project_id = self._confirmed_project(GOAL)
+        self._create_first_version(project_id, session_id)
+        self.assertEqual(self._version_numbers(project_id), [1])
+
+        # ---------------------------------------------- press 1: a change that writes
+        staged = self._stage_change(project_id, CHANGE)
+        self.assertEqual(int(staged["version"]), 2)
+        self.assertIs(staged.get("already_applied"), False)
+        self.assertIs(staged.get("retargeted"), False)
+        first = self._run_change(project_id, str(staged["task_text"]))
+        self.assertGreater(int(first.get("files_created", 0)), 0, first)
+        self.assertEqual(int(self._detail(project_id)["project"]["current_version"]), 2)
+        self.assertEqual(self._version_numbers(project_id), [1, 2])
+        calls_after_first = self._provider_calls()
+
+        # ... «Что сделал Forge» is quoted from the model's own answer, not composed:
+        # the first two non-empty lines of it, exactly.
+        excerpt = str(first.get("answer_excerpt") or "")
+        self.assertTrue(excerpt.strip(), first)
+        expected = [
+            line.strip() for line in CHANGE_ANSWER.splitlines() if line.strip()
+        ][:2]
+        self.assertEqual(excerpt, "\n".join(expected))
+        self.assertLessEqual(len(excerpt.splitlines()), 2)
+
+        # ------------------------------------- press 2: the same words, same sentence
+        # Spacing and letter case are not a different request.
+        repeat = self._stage_change(project_id, "  " + CHANGE.upper() + "\n\n")
+        self.assertIs(repeat.get("already_applied"), True, repeat)
+        self.assertEqual(str(repeat.get("task_text") or ""), "", repeat)
+        self.assertEqual(int(repeat["version"]), 2)
+        self.assertEqual(
+            self._version_numbers(project_id), [1, 2],
+            "a repeated press recorded another version",
+        )
+        # Nothing was dispatched for it: the same answer, no second run.
+        self.assertEqual(self._provider_calls(), calls_after_first)
+        # And the project still says what it said.
+        self.assertEqual(int(self._detail(project_id)["project"]["current_version"]), 2)
+        self.steps.append(
+            "a repeated change text was answered with already_applied=True and kept "
+            f"versions {self._version_numbers(project_id)}"
+        )
+
+        # ------------------------------- a change that writes nothing, twice in a row
+        zero_staged = self._stage_change(project_id, ZERO_FILE_CHANGE)
+        self.assertEqual(int(zero_staged["version"]), 3)
+        zero = self._run_change(project_id, str(zero_staged["task_text"]))
+        self.assertEqual(int(zero.get("files_created", -1)), 0, zero)
+        # The model answered; the answer is quoted, screened, and says nothing was written.
+        self.assertTrue(str(zero.get("answer_excerpt") or "").strip(), zero)
+        detail = self._detail(project_id)
+        self.assertEqual(int(detail["project"]["current_version"]), 2, detail["project"])
+        attempt = next(item for item in detail["versions"] if int(item["version"]) == 3)
+        self.assertEqual(int(attempt["file_count"]), 0, attempt)
+        self.assertIs(detail["presentation"]["change_not_written"], True)
+        calls_after_zero = self._provider_calls()
+
+        # The owner presses again on the same sentence: the retry targets v3, never v4.
+        retry = self._stage_change(project_id, ZERO_FILE_CHANGE)
+        self.assertIs(retry.get("retargeted"), True, retry)
+        self.assertIs(retry.get("already_applied"), False, retry)
+        self.assertEqual(int(retry["version"]), 3)
+        self.assertTrue(str(retry.get("task_text") or "").strip(), retry)
+        self.assertEqual(
+            self._version_numbers(project_id), [1, 2, 3],
+            "an empty change pressed twice recorded another version",
+        )
+        self.assertEqual(self._provider_calls(), calls_after_zero)
+        self.steps.append(
+            "a zero-file change pressed twice re-targeted v3 instead of appending v4"
+        )
+
+    def test_the_empty_slot_is_labelled_and_the_answer_is_screened(self) -> None:
+        """The words the card prints, and the screen's own use of them."""
+
+        from app.projects.service import change_fingerprint  # noqa: PLC0415 - local import
+        from app.projects.what_forge_did import answer_excerpt  # noqa: PLC0415
+
+        # The fingerprint is spacing- and case-insensitive, and empty stays empty.
+        self.assertEqual(change_fingerprint("  Добавь   строку \n"), "добавь строку")
+        self.assertEqual(change_fingerprint(""), "")
+        self.assertEqual(change_fingerprint(None), "")
+
+        # Two lines, collapsed, bounded -- and a secret-shaped answer never leaves.
+        self.assertEqual(
+            answer_excerpt("Первая строка.\n\nВторая строка.\nТретья."),
+            "Первая строка.\nВторая строка.",
+        )
+        self.assertEqual(answer_excerpt(""), "")
+        self.assertEqual(answer_excerpt(None), "")
+        self.assertEqual(
+            answer_excerpt("sk-" + "a1B2c3D4" * 8), "[REDACTED:api_key]"
+        )
+        long_line = "x" * 900
+        self.assertLessEqual(len(answer_excerpt(long_line)), 400)
+
+        # The card prints all three facts, and the interface has the words for them.
+        screen = PROJECTS_SCREEN.read_text(encoding="utf-8")
+        for marker in (
+            'data-testid="change-did-summary"',
+            'data-testid="change-did-no-files"',
+            'data-testid="change-did-answer"',
+            "answer_excerpt",
+        ):
+            self.assertIn(marker, screen)
+        i18n = I18N.read_text(encoding="utf-8")
+        self.assertIn('"projects.change.did.title": "Что сделал Forge"', i18n)
+        self.assertIn('"projects.change.did.no_files": "Модель не вернула файлы"', i18n)
+        self.assertIn("projects.change.zero_files", screen)
+
+
+class MockChangeCannotOverwriteTests(_Case):
+    """The offline scaffold fills an empty project and never rewrites a real one.
+
+    ``MOCK_DETERMINISTIC`` answers with a generic ``index.html`` + ``app.py``. Applied to
+    a project that already holds the owner's own code it would replace that code with a
+    template while the card said "the project changed" -- measured in the same class of
+    failure as a zero-file run that looked like a success. So the offline engine answers
+    a change on a non-empty project with a text that names no file: nothing is written,
+    the run says so, and the files on disk stay byte-identical.
+    """
+
+    def test_a_mock_change_writes_nothing_and_leaves_the_files_alone(self) -> None:
+        session_id, project_id = self._confirmed_project(GOAL)
+        self._create_first_version(project_id, session_id)
+        before_files = self._workspace_files(project_id)
+        self.assertGreater(len(before_files), 0, before_files)
+
+        staged = self._json(
+            self.client.post(
+                f"/api/projects/{project_id}/versions",
+                {"change": "Переделай страницу под тёмную тему."},
+            ),
+            "stage a mock change",
+        )
+        self.assertEqual(int(staged["version"]), 2)
+
+        # The offline provider, in write mode, exactly as the card would send it.
+        payload = screen_change_payload(
+            description=str(staged["task_text"]),
+            category="code",
+            providerName="mock",
+            modelName="deterministic-offline",
+            writeMode=True,
+            lifecycleProjectId=project_id,
+        )
+        run = self._json(self.client.post("/api/tasks/run", payload), "run the mock change")
+
+        self.assertEqual(int(run.get("files_created", -1)), 0, run)
+        self.assertIs(bool(run.get("success")), False, run)
+        self.assertEqual(str(run.get("provider_used") or ""), "mock")
+        # The mode really was the deterministic scaffold's -- and it was not applied.
+        self.assertEqual(
+            str((run.get("write_mode") or "")).upper(), "MOCK_DETERMINISTIC", run
+        )
+        detail = self._detail(project_id)
+        self.assertEqual(int(detail["project"]["current_version"]), 1, detail["project"])
+        attempt = next(item for item in detail["versions"] if int(item["version"]) == 2)
+        self.assertEqual(int(attempt["file_count"]), 0, attempt)
+        # THE PROJECT IS UNTOUCHED, byte for byte: no template replaced its code.
+        self.assertEqual(self._workspace_files(project_id), before_files)
+
+    def test_an_empty_project_still_gets_the_scaffold(self) -> None:
+        """The other half of the same rule: a creation may be scaffolded by Forge."""
+
+        session_id, project_id = self._confirmed_project(GOAL)
+        # The project record exists with no files yet; the mock creation fills it.
+        payload = screen_change_payload(
+            description=GOAL,
+            category="code",
+            providerName="mock",
+            modelName="deterministic-offline",
+            writeMode=True,
+            discoverySessionId=session_id,
+        )
+        created = self._json(self.client.post("/api/tasks/run", payload), "mock creation")
+        self.assertEqual(created.get("lifecycle_project_id"), project_id, created)
+        self.assertGreater(int(created.get("files_created", 0)), 0, created)
+        self.assertEqual(
+            str((created.get("write_mode") or "")).upper(), "MOCK_DETERMINISTIC", created
+        )
 
 
 if __name__ == "__main__":

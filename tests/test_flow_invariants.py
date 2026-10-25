@@ -1170,12 +1170,17 @@ class OnePressChangeTests(unittest.TestCase):
         source = PROJECTS_TSX.read_text(encoding="utf-8")
         # The button is off for the whole flight, not only while the request travels.
         self.assertIn("const changeBusy = busy === \"version\" || changeLocked;", source)
-        self.assertIn("disabled={changeBusy || changeEmpty}", source)
+        # ... and the decision itself lives in `change-state.ts`, where it is executed by
+        # `ChangeBlockTests` below. The screen hands it the flight facts.
+        self.assertIn("inFlight: changeStarting || changeLocked,", source)
+        self.assertIn("disabled={controls.primaryDisabled}", source)
         self.assertIn("changeLocked: boolean;", source)
         self.assertIn("changeLocked={changeLocked}", source)
         self.assertIn("from \"../change-flight\"", source)
-        # The guard is taken synchronously, BEFORE the first await of the handler.
-        handler = source[source.index("const startChange = async () => {"):]
+        # The guard is taken synchronously, BEFORE the first await of the handler. The
+        # handler takes an optional provider so the zero-file retry can switch it in the
+        # same press; the guard still comes first.
+        handler = source[source.index("const startChange = async (overrideProvider?: string) => {"):]
         handler = handler[: handler.index("\n  };")]
         acquired = handler.index("changeGuardRef.current.tryAcquire()")
         first_await = handler.index("await ")
@@ -1233,6 +1238,257 @@ class OnePressChangeTests(unittest.TestCase):
         self.assertIn('data-testid="change-refusal"', source)
         self.assertIn('data-testid="change-refusal-detail"', source)
         self.assertIn('t(lang, "projects.change.technical")', source)
+
+
+class MockIsLoudTests(unittest.TestCase):
+    """Invariant 7: mock never looks like a change, and a zero-file run never a success.
+
+    Measured defect (two projects, the same shape): the owner pressed «Внести изменения»
+    three times on one sentence, `mock` (``deterministic-offline``) or a provider that
+    answered nothing was behind the run, and **each press recorded another version with
+    zero files** (v3, v4, v5 in one record; v4 in another). The card said nothing about
+    the offline engine before the press and nothing honest after it.
+
+    The rules live in ``ui/src/change-state.ts`` and are executed here from their own
+    source with Node, so this file tests the code the screen runs -- not a copy of it.
+    """
+
+    @staticmethod
+    def _state_import() -> str:
+        return f"import * as s from {json.dumps((UI_SOURCE / 'change-state.ts').as_uri())};"
+
+    #: Node's own stdout is decoded with the host's code page here, so every answer is
+    #: emitted as pure ASCII (``\uXXXX`` escapes are valid JSON) and read back as UTF-8
+    #: text by ``json.loads``. Without it «Изменения внесены» arrived as mojibake.
+    _ASCII_JSON = (
+        r"const __a=(v)=>JSON.stringify(v).replace(/[\u007f-\uffff]/g,"
+        r"(c)=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));"
+    )
+
+    @classmethod
+    def _ask(cls, expression: str):
+        script = (
+            cls._state_import()
+            + cls._ASCII_JSON
+            + f"process.stdout.write(__a({expression}));"
+        )
+        return json.loads(_node(script))
+
+    # ------------------------------------------------------------------ the warning
+    def test_01_a_mock_change_carries_a_warning_before_the_press(self) -> None:
+        """The offline engine is named as such on the button's own block."""
+
+        for name, expected in (
+            ("mock", True),
+            ("MOCK", True),
+            ("deterministic-offline", True),
+            (" offline ", True),
+            ("deepseek", False),
+            ("", False),  # unknown is not an accusation
+        ):
+            with self.subTest(provider=name):
+                self.assertIs(self._ask(f"s.isMockProvider({json.dumps(name)})"), expected)
+
+        # «Авто» is the backend's own default, and the warning follows the engine that
+        # will really answer -- not the empty string the select carries.
+        self.assertEqual(
+            self._ask('s.effectiveProvider("", "deepseek")'), "deepseek"
+        )
+        self.assertEqual(self._ask('s.effectiveProvider("mock", "deepseek")'), "mock")
+        self.assertIs(
+            self._ask('s.isMockProvider(s.effectiveProvider("", "mock"))'), True
+        )
+
+    def test_02_the_warning_is_printed_above_the_button_in_words_the_owner_reads(self) -> None:
+        """The exact sentence, above the button, in both screens that can start a run."""
+
+        i18n = I18N.read_text(encoding="utf-8")
+        expected = (
+            "Выбран mock — файлы НЕ изменятся, это офлайн-заглушка. "
+            "Для настоящих изменений выберите deepseek/openrouter/gemini."
+        )
+        self.assertIn(f'"forge.mock.warning": "{expected}"', i18n)
+        projects = PROJECTS_TSX.read_text(encoding="utf-8")
+        forge = FORGE_TSX.read_text(encoding="utf-8")
+        for source, marker in (
+            (projects, 'data-testid="change-mock-warning"'),
+            (forge, 'data-testid="launch-mock-warning"'),
+        ):
+            self.assertIn(marker, source)
+            self.assertIn('t(lang, "forge.mock.warning")', source)
+            # The warning is rendered BEFORE the run button it belongs to.
+            self.assertLess(
+                source.index("forge.mock.warning"),
+                source.index('data-testid="change-start"')
+                if source is projects
+                else source.index("runs.form.submit"),
+                "the mock warning must sit above the button, not below it",
+            )
+        # The change block asks the module, so the decision is not re-implemented inline.
+        self.assertIn("changeControls({", projects)
+        self.assertIn("mocked: effectiveMock,", projects)
+
+    # ------------------------------------------------- one press, then another button
+    def test_03_a_successful_change_replaces_the_button_instead_of_inviting_it(self) -> None:
+        """«Изменения внесены (vN)» + the smaller «Внести ещё изменения»."""
+
+        applied = self._ask(
+            's.changeControls({empty: false, inFlight: false, finished: true,'
+            " filesWritten: 2, version: 3, mocked: false, realProvider: 'deepseek',"
+            " armed: false})"
+        )
+        self.assertEqual(applied["primary"], "applied")
+        self.assertIs(applied["primaryDisabled"], True)
+        self.assertEqual(applied["primaryVersion"], 3)
+        self.assertIs(applied["secondaryVisible"], True)
+        self.assertIs(applied["formFrozen"], True)
+        self.assertEqual(applied["outcome"], "applied")
+        # Only the smaller control re-arms the form, and then the ordinary action is back.
+        armed = self._ask(
+            's.changeControls({empty: false, inFlight: false, finished: true,'
+            " filesWritten: 2, version: 3, mocked: false, realProvider: 'deepseek',"
+            " armed: true})"
+        )
+        self.assertEqual(armed["primary"], "start")
+        self.assertIs(armed["primaryDisabled"], False)
+        self.assertIs(armed["secondaryVisible"], False)
+        self.assertIs(armed["formFrozen"], False)
+
+    def test_04_a_zero_file_change_offers_the_real_model_and_never_success(self) -> None:
+        """«Повторить с реальной моделью», the best non-mock provider, honest words."""
+
+        empty = self._ask(
+            's.changeControls({empty: false, inFlight: false, finished: true,'
+            " filesWritten: 0, version: 3, mocked: true, realProvider: 'deepseek',"
+            " armed: false})"
+        )
+        self.assertEqual(empty["primary"], "retry")
+        self.assertIs(empty["primaryDisabled"], False)
+        self.assertEqual(empty["outcome"], "empty")
+        self.assertIs(empty["secondaryVisible"], True)
+        self.assertIs(empty["formFrozen"], True)
+        # With no real provider the button is off rather than silently retrying mock.
+        blocked = self._ask(
+            's.changeControls({empty: false, inFlight: false, finished: true,'
+            " filesWritten: 0, version: 3, mocked: true, realProvider: '', armed: false})"
+        )
+        self.assertEqual(blocked["primary"], "retry")
+        self.assertIs(blocked["primaryDisabled"], True)
+        # While the run is in flight nothing but «Отправляю…» is offered.
+        flying = self._ask(
+            's.changeControls({empty: false, inFlight: true, finished: false,'
+            " filesWritten: 0, version: 0, mocked: false, realProvider: 'deepseek',"
+            " armed: false})"
+        )
+        self.assertEqual(flying["primary"], "sending")
+        self.assertIs(flying["primaryDisabled"], True)
+        self.assertIs(flying["secondaryVisible"], False)
+
+    def test_05_the_best_non_mock_provider_is_the_deployment_default(self) -> None:
+        """One click switches to a provider that can really change files."""
+
+        options = ["mock", "openrouter", "radox", "deepseek", "google"]
+        self.assertEqual(
+            self._ask(f"s.bestRealProvider({json.dumps(options)}, 'deepseek')"),
+            "deepseek",
+        )
+        # A default that IS the mock is skipped instead of being offered again.
+        self.assertEqual(
+            self._ask(f"s.bestRealProvider({json.dumps(['mock', 'openrouter'])}, 'mock')"),
+            "openrouter",
+        )
+        self.assertEqual(
+            self._ask("s.bestRealProvider(['mock', 'deterministic-offline'], 'mock')"), ""
+        )
+
+    def test_06_the_honest_words_exist_in_both_languages(self) -> None:
+        """«файлов 0 — код не менялся», «Модель не вернула файлы», the retry and the rearm."""
+
+        i18n = I18N.read_text(encoding="utf-8")
+        for text in (
+            "файлов 0 — код не менялся",
+            "Модель не вернула файлы",
+            "Повторить с реальной моделью",
+            "Внести ещё изменения",
+            "Изменения внесены ({version})",
+            "пустая запись: файлов 0 — код не менялся",
+            "0 files — the code did not change",
+            "The model returned no files",
+            "Retry with a real model",
+            "Make one more change",
+        ):
+            self.assertIn(text, i18n)
+        # The version table labels an empty record as an empty record.
+        projects = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn('t(lang, "projects.version.empty")', projects)
+
+    # ------------------------------------------------------- «Что сделал Forge»
+    def test_07_what_forge_did_comes_from_the_models_own_answer(self) -> None:
+        """Summary + files with sizes, and the answer's first two lines when no file."""
+
+        wrote = self._ask(
+            "s.whatForgeDid({summary: "
+            + json.dumps("Добавил подпись в подвал")
+            + ", files: [{path: 'index.html', size: 1200, change: 'update'},"
+            " {path: 'notes.md', size: 40, change: 'create'}],"
+            " answerExcerpt: "
+            + json.dumps("Готово.\nПодпись добавлена.")
+            + "})"
+        )
+        self.assertEqual(wrote["summary"], "Добавил подпись в подвал")
+        self.assertIs(wrote["noFiles"], False)
+        self.assertEqual(
+            wrote["files"],
+            [
+                {"path": "index.html", "size": 1200, "change": "update"},
+                {"path": "notes.md", "size": 40, "change": "create"},
+            ],
+        )
+        # No file from the model: the block says exactly that and quotes the answer.
+        nothing = self._ask(
+            "s.whatForgeDid({summary: "
+            + json.dumps("Не могу изменить файлы")
+            + ", files: [], answerExcerpt: "
+            + json.dumps("Первая строка ответа.\nВторая строка.\nТретья не нужна.")
+            + "})"
+        )
+        self.assertIs(nothing["noFiles"], True)
+        self.assertEqual(nothing["files"], [])
+        self.assertEqual(
+            nothing["answerLines"], ["Первая строка ответа.", "Вторая строка."]
+        )
+        # Empty inputs stay empty: nothing is composed in their place.
+        blank = self._ask("s.whatForgeDid({})")
+        self.assertEqual(blank["summary"], "")
+        self.assertEqual(blank["files"], [])
+        self.assertEqual(blank["answerLines"], [])
+        self.assertIs(blank["noFiles"], True)
+        # The block is rendered by the card, from the response's own fields.
+        projects = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn('data-testid="change-what-forge-did"', projects)
+        self.assertIn('t(lang, "projects.change.did.no_files")', projects)
+        self.assertIn("dispatched?.response.answer_excerpt", projects)
+        self.assertIn("model_intent", projects)
+
+    def test_08_an_empty_version_is_labelled_as_an_empty_version(self) -> None:
+        """The count alone read like a file count; the label says what it means."""
+
+        self.assertEqual(self._ask("s.versionFilesWord(0)"), "empty")
+        self.assertEqual(self._ask("s.versionFilesWord(3)"), "files")
+        self.assertEqual(self._ask("s.versionFilesWord(undefined)"), "empty")
+
+    def test_09_the_screen_switches_the_provider_in_the_retry_press(self) -> None:
+        """«Повторить с реальной моделью» is one action: switch and dispatch the same text."""
+
+        projects = PROJECTS_TSX.read_text(encoding="utf-8")
+        self.assertIn("const retryWithRealModel = () => {", projects)
+        self.assertIn("setProvider(realProvider);", projects)
+        self.assertIn("void startChange(realProvider);", projects)
+        self.assertIn('onClick={\n                    controls.primary === "retry" ? onRetryWithRealModel : onStartChange\n                  }', projects)
+        # The second press of the same words is answered by the backend, not by a new
+        # version, and the card says so.
+        self.assertIn("stagedOutcome.value.already_applied === true", projects)
+        self.assertIn('t(lang, "projects.change.already_applied")', projects)
 
 
 if __name__ == "__main__":

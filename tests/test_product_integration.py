@@ -3588,6 +3588,9 @@ class CompatibilityTests(Block8Case):
                 # and last: an empty mapping means this entry point made no decision, and
                 # no field that existed before it changed.
                 "model_choice",
+                # «Что сделал Forge»: the model's own first lines, screened and bounded by
+                # the backend, so a run that wrote no file can say what it replied.
+                "answer_excerpt",
             },
         )
         status = SystemStatusResponse("c", "a", "READY", 1, 1).to_dict()

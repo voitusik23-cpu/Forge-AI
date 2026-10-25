@@ -4120,7 +4120,20 @@ POST /api/tasks/run  { category: "code", write_mode: true }
 - On the offline provider the "answer" is the deterministic plan text, which
   names no file: the pipeline runs end to end and reports `no_changes`. With a
   lifecycle project it is the mock scaffold instead, and only in
-  `MOCK_DETERMINISTIC` mode.
+  `MOCK_DETERMINISTIC` mode -- and only when applying it would not overwrite a file
+  the project already has (`scaffold_conflicts_with`): the scaffold may fill a
+  project and never replace the owner's own `index.html`/`app.py`, so a `mock`
+  "change" of a delivered project writes nothing and fails honestly.
+- A repeated change press never records a second version. `new_version` is
+  idempotent by (project, change text) with whitespace and letter case normalised
+  away (`change_fingerprint`): the last version recorded for the same words is either
+  `already_applied` (it holds files and is current, so `task_text` is empty and no run
+  is dispatched) or `retargeted` (it holds no files, so the retry writes into the same
+  version number instead of appending another empty one).
+- Every run response publishes `answer_excerpt`: the first two non-empty lines of the
+  model's own answer, collapsed, bounded to 400 characters and screened by the
+  repository's credential check (`app.projects.what_forge_did`). A run that wrote no
+  file can therefore say what the model replied instead of leaving the card silent.
 
 ### Verified limitation
 
@@ -4233,7 +4246,21 @@ POST /api/tasks/run  { category: "code", write_mode: true }
 - На offline-провайдере «ответ» — это детерминированный текст плана, который не
   называет ни одного файла: конвейер проходит целиком и сообщает `no_changes`. При
   наличии lifecycle-проекта ответом служит mock-каркас, и только в режиме
-  `MOCK_DETERMINISTIC`.
+  `MOCK_DETERMINISTIC` — и только когда его применение не перезапишет файл, который в
+  проекте уже есть (`scaffold_conflicts_with`): каркас может заполнить проект и
+  никогда не заменяет собственные `index.html`/`app.py` владельца, поэтому «изменение»
+  через `mock` для готового проекта ничего не пишет и честно завершается ошибкой.
+- Повторное нажатие «Внести изменения» не записывает вторую версию. `new_version`
+  идемпотентен по паре (проект, текст изменения) с нормализацией пробелов и регистра
+  (`change_fingerprint`): последняя версия, записанная для тех же слов, — это либо
+  `already_applied` (в ней есть файлы, и она текущая, поэтому `task_text` пуст и запуск
+  не отправляется), либо `retargeted` (файлов нет, и повтор пишет в тот же номер
+  версии, а не добавляет ещё одну пустую).
+- Каждый ответ запуска публикует `answer_excerpt`: первые две непустые строки
+  собственного ответа модели, сжатые, ограниченные 400 символами и проверенные
+  штатной проверкой учётных данных (`app.projects.what_forge_did`). Поэтому запуск,
+  не записавший ни одного файла, всё равно может сказать, что ответила модель, вместо
+  молчания карточки.
 
 ### Проверенное ограничение
 

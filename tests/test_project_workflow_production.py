@@ -845,6 +845,9 @@ class SuccessfulWorkflowTests(WorkflowTestCase):
                 # Additive and last, like every field above it: an empty mapping means
                 # this entry point made no decision.
                 "model_choice",
+                # «Что сделал Forge»: the model's own first lines, screened and bounded by
+                # the backend, so a run that wrote no file can say what it replied.
+                "answer_excerpt",
             },
         )
 

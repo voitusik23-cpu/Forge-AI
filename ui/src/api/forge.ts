@@ -114,6 +114,20 @@ export type TaskRunResponse = {
    * entry point made no routing decision — never that the run was free.
    */
   model_choice?: ModelChoice;
+  /**
+   * The intent the answer declared, parsed by `parse_model_intent`
+   * (`app/agent_runtime/intent.py`): `intent_type`, `summary`, `valid`,
+   * `validation_errors`, `next_action`, `raw_text_preserved`. Empty when the entry point
+   * parsed no answer. The **summary is the model's own first line**, which is what
+   * «Что сделал Forge» quotes — never a sentence composed by the interface.
+   */
+  model_intent?: Record<string, unknown>;
+  /**
+   * The first two lines of the model's own answer, collapsed, bounded and screened by
+   * the backend (`app/projects/what_forge_did.py`). Empty means there is nothing to
+   * quote — the interface then says so instead of inventing a reason.
+   */
+  answer_excerpt?: string;
 };
 
 /**
@@ -1368,6 +1382,19 @@ export type LifecycleNewVersion = {
   version?: number;
   task_text?: string;
   change_request?: LifecycleChangeRequest;
+  /**
+   * The same words are one change: true when the last version recorded for this exact
+   * text is current and holds files, so `task_text` is empty and **no run may be
+   * dispatched**. It is an answer («это уже внесено»), not a failure.
+   */
+  already_applied?: boolean;
+  /**
+   * True when the retry writes into the version number already recorded for these same
+   * words instead of appending another empty one. `task_text` is a real task.
+   */
+  retargeted?: boolean;
+  /** The run the same words produced last time, or "" — quoted so the card can name it. */
+  previous_run_id?: string;
 };
 
 /** `GET /api/projects/{id}/history`: every version, newest first. */
