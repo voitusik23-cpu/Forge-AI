@@ -65,6 +65,7 @@ import {
   stopProjectRun,
   verificationLabel,
   verifyProject,
+  uploadProjectAttachment,
   type DispatchResult,
   type Failure,
   type LifecycleArtifact,
@@ -105,6 +106,19 @@ import {
   type ChangeControls,
   type ForgeDid,
 } from "../change-state";
+// THE SCREENSHOT THE OWNER ATTACHES TO A CHANGE. What counts as an image on the client,
+// how large, how many, and how the bytes reach the API. The image is an artefact for the
+// owner: the model is told in words that it cannot see it (see the panel's own hint).
+import {
+  IMAGE_ACCEPT,
+  MAX_ATTACHMENTS_PER_CHANGE,
+  MAX_ATTACHMENT_BYTES,
+  dragHasFiles,
+  imageFilesFrom,
+  isImageFile,
+  readFileAsBase64,
+  type ChangeAttachment,
+} from "../change-attachments";
 // THE REPAIR PANEL: what a failed launch means in one plain sentence, the redacted log tail,
 // and the two ways to fix it («Исправить автоматически» and the one-line chat). The rules
 // import nothing, so `tests/test_self_repair.py` executes them directly from Node.
@@ -789,6 +803,11 @@ const ProjectCard = ({
   change,
   onChange,
   changeError,
+  attachments,
+  attachmentBusy,
+  attachmentError,
+  onPickAttachments,
+  onRemoveAttachment,
   onStartChange,
   changeFailure,
   changeLocked,
@@ -866,6 +885,22 @@ const ProjectCard = ({
   change: string;
   onChange: (value: string) => void;
   changeError: string;
+  /**
+   * THE SCREENSHOTS OF THIS CHANGE, already kept with the project.
+   *
+   * The image is an artefact the owner and Forge keep; it is **not** model input. The
+   * panel therefore asks for the error text in one line and the task text says, in words,
+   * that the model cannot see the picture.
+   */
+  attachments: ChangeAttachment[];
+  /** True while one screenshot is travelling to the backend. */
+  attachmentBusy: boolean;
+  /** Why the last screenshot was not attached (the backend's own sentence). */
+  attachmentError: string;
+  /** Files from the picker, a paste or a drop; each one is uploaded immediately. */
+  onPickAttachments: (files: File[]) => void;
+  /** «×» on one chip: the file stays on disk, it just stops being part of this change. */
+  onRemoveAttachment: (path: string) => void;
   /** THE one action of this screen: stage the change and run it. */
   onStartChange: () => void;
   /**
@@ -1104,6 +1139,10 @@ const ProjectCard = ({
   const projectId = String(project.project_id ?? "");
   const canDelete = projectId !== "";
   const changeRef = useRef<HTMLTextAreaElement | null>(null);
+  /* THE SCREENSHOT INPUT: one hidden <input type="file"> opened by the visible button, and
+     a flag that lights the field up while a file is dragged over it. */
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const [attachmentDrag, setAttachmentDrag] = useState(false);
   // The primary action of this screen is gated by the text it acts on, and the reason it
   // is off is printed as a sentence: the owner's words were «где кнопка, которая
   // подтверждает ввод?» -- a control that looks like a caption cannot answer that, and a
@@ -1337,26 +1376,127 @@ const ProjectCard = ({
         <div data-testid="project-change">
           <div className="label">{t(lang, "projects.newversion.title")}</div>
           <div className="stack" style={{ gap: 10, marginTop: 8 }}>
-            <Field
-              label={t(lang, "projects.newversion.field")}
-              hint={t(lang, "projects.newversion.hint")}
-              error={changeError}
+            {/* THE FIELD IS ALSO THE DROP ZONE, and a paste into it is a screenshot when
+                the clipboard holds one. Both are the same action as the button: the file
+                travels to `POST /api/projects/{id}/attachments` and comes back as a chip
+                naming the project-relative path the change text will mention. */}
+            <div
+              className={`change-attach-zone${attachmentDrag ? " change-attach-zone--over" : ""}`}
+              data-testid="change-drop"
+              onDragOver={(event) => {
+                if (!dragHasFiles(event.dataTransfer)) return;
+                event.preventDefault();
+                if (!controls.formFrozen) setAttachmentDrag(true);
+              }}
+              onDragLeave={() => setAttachmentDrag(false)}
+              onDrop={(event) => {
+                setAttachmentDrag(false);
+                const files = imageFilesFrom(event.dataTransfer);
+                if (files.length === 0) return;
+                event.preventDefault();
+                if (!controls.formFrozen) onPickAttachments(files);
+              }}
             >
-              <textarea
-                className="input"
-                rows={3}
-                ref={changeRef}
-                value={change}
-                onChange={(event) => onChange(event.target.value)}
-                placeholder={t(lang, "projects.newversion.placeholder")}
-                data-testid="change-textarea"
-                /* ONE PRESS, THEN A DIFFERENT BUTTON: after a change the words it was
-                   made of are frozen on screen until the owner asks for another change,
-                   so the same sentence cannot be sent twice by a second press. */
-                readOnly={controls.formFrozen}
-                disabled={controls.formFrozen}
+              <Field
+                label={t(lang, "projects.newversion.field")}
+                hint={t(lang, "projects.newversion.hint")}
+                error={changeError}
+              >
+                <textarea
+                  className="input"
+                  rows={3}
+                  ref={changeRef}
+                  value={change}
+                  onChange={(event) => onChange(event.target.value)}
+                  /* A PASTED SCREENSHOT BECOMES AN ATTACHMENT. A pasted sentence stays a
+                     sentence: only a clipboard that really holds an image is intercepted. */
+                  onPaste={(event) => {
+                    const files = imageFilesFrom(event.clipboardData);
+                    if (files.length === 0) return;
+                    event.preventDefault();
+                    if (!controls.formFrozen) onPickAttachments(files);
+                  }}
+                  placeholder={t(lang, "projects.newversion.placeholder")}
+                  data-testid="change-textarea"
+                  /* ONE PRESS, THEN A DIFFERENT BUTTON: after a change the words it was
+                     made of are frozen on screen until the owner asks for another change,
+                     so the same sentence cannot be sent twice by a second press. */
+                  readOnly={controls.formFrozen}
+                  disabled={controls.formFrozen}
+                />
+              </Field>
+              <div className="row between change-attach-row" data-testid="change-attach">
+                <span>
+                  <Button
+                    size="small"
+                    tone="ghost"
+                    disabled={controls.formFrozen || attachmentBusy}
+                    disabledReason={
+                      controls.formFrozen
+                        ? t(lang, "projects.change.again")
+                        : attachmentBusy
+                          ? t(lang, "projects.attach.uploading")
+                          : undefined
+                    }
+                    onClick={() => attachmentInputRef.current?.click()}
+                  >
+                    {attachmentBusy
+                      ? t(lang, "projects.attach.uploading")
+                      : t(lang, "projects.attach.button")}
+                  </Button>
+                </span>
+                <span className="small muted">{t(lang, "projects.attach.drop")}</span>
+              </div>
+              <input
+                ref={attachmentInputRef}
+                type="file"
+                accept={IMAGE_ACCEPT}
+                multiple
+                hidden
+                data-testid="attachment-input"
+                onChange={(event) => {
+                  const chosen = Array.from(event.target.files ?? []).filter(isImageFile);
+                  /* The same input may offer the same file twice; clearing it makes the
+                     next pick of that file an event again. */
+                  event.target.value = "";
+                  if (chosen.length > 0) onPickAttachments(chosen);
+                }}
               />
-            </Field>
+              {attachments.length > 0 ? (
+                <>
+                  <div className="attachment-list" data-testid="change-attachments">
+                    {attachments.map((item) => (
+                      <div className="attachment-chip" data-testid="attachment-chip" key={item.path}>
+                        <img className="attachment-thumb" src={item.previewUrl} alt="" />
+                        <span className="attachment-name" title={item.path}>
+                          {item.name}
+                        </span>
+                        <button
+                          type="button"
+                          className="attachment-remove"
+                          title={t(lang, "projects.attach.remove")}
+                          aria-label={t(lang, "projects.attach.remove")}
+                          data-testid="attachment-remove"
+                          onClick={() => onRemoveAttachment(item.path)}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  {/* THE MODEL CANNOT SEE PIXELS, so the panel asks for the text in one
+                      line. The image is kept as an artefact for the owner and for Forge. */}
+                  <div className="small muted attachment-hint" data-testid="attachment-hint">
+                    {t(lang, "projects.attach.hint")}
+                  </div>
+                </>
+              ) : null}
+              {attachmentError !== "" ? (
+                <div className="notice warn" style={{ marginTop: 8 }} data-testid="attachment-error">
+                  {attachmentError}
+                </div>
+              ) : null}
+            </div>
             {/* THE STATUS STRIP, immediately above the one action.
                 One glance answers «оно вообще началось?»: the run id the dispatch named,
                 the stage word the run record proves, and -- once it ends -- either
@@ -3182,6 +3322,112 @@ export const Projects = ({
 
   const [change, setChange] = useState("");
   const [changeError, setChangeError] = useState("");
+  /**
+   * THE SCREENSHOTS ATTACHED TO THIS CHANGE, kept with the project.
+   *
+   * The owner's complaint was that an honest error gave him nothing to send to Forge. A
+   * screenshot is what he has, so «Что сделать?» takes one -- but the model cannot read
+   * pixels, so the panel asks for the error text in one line and the backend writes the
+   * notice `Приложен скриншот: <path>. Модель не видит изображения — ...` into the task
+   * text. The image stays an artefact for the owner and for Forge; nothing here pretends
+   * the model looked at it.
+   */
+  const [attachments, setAttachments] = useState<ChangeAttachment[]>([]);
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [attachmentError, setAttachmentError] = useState("");
+
+  /**
+   * Upload one paste/drop/pick, one file at a time, and keep what the backend stored.
+   *
+   * Every refusal is the backend's own sentence (not an image / over 5 MB / outside the
+   * project), printed under the field: a control that silently does nothing is the defect
+   * this panel was built to remove. The chip appears only after the API answered with a
+   * real path, so a chip always means «этот файл уже в проекте».
+   */
+  const addAttachments = async (files: File[]): Promise<void> => {
+    if (selectedId === "" || files.length === 0) return;
+    setAttachmentError("");
+    setAttachmentBusy(true);
+    try {
+      let kept = attachments.length;
+      for (const file of files) {
+        if (kept >= MAX_ATTACHMENTS_PER_CHANGE) {
+          setAttachmentError(t(lang, "projects.attach.error.count"));
+          break;
+        }
+        if (!isImageFile(file)) {
+          setAttachmentError(t(lang, "projects.attach.error.image"));
+          continue;
+        }
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          setAttachmentError(t(lang, "projects.attach.error.size"));
+          continue;
+        }
+        let data = "";
+        try {
+          data = await readFileAsBase64(file);
+        } catch {
+          setAttachmentError(
+            t(lang, "projects.attach.error.failed").replace(
+              "{reason}",
+              t(lang, "projects.attach.error.image")
+            )
+          );
+          continue;
+        }
+        const outcome = await uploadProjectAttachment(selectedId, file.name, data);
+        if (!outcome.ok) {
+          const reason =
+            String(outcome.failure.detail ?? "").trim() || t(lang, "projects.err.generic");
+          setAttachmentError(
+            t(lang, "projects.attach.error.failed").replace("{reason}", reason)
+          );
+          continue;
+        }
+        const path = String(outcome.value.path ?? "").trim();
+        if (path === "") {
+          setAttachmentError(
+            t(lang, "projects.attach.error.failed").replace(
+              "{reason}",
+              t(lang, "projects.err.generic")
+            )
+          );
+          continue;
+        }
+        const item: ChangeAttachment = {
+          path,
+          name: String(outcome.value.name ?? "") || file.name || "screenshot",
+          kind: String(outcome.value.kind ?? ""),
+          bytes: Number(outcome.value.bytes ?? file.size ?? 0),
+          previewUrl: URL.createObjectURL(file),
+        };
+        kept += 1;
+        setAttachments((current) =>
+          current.some((entry) => entry.path === item.path) ? current : [...current, item]
+        );
+      }
+    } finally {
+      setAttachmentBusy(false);
+    }
+  };
+
+  /** «×» on a chip: the change stops naming the file. It stays on disk in the project. */
+  const removeAttachment = (path: string): void => {
+    setAttachments((current) => {
+      const gone = current.find((item) => item.path === path);
+      if (gone) URL.revokeObjectURL(gone.previewUrl);
+      return current.filter((item) => item.path !== path);
+    });
+  };
+
+  /** Drop every chip, releasing its local thumbnail URL. */
+  const clearAttachments = (): void => {
+    setAttachments((current) => {
+      current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      return [];
+    });
+    setAttachmentError("");
+  };
   const [changeFailure, setChangeFailure] = useState<Failure | null>(null);
   const [dispatched, setDispatched] = useState<DispatchResult | null>(null);
   const [changeOutcome, setChangeOutcome] = useState<ChangeOutcome | null>(null);
@@ -3252,6 +3498,9 @@ export const Projects = ({
     setChangeRunId("");
     setChangeRecord(null);
     setChangeArmed(false);
+    // The screenshots belong to the change of the project that was open: another card
+    // must not inherit them (their paths name that project's files).
+    clearAttachments();
     setFiles(null);
     setHistory(null);
     setSelectedVersion(0);
@@ -3380,7 +3629,10 @@ export const Projects = ({
       setBusy("version");
       setChangeArmed(false);
       const fromVersion = currentVersionNumber;
-      const stagedOutcome = await createProjectVersion(selectedId, trimmed);
+      // THE SCREENSHOTS TRAVEL WITH THE CHANGE: the paths the upload route published.
+      // The backend re-derives each one before it reaches the model's task text.
+      const attachmentPaths = attachments.map((item) => item.path);
+      const stagedOutcome = await createProjectVersion(selectedId, trimmed, attachmentPaths);
       if (!stagedOutcome.ok) {
         setBusy("");
         setChangeStarting(false);
@@ -3686,6 +3938,9 @@ export const Projects = ({
     setChangeError("");
     setChangeFailure(null);
     setDispatchFailure(null);
+    // A new change starts with its own screenshot, not with the previous one's: the chip
+    // would otherwise silently re-attach a picture of a problem that is already fixed.
+    clearAttachments();
   };
   /**
    * «Повторить с реальной моделью»: switch to the best available non-mock provider and
@@ -4277,6 +4532,11 @@ export const Projects = ({
           change={change}
           onChange={setChange}
           changeError={changeError}
+          attachments={attachments}
+          attachmentBusy={attachmentBusy}
+          attachmentError={attachmentError}
+          onPickAttachments={(files) => void addAttachments(files)}
+          onRemoveAttachment={removeAttachment}
           onStartChange={() => void startChange()}
           changeFailure={changeFailure}
           changeLocked={changeLocked}

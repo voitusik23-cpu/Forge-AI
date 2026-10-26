@@ -1381,6 +1381,11 @@ export type LifecycleNewVersion = {
   project?: LifecycleProject;
   version?: number;
   task_text?: string;
+  /**
+   * The screenshots this change names, project-relative. Empty when it names none, so the
+   * field is additive and a caller that never attaches anything sees the same answer.
+   */
+  attachments?: string[];
   change_request?: LifecycleChangeRequest;
   /**
    * The same words are one change: true when the last version recorded for this exact
@@ -1455,12 +1460,58 @@ export const loadProjectFiles = (
     )
   );
 
-/** `POST /api/projects/{id}/versions` — stage the next version; the backend composes the task text. */
+/**
+ * `POST /api/projects/{id}/versions` — stage the next version; the backend composes the task text.
+ *
+ * `attachmentPaths` are the project-relative paths `uploadProjectAttachment` answered with.
+ * The backend re-derives each one (it must still be this project's own file) and writes the
+ * honest notice into the text the model reads; the staged change keeps the owner's words.
+ */
 export const createProjectVersion = (
   projectId: string,
-  change: string
+  change: string,
+  attachmentPaths: string[] = []
 ): Promise<Result<LifecycleNewVersion>> =>
-  postJson<LifecycleNewVersion>(projectPath(projectId, "/versions"), { change });
+  postJson<LifecycleNewVersion>(projectPath(projectId, "/versions"), {
+    change,
+    // THE SCREENSHOTS THIS CHANGE NAMES, as the project-relative paths the backend
+    // published. It re-derives each one before it is written into the task text, so this
+    // field can only ever name a file of this project. Omitted entirely when there is
+    // none, so a change without a screenshot sends the body it always sent.
+    ...(attachmentPaths.length > 0 ? { attachments: [...attachmentPaths] } : {}),
+  });
+
+/**
+ * One screenshot kept with the project (`POST /api/projects/{id}/attachments`).
+ *
+ * `path` is the project-relative location (`.forge/projects/.../.forge/attachments/...`);
+ * `kind` is what the **bytes** are (`png`, `jpeg`, `gif`, `webp`), decided by magic bytes
+ * on the server, never by the file's name. The image itself is not model input.
+ */
+export type ProjectAttachment = {
+  path?: string;
+  bytes?: number;
+  kind?: string;
+  name?: string;
+};
+
+/**
+ * `POST /api/projects/{id}/attachments` — keep one screenshot with the project.
+ *
+ * Base64 JSON rather than multipart: this surface has one body contract and no multipart
+ * dependency, and a screenshot is a single small blob. Refusals are the backend's own
+ * sentences (not an image / over 5 MB / outside the project), carried in the usual
+ * `Failure`, so the card can print exactly why nothing was attached.
+ */
+export const uploadProjectAttachment = (
+  projectId: string,
+  filename: string,
+  dataBase64: string
+): Promise<Result<ProjectAttachment>> =>
+  postJson<ProjectAttachment>(projectPath(projectId, "/attachments"), {
+    filename,
+    data: dataBase64,
+  });
 
 /** `POST /api/projects/{id}/archive` — freeze the record without deleting anything. */
 export const archiveProject = (projectId: string): Promise<Result<{ project?: LifecycleProject }>> =>

@@ -8,6 +8,7 @@ POST /api/projects/{id}/archive                  -> archived record
 POST /api/projects/{id}/restore                  -> record back at its old status
 GET  /api/projects/{id}/history                  -> versions, newest first
 GET  /api/projects/{id}/files?version=           -> one version's artifact manifest
+POST /api/projects/{id}/attachments {filename,data} -> keep one screenshot with the project
 POST /api/projects/{id}/verify                   -> re-judged record
 GET  /api/projects/{id}/entrypoint               -> the one detected entry point, or null
 POST /api/projects/{id}/preview  {action}        -> start/stop the read-only preview
@@ -51,8 +52,26 @@ Four properties are deliberate:
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any, Dict, List, Mapping, Optional
 
+# ``Request`` is imported here, at module level, for one reason: the upload route annotates
+# its parameter with it, and with ``from __future__ import annotations`` that annotation is
+# resolved against this module's globals. A type imported inside the route would leave
+# FastAPI reading ``request`` as a required *query* parameter (422 on every upload).
+# ``app/api/provider_key_routes.py`` imports it at module level for the same reason.
+from fastapi import Request
+
+from app.projects.attachments import (
+    MAX_ATTACHMENTS_PER_CHANGE,
+    MAX_ATTACHMENT_BYTES,
+    AttachmentRefused,
+    AttachmentTooLarge,
+    existing_attachment,
+    store_attachment,
+    with_attachment_notices,
+)
 from app.projects.entrypoint import (
     SERVE_KIND_STATIC,
     EntryPoint,
@@ -542,6 +561,167 @@ def register_project_routes(
         ) as exc:
             raise _refusal(exc) from exc
 
+    # ------------------------------------------------------- screenshots of a problem
+    #
+    # «Как сказать Forge, что приложение сломалось?» The owner has a screenshot, not a
+    # sentence. It is kept with the project and named in the task text -- but it is NOT
+    # model input, and the sentence the model reads says so
+    # (:data:`app.projects.attachments.ATTACHMENT_NOTICE`).
+
+    #: Where an upload may come from. The surface binds loopback and refuses any other
+    #: bind at composition (``enforce_loopback_bind``), so this check is the route-level
+    #: half of the same promise; ``testclient`` is Starlette's in-process transport, which
+    #: is this same process and never a network peer.
+    _UPLOAD_CLIENTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+
+    def _require_local_uploader(request: Any) -> None:
+        """Refuse an upload that did not arrive over this machine's loopback transport."""
+
+        client = getattr(request, "client", None)
+        host = str(getattr(client, "host", "") or "").strip().lower()
+        if host in _UPLOAD_CLIENTS:
+            return
+        code = "attachment_not_local"
+        raise HTTPException(
+            status_code=403,
+            detail={
+                **error_body(error_code=code, code=code),
+                "error": "Скриншоты принимаются только с этого компьютера.",
+            },
+        )
+
+    def _attachment_refusal(exc: Exception, status: int) -> "HTTPException":
+        """A refused upload with the status that names the real reason.
+
+        ``400`` is a body that is not an image or a reference that is not this project's
+        file; ``413`` is the size limit. Never ``500``: every one of these is the caller's
+        input, and the sentence is the layer's own.
+        """
+
+        code = str(getattr(exc, "code", "attachment_refused"))
+        return HTTPException(
+            status_code=status,
+            detail={**error_body(error_code=code, code=code), "error": str(exc)},
+        )
+
+    @app.post("/api/projects/{project_id}/attachments")
+    def create_project_attachment(
+        project_id: str,
+        payload: Dict[str, Any],
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Keep one screenshot with this project and answer with its published path.
+
+        JSON with base64 ``data`` rather than multipart: this surface has one body
+        contract, one error envelope and no multipart dependency, and a screenshot is a
+        single small blob. What the answer names is ``path`` -- the project-relative
+        location (``.forge/projects/.../.forge/attachments/<timestamp>-<name>``), never an
+        absolute host path -- plus ``bytes`` and the ``kind`` the bytes really are.
+        """
+
+        _require_local_uploader(request)
+        body = dict(payload or {})
+        data_base64 = body.get("data")
+        if not isinstance(data_base64, str) or not data_base64.strip():
+            raise body_error_exception("'data' must be base64-encoded image bytes")
+        # A base64 string longer than 4/3 of the limit cannot decode into anything
+        # smaller, so it is refused before the bytes are allocated.
+        if len(data_base64) > ((MAX_ATTACHMENT_BYTES * 4) // 3) + 8:
+            raise _attachment_refusal(
+                AttachmentTooLarge(
+                    "Скриншот больше 5 МБ: уменьшите его и приложите снова."
+                ),
+                413,
+            )
+        try:
+            blob = base64.b64decode(data_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise body_error_exception(
+                "'data' must be base64-encoded image bytes"
+            ) from exc
+
+        project = _guard(lambda: projects.open_project(_project_id(project_id)))
+        workspace = _workspace_of(project)
+        try:
+            stored = store_attachment(workspace, blob, body.get("filename"))
+        except AttachmentTooLarge as exc:
+            raise _attachment_refusal(exc, 413) from exc
+        except AttachmentRefused as exc:
+            raise _attachment_refusal(exc, 400) from exc
+        return {
+            # ONE composed location, the same convention as an artifact's ``location``:
+            # the client never joins two fields and cannot build an absolute path. It is
+            # repository-relative for a project whose files live inside the repository,
+            # and relative to the owner's configured project root for one delivered
+            # outside it -- never an absolute host path either way.
+            "path": f"{project.project_path}/{stored['relative']}",
+            "bytes": stored["bytes"],
+            "kind": stored["kind"],
+            # The owner's own name, sanitised -- what the chip shows him back.
+            "name": stored["name"],
+        }
+
+    @app.post("/api/projects/{project_id}/versions")
+    def create_project_version(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        change = payload.get("change")
+        if not isinstance(change, str) or not change.strip():
+            raise body_error_exception("'change' must be a non-empty string")
+        attachments = payload.get("attachments")
+        if attachments is not None:
+            if not isinstance(attachments, list) or any(
+                not isinstance(item, str) for item in attachments
+            ):
+                raise body_error_exception(
+                    "'attachments' must be a list of screenshot paths"
+                )
+            if len(attachments) > MAX_ATTACHMENTS_PER_CHANGE:
+                raise body_error_exception(
+                    "'attachments' accepts at most "
+                    f"{MAX_ATTACHMENTS_PER_CHANGE} screenshots"
+                )
+        # THE REFERENCES ARE RE-DERIVED, NEVER TRUSTED, and that happens BEFORE the
+        # version is staged: a path outside this project's own attachments folder cannot
+        # create a version and then fail.
+        kept: List[str] = []
+        project: Any = None
+        if attachments:
+            project = _guard(lambda: projects.open_project(_project_id(project_id)))
+            workspace = _workspace_of(project)
+            for item in attachments:
+                try:
+                    kept.append(
+                        existing_attachment(workspace, project.project_path, item)
+                    )
+                except AttachmentRefused as exc:
+                    raise _attachment_refusal(exc, 400) from exc
+        result = _guard(
+            lambda: projects.new_version(_project_id(project_id), change)
+        )
+        # THE HONEST REFERENCE. The staged version keeps the owner's own words (so the
+        # same sentence is still the same change); only the text the run executes -- the
+        # text the model reads -- names the screenshot and says it cannot be seen.
+        task_text = result.task_text
+        if kept and task_text:
+            task_text = with_attachment_notices(task_text, kept)
+        return {
+            "project": result.project.to_dict(),
+            "version": result.version,
+            "task_text": task_text,
+            # The screenshots this change names, project-relative. Additive: a caller that
+            # sends none gets the list it always got (an empty one).
+            "attachments": kept,
+            "change_request": result.change_request.to_dict(),
+            # THE SAME WORDS ARE ONE CHANGE. ``already_applied`` means the last version
+            # recorded for this exact text is current and holds files, so ``task_text``
+            # is empty and no run may be dispatched; ``retargeted`` means the retry
+            # writes into the same version number instead of appending another empty
+            # one. Both are published so a client can say what happened rather than
+            # pressing again.
+            "already_applied": bool(result.already_applied),
+            "retargeted": bool(result.retargeted),
+            "previous_run_id": result.previous_run_id,
+        }
+
     # Registered BEFORE the ``{project_id}`` route below: FastAPI matches in
     # registration order, so a literal path must come first or it would be read as
     # an id.
@@ -591,30 +771,6 @@ def register_project_routes(
     def get_project(project_id: str) -> Dict[str, Any]:
         project = _guard(lambda: projects.open_project(_project_id(project_id)))
         return _detail(project)
-
-    @app.post("/api/projects/{project_id}/versions")
-    def create_project_version(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        change = payload.get("change")
-        if not isinstance(change, str) or not change.strip():
-            raise body_error_exception("'change' must be a non-empty string")
-        result = _guard(
-            lambda: projects.new_version(_project_id(project_id), change)
-        )
-        return {
-            "project": result.project.to_dict(),
-            "version": result.version,
-            "task_text": result.task_text,
-            "change_request": result.change_request.to_dict(),
-            # THE SAME WORDS ARE ONE CHANGE. ``already_applied`` means the last version
-            # recorded for this exact text is current and holds files, so ``task_text``
-            # is empty and no run may be dispatched; ``retargeted`` means the retry
-            # writes into the same version number instead of appending another empty
-            # one. Both are published so a client can say what happened rather than
-            # pressing again.
-            "already_applied": bool(result.already_applied),
-            "retargeted": bool(result.retargeted),
-            "previous_run_id": result.previous_run_id,
-        }
 
     @app.post("/api/projects/{project_id}/archive")
     def archive_project(project_id: str) -> Dict[str, Any]:
