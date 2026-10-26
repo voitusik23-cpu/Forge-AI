@@ -8668,3 +8668,53 @@ and follows no symlink, so a nested page cannot become an entry.
 (никогда не усекаясь молча в неверную точку входа: манифест всё равно даёт все записанные пути).
 Сканирование корня читает только имена, никогда тела, не рекурсирует и не следует симлинкам,
 поэтому вложенная страница не может стать точкой входа.
+
+
+## 2026-10-26 — A failed launch is explained and repaired under its own button
+
+**Decision.** A refused launch is explained by one panel
+(`ui/src/components/RepairPanel.tsx`) rendered immediately under «Запустить приложение», and
+the cause it prints is derived only from the redacted log lines the `409
+project_launch_refused` already carries (`ui/src/repair.ts`). Its two correction actions
+(«Исправить автоматически» and the one-line chat) go through the *existing* change path
+(`POST /api/projects/{id}/versions` + the dispatch), sharing the change block's strip and
+AliveBar element, with at most two automatic attempts per project in one session. The
+project's own `<project>\launch.log` is read into the same facts and appended on failure, so
+a program started from its desktop shortcut fails into the same panel.
+
+**Why.** The owner asked for one place instead of two "change" flows, for the error to be
+said in plain words immediately under the button, and for Forge to fix a failing program
+itself without him running to the agent each time. Keeping the cause mapping and the attempt
+cap in a pure, Node-executable module means the words he reads are the words the test
+executes.
+
+**Rejected alternatives.** A second change flow inside the panel (a copy of the dispatch
+logic) — it would drift from «Что поправить?»; guessing the port or the module name when the
+log does not name one; relaunching after a zero-file run (unchanged code cannot start); an
+unbounded number of automatic attempts (a loop that would keep spending provider calls on a
+project that needs a decision from the owner).
+
+
+## 2026-10-26 — Неудачный запуск объясняется и чинится под своей кнопкой
+
+**Решение.** Отказ запуска объясняет одна панель (`ui/src/components/RepairPanel.tsx`),
+отрисованная сразу под «Запустить приложение», а причина в ней выводится только из строк
+журнала без секретов, которые уже несёт `409 project_launch_refused`
+(`ui/src/repair.ts`). Оба её действия починки («Исправить автоматически» и однострочный
+чат) идут по **существующему** пути изменения (`POST /api/projects/{id}/versions` + запуск),
+разделяя элемент полосы состояния и AliveBar блока изменения, с не более чем двумя
+автоматическими попытками на проект за сессию. Собственный `<project>\launch.log` проекта
+читается в те же факты и дописывается при ошибке, поэтому программа, запущенная ярлыком с
+рабочего стола, падает в ту же панель.
+
+**Почему.** Владелец просил одно место вместо двух «потоков изменения», чтобы ошибка
+говорилась простыми словами сразу под кнопкой, а Forge сам чинил падающую программу, без
+беготни к агенту каждый раз. Держа отображение причин и предел попыток в чистом модуле,
+исполняемом Node, мы гарантируем: слова, которые он читает, — это слова, которые исполняет
+тест.
+
+**Отклонённые варианты.** Второй поток изменения внутри панели (копия логики запуска) — он
+разошёлся бы с «Что поправить?»; угадывание порта или имени модуля, если журнал их не
+называет; перезапуск после запуска с нулём файлов (неизменённый код не запустится);
+неограниченное число автоматических попыток (цикл, тратящий вызовы провайдера на проект,
+которому нужно решение владельца).

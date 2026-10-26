@@ -91,6 +91,11 @@ from app.projects.entrypoint import (
     EntryPoint,
     resolve_entry,
 )
+from app.projects.launch_log import (
+    LAUNCH_LOG_NAME,
+    append_launch_log,
+    read_launch_log_tail,
+)
 from app.projects.models import ProjectError
 from app.projects.ports import port_from_url, probe_http
 from app.projects.runner import (
@@ -775,6 +780,16 @@ class ProjectLauncher:
         facts, sentence = self._refusal_facts(status, state)
         facts["project_id"] = project_id
         facts["entry_kind"] = str(entry.kind)
+        # THE OTHER WAY INTO THIS PROJECT. A program started from its desktop shortcut runs
+        # outside Forge, so the single channel left is `<project>\launch.log`, which the
+        # project's own launcher writes (the mail project already does). It is read *before*
+        # this refusal appends its own block, so the panel sees what the shortcut left
+        # behind; the block appended below is what makes the next press see this failure.
+        workspace = getattr(target, "workspace", None)
+        own_tail = read_launch_log_tail(workspace)
+        if own_tail:
+            facts["launch_log_tail"] = own_tail
+            facts["launch_log_path"] = LAUNCH_LOG_NAME
         if url:
             facts["url"] = url
             sentence = (
@@ -804,6 +819,17 @@ class ProjectLauncher:
             else "port_not_opened"
         )
         facts["refusal_reason"] = reason_code
+        # ONE LOG FOR BOTH WAYS IN. This failure is appended to `<project>\launch.log` --
+        # bounded, redacted, and only when a process really ran -- so a launch that fails
+        # from the desktop shortcut afterwards carries the same reason, and the panel under
+        # the button reads the one file both paths write. A folder that refuses the write
+        # is not an error: the refusal itself still carries the run's own tail.
+        if facts.get("log_tail") or isinstance(facts.get("exit_code"), int):
+            append_launch_log(
+                workspace,
+                _launch_log_reason(facts),
+                facts.get("log_tail") or (),
+            )
         return LaunchRefusal(sentence, reason_code=reason_code, facts=facts)
 
     def _refusal_facts(
@@ -909,6 +935,26 @@ class ProjectLauncher:
                 reason_code="window_failed",
                 facts={"project_id": project_id, "url": url},
             ) from exc
+
+
+def _launch_log_reason(facts: Dict[str, Any]) -> str:
+    """The short, plain line a failed launch writes into the project's own log.
+
+    It names what Forge itself observed -- whether the program waited for console input and
+    which exit code it ended with -- and never the log's path or a secret. The client turns
+    the *log lines* into the owner's sentence; this line only has to survive to the next
+    press.
+    """
+
+    parts = ["запуск не удался"]
+    if facts.get("waiting_for_input"):
+        parts.append("программа ждала ввода в консоли")
+    code = facts.get("exit_code")
+    if isinstance(code, int):
+        parts.append(f"код {code}")
+    else:
+        parts.append("порт не открылся")
+    return ", ".join(parts) + "."
 
 
 def _workspace_path(workspace: Any) -> Optional[Path]:

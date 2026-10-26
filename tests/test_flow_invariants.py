@@ -1178,10 +1178,13 @@ class OnePressChangeTests(unittest.TestCase):
         self.assertIn("changeLocked={changeLocked}", source)
         self.assertIn("from \"../change-flight\"", source)
         # The guard is taken synchronously, BEFORE the first await of the handler. The
-        # handler takes an optional provider so the zero-file retry can switch it in the
-        # same press; the guard still comes first.
-        handler = source[source.index("const startChange = async (overrideProvider?: string) => {"):]
+        # handler takes an optional provider (so the zero-file retry can switch it in the
+        # same press) and an optional text (the repair panel's chat sends its own sentence
+        # through this very handler); the guard still comes first.
+        handler = source[source.index("const startChange = async ("):]
         handler = handler[: handler.index("\n  };")]
+        self.assertIn("overrideProvider?: string", handler)
+        self.assertIn("textOverride?: string", handler)
         acquired = handler.index("changeGuardRef.current.tryAcquire()")
         first_await = handler.index("await ")
         self.assertLess(

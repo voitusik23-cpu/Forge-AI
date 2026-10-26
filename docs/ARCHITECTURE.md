@@ -6197,3 +6197,100 @@ arbitrary base URL into a provider's transport is separate work.
 записываются и показываются, но транспортом каждого провайдера по-прежнему владеет его
 собственная константа адреса; подключение произвольного базового URL к транспорту — отдельная
 работа.
+
+
+## Repairing a failed launch, right under the button v0.1
+
+The owner's requirement: «если проблемы — говорит об этом сразу под строкой "Запустить
+приложение" и предлагает решить… и я там мог бы с ним переписываться», and «если падает
+программа, Forge сам её и чинит, показывает ошибку, предлагает пути решения».
+
+**One panel, one place.** `ui/src/components/RepairPanel.tsx` is rendered inside
+`data-testid="project-launch"`, immediately after the launch button, and it is the only block
+that explains a failed launch. On success nothing changes: the card prints the single green
+line `projects.launch.success` («Открыто в отдельном окне: <url>») and «Открыть ещё раз».
+The panel appears only when the `409 project_launch_refused` carries run facts
+(`log_tail`, `launch_log_tail`, `exit_code`, `waiting_for_input`); an approval or archived
+refusal keeps its plain sentence, because it has no log to read.
+
+**The cause is read from the log, never guessed.** `ui/src/repair.ts` maps the refusal's own
+lines to five plain sentences — a missing library (`ModuleNotFoundError`/`Cannot find
+module`), a busy port (`WinError 10013`/`10048`, `EADDRINUSE`, "address already in use"), a
+syntax error (with the source line), a program waiting for console input (the backend's fact
+or a prompt-shaped line), and a process that exited (with its code). When nothing matches it
+says «причина в журнале не видна». The last three redacted lines stay visible; the whole
+bounded tail, the log path and the backend's own sentence are folded under «Показать журнал
+полностью».
+
+**The two actions are the existing change path.** «Исправить автоматически» composes one
+deterministic instruction (`composeRepairInstruction`: the error line + «Исправь и добейся,
+чтобы приложение запускалось.») and the one-line chat sends the owner's own text. Both call
+`startChange` — the very handler «Что поправить?» uses — so the version staging, the
+dispatch, the status strip, the AliveBar and the outcome are the same objects; the panel
+receives the change block's own strip element as `children`, so there is no second flow. The
+loop itself (`driveRepair`) performs exactly one dispatch and at most one launch retry per
+press, counts **automatic** attempts only, and stops after `REPAIR_ATTEMPT_LIMIT = 2` with
+«больше не пробую сам — скажите, что менять». A run that wrote no file is never relaunched:
+the panel says «изменения не записаны». A successful retry clears the panel and leaves the
+green line.
+
+**Both ways into a project share one log.** `app/projects/launch_log.py` reads and appends
+`<project>\launch.log`. A program started from its desktop shortcut runs outside Forge, so
+that file (which the mail project's launcher already writes) is the only channel left: the
+launch refusal publishes its redacted tail as `launch_log_tail`/`launch_log_path`, read
+before the refusal appends its own bounded block, which is what makes the next press — from
+either path — show the same reason. Every line goes through the runner's
+`redact_output_text`; the file is trimmed past 64 KiB from the front.
+
+`tests/test_self_repair.py` executes the client rules from their TypeScript source with Node
+and drives the loop with injected fakes; the backend evidence is produced by the real
+`ProjectLauncher` over a real folder and a fake supervisor.
+
+
+## Починка неудачного запуска прямо под кнопкой v0.1
+
+Требование владельца: «если проблемы — говорит об этом сразу под строкой "Запустить
+приложение" и предлагает решить… и я там мог бы с ним переписываться», и «если падает
+программа, Forge сам её и чинит, показывает ошибку, предлагает пути решения».
+
+**Одна панель, одно место.** `ui/src/components/RepairPanel.tsx` рендерится внутри
+`data-testid="project-launch"`, сразу после кнопки запуска, и это единственный блок,
+объясняющий неудачный запуск. При успехе ничего не меняется: карточка печатает одну зелёную
+строку `projects.launch.success` («Открыто в отдельном окне: <url>») и «Открыть ещё раз».
+Панель появляется только когда `409 project_launch_refused` несёт факты запуска
+(`log_tail`, `launch_log_tail`, `exit_code`, `waiting_for_input`); отказ по одобрению или
+архиву сохраняет своё предложение, потому что читать журнал там нечего.
+
+**Причина читается из журнала, а не угадывается.** `ui/src/repair.ts` переводит
+собственные строки отказа в пять понятных предложений — не хватает библиотеки
+(`ModuleNotFoundError`/`Cannot find module`), порт занят (`WinError 10013`/`10048`,
+`EADDRINUSE`, "address already in use"), ошибка в коде (с номером строки), программа ждёт
+ввода (факт бэкенда или строка-приглашение), процесс завершился (с кодом). Если ничего не
+совпало, панель говорит «причина в журнале не видна». Последние три строки (без секретов)
+остаются на виду; полный ограниченный хвост, путь журнала и собственное предложение
+бэкенда складываются под «Показать журнал полностью».
+
+**Два действия — это существующий путь изменения.** «Исправить автоматически» составляет
+одну детерминированную инструкцию (`composeRepairInstruction`: строка ошибки + «Исправь и
+добейся, чтобы приложение запускалось.»), а однострочный чат отправляет текст владельца.
+Оба вызывают `startChange` — тот самый обработчик, что и «Что поправить?», поэтому запись
+версии, запуск, полоса состояния, AliveBar и итог — те же объекты; панель получает
+собственный элемент полосы блока изменения как `children`, поэтому второго потока нет.
+Сам цикл (`driveRepair`) делает ровно один запуск изменения и не более одной повторной
+попытки запуска за нажатие, считает только **автоматические** попытки и останавливается
+после `REPAIR_ATTEMPT_LIMIT = 2` с «больше не пробую сам — скажите, что менять». Запуск,
+не записавший ни одного файла, не перезапускается: панель говорит «изменения не записаны».
+Успешная повторная попытка убирает панель и оставляет зелёную строку.
+
+**Оба входа в проект делят один журнал.** `app/projects/launch_log.py` читает и дописывает
+`<project>\launch.log`. Программа, запущенная ярлыком с рабочего стола, работает вне Forge,
+поэтому этот файл (его уже пишет лаунчер почтового проекта) — единственный оставшийся
+канал: отказ запуска публикует его хвост без секретов как
+`launch_log_tail`/`launch_log_path`, прочитанный до того, как отказ допишет свой
+ограниченный блок, — именно это позволяет следующему нажатию (любым путём) показать ту же
+причину. Каждая строка проходит через `redact_output_text` раннера; файл обрезается спереди
+после 64 КиБ.
+
+`tests/test_self_repair.py` исполняет клиентские правила из их TypeScript-исходника через
+Node и прогоняет цикл на подставных зависимостях; доказательство бэкенда получается настоящим
+`ProjectLauncher` на настоящей папке и подставном супервизоре.

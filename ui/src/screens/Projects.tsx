@@ -105,6 +105,18 @@ import {
   type ChangeControls,
   type ForgeDid,
 } from "../change-state";
+// THE REPAIR PANEL: what a failed launch means in one plain sentence, the redacted log tail,
+// and the two ways to fix it («Исправить автоматически» and the one-line chat). The rules
+// import nothing, so `tests/test_self_repair.py` executes them directly from Node.
+import {
+  composeRepairInstruction,
+  driveRepair,
+  initialRepairState,
+  repairPanelModel,
+  type LaunchFacts,
+  type RepairState,
+} from "../repair";
+import { RepairPanel } from "../components/RepairPanel";
 
 const text = (value: unknown, fallback = "—"): string =>
   value === undefined || value === null || value === "" ? fallback : String(value);
@@ -815,6 +827,14 @@ const ProjectCard = ({
   launchBusy,
   launchNotice,
   launchFailure,
+  repairFacts,
+  repairAttempts,
+  repairState,
+  repairChat,
+  onRepairChat,
+  onRepairSend,
+  onRepairAuto,
+  repairBusy,
   onDelete,
   open,
   folder,
@@ -935,6 +955,22 @@ const ProjectCard = ({
   launchNotice: string;
   /** The backend's refusal verbatim, when the launch could not show anything. */
   launchFailure: Failure | null;
+  /**
+   * THE REPAIR PANEL's facts: the refusal's structured fields (its redacted log tail, the
+   * exit code, whether the program waited for input) and the project-launcher log the
+   * backend also read. `null` means "no panel": either nothing failed yet, or the refusal
+   * carried no run facts to explain (an approval refusal keeps its plain sentence).
+   */
+  repairFacts: LaunchFacts | null;
+  /** Automatic repair attempts already spent on this project in this session. */
+  repairAttempts: number;
+  /** The repair loop's last answer, from `ui/src/repair.ts`. */
+  repairState: RepairState | null;
+  repairChat: string;
+  onRepairChat: (value: string) => void;
+  onRepairSend: () => void;
+  onRepairAuto: () => void;
+  repairBusy: boolean;
   /**
    * Delete this project: the parent asks the backend, which *moves* the folder into
    * `.forge/projects-deleted`. The click is refused until it is confirmed inside the card,
@@ -1127,37 +1163,17 @@ const ProjectCard = ({
    * edit a project: one textarea, one button, no terminal. Keeping the JSX in one
    * place while moving where it appears is what lets the same handlers serve it.
    */
-  const changeBlock = (
+  /* THE CHANGE FLIGHT, AS ONE VALUE.
+   *
+   * The status strip, the outcome and the live bar are the *one* report of a change run
+   * in this card. They are built here, from the facts above, and rendered twice: inside
+   * «Что поправить?» and inside the repair panel under the launch button
+   * (`ui/src/components/RepairPanel.tsx`), which receives this very element as its
+   * `children`. That is what makes a change dispatched from the panel indistinguishable
+   * from one dispatched from the block: same strip, same words, same run state -- one
+   * flow, not two. */
+  const changeFlightBlock = (
     <>
-        {/* ----------------------------------------------------------- new version */}
-        <div data-testid="project-change">
-          <div className="label">{t(lang, "projects.newversion.title")}</div>
-          <div className="stack" style={{ gap: 10, marginTop: 8 }}>
-            <Field
-              label={t(lang, "projects.newversion.field")}
-              hint={t(lang, "projects.newversion.hint")}
-              error={changeError}
-            >
-              <textarea
-                className="input"
-                rows={3}
-                ref={changeRef}
-                value={change}
-                onChange={(event) => onChange(event.target.value)}
-                placeholder={t(lang, "projects.newversion.placeholder")}
-                data-testid="change-textarea"
-                /* ONE PRESS, THEN A DIFFERENT BUTTON: after a change the words it was
-                   made of are frozen on screen until the owner asks for another change,
-                   so the same sentence cannot be sent twice by a second press. */
-                readOnly={controls.formFrozen}
-                disabled={controls.formFrozen}
-              />
-            </Field>
-            {/* THE STATUS STRIP, immediately above the one action.
-                One glance answers «оно вообще началось?»: the run id the dispatch named,
-                the stage word the run record proves, and -- once it ends -- either
-                «Готово: vN записана» or the backend's own refusal, verbatim. It appears on
-                the click, not after the first refresh. */}
             {changeStrip !== null ? (
               <div
                 className="notice"
@@ -1312,6 +1328,41 @@ const ProjectCard = ({
                 testId="change-alive"
               />
             ) : null}
+    </>
+  );
+
+  const changeBlock = (
+    <>
+        {/* ----------------------------------------------------------- new version */}
+        <div data-testid="project-change">
+          <div className="label">{t(lang, "projects.newversion.title")}</div>
+          <div className="stack" style={{ gap: 10, marginTop: 8 }}>
+            <Field
+              label={t(lang, "projects.newversion.field")}
+              hint={t(lang, "projects.newversion.hint")}
+              error={changeError}
+            >
+              <textarea
+                className="input"
+                rows={3}
+                ref={changeRef}
+                value={change}
+                onChange={(event) => onChange(event.target.value)}
+                placeholder={t(lang, "projects.newversion.placeholder")}
+                data-testid="change-textarea"
+                /* ONE PRESS, THEN A DIFFERENT BUTTON: after a change the words it was
+                   made of are frozen on screen until the owner asks for another change,
+                   so the same sentence cannot be sent twice by a second press. */
+                readOnly={controls.formFrozen}
+                disabled={controls.formFrozen}
+              />
+            </Field>
+            {/* THE STATUS STRIP, immediately above the one action.
+                One glance answers «оно вообще началось?»: the run id the dispatch named,
+                the stage word the run record proves, and -- once it ends -- either
+                «Готово: vN записана» or the backend's own refusal, verbatim. It appears on
+                the click, not after the first refresh. */}
+            {changeFlightBlock}
 
             {/* THE ONE ACTION OF THIS SCREEN, directly under the text it acts on and under
                 the strip that reports on it. There used to be TWO primary buttons for one
@@ -1875,12 +1926,38 @@ const ProjectCard = ({
               <span className="small muted">{t(lang, "projects.empty.title")}</span>
             ) : null}
           </div>
-          <div className="small muted" style={{ marginTop: 6 }}>
-            {t(lang, "projects.launch.hint")}
-          </div>
-          {/* The refusal is the backend's own sentence, with its own facts (run state,
-              exit code, the redacted log tail) printed as they arrived. */}
-          {launchFailure !== null ? (
+          {/* ================================================ the repair panel */}
+          {/* THE PANEL, IMMEDIATELY UNDER THE BUTTON, and only it explains a failure. The
+              owner's requirement: «если проблемы — говорит об этом сразу под строкой
+              "Запустить приложение" и предлагает решить… и я там мог бы с ним
+              переписываться». One plain sentence read from the log, the redacted tail, the
+              folded full log, «Исправить автоматически» and the one-line chat. Its strip is
+              `changeFlightBlock` -- the very element «Что поправить?» renders -- so a change
+              started here and a change started there are one flow with one set of words. */}
+          {repairFacts !== null ? (
+            <div style={{ marginTop: 8 }} data-testid="project-launch-failure">
+              <RepairPanel
+                lang={lang}
+                facts={repairFacts}
+                attempts={repairAttempts}
+                state={repairState}
+                detail={launchFailure?.detail ?? ""}
+                busy={repairBusy || launchBusy}
+                chat={repairChat}
+                mockWarning={controls.mockWarning}
+                fallbackAvailable={
+                  launchFailure?.fields?.fallback_available === true &&
+                  typeof launchFailure?.fields?.fallback_url === "string"
+                }
+                onChat={onRepairChat}
+                onSend={onRepairSend}
+                onAutoRepair={onRepairAuto}
+                onFallback={onLaunchFallback}
+              >
+                {changeFlightBlock}
+              </RepairPanel>
+            </div>
+          ) : launchFailure !== null ? (
             <div style={{ marginTop: 8 }} data-testid="project-launch-failure">
               <Refusal lang={lang} failure={launchFailure} />
               <LaunchFacts
@@ -1905,6 +1982,9 @@ const ProjectCard = ({
               </div>
             </div>
           ) : null}
+          <div className="small muted" style={{ marginTop: 6 }}>
+            {t(lang, "projects.launch.hint")}
+          </div>
         </div>
 
         {/* ----------------------------------------------------- the project on disk */}
@@ -2422,6 +2502,23 @@ export const Projects = ({
   const [launchBusy, setLaunchBusy] = useState(false);
   const [launchNotice, setLaunchNotice] = useState("");
   const [launchFailure, setLaunchFailure] = useState<Failure | null>(null);
+  // THE REPAIR PANEL (under the launch button). `repairFacts` holds the refusal's own
+  // structured fields -- the redacted log tail, the exit code, `waiting_for_input`, and the
+  // project launcher's own log -- and the panel exists only while they do. `repairAttempts`
+  // counts *automatic* repairs (a sentence the owner types never spends one), and
+  // `repairState` is the loop's last answer; both rules live in `ui/src/repair.ts`.
+  const [repairFacts, setRepairFacts] = useState<LaunchFacts | null>(null);
+  const [repairAttempts, setRepairAttempts] = useState(0);
+  const [repairState, setRepairState] = useState<RepairState | null>(null);
+  const [repairChat, setRepairChat] = useState("");
+  const [repairBusy, setRepairBusy] = useState(false);
+  // A synchronous guard beside the visible flag, so a double click on «Исправить
+  // автоматически» cannot start two change runs in one tick (the same defect the change
+  // button's guard exists for; measured there as two versions at zero files).
+  const repairBusyRef = useRef(false);
+  // THE CAP IS PER PROJECT FOR THE WHOLE SESSION: switching to another project and back
+  // must not hand the same failing program two fresh automatic attempts.
+  const repairAttemptsByProject = useRef<Record<string, number>>({});
   // The row's own launch: same route, same answer, printed under exactly the row that
   // was clicked. The list summary carries no entry point, so the row reads the project's
   // detail first and names the digest the backend itself published -- the approval keeps
@@ -2644,26 +2741,156 @@ export const Projects = ({
   // already shown for this entry point, so the runner's approval keeps naming the exact
   // command; a static page needs none. The answer is printed as it arrived: the URL that
   // is open in its own window, or the backend's refusal verbatim.
+  /**
+   * ONE LAUNCH REQUEST, used by the button and by the repair loop's retry.
+   *
+   * Both callers must make the *same* request (same digest, same approval, no silent
+   * fallback), or the retry would not be a retry of the thing the owner pressed. The
+   * returned `facts` are the refusal's structured fields, unread and unmodified: the panel
+   * derives its cause from them.
+   */
+  const requestLaunch = async (
+    staticFallback = false
+  ): Promise<{
+    ok: boolean;
+    value: LifecycleLaunch | null;
+    failure: Failure | null;
+    facts: LaunchFacts;
+  }> => {
+    if (selectedId === "") return { ok: false, value: null, failure: null, facts: {} };
+    const digest = String(entrypoint?.digest ?? "");
+    const outcome = await launchProject(
+      selectedId,
+      digest === "" ? undefined : digest,
+      staticFallback
+    );
+    if (!outcome.ok) {
+      return {
+        ok: false,
+        value: null,
+        failure: outcome.failure,
+        facts: (outcome.failure.fields ?? {}) as LaunchFacts,
+      };
+    }
+    return { ok: true, value: outcome.value, failure: null, facts: {} };
+  };
+
+  /**
+   * Show a refused launch: the plain sentence, or the repair panel when the log explains it.
+   *
+   * The panel is offered only when the refusal carries run facts (`log_tail`, an exit code,
+   * `waiting_for_input`, the launcher's own log). An approval or archived refusal has no
+   * cause to read, and a panel that invented one would be worse than the honest sentence.
+   */
+  const showLaunchRefusal = (failure: Failure) => {
+    setLaunchFailure(failure);
+    setLaunchNotice("");
+    const facts = (failure.fields ?? {}) as LaunchFacts;
+    setRepairFacts(repairPanelModel(facts, repairAttempts).hasRunFacts ? facts : null);
+    setRepairState(null);
+  };
+
   const launchSelected = async (staticFallback = false) => {
     if (selectedId === "") return;
-    const digest = String(entrypoint?.digest ?? "");
     setLaunchBusy(true);
     setActionFailure(null);
     setActionNotice("");
     setLaunchFailure(null);
     setLaunchNotice("");
-    const outcome = await launchProject(selectedId, digest === "" ? undefined : digest, staticFallback);
+    setRepairState(null);
+    const outcome = await requestLaunch(staticFallback);
     setLaunchBusy(false);
     if (!outcome.ok) {
-      setLaunchFailure(outcome.failure);
+      if (outcome.failure !== null) showLaunchRefusal(outcome.failure);
       return;
     }
-    setLaunchNotice(launchSentence(lang, outcome.value));
+    // A launch that really opened a window is a single green line and nothing else.
+    setRepairFacts(null);
+    setRepairState(null);
+    setRepairChat("");
+    setLaunchNotice(launchSentence(lang, outcome.value ?? {}));
     // The backend may have started the project's process or its preview: refresh the card
     // so its runtime blocks agree with the window that just opened. The refresh is quiet,
     // so the notice stays on screen while the record is read again.
     await loadDetail(selectedId, { quiet: true });
     await loadList();
+  };
+
+  /**
+   * ONE PRESS OF THE PANEL: one change run, then at most one launch retry.
+   *
+   * The steps are `driveRepair`'s (`ui/src/repair.ts`), not this function's: the panel and
+   * its test execute the same loop. What this handler adds is only the wiring -- a change is
+   * dispatched through `startChange`, the very handler «Что поправить?» uses, so the strip,
+   * the live bar and the outcome are the same objects; the retry is `requestLaunch`, the
+   * very request the button makes. A run that wrote no file never reaches the launch.
+   */
+  const runRepair = async (instruction: string, auto: boolean) => {
+    if (selectedId === "" || repairBusyRef.current) return;
+    if (instruction.trim() === "") return;
+    repairBusyRef.current = true;
+    setRepairBusy(true);
+    try {
+      const next = await driveRepair(
+        {
+          dispatch: async (text) => {
+            const outcome = await startChange(undefined, text);
+            if (outcome === null) return { ok: false, filesWritten: 0, version: 0 };
+            return {
+              ok: true,
+              filesWritten: Math.max(
+                Number(outcome.filesCreated ?? 0),
+                outcome.files.length
+              ),
+              version: outcome.toVersion,
+            };
+          },
+          launch: async () => {
+            const answer = await requestLaunch();
+            return {
+              ok: answer.ok,
+              url: String(answer.value?.url ?? ""),
+              facts: answer.facts,
+            };
+          },
+        },
+        repairState ?? initialRepairState(repairAttempts),
+        { instruction, countAttempt: auto }
+      );
+      setRepairState(next);
+      setRepairAttempts(next.attempts);
+      if (selectedId !== "") repairAttemptsByProject.current[selectedId] = next.attempts;
+      if (next.phase === "opened") {
+        // The honest success: a real window on a URL a probe answered. The panel goes away
+        // and the green line takes its place, exactly as for a launch that worked first time.
+        setLaunchFailure(null);
+        setRepairFacts(null);
+        setRepairChat("");
+        setLaunchNotice(t(lang, "projects.repair.opened").replace("{url}", next.url));
+        await loadDetail(selectedId, { quiet: true });
+        await loadList();
+      } else if (next.facts !== null) {
+        // Still failing: the panel keeps the *new* reason and the new log tail.
+        setRepairFacts(next.facts);
+      }
+    } finally {
+      setRepairBusy(false);
+      repairBusyRef.current = false;
+    }
+  };
+
+  /** «Исправить автоматически»: the deterministic instruction, one press, one attempt. */
+  const repairAuto = () => {
+    if (repairFacts === null) return;
+    const model = repairPanelModel(repairFacts, repairAttempts);
+    void runRepair(composeRepairInstruction(model.cause), true);
+  };
+
+  /** The one-line chat: the owner's own words go down the same change path. */
+  const repairSend = () => {
+    const text = repairChat.trim();
+    if (text === "" || repairFacts === null) return;
+    void runRepair(text, false);
   };
 
   // ---------------------------------------------------------------- local run
@@ -3008,6 +3235,15 @@ export const Projects = ({
     setLaunchBusy(false);
     setLaunchNotice("");
     setLaunchFailure(null);
+    // The repair panel belongs to the project that was on screen: its cause, its log and its
+    // chat text are reset with everything else. The *spent attempts* come back from the
+    // session's own record, so returning to a project cannot re-arm two more automatic tries.
+    setRepairFacts(null);
+    setRepairAttempts(repairAttemptsByProject.current[selectedId] ?? 0);
+    setRepairState(null);
+    setRepairChat("");
+    setRepairBusy(false);
+    repairBusyRef.current = false;
     setDispatched(null);
     setChangeOutcome(null);
     setDispatchFailure(null);
@@ -3111,16 +3347,23 @@ export const Projects = ({
    *   run started, and the card must not suggest one did;
    * * a run sets `changeRunId`, which the strip prints and the poller follows.
    */
-  const startChange = async (overrideProvider?: string) => {
-    if (selectedId === "") return;
-    const trimmed = change.trim();
+  const startChange = async (
+    overrideProvider?: string,
+    textOverride?: string
+  ): Promise<ChangeOutcome | null> => {
+    if (selectedId === "") return null;
+    // THE TEXT COMES FROM ONE OF TWO PLACES and is otherwise the same action: the
+    // «Что поправить?» textarea, or a line typed into the repair panel's chat. Both go
+    // through this one handler, so a change started from the panel is indistinguishable
+    // from one started from the block -- same guard, same strip, same outcome object.
+    const trimmed = (textOverride !== undefined ? textOverride : change).trim();
     if (trimmed === "") {
       setChangeError(t(lang, "projects.newversion.error"));
-      return;
+      return null;
     }
     // ONE PRESS, ONE DISPATCH. The guard is taken synchronously: a second click of a
     // double click finds it held and does nothing, so no second version is created.
-    if (!changeGuardRef.current.tryAcquire()) return;
+    if (!changeGuardRef.current.tryAcquire()) return null;
     const chosen = overrideProvider !== undefined ? overrideProvider : provider;
     try {
       setChangeError("");
@@ -3142,7 +3385,7 @@ export const Projects = ({
         setBusy("");
         setChangeStarting(false);
         setChangeFailure(stagedOutcome.failure);
-        return;
+        return null;
       }
       // THE SAME WORDS ARE ONE CHANGE. The backend refuses to record a second version
       // for a sentence it already holds: `already_applied` means the change is in the
@@ -3152,7 +3395,7 @@ export const Projects = ({
         setBusy("");
         setChangeStarting(false);
         setChangeArmed(false);
-        setChangeOutcome({
+        const already: ChangeOutcome = {
           runId: String(stagedOutcome.value.previous_run_id ?? ""),
           filesCreated: 0,
           attached: true,
@@ -3161,9 +3404,10 @@ export const Projects = ({
           stagedVersion: Number(stagedOutcome.value.version ?? fromVersion),
           files: [],
           alreadyApplied: true,
-        });
+        };
+        setChangeOutcome(already);
         await loadDetail(selectedId, { quiet: true });
-        return;
+        return already;
       }
       const taskText = String(stagedOutcome.value.task_text ?? "");
       if (taskText === "") {
@@ -3175,7 +3419,7 @@ export const Projects = ({
           path: `/api/projects/${selectedId}/versions`,
           detail: t(lang, "projects.newversion.error"),
         });
-        return;
+        return null;
       }
       // The staged version is a real fact (the record now carries a pending version), so the
       // card refreshes it before the run starts -- QUIETLY. A non-quiet refresh replaces the
@@ -3206,7 +3450,7 @@ export const Projects = ({
       setChangeStarting(false);
       if (!outcome.ok) {
         setDispatchFailure(outcome.failure);
-        return;
+        return null;
       }
       setDispatched(outcome.value);
       setChangeRunId(String(outcome.value.response.run_id ?? ""));
@@ -3226,7 +3470,7 @@ export const Projects = ({
         const manifest = await loadProjectFiles(selectedId, toVersion);
         if (manifest.ok) changed = manifest.value.files ?? [];
       }
-      setChangeOutcome({
+      const finished: ChangeOutcome = {
         runId: String(outcome.value.response.run_id ?? ""),
         filesCreated: Number(outcome.value.response.files_created ?? 0),
         attached: String(outcome.value.response.lifecycle_project_id ?? "") === selectedId,
@@ -3234,9 +3478,14 @@ export const Projects = ({
         toVersion,
         stagedVersion: Number(stagedOutcome.value.version ?? toVersion),
         files: changed,
-      });
+      };
+      setChangeOutcome(finished);
       await loadList();
       onRefresh();
+      // The outcome is also *returned*: the repair panel decides from these very numbers
+      // whether a launch retry is honest at all (a run that wrote no file has repaired
+      // nothing), so it must read the same object the strip renders.
+      return finished;
     } finally {
       // The request travel is over; the button stays off through `changeLocked` until the
       // run reaches a terminal state or a refusal is on screen.
@@ -4066,6 +4315,14 @@ export const Projects = ({
           launchBusy={launchBusy}
           launchNotice={launchNotice}
           launchFailure={launchFailure}
+          repairFacts={repairFacts}
+          repairAttempts={repairAttempts}
+          repairState={repairState}
+          repairChat={repairChat}
+          onRepairChat={setRepairChat}
+          onRepairSend={repairSend}
+          onRepairAuto={repairAuto}
+          repairBusy={repairBusy}
           onDelete={() => void deleteSelected()}
           open={openBlock}
           folder={folderBlock}
