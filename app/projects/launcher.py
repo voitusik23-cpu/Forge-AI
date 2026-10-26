@@ -456,7 +456,7 @@ class ProjectLauncher:
         """Serve a static page read-only (or reuse its preview) and open it."""
 
         url, reused = self._ensure_page_url(project_id, target, entry)
-        window = self._open_window(project_id, url)
+        window = self._open_window(project_id, url, getattr(target, "workspace", None))
         return LaunchResult(
             project_id=project_id,
             url=url,
@@ -556,7 +556,7 @@ class ProjectLauncher:
         # A server that was already up before this click is a success, and the payload
         # says so instead of pretending a second copy was started.
         reused = reused or bool(status.get("reused"))
-        window = self._open_window(project_id, url)
+        window = self._open_window(project_id, url, getattr(target, "workspace", None))
         return LaunchResult(
             project_id=project_id,
             url=url,
@@ -919,9 +919,17 @@ class ProjectLauncher:
         except Exception:  # noqa: BLE001 - detection never breaks the refusal
             return None
 
-    def _open_window(self, project_id: str, url: str) -> WindowResult:
+    def _open_window(self, project_id: str, url: str, workspace: Any = None) -> WindowResult:
+        """Open the project's window, and record a dead plan in the project's own log.
+
+        A launch that had to fall back -- Chrome exited inside two seconds, so Edge was
+        used -- is a success with a story, and the story belongs in the project's
+        ``launch.log``: that is the file the next press, and the project's own desktop
+        shortcut, both read. A log that cannot be written never holds a window back.
+        """
+
         try:
-            return self._windows.open(project_id, url)
+            result = self._windows.open(project_id, url)
         except WindowRefusal as exc:
             raise LaunchRefusal(
                 str(exc),
@@ -935,6 +943,14 @@ class ProjectLauncher:
                 reason_code="window_failed",
                 facts={"project_id": project_id, "url": url},
             ) from exc
+        failures = tuple(getattr(result, "failures", ()) or ())
+        if failures:
+            append_launch_log(
+                workspace,
+                "окно открыто через %s после отказа: %s"
+                % (getattr(result, "window", ""), "; ".join(str(item) for item in failures)),
+            )
+        return result
 
 
 def _launch_log_reason(facts: Dict[str, Any]) -> str:

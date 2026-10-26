@@ -5103,6 +5103,22 @@ invariants, not best effort:
 * **Approval, containment and reuse are unchanged.** `confirm` + `entrypoint_digest` still go through
   `LocalRunner.start_confirmed`, the sandbox is still the job object plus the low-integrity token, and
   a running server is still reused (`reused: true`) instead of restarted.
+* **Every launch gets its own browser profile, and a process that exited is not a window.**
+  `--user-data-dir` points at `<repo>/.forge/app-profile/<project-id>/launch-<time>-<pid>-<random>`,
+  created for that launch (`PROFILE_RETENTION = 2` kept per project). A profile reused from an earlier
+  attempt is the measured cause of the grey window: the page never rendered and the title bar fell back
+  to the bare host (`127.0.0.1_/`), and Chromium answers a launch on a profile it already holds with
+  exit `0` and no window at all. A browser that exits inside `WINDOW_GRACE_SECONDS = 2.0` -- with a
+  failure code **or with `0`** -- is therefore a dead plan: the next browser is tried, and the dead
+  plans are returned in `WindowResult.failures`.
+* **A dead window plan is written to the project's own log.** `ProjectLauncher._open_window` appends
+  the failures to `<project>\launch.log` («окно открыто через edge_app после отказа: chrome.exe:
+  exit … внутри 2 с»), because that is the file the next press and the project's desktop shortcut both
+  read. `tools/open_mail_ai.py` is the one-double-click launcher that follows the same rules outside
+  Forge: it starts `pythonw.exe app.py` with `CREATE_NO_WINDOW` unless `/api/health` answers, checks
+  `GET /`, opens `--app=<url>` in Chrome then Edge, **confirms the window really rendered** (the window
+  of that process, with a title that is not the bare host), discards the profile and retries without the
+  browser sandbox when it did not, and ends in `os.startfile` **plus** a message box — never in silence.
 
 #### Русская версия
 
@@ -5143,6 +5159,23 @@ invariants, not best effort:
 * **Одобрение, сдерживание и переиспользование не меняются.** `confirm` + `entrypoint_digest`
   по-прежнему идут через `LocalRunner.start_confirmed`, sandbox остаётся job object + low-integrity
   token, а работающий сервер переиспользуется.
+* **У каждого запуска свой профиль браузера, а завершившийся процесс окном не считается.**
+  `--user-data-dir` указывает на `<repo>/.forge/app-profile/<project-id>/launch-<время>-<pid>-<случайное>`,
+  созданный для этого запуска (на проект хранится `PROFILE_RETENTION = 2`). Профиль, оставшийся от
+  прошлой попытки, — измеренная причина серого окна: страница не отрисовывалась, а заголовок падал до
+  голого хоста (`127.0.0.1_/`); кроме того, Chromium отвечает на запуск со «своим» профилем кодом `0`
+  и без окна вообще. Поэтому браузер, вышедший раньше `WINDOW_GRACE_SECONDS = 2.0` — с кодом ошибки
+  **или с `0`** — это погибший план: пробуется следующий браузер, а погибшие планы возвращаются в
+  `WindowResult.failures`.
+* **Погибший план окна дописывается в собственный журнал проекта.** `ProjectLauncher._open_window`
+  дописывает отказы в `<project>\launch.log` («окно открыто через edge_app после отказа: chrome.exe:
+  exit … внутри 2 с»), потому что именно этот файл читает следующее нажатие и ярлык проекта.
+  `tools/open_mail_ai.py` — лаунчер для одного двойного щелчка, работающий по тем же правилам вне
+  Forge: он поднимает `pythonw.exe app.py` с `CREATE_NO_WINDOW`, если `/api/health` не отвечает,
+  проверяет `GET /`, открывает `--app=<url>` в Chrome, затем в Edge, **подтверждает, что окно реально
+  отрисовалось** (окно именно этого процесса и заголовок не равен голому хосту), при неудаче удаляет
+  профиль и повторяет попытку без песочницы браузера, а заканчивает `os.startfile` **и** окном
+  сообщения — но никогда молчанием.
 
 ### States, approval and output
 

@@ -56,6 +56,7 @@ from app.projects import runner as runner_module
 from app.projects.app_window import (
     APP_PROFILE_DIRECTORY,
     APP_WINDOW_SIZE,
+    PROFILE_RETENTION,
     WINDOW_CHROME_APP,
     WINDOW_DEFAULT_BROWSER,
     WINDOW_EDGE_APP,
@@ -610,21 +611,28 @@ class AppWindowTests(unittest.TestCase):
         self.assertEqual(result.window, WINDOW_CHROME_APP)
         self.assertEqual(result.program.lower(), "chrome.exe")
         self.assertEqual(result.pid, 9876)
+        self.assertEqual(result.failures, ())
         self.assertEqual(len(spawn.calls), 1)
         call = spawn.calls[0]
-        profile = self.profiles / PROJECT_ID
         self.assertEqual(
-            call["vector"],
+            call["vector"][:3],
             [
                 r"C:\fake\Google\Chrome\chrome.exe",
                 "--app=http://127.0.0.1:4321/index.html",
                 f"--window-size={APP_WINDOW_SIZE}",
-                f"--user-data-dir={profile}",
             ],
         )
+        self.assertEqual(len(call["vector"]), 4)
+        # The profile is this project's own, and a directory created for this launch only.
+        profile = pathlib.Path(call["vector"][3][len("--user-data-dir=") :])
+        self.assertTrue(
+            call["vector"][3].startswith(f"--user-data-dir={self.profiles / PROJECT_ID}"),
+            call["vector"][3],
+        )
+        self.assertTrue(profile.name.startswith("launch-"), profile.name)
         # No shell, no console, detached: a folder or a URL can never become a command.
         self.assertIs(call["kwargs"].get("shell"), False)
-        self.assertTrue(profile.is_dir(), "the per-project profile really exists")
+        self.assertTrue(profile.is_dir(), "the fresh per-launch profile really exists")
         self.assertEqual(startfile.urls, [], "the default browser is not touched")
 
     def test_02_edge_is_the_fallback_with_the_same_vector(self) -> None:
@@ -662,21 +670,40 @@ class AppWindowTests(unittest.TestCase):
         self.assertEqual(spawn.calls, [])
         self.assertEqual(startfile.urls, [])
 
-    def test_05_the_profile_is_per_project_and_reused(self) -> None:
+    def test_05_the_profile_is_fresh_for_every_launch_of_one_project(self) -> None:
         opener, spawn, _startfile = self._opener({"chrome": r"C:\fake\chrome.exe"})
         other = "proj-ba9876543210"
         first = opener.profile_for(PROJECT_ID)
         again = opener.profile_for(PROJECT_ID)
         second = opener.profile_for(other)
-        self.assertEqual(first, again, "a second launch of one project uses its own profile")
+        # A profile reused from an earlier attempt is what served the grey window, so
+        # every launch gets its own; the project's directory is what keeps them together.
+        self.assertNotEqual(first, again, "a second launch gets its own fresh profile")
         self.assertNotEqual(first, second, "two projects never share a profile")
-        self.assertEqual(first.name, PROJECT_ID)
-        self.assertEqual(first.parent, self.profiles)
+        self.assertTrue(first.name.startswith("launch-"), first.name)
+        self.assertEqual(first.parent.name, PROJECT_ID)
+        self.assertEqual(first.parent.parent, self.profiles)
+        self.assertTrue(first.is_dir() and again.is_dir())
+        self.assertEqual(second.parent.name, other)
         opener.open(PROJECT_ID, "http://127.0.0.1:8000/")
         opener.open(PROJECT_ID, "http://127.0.0.1:8000/")
         self.assertEqual(len(spawn.calls), 2)
-        # The same window memory, so the second launch restores the same window.
-        self.assertEqual(spawn.calls[0]["vector"][3], spawn.calls[1]["vector"][3])
+        self.assertNotEqual(
+            spawn.calls[0]["vector"][3],
+            spawn.calls[1]["vector"][3],
+            "the second launch does not inherit the first profile",
+        )
+
+    def test_05b_only_the_newest_launch_profiles_are_kept(self) -> None:
+        opener, _spawn, _startfile = self._opener({"chrome": r"C:\fake\chrome.exe"})
+        made = [opener.profile_for(PROJECT_ID) for _index in range(PROFILE_RETENTION + 3)]
+        kept = sorted(
+            item.name
+            for item in (self.profiles / PROJECT_ID).iterdir()
+            if item.is_dir() and item.name.startswith("launch-")
+        )
+        self.assertEqual(len(kept), PROFILE_RETENTION, kept)
+        self.assertIn(made[-1].name, kept, "the profile of this launch is never pruned")
 
     def test_06_an_unsafe_project_id_never_becomes_a_path(self) -> None:
         opener, spawn, _startfile = self._opener({"chrome": r"C:\fake\chrome.exe"})
@@ -699,18 +726,17 @@ class AppWindowTests(unittest.TestCase):
         self.assertEqual(len(spawn.calls), 2, "the plan after the dead one is tried")
         self.assertEqual(spawn.calls[0]["vector"][0], r"C:\fake\chrome.exe")
         self.assertEqual(spawn.calls[1]["vector"][0], r"C:\fake\msedge.exe")
-        # The edge plan is the same exact vector, with this project's own profile.
-        profile = self.profiles / PROJECT_ID
-        self.assertEqual(
-            spawn.calls[1]["vector"],
-            [
-                r"C:\fake\msedge.exe",
-                "--app=http://127.0.0.1:9100/",
-                f"--window-size={APP_WINDOW_SIZE}",
-                f"--user-data-dir={profile}",
-            ],
-        )
+        # The edge plan is the same exact vector, with its own fresh profile.
+        self.assertEqual(spawn.calls[1]["vector"][1], "--app=http://127.0.0.1:9100/")
+        self.assertEqual(spawn.calls[1]["vector"][2], f"--window-size={APP_WINDOW_SIZE}")
+        profile = pathlib.Path(spawn.calls[1]["vector"][3][len("--user-data-dir=") :])
+        self.assertEqual(profile.parent, self.profiles / PROJECT_ID)
+        self.assertTrue(profile.is_dir())
         self.assertEqual(startfile.urls, [], "the default browser is not needed")
+        # Both dead plans are remembered, and the one that really opened is named.
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("chrome.exe", result.failures[0])
+        self.assertIn("exit", result.failures[0])
 
     def test_08_when_every_chromium_plan_dies_the_default_browser_is_the_last_resort(
         self,
@@ -725,16 +751,21 @@ class AppWindowTests(unittest.TestCase):
         self.assertEqual(len(spawn.calls), 2)
         self.assertEqual(startfile.urls, ["http://127.0.0.1:9200/"])
 
-    def test_09_a_handoff_to_a_running_browser_is_a_window_not_a_failure(self) -> None:
-        # Chrome's singleton: a second launch on a profile a browser already holds exits 0.
+    def test_09_an_exit_zero_inside_the_grace_period_is_a_handoff_not_a_window(self) -> None:
+        # Chrome's singleton answers a launch on a profile it already holds with exit 0
+        # and no window of its own -- the measured way a launch reported a window while
+        # the owner was looking at a stale one. It is a dead plan, and Edge is tried.
         opener, spawn, startfile = self._dead_opener(
             {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"},
             spawn=_DeadSpawn(code=0),
         )
         result = opener.open(PROJECT_ID, "http://127.0.0.1:9300/")
-        self.assertEqual(result.window, WINDOW_CHROME_APP)
-        self.assertEqual(len(spawn.calls), 1, "a clean handoff is not retried on Edge")
-        self.assertEqual(startfile.urls, [])
+        self.assertEqual(result.window, WINDOW_DEFAULT_BROWSER)
+        self.assertEqual(len(spawn.calls), 2, "a clean handoff is not a window; Edge is tried")
+        self.assertEqual(startfile.urls, ["http://127.0.0.1:9300/"])
+        self.assertEqual(len(result.failures), 2, result.failures)
+        self.assertIn("chrome.exe", result.failures[0])
+        self.assertIn("exit 0", result.failures[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -1163,6 +1194,42 @@ class LauncherUnitTests(unittest.TestCase):
         self.assertEqual(self.spawn.calls, [], "a portless URL never becomes a window")
         self.assertEqual(self.startfile.urls, [], "and not the default browser either")
 
+    def test_13d_a_dead_window_plan_is_written_into_the_project_s_own_launch_log(self) -> None:
+        # Chrome exits inside the grace period (a handoff or a refusal); Edge opens the
+        # window. That is a success *with a story*, and the story goes into the project's
+        # launch.log -- the file the next press and the desktop shortcut both read.
+        self.windows = AppWindowOpener(
+            which=_FakeWhich(
+                {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"}
+            ),
+            spawn=_FlakySpawn(dead_calls=1),
+            startfile=self.startfile,
+            exists=lambda item: False,
+            profile_root=self.base / "profiles",
+            grace_seconds=0.05,
+        )
+        entry = self._entry()
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        # A static page: the launch route's page branch, which opens the window without
+        # starting a process, so this test is about the window and its log only.
+        entry = resolve_entry([{"path": "index.html"}]).entry
+        previews = _FakePreviews(
+            running={"running": True, "url": "http://127.0.0.1:8790/"},
+            started={"running": True, "url": "http://127.0.0.1:8790/"},
+        )
+        result = self._launcher(previews=previews, probe=_answering(8790)).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+        )
+        self.assertEqual(result.window, WINDOW_EDGE_APP)
+        text = (self.workspace / "launch.log").read_text(encoding="utf-8")
+        self.assertIn("Forge:", text, text)
+        self.assertIn("chrome.exe", text, text)
+        self.assertIn("exit", text, text)
+        self.assertIn(WINDOW_EDGE_APP, text, text)
+
     def test_14_the_notice_names_both_ports_when_the_manifest_differs(self) -> None:
         # The manifest claims 8765; the application chose 8790 and was already running.
         # Both facts are said out loud, and the window opens the port that answered.
@@ -1396,18 +1463,25 @@ class LaunchRouteTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertIn(b"LAUNCH-STATIC-OK", response.read())
 
-        # The exact window argv: app mode, the fixed size, this project's profile.
+        # The exact window argv: app mode, the fixed size, a fresh profile of this
+        # project's own -- never one an earlier launch left behind.
         call = self.spawn.calls[-1]
-        profile = self.base / APP_PROFILE_DIRECTORY / project.project_id
+        profile_root = self.base / APP_PROFILE_DIRECTORY / project.project_id
         self.assertEqual(
-            call["vector"],
+            call["vector"][:3],
             [
                 r"C:\fake\Google\Chrome\chrome.exe",
                 f"--app={url}",
                 f"--window-size={APP_WINDOW_SIZE}",
-                f"--user-data-dir={profile}",
             ],
         )
+        self.assertEqual(len(call["vector"]), 4)
+        self.assertTrue(
+            call["vector"][3].startswith(f"--user-data-dir={profile_root}"),
+            call["vector"][3],
+        )
+        profile = pathlib.Path(call["vector"][3][len("--user-data-dir=") :])
+        self.assertTrue(profile.is_dir(), "the fresh profile really exists")
         self.assertIs(call["kwargs"].get("shell"), False)
         self.assertEqual(self.startfile.urls, [])
 

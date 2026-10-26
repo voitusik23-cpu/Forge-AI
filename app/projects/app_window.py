@@ -11,12 +11,12 @@ this machine and starts it in app mode:
 
 ======================  =====================================================
 ``chrome_app``          ``chrome.exe --app=<url> --window-size=1280,900
-                        --user-data-dir=<repo>/.forge/app-profile/<project-id>``
+                        --user-data-dir=<repo>/.forge/app-profile/<project-id>/launch-…``
 ``edge_app``            the same argument vector, with ``msedge.exe``
 ``default_browser``     ``os.startfile(<url>)`` -- the last resort
 ======================  =====================================================
 
-Five rules make that safe and honest:
+Six rules make that safe and honest:
 
 * **The URL is loopback and comes from the caller.** It is the URL the project's
   own process bound or the preview server serves; :meth:`AppWindowOpener.open`
@@ -25,18 +25,22 @@ Five rules make that safe and honest:
 * **No shell.** An argument vector and ``shell=False``: a URL or a folder name can
   never become a command. The one non-process path is ``os.startfile``, which is
   the Windows shell's own "open with the default program" call, given a checked URL.
-* **One profile per project.** ``--user-data-dir`` points at
-  ``.forge/app-profile/<project-id>``, created here. Chromium remembers a window's
-  size and position inside its profile, so a second launch of the same project
-  restores the same window instead of a fresh default one -- and two projects never
-  share a profile.
+* **One profile per launch, never a shared one.** ``--user-data-dir`` points at a
+  directory created for *this* launch under ``.forge/app-profile/<project-id>/``.
+  Chromium remembers a window's size and position inside its profile, so a stable
+  profile looks like the friendlier choice -- and it is the measured cause of the grey
+  window the owner was looking at: a profile left behind by an earlier attempt served a
+  blank page whose title bar fell back to the bare host (``127.0.0.1_/``), and Chromium's
+  own singleton answers a second launch on a profile it already holds with *no window
+  at all* (exit ``0``). A fresh profile per launch cannot do either; only the last
+  :data:`PROFILE_RETENTION` directories are kept, so it cannot fill a disk.
 * **An allow-list, not a search.** Exactly the two Chromium browsers above are
   started by name; there is no arbitrary program and no free-form argument.
-* **A plan that dies is not a window.** Each browser is watched briefly after it is
-  started; a browser that exits with a failure never became the window, so the next
-  plan is tried -- Chrome, then Edge, then the machine's default browser. The answer
-  names the one that really opened, and a machine where none of them can run gets a
-  refusal instead of a claim.
+* **A plan that dies is not a window.** Each browser is watched for
+  :data:`WINDOW_GRACE_SECONDS` after it is started; a browser that exits inside that
+  window -- with a failure *or* with ``0`` -- never became the window, so the next plan
+  is tried. The answer names the one that really opened, remembers which plans died,
+  and a machine where none of them can run gets a refusal instead of a claim.
 * **A refusal is a sentence.** When no browser can be resolved, or the profile
   cannot be created, or the URL is not loopback, :class:`WindowRefusal` says so and
   nothing is started.
@@ -51,6 +55,7 @@ import shutil
 import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+import uuid
 
 from app.projects.models import ProjectError
 from app.projects.store import is_safe_project_id, repository_root
@@ -59,6 +64,7 @@ __all__ = [
     "APP_PROFILE_DIRECTORY",
     "APP_WINDOW_SIZE",
     "AppWindowOpener",
+    "PROFILE_RETENTION",
     "WINDOW_CHROME_APP",
     "WINDOW_DEFAULT_BROWSER",
     "WINDOW_EDGE_APP",
@@ -87,15 +93,22 @@ WINDOW_KINDS: Tuple[str, ...] = (
 #: (gitignored) ``.forge`` directory.
 APP_PROFILE_DIRECTORY = "app-profile"
 
-#: The window the product asks for on a project's first launch. After that the
-#: project's own profile remembers where the owner put the window.
+#: The window the product asks for on a project's launch. A per-launch profile cannot
+#: remember a previous window's placement; the size stays fixed instead.
 APP_WINDOW_SIZE = "1280,900"
 
-#: How long a started browser is watched before its window is accepted. A browser
-#: that is still running after this is the window; one that exits non-zero inside it
-#: never became one, and the next plan is tried. Measured on a confined host: Chrome
-#: aborts after roughly 0.5-0.8 s because its own sandbox cannot initialise there.
-WINDOW_GRACE_SECONDS = 1.0
+#: How long a started browser is watched before its window is accepted. A browser that
+#: is still running after this is the window; one that exits inside it -- with a failure
+#: code **or with ``0``**, because it handed the request to an instance already running
+#: on that profile -- never became a window, and the next plan is tried. Measured on a
+#: confined host: Chrome aborts after roughly 0.5-0.8 s because its own sandbox cannot
+#: initialise there.
+WINDOW_GRACE_SECONDS = 2.0
+
+#: How many of a project's per-launch profiles are kept on disk. Each launch gets a
+#: fresh directory (see :meth:`AppWindowOpener.profile_for`); the newest
+#: :data:`PROFILE_RETENTION` are kept and the older ones are removed.
+PROFILE_RETENTION = 2
 
 
 class WindowRefusal(ProjectError):
@@ -110,7 +123,14 @@ class WindowRefusal(ProjectError):
 
 @dataclass(frozen=True)
 class WindowResult:
-    """What was started: which kind of window, the program, its pid and the URL."""
+    """What was started: which kind of window, the program, its pid and the URL.
+
+    ``failures`` names every plan that died before the window that really opened: one
+    ``"<program>: <reason>"`` string per plan. It is what turns "the window opened" into
+    "the window opened *after* Chrome exited 0 inside two seconds" in the project's own
+    ``launch.log``, so the next person to read the log knows why the second browser was
+    used.
+    """
 
     window: str
     program: str
@@ -118,6 +138,7 @@ class WindowResult:
     url: str
     arguments: Tuple[str, ...] = ()
     profile: str = ""
+    failures: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         """The public shape. The absolute profile path stays out of it."""
@@ -130,12 +151,13 @@ class WindowResult:
             "diagnostics": {
                 "arguments": list(self.arguments),
                 "profile": self.profile,
+                "failures": list(self.failures),
             },
         }
 
 
 def default_profile_root() -> Path:
-    """``<repository>/.forge/app-profile``: one profile directory per project."""
+    """``<repository>/.forge/app-profile``: one directory of profiles per project."""
 
     return repository_root() / ".forge" / APP_PROFILE_DIRECTORY
 
@@ -282,20 +304,42 @@ class AppWindowOpener:
         )
 
     # ---------------------------------------------------------------- the plan
-    def profile_for(self, project_id: object) -> Path:
-        """The project's own browser profile directory, created if it is absent.
-
-        It is the profile that carries the window's remembered size and position, so
-        it is per project and never shared: two projects must not inherit each
-        other's window placement.
-        """
+    def project_profile_root(self, project_id: object) -> Path:
+        """``<root>/<project-id>``: this project's own directory of launch profiles."""
 
         if not is_safe_project_id(project_id):
             raise WindowRefusal(
                 "Идентификатор проекта не годится для профиля окна: "
                 "окно приложения не открыто."
             )
-        target = self._profile_root / str(project_id)
+        root = self._profile_root / str(project_id)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WindowRefusal(
+                "Не удалось создать профиль окна приложения "
+                f"({type(exc).__name__}): окно не открыто."
+            ) from exc
+        return root
+
+    def profile_for(self, project_id: object) -> Path:
+        """A **fresh** browser profile directory for this launch, created here.
+
+        It is fresh on purpose. A profile reused from an earlier attempt is what put the
+        grey window on the owner's screen: it served a blank page whose title bar fell
+        back to the bare host, and Chromium's singleton answers a launch on a profile it
+        already holds with no window at all and exit ``0`` -- a claim of a window that is
+        not there. A new directory under ``<root>/<project-id>/launch-…`` cannot do
+        either, so two projects never share one and no launch inherits the last one's
+        state. Only :data:`PROFILE_RETENTION` directories are kept per project.
+        """
+
+        root = self.project_profile_root(project_id)
+        # Prune *before* creating, and leave room for the new one: the profile this
+        # launch is about to use must never be the one removed by its own retention rule.
+        self._prune_profiles(root, max(1, PROFILE_RETENTION - 1))
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        target = root / f"launch-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -305,6 +349,32 @@ class AppWindowOpener:
             ) from exc
         return target
 
+    @staticmethod
+    def _prune_profiles(root: Path, keep: int = PROFILE_RETENTION) -> None:
+        """Keep only the newest ``keep`` launch profiles of one project.
+
+        Only directories this method itself recognises -- a ``launch-`` prefix directly
+        inside the project's own profile root -- are ever removed, and a failure to
+        remove one changes nothing: a disk is cheaper than a broken launch.
+        """
+
+        try:
+            candidates = [
+                item
+                for item in root.iterdir()
+                if item.is_dir() and item.name.startswith("launch-")
+            ]
+        except OSError:
+            return
+        if len(candidates) <= max(1, int(keep)):
+            return
+        try:
+            ordered = sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
+        except OSError:
+            return
+        for stale in ordered[max(1, int(keep)) :]:
+            shutil.rmtree(str(stale), ignore_errors=True)
+
     def plans(
         self, project_id: object, url: object
     ) -> Tuple[Tuple[str, str, Tuple[str, ...], Path], ...]:
@@ -312,9 +382,11 @@ class AppWindowOpener:
 
         Chrome first, Edge second. A plan is ``(window, program, argv, profile)`` and
         the *exact* argument vector is fixed here, so a caller cannot add a word to it
-        and a test can assert it. The list is empty when no Chromium browser is
-        installed: the machine's own default browser is then the last resort, and
-        :meth:`open` records which of the three really happened.
+        and a test can assert it. Each plan gets its own fresh profile: Chrome and Edge
+        do not write into one directory, and a fresh one per launch is what keeps a stale
+        profile from deciding what the window shows. The list is empty when no Chromium
+        browser is installed: the machine's own default browser is then the last resort,
+        and :meth:`open` records which of the three really happened.
         """
 
         if not _looks_like_loopback(url):
@@ -341,16 +413,17 @@ class AppWindowOpener:
         return tuple(plans)
 
     @staticmethod
-    def _survives(child: Any, grace: float) -> Tuple[bool, Optional[int]]:
+    def _became_a_window(child: Any, grace: float) -> Tuple[bool, Optional[int]]:
         """``(usable, exit_code)`` for a just-spawned browser.
 
         A browser that is still running after the grace period is the window. One that
-        exited with ``0`` handed the request to an instance already running on this
-        profile -- Chrome's singleton does that -- so a window was asked for and that
-        is a success too. A browser that exited with any other code never became a
-        window at all (measured on a confined host: Chrome aborts with
-        ``STATUS_BREAKPOINT`` because its own sandbox cannot initialise), and the
-        caller must move on to the next plan instead of reporting a window that is not
+        exits inside it never became *this* launch's window, whatever its code: a
+        Chromium singleton answers a launch on a profile it already holds with exit
+        ``0`` and no window of its own -- which is exactly how a launch reported a
+        window while the owner was looking at a stale one -- and a refusal exits with a
+        failure code (measured on a confined host: Chrome aborts with
+        ``STATUS_BREAKPOINT`` because its own sandbox cannot initialise there). Both make
+        the caller move on to the next plan instead of claiming a window that is not
         there.
         """
 
@@ -363,7 +436,7 @@ class AppWindowOpener:
         while True:
             code = poll()
             if code is not None:
-                return int(code) == 0, int(code)
+                return False, int(code)
             if time.monotonic() >= deadline:
                 return True, None
             time.sleep(0.025)
@@ -373,9 +446,11 @@ class AppWindowOpener:
         """Start the first usable window, or raise :class:`WindowRefusal`.
 
         The fallback chain is the specification and it is applied **at runtime**: a
-        Chromium browser that cannot start on this host is not a window, so the next
-        one is tried, and the machine's default browser is the last resort. Nothing is
-        claimed that did not happen: ``window`` names the one that really opened.
+        Chromium browser that cannot start on this host -- or that hands the request to
+        an instance it does not own and exits -- is not a window, so the next one is
+        tried, and the machine's default browser is the last resort. Nothing is claimed
+        that did not happen: ``window`` names the one that really opened, and
+        ``failures`` names every plan that died before it.
         """
 
         address = str(url)
@@ -398,7 +473,7 @@ class AppWindowOpener:
                 failures.append(f"{Path(program).name}: {type(exc).__name__}")
                 continue
             pid = int(getattr(child, "pid", 0) or 0)
-            usable, code = self._survives(child, self._grace_seconds)
+            usable, code = self._became_a_window(child, self._grace_seconds)
             if usable:
                 return WindowResult(
                     window=window,
@@ -407,8 +482,12 @@ class AppWindowOpener:
                     url=address,
                     arguments=tuple(str(part) for part in vector[1:]),
                     profile=str(profile),
+                    failures=tuple(failures),
                 )
-            failures.append(f"{Path(program).name}: exit {code}")
+            # Exit 0 inside the grace period is a handoff, not a window: Chromium's
+            # singleton does that on a profile it already holds. It is recorded as a
+            # dead plan, and the next browser is tried.
+            failures.append(f"{Path(program).name}: exit {code} внутри {self._grace_seconds:g} с")
         # No Chromium browser can run here (or none is installed): the machine's own
         # default browser is the honest last resort. It cannot give a window without an
         # address bar, and the answer says so.
@@ -428,4 +507,5 @@ class AppWindowOpener:
             url=address,
             arguments=(),
             profile="",
+            failures=tuple(failures),
         )
