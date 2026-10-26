@@ -5105,20 +5105,31 @@ invariants, not best effort:
   a running server is still reused (`reused: true`) instead of restarted.
 * **Every launch gets its own browser profile, and a process that exited is not a window.**
   `--user-data-dir` points at `<repo>/.forge/app-profile/<project-id>/launch-<time>-<pid>-<random>`,
-  created for that launch (`PROFILE_RETENTION = 2` kept per project). A profile reused from an earlier
+  created for that attempt (`PROFILE_RETENTION = 2` kept per project). A profile reused from an earlier
   attempt is the measured cause of the grey window: the page never rendered and the title bar fell back
   to the bare host (`127.0.0.1_/`), and Chromium answers a launch on a profile it already holds with
   exit `0` and no window at all. A browser that exits inside `WINDOW_GRACE_SECONDS = 2.0` -- with a
-  failure code **or with `0`** -- is therefore a dead plan: the next browser is tried, and the dead
-  plans are returned in `WindowResult.failures`.
-* **A dead window plan is written to the project's own log.** `ProjectLauncher._open_window` appends
-  the failures to `<project>\launch.log` («окно открыто через edge_app после отказа: chrome.exe:
-  exit … внутри 2 с»), because that is the file the next press and the project's desktop shortcut both
-  read. `tools/open_mail_ai.py` is the one-double-click launcher that follows the same rules outside
-  Forge: it starts `pythonw.exe app.py` with `CREATE_NO_WINDOW` unless `/api/health` answers, checks
-  `GET /`, opens `--app=<url>` in Chrome then Edge, **confirms the window really rendered** (the window
-  of that process, with a title that is not the bare host), discards the profile and retries without the
-  browser sandbox when it did not, and ends in `os.startfile` **plus** a message box — never in silence.
+  failure code **or with `0`** -- is therefore a dead plan, and so is a browser that survives without a
+  visible window of *its own process* whose title is not the bare host: `WindowResult.failures` names
+  every one of them, and `WindowResult.title`/`.pid` name the window the OS really reported.
+* **A browser whose own sandbox cannot start is retried once, with the same browser, and told.**
+  Measured on this machine: Chrome aborts with `0x80000003` (`STATUS_BREAKPOINT`) when a Python process
+  starts it, while the very same browser renders the application with `--no-sandbox --test-type`. So a
+  browser whose sandboxed attempt produced no window is retried **once** with `NO_SANDBOX_FLAGS`, and
+  only after that the next browser is tried; the retry never replaces the first attempt. The result
+  records which attempt really opened the window (`WindowResult.sandboxed`/`.downgraded`, published as
+  `sandboxed`/`downgraded` in the launch payload), and `ProjectLauncher._open_window` appends the exact
+  sentence «песочница недоступна (0x80000003) — повтор без песочницы» to `<project>\launch.log` beside
+  the dead plans («окно открыто через edge_app после отказа: …») -- that is the file the next press and
+  the project's desktop shortcut both read. «Настройки → Как открываются окна» can forbid the retry
+  (`window_downgrade_allowed`, default `true`); then no browser is started without its sandbox, and a
+  launch that cannot open a window is the typed `409 project_launch_refused` carrying the failure list
+  and the log tail, never a claimed window.
+* **The project's own one-click launcher follows the same rules outside Forge.** `tools/open_mail_ai.py`
+  starts `pythonw.exe app.py` with `CREATE_NO_WINDOW` unless `/api/health` answers, checks `GET /`,
+  opens `--app=<url>` in Chrome then Edge, **confirms the window really rendered** (the window of that
+  process, with a title that is not the bare host), discards the profile and retries without the browser
+  sandbox when it did not, and ends in `os.startfile` **plus** a message box — never in silence.
 
 #### Русская версия
 
@@ -5161,20 +5172,31 @@ invariants, not best effort:
   token, а работающий сервер переиспользуется.
 * **У каждого запуска свой профиль браузера, а завершившийся процесс окном не считается.**
   `--user-data-dir` указывает на `<repo>/.forge/app-profile/<project-id>/launch-<время>-<pid>-<случайное>`,
-  созданный для этого запуска (на проект хранится `PROFILE_RETENTION = 2`). Профиль, оставшийся от
+  созданный для этой попытки (на проект хранится `PROFILE_RETENTION = 2`). Профиль, оставшийся от
   прошлой попытки, — измеренная причина серого окна: страница не отрисовывалась, а заголовок падал до
   голого хоста (`127.0.0.1_/`); кроме того, Chromium отвечает на запуск со «своим» профилем кодом `0`
   и без окна вообще. Поэтому браузер, вышедший раньше `WINDOW_GRACE_SECONDS = 2.0` — с кодом ошибки
-  **или с `0`** — это погибший план: пробуется следующий браузер, а погибшие планы возвращаются в
-  `WindowResult.failures`.
-* **Погибший план окна дописывается в собственный журнал проекта.** `ProjectLauncher._open_window`
-  дописывает отказы в `<project>\launch.log` («окно открыто через edge_app после отказа: chrome.exe:
-  exit … внутри 2 с»), потому что именно этот файл читает следующее нажатие и ярлык проекта.
-  `tools/open_mail_ai.py` — лаунчер для одного двойного щелчка, работающий по тем же правилам вне
-  Forge: он поднимает `pythonw.exe app.py` с `CREATE_NO_WINDOW`, если `/api/health` не отвечает,
-  проверяет `GET /`, открывает `--app=<url>` в Chrome, затем в Edge, **подтверждает, что окно реально
-  отрисовалось** (окно именно этого процесса и заголовок не равен голому хосту), при неудаче удаляет
-  профиль и повторяет попытку без песочницы браузера, а заканчивает `os.startfile` **и** окном
+  **или с `0`** — это погибший план; погибшим планом считается и браузер, который выжил, но не показал
+  видимого окна *своего процесса* с заголовком не «голый хост». Все они перечислены в
+  `WindowResult.failures`, а `WindowResult.title`/`.pid` называют окно, которое реально видел ОС.
+* **Браузер, у которого не поднимается собственная песочница, повторяется один раз — тем же браузером,
+  и это сказано.** Измерено на этой машине: Chrome падает с `0x80000003` (`STATUS_BREAKPOINT`), когда
+  его запускает процесс Python, а тот же самый браузер рисует приложение с `--no-sandbox --test-type`.
+  Поэтому браузер, чья попытка с песочницей не дала окна, повторяется **один раз** с
+  `NO_SANDBOX_FLAGS`, и только после этого пробуется следующий браузер; повтор никогда не заменяет
+  первую попытку. Результат помнит, какая попытка реально открыла окно (`WindowResult.sandboxed`/
+  `.downgraded`, в ответе запуска — `sandboxed`/`downgraded`), а `ProjectLauncher._open_window`
+  дописывает точную фразу «песочница недоступна (0x80000003) — повтор без песочницы» в
+  `<project>\launch.log` рядом с погибшими планами («окно открыто через edge_app после отказа: …»):
+  именно этот файл читает следующее нажатие и ярлык проекта. «Настройки → Как открываются окна» могут
+  запретить повтор (`window_downgrade_allowed`, по умолчанию `true`); тогда браузер без песочницы не
+  запускается, а запуск, которому не удалось открыть окно, — это типизированный
+  `409 project_launch_refused` со списком отказов и хвостом журнала, но никогда не заявленное окно.
+* **Собственный лаунчер проекта для одного двойного щелчка следует тем же правилам вне Forge.**
+  `tools/open_mail_ai.py` поднимает `pythonw.exe app.py` с `CREATE_NO_WINDOW`, если `/api/health` не
+  отвечает, проверяет `GET /`, открывает `--app=<url>` в Chrome, затем в Edge, **подтверждает, что окно
+  реально отрисовалось** (окно именно этого процесса и заголовок не равен голому хосту), при неудаче
+  удаляет профиль и повторяет попытку без песочницы браузера, а заканчивает `os.startfile` **и** окном
   сообщения — но никогда молчанием.
 
 ### States, approval and output

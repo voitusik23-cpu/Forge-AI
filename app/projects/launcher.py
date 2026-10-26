@@ -249,6 +249,12 @@ class LaunchResult:
     #: The port that really answered (verified with a ``GET /``), never a claim. ``0``
     #: only on a payload that opened no window at all.
     observed_port: int = 0
+    #: Which attempt really produced the window: the first, sandboxed one, or the
+    #: documented retry without the browser's sandbox. They are published so a client --
+    #: and the owner reading the payload -- can tell "opened normally" from "opened after
+    #: the browser's sandbox could not start", which is a fact about this machine.
+    window_sandboxed: bool = False
+    window_downgraded: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """The public shape: the facts a client needs and nothing else."""
@@ -262,6 +268,8 @@ class LaunchResult:
             "project_id": self.project_id,
             "entry_kind": self.entry_kind,
             "observed_port": int(self.observed_port),
+            "sandboxed": bool(self.window_sandboxed),
+            "downgraded": bool(self.window_downgraded),
         }
         if self.fallback:
             payload["fallback"] = True
@@ -289,13 +297,21 @@ class ProjectLauncher:
         previews: Any = None,
         windows: Any = None,
         probe: Any = None,
+        window_policy: Any = None,
         readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
         clock: Any = None,
         sleep: Any = None,
     ) -> None:
         self._runner = runner
         self._previews = previews
-        self._windows = windows if windows is not None else AppWindowOpener()
+        #: ``window_policy`` answers the owner's «Настройки» question "may a browser whose
+        #: own sandbox cannot start be retried without it?". It is handed to the opener
+        #: this launcher composes; an injected opener brings its own policy.
+        self._windows = (
+            windows
+            if windows is not None
+            else AppWindowOpener(window_policy=window_policy)
+        )
         #: ``None`` means "the module's real probe", resolved at call time so a test can
         #: patch :func:`app.projects.ports.probe_http` and still be asked.
         self._probe = probe
@@ -467,6 +483,8 @@ class ProjectLauncher:
             notice=notice,
             fallback=bool(notice),
             observed_port=port_from_url(url),
+            window_sandboxed=bool(getattr(window, "sandboxed", False)),
+            window_downgraded=bool(getattr(window, "downgraded", False)),
         )
 
     # --------------------------------------------------------------- a process
@@ -568,6 +586,8 @@ class ProjectLauncher:
                 manifest_port, observed_port, bool(status.get("reused"))
             ),
             observed_port=observed_port,
+            window_sandboxed=bool(getattr(window, "sandboxed", False)),
+            window_downgraded=bool(getattr(window, "downgraded", False)),
         )
 
     # ------------------------------------------------------------- the two numbers
@@ -920,21 +940,39 @@ class ProjectLauncher:
             return None
 
     def _open_window(self, project_id: str, url: str, workspace: Any = None) -> WindowResult:
-        """Open the project's window, and record a dead plan in the project's own log.
+        """Open the project's window, and write every downgrade into its own log.
 
-        A launch that had to fall back -- Chrome exited inside two seconds, so Edge was
-        used -- is a success with a story, and the story belongs in the project's
+        A launch that had to fall back -- Chrome exited inside two seconds, or a browser
+        survived without a rendered window, and the same browser was retried without its
+        sandbox -- is a success with a story, and the story belongs in the project's
         ``launch.log``: that is the file the next press, and the project's own desktop
-        shortcut, both read. A log that cannot be written never holds a window back.
+        shortcut, both read. The opener hands over the exact sentences; this method only
+        writes them. A log that cannot be written never holds a window back.
+
+        When no plan works, the refusal carries the same facts -- the dead plans and the
+        log tail that now contains every downgrade -- so a grey window is replaced by a
+        typed ``project_launch_refused`` the panel can explain.
         """
 
         try:
             result = self._windows.open(project_id, url)
         except WindowRefusal as exc:
+            for line in getattr(exc, "log_lines", ()) or ():
+                append_launch_log(workspace, str(line))
+            tail = read_launch_log_tail(workspace)
+            facts: Dict[str, Any] = {
+                "project_id": project_id,
+                "url": url,
+                "refusal_reason": "window_refused",
+                "window_failures": [str(item) for item in getattr(exc, "failures", ()) or ()],
+            }
+            if tail:
+                facts["launch_log_tail"] = tail
+                facts["launch_log_path"] = LAUNCH_LOG_NAME
             raise LaunchRefusal(
                 str(exc),
                 reason_code="window_refused",
-                facts={"project_id": project_id, "url": url},
+                facts=facts,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - an opener failure is a refusal
             raise LaunchRefusal(
@@ -943,6 +981,8 @@ class ProjectLauncher:
                 reason_code="window_failed",
                 facts={"project_id": project_id, "url": url},
             ) from exc
+        for line in getattr(result, "log_lines", ()) or ():
+            append_launch_log(workspace, str(line))
         failures = tuple(getattr(result, "failures", ()) or ())
         if failures:
             append_launch_log(

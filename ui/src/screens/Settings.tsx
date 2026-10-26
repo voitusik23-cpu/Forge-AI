@@ -251,6 +251,110 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
 };
 
 /**
+ * «Как открываются окна»: the policy of a project's window, and the one switch that can
+ * forbid its fallback.
+ *
+ * The line is the policy the backend really applies (`app/projects/app_window.py`): the
+ * first attempt at a browser always keeps its sandbox; only a browser that produced no
+ * window is retried **once** without it, and that retry is written into the project's
+ * `launch.log`. The switch is the owner's veto: off means the launch refuses honestly
+ * instead of starting an unsandboxed browser. It is read at every launch, so the next
+ * press obeys a change made here without a restart.
+ */
+const WindowPolicyCard = ({ lang }: { lang: Lang }) => {
+  const [allowed, setAllowed] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [failure, setFailure] = useState<Failure | null>(null);
+
+  const load = useCallback(async () => {
+    const outcome = await loadSettings();
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    setFailure(null);
+    setAllowed(outcome.value.window_downgrade_allowed !== false);
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const save = async (value: boolean) => {
+    setBusy(true);
+    setNotice("");
+    setFailure(null);
+    const outcome = await saveProjectRoot({ window_downgrade_allowed: value });
+    setBusy(false);
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    const next = outcome.value.window_downgrade_allowed !== false;
+    setAllowed(next);
+    setNotice(
+      t(lang, "settings.windows.saved").replace(
+        "{state}",
+        t(lang, next ? "settings.windows.allowed" : "settings.windows.forbidden")
+      )
+    );
+  };
+
+  const enabled = allowed !== false;
+
+  return (
+    <Card className="rise d1">
+      <CardHead
+        title={t(lang, "settings.windows.title")}
+        hint={t(lang, "settings.windows.hint")}
+        action={
+          <Badge tone={enabled ? "ok" : "warn"}>
+            {t(lang, enabled ? "settings.windows.allowed" : "settings.windows.forbidden")}
+          </Badge>
+        }
+      />
+      <div className="stack" style={{ gap: 12 }} data-testid="settings-window-policy">
+        <div className="small" data-testid="settings-window-policy-line">
+          {t(lang, "settings.windows.policy")}
+        </div>
+        <label className="row" style={{ gap: 10 }}>
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={busy || allowed === null}
+            onChange={(event) => void save(event.target.checked)}
+            data-testid="settings-window-downgrade"
+          />
+          <span>
+            {t(lang, "settings.windows.allow")}
+            <span className="small muted" style={{ display: "block" }}>
+              {t(lang, "settings.windows.allow.hint")}
+            </span>
+          </span>
+        </label>
+        {notice !== "" ? (
+          <div className="notice" data-testid="settings-window-notice">
+            {notice}
+          </div>
+        ) : null}
+        {failure !== null ? (
+          <div className="notice warn" data-testid="settings-window-failure">
+            <div>{`HTTP ${failure.status}${failure.code ? ` · ${failure.code}` : ""}`}</div>
+            {failure.detail ? (
+              <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+                {failure.detail}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="small muted">{t(lang, "settings.windows.storage")}</div>
+      </div>
+    </Card>
+  );
+};
+
+/**
  * «Провайдеры и ключи»: the place the owner could not find.
  *
  * His complaint: providers came from `.env`, which he is not supposed to edit, so there
@@ -798,6 +902,11 @@ export const Settings = ({
       </Card>
 
       <ProjectRootCard lang={lang} />
+
+      {/* «Как открываются окна»: the window policy and the veto over the unsandboxed
+          retry. The sandbox always stays on the first attempt; this only forbids the
+          documented fallback. */}
+      <WindowPolicyCard lang={lang} />
 
       {/* «Как выбирается модель»: the rule automatic routing applies, with the setting that
           is in force right now. A reader who wonders «где выбрать модель?» finds the answer

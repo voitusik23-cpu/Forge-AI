@@ -507,6 +507,11 @@ def create_api_app(
         )
     )
     app.state.forge_runner = runner
+    # The owner's settings, composed once for this process. They are read here -- before
+    # the launch route exists -- because the window it opens consults one of them: whether
+    # a browser whose own sandbox cannot start may be retried without it. The same store
+    # backs «Настройки», so the switch and the launch can never disagree.
+    owner_settings = settings_store if settings_store is not None else AppSettingsStore()
     # The card's technical block needs facts the project store does not hold: the
     # run's own durable record, the provider registry ids and the route list. They
     # are supplied as read-only callables from this composition, so the project
@@ -519,6 +524,7 @@ def create_api_app(
         runner=runner,
         opener=project_opener,
         window_opener=window_opener,
+        window_policy=owner_settings.window_downgrade_allowed,
         environment_facts=lambda: {
             "provider_registry_ids": _provider_registry_ids(api_service),
             "api_routes": sorted(
@@ -542,10 +548,10 @@ def create_api_app(
     )
     register_discovery_routes(app, discovery, projects)
 
-    # The owner's settings, composed once for this process. The routes are read/write;
-    # the value they hold is consumed by the launcher (``app/api/main.py``), which builds
-    # the project store with it, so «Настройки» and where a project lands cannot disagree.
-    owner_settings = settings_store if settings_store is not None else AppSettingsStore()
+    # The routes of that same settings store are registered here. The value it holds is
+    # consumed by the launcher (``app/api/main.py``), which builds the project store with
+    # it, and by the launch route's window policy, composed above -- so «Настройки» and
+    # where a project lands, and how its window opens, cannot disagree.
     register_settings_routes(app, owner_settings)
 
     # «Провайдеры и ключи»: the place the owner could not find. The non-secret half of an

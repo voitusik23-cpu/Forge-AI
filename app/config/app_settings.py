@@ -35,6 +35,12 @@ Two values live in it:
     and it is added to ``project_roots_known``. It is *not* the owner's choice: his
     ``project_root`` is untouched, so «Сменить папку» (or fixing the permission) brings
     the projects back to the folder he asked for.
+
+``window_downgrade_allowed``
+    whether a browser whose own sandbox cannot start may be retried **once** without it
+    when Forge opens a project's window (default ``true``: the retry is what turned the
+    owner's grey window into his real page). «Настройки» can turn it off, and then the
+    launch refuses honestly instead of starting an unsandboxed browser.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ __all__ = [
     "PROVIDERS_KEY",
     "SETTINGS_ENV_VAR",
     "SETTINGS_SCHEMA_VERSION",
+    "WINDOW_DOWNGRADE_ALLOWED_KEY",
     "AppSettingsError",
     "AppSettingsStore",
     "default_project_root",
@@ -80,6 +87,12 @@ PROVIDERS_KEY = "providers"
 #: The root actually used when the configured one was not writable. Separate from
 #: ``project_root`` on purpose: the owner's choice is not overwritten by a fallback.
 PROJECT_ROOT_FALLBACK_KEY = "project_root_fallback"
+
+#: Whether a browser that cannot start with its own sandbox may be retried once without
+#: it (the documented relaxation of :mod:`app.projects.app_window`). Default ``true``:
+#: the owner asked for that retry, and it is what turns a grey window into his page.
+#: «Настройки» writes ``false`` to forbid it, and the launch then refuses honestly.
+WINDOW_DOWNGRADE_ALLOWED_KEY = "window_downgrade_allowed"
 
 #: Every key this store owns. Everything else in the file is preserved verbatim, so a
 #: setting written by another module (the provider entries above) is not erased the next
@@ -380,6 +393,38 @@ class AppSettingsStore:
         self._write(self.project_root(), known, fallback=str(root))
         return root
 
+    # ------------------------------------------------------- how windows open
+    def window_downgrade_allowed(self) -> bool:
+        """Whether a browser may be retried once without its own sandbox.
+
+        Read from the raw document, not from :meth:`read` (which normalises the
+        project-root keys): the boolean the owner set in «Настройки» is exactly what this
+        answers. A missing, unreadable or non-boolean value means **allowed** -- that is
+        the documented default, and the retry is the owner's own request.
+        """
+
+        raw = read_settings_document(self._path).get(WINDOW_DOWNGRADE_ALLOWED_KEY)
+        return raw if isinstance(raw, bool) else True
+
+    def set_window_downgrade_allowed(self, value: object) -> bool:
+        """Persist the owner's «повтор без песочницы» switch and return it.
+
+        Only that one key is written, so the provider entries and the project root in the
+        same file survive unchanged.
+        """
+
+        if not isinstance(value, bool):
+            raise AppSettingsError(
+                "Значение «повтор без песочницы» должно быть true или false.",
+                field=WINDOW_DOWNGRADE_ALLOWED_KEY,
+            )
+        document = read_settings_document(self._path)
+        document[WINDOW_DOWNGRADE_ALLOWED_KEY] = bool(value)
+        document.setdefault("schema", SETTINGS_SCHEMA_VERSION)
+        document["updated_at"] = _now_iso()
+        write_settings_document(self._path, document)
+        return bool(value)
+
     def set_project_root(self, value: object) -> Path:
         """Store ``value`` as the project root and remember the previous ones.
 
@@ -474,6 +519,7 @@ class AppSettingsStore:
             "project_root_label_grant_reason": label_grant_reason,
             "project_root_label_grant_command": label_grant_command,
             "project_roots_known": [str(item) for item in self.known_project_roots()],
+            "window_downgrade_allowed": self.window_downgrade_allowed(),
             "settings_path": str(self._path),
             "schema": SETTINGS_SCHEMA_VERSION,
         }

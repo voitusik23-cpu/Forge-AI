@@ -1186,6 +1186,13 @@ export type LifecycleLaunch = {
   stage?: string;
   /** The port that really answered (verified with a GET), never a claim. */
   observed_port?: number;
+  /**
+   * Which attempt really produced the window. `sandboxed` names the browser's first,
+   * sandboxed attempt; `downgraded` is `true` only when that browser was retried once
+   * without its sandbox (the documented relaxation, written into the project's journal).
+   */
+  sandboxed?: boolean;
+  downgraded?: boolean;
 };
 
 /**
@@ -1678,6 +1685,12 @@ export type ForgeSettings = {
   project_root_label_grant_command?: string;
   project_root_attempted?: ProjectRootAttempt[];
   project_roots_known?: string[];
+  /**
+   * «Как открываются окна»: whether a browser whose own sandbox cannot start may be
+   * retried **once** without it. Default `true` — the retry is what turns a grey window
+   * into the owner's page — and every downgrade is written into the project's launch log.
+   */
+  window_downgrade_allowed?: boolean;
   settings_path?: string;
   schema?: string;
   created?: boolean;
@@ -1687,13 +1700,17 @@ export const loadSettings = (): Promise<Result<ForgeSettings>> =>
   readJson<ForgeSettings>("/api/settings");
 
 /**
- * `POST /api/settings` — set the project root, or restore the desktop default.
+ * `POST /api/settings` — set the project root, restore the desktop default, or decide
+ * whether a project window may be retried without the browser's sandbox.
  *
  * The value is stored in the application's own settings file (`.forge/settings.json`),
  * not in `.env`, and the folder is created here so a typo fails where it was typed.
  */
 export const saveProjectRoot = (
-  body: { project_root: string } | { use_desktop: true }
+  body:
+    | { project_root: string }
+    | { use_desktop: true }
+    | { window_downgrade_allowed: boolean }
 ): Promise<Result<ForgeSettings>> => postJson<ForgeSettings>("/api/settings", body);
 
 // --------------------------------------------------------------- providers and keys

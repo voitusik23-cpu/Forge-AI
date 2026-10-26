@@ -16,7 +16,7 @@ this machine and starts it in app mode:
 ``default_browser``     ``os.startfile(<url>)`` -- the last resort
 ======================  =====================================================
 
-Six rules make that safe and honest:
+Eight rules make that safe and honest:
 
 * **The URL is loopback and comes from the caller.** It is the URL the project's
   own process bound or the preview server serves; :meth:`AppWindowOpener.open`
@@ -41,6 +41,19 @@ Six rules make that safe and honest:
   window -- with a failure *or* with ``0`` -- never became the window, so the next plan
   is tried. The answer names the one that really opened, remembers which plans died,
   and a machine where none of them can run gets a refusal instead of a claim.
+* **A process is not a window either.** A browser that survives is confirmed by asking
+  the OS for a **visible window that belongs to that process**, with a title that is a
+  rendered page and not the bare host. That is the measured difference between the
+  owner's real «Почта АИ» window and the grey ``127.0.0.1_/`` one.
+* **A browser whose own sandbox cannot start is retried once, and told.** Measured on
+  the owner's machine (``0x80000003``, ``STATUS_BREAKPOINT``, when a Chromium browser is
+  started by a Python process inside its job object): a browser started *by Forge* may
+  abort, or may show the grey page, while the very same browser without its sandbox
+  renders the application. So each browser gets one second, documented attempt with
+  :data:`NO_SANDBOX_FLAGS` -- but only after the sandboxed attempt produced no window,
+  never instead of it, and every such downgrade is written into the project's
+  ``launch.log`` in so many words. «Настройки» can forbid the retry; then the refusal
+  is the honest answer instead of an unsandboxed browser.
 * **A refusal is a sentence.** When no browser can be resolved, or the profile
   cannot be created, or the URL is not loopback, :class:`WindowRefusal` says so and
   nothing is started.
@@ -48,9 +61,10 @@ Six rules make that safe and honest:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -64,17 +78,22 @@ __all__ = [
     "APP_PROFILE_DIRECTORY",
     "APP_WINDOW_SIZE",
     "AppWindowOpener",
+    "NO_SANDBOX_FLAGS",
     "PROFILE_RETENTION",
+    "SANDBOX_DOWNGRADE_NOTE",
     "WINDOW_CHROME_APP",
     "WINDOW_DEFAULT_BROWSER",
     "WINDOW_EDGE_APP",
     "WINDOW_GRACE_SECONDS",
     "WINDOW_KINDS",
+    "WINDOW_TITLE_WAIT_SECONDS",
+    "WindowPlan",
     "WindowRefusal",
     "WindowResult",
     "default_profile_root",
     "detached_flags",
     "is_loopback_url_with_port",
+    "window_title_means_a_page",
 ]
 
 #: A Chromium browser in app mode: a standalone window with no address bar.
@@ -105,20 +124,86 @@ APP_WINDOW_SIZE = "1280,900"
 #: initialise there.
 WINDOW_GRACE_SECONDS = 2.0
 
+#: How long one attempt is watched for a **visible window with a real title** after the
+#: process survived the grace period. The measured grey window showed its title bar
+#: within a second; a real page a moment later. A browser that never produces such a
+#: window is not this launch's window, and the next plan is tried.
+WINDOW_TITLE_WAIT_SECONDS = 6.0
+
+#: The two flags of the one documented retry: the same browser, the same URL, a fresh
+#: profile, but without the browser's own sandbox (and with the infobar suppressed). The
+#: pair is the one the owner's desktop launcher and the project's own ``app.py`` already
+#: use; it is only ever reached by a retry, never by the first attempt.
+NO_SANDBOX_FLAGS: Tuple[str, ...] = ("--no-sandbox", "--test-type")
+
+#: The exact words the owner reads in ``<project>\launch.log`` when a browser's first,
+#: sandboxed attempt produced no window and the same browser is retried without its
+#: sandbox. The words are fixed because they are the log line, not a comment.
+SANDBOX_DOWNGRADE_NOTE = "песочница недоступна (0x80000003) — повтор без песочницы"
+
 #: How many of a project's per-launch profiles are kept on disk. Each launch gets a
 #: fresh directory (see :meth:`AppWindowOpener.profile_for`); the newest
 #: :data:`PROFILE_RETENTION` are kept and the older ones are removed.
 PROFILE_RETENTION = 2
 
+#: A window whose title bar fell back to the bare host is a page that never rendered --
+#: the measured signature of the grey window (``127.0.0.1_/``). It is not a success.
+_FAILED_WINDOW_TITLE = re.compile(r"^127\.0\.0\.1(?=$|[\s:/_])")
+
+#: The window class both Chromium browsers use, so a recycled pid cannot be mistaken
+#: for our own browser window.
+_BROWSER_WINDOW_CLASS = "Chrome_WidgetWin"
+
 
 class WindowRefusal(ProjectError):
-    """No window was opened, and this is why."""
+    """No window was opened, and this is why.
+
+    ``failures`` and ``log_lines`` are the same facts :class:`WindowResult` carries on a
+    success: every plan that died, and every downgrade the caller has to write into the
+    project's own log. They make the refusal explain itself instead of only saying no.
+    """
 
     code = "project_window_refused"
 
-    def __init__(self, message: str, *, window: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        window: str = "",
+        failures: Sequence[str] = (),
+        log_lines: Sequence[str] = (),
+    ) -> None:
         super().__init__(message)
         self.window = str(window or "")
+        self.failures: Tuple[str, ...] = tuple(str(item) for item in failures)
+        self.log_lines: Tuple[str, ...] = tuple(str(item) for item in log_lines)
+
+
+@dataclass(frozen=True)
+class WindowPlan:
+    """One attempt at one window: the browser, its exact argv, and its own profile.
+
+    ``sandboxed`` is ``True`` for a browser's first attempt and ``False`` only for the
+    one documented retry (:data:`NO_SANDBOX_FLAGS`). ``profile`` is a directory created
+    for *this* attempt just before it starts -- never one an earlier attempt left behind,
+    and never one a plan that is not reached creates at all.
+    """
+
+    window: str
+    program: str
+    vector: Tuple[str, ...]
+    profile: Path
+    sandboxed: bool = True
+
+    @property
+    def downgraded(self) -> bool:
+        """True for the one retry without the browser's sandbox."""
+
+        return not self.sandboxed
+
+    @property
+    def program_name(self) -> str:
+        return Path(self.program).name
 
 
 @dataclass(frozen=True)
@@ -130,6 +215,11 @@ class WindowResult:
     "the window opened *after* Chrome exited 0 inside two seconds" in the project's own
     ``launch.log``, so the next person to read the log knows why the second browser was
     used.
+
+    ``sandboxed`` and ``downgraded`` name *which attempt* produced the window: the first,
+    sandboxed one, or the documented retry without the sandbox. ``title`` is the window
+    title the OS reported, and ``log_lines`` are the sentences the caller writes into the
+    project's log (a downgrade is never silent).
     """
 
     window: str
@@ -139,6 +229,10 @@ class WindowResult:
     arguments: Tuple[str, ...] = ()
     profile: str = ""
     failures: Tuple[str, ...] = ()
+    sandboxed: bool = True
+    downgraded: bool = False
+    title: str = ""
+    log_lines: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         """The public shape. The absolute profile path stays out of it."""
@@ -148,10 +242,14 @@ class WindowResult:
             "program": self.program,
             "pid": int(self.pid),
             "url": self.url,
+            "sandboxed": bool(self.sandboxed),
+            "downgraded": bool(self.downgraded),
             "diagnostics": {
                 "arguments": list(self.arguments),
                 "profile": self.profile,
                 "failures": list(self.failures),
+                "title": self.title,
+                "log_lines": list(self.log_lines),
             },
         }
 
@@ -160,6 +258,68 @@ def default_profile_root() -> Path:
     """``<repository>/.forge/app-profile``: one directory of profiles per project."""
 
     return repository_root() / ".forge" / APP_PROFILE_DIRECTORY
+
+
+def window_title_means_a_page(title: object) -> bool:
+    """Whether a window title looks like a rendered page, not a failed one.
+
+    A page that never rendered falls back to its address in the title bar; the measured
+    example on this machine was ``127.0.0.1_/``. Such a window is the grey window this
+    module exists to prevent, so it is never accepted as the project's window.
+    """
+
+    text = str(title or "").strip()
+    if not text:
+        return False
+    return _FAILED_WINDOW_TITLE.match(text) is None
+
+
+def _default_visible_windows(pid: int) -> Optional[List[Tuple[int, str]]]:
+    """``[(hwnd, title)]`` for the visible browser windows of one process.
+
+    A thin ``user32`` read and nothing else: no dependency, no shell. ``None`` means this
+    host cannot answer the question (no Win32 API, or the call itself failed), and the
+    caller then falls back to "a process that survived the grace period is the window"
+    instead of pretending no window exists.
+    """
+
+    if os.name != "nt":  # pragma: no cover - this product runs on Windows
+        return None
+    try:
+        import ctypes
+    except Exception:  # pragma: no cover - defensive
+        return None
+    found: List[Tuple[int, str]] = []
+    try:
+        user32 = ctypes.windll.user32
+        callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _visit(hwnd: Any, _param: Any) -> bool:
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = int(user32.GetWindowTextLengthW(hwnd))
+                if length <= 0:
+                    return True
+                text = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, text, length + 1)
+                name = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, name, 256)
+                if not str(name.value).startswith(_BROWSER_WINDOW_CLASS):
+                    return True
+                owner = ctypes.c_ulong(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if int(owner.value) != int(pid):
+                    return True
+                found.append((int(hwnd), str(text.value)))
+            except Exception:  # noqa: BLE001 - a window scan must never break a launch
+                return True
+            return True
+
+        user32.EnumWindows(callback(_visit), None)
+    except Exception:  # noqa: BLE001 - an unanswerable host is "cannot check"
+        return None
+    return found
 
 
 def detached_flags() -> int:
@@ -246,11 +406,16 @@ _looks_like_loopback = is_loopback_url_with_port
 class AppWindowOpener:
     """Resolve and start the one standalone window a launched project gets.
 
-    ``which``, ``spawn``, ``startfile`` and ``exists`` are injectable so a test can
-    prove *which* program would have been started, with which argument vector, on a
-    machine whose installed browsers the test names -- without opening a real browser
-    window on the machine running the suite. The production defaults are the real
+    ``which``, ``spawn``, ``startfile``, ``exists`` and ``visible_windows`` are injectable
+    so a test can prove *which* program would have been started, with which argument
+    vector, on a machine whose installed browsers the test names -- without opening a real
+    browser window on the machine running the suite. The production defaults are the real
     ones.
+
+    ``window_policy`` is a zero-argument callable answering whether the documented retry
+    without the browser's sandbox is allowed. It is the owner's «Настройки» switch, read
+    at every launch; an absent (or failing) policy means allowed, because the owner asked
+    for the retry. It never turns the *first* attempt into an unsandboxed one.
     """
 
     def __init__(
@@ -260,15 +425,23 @@ class AppWindowOpener:
         spawn: Optional[Callable[..., Any]] = None,
         startfile: Optional[Callable[[str], Any]] = None,
         exists: Optional[Callable[[object], bool]] = None,
+        visible_windows: Optional[Callable[[int], Optional[Sequence[Tuple[int, str]]]]] = None,
+        window_policy: Optional[Callable[[], bool]] = None,
         profile_root: Optional[object] = None,
         grace_seconds: float = WINDOW_GRACE_SECONDS,
+        title_wait_seconds: float = WINDOW_TITLE_WAIT_SECONDS,
     ) -> None:
         self._which = which if which is not None else _default_which
         self._spawn = spawn if spawn is not None else subprocess.Popen
         self._startfile = startfile if startfile is not None else _default_startfile
         self._exists = exists if exists is not None else (lambda item: Path(str(item)).is_file())
+        self._visible_windows = (
+            visible_windows if visible_windows is not None else _default_visible_windows
+        )
+        self._window_policy = window_policy
         self._profile_root = Path(profile_root) if profile_root is not None else default_profile_root()
         self._grace_seconds = max(0.0, float(grace_seconds))
+        self._title_seconds = max(0.0, float(title_wait_seconds))
 
     # -------------------------------------------------------------- resolution
     def chrome(self) -> Optional[str]:
@@ -322,6 +495,13 @@ class AppWindowOpener:
             ) from exc
         return root
 
+    def _next_profile_path(self, project_id: object) -> Path:
+        """A unique profile directory of this project, **not created yet**."""
+
+        root = self.project_profile_root(project_id)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        return root / f"launch-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
     def profile_for(self, project_id: object) -> Path:
         """A **fresh** browser profile directory for this launch, created here.
 
@@ -338,8 +518,7 @@ class AppWindowOpener:
         # Prune *before* creating, and leave room for the new one: the profile this
         # launch is about to use must never be the one removed by its own retention rule.
         self._prune_profiles(root, max(1, PROFILE_RETENTION - 1))
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        target = root / f"launch-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        target = self._next_profile_path(project_id)
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -376,17 +555,24 @@ class AppWindowOpener:
             shutil.rmtree(str(stale), ignore_errors=True)
 
     def plans(
-        self, project_id: object, url: object
-    ) -> Tuple[Tuple[str, str, Tuple[str, ...], Path], ...]:
-        """Every standalone-window launch this host allows, best first.
+        self,
+        project_id: object,
+        url: object,
+        *,
+        allow_downgrade: bool = True,
+    ) -> Tuple[WindowPlan, ...]:
+        """Every standalone-window attempt this host allows, in the order to try them.
 
-        Chrome first, Edge second. A plan is ``(window, program, argv, profile)`` and
-        the *exact* argument vector is fixed here, so a caller cannot add a word to it
-        and a test can assert it. Each plan gets its own fresh profile: Chrome and Edge
-        do not write into one directory, and a fresh one per launch is what keeps a stale
-        profile from deciding what the window shows. The list is empty when no Chromium
-        browser is installed: the machine's own default browser is then the last resort,
-        and :meth:`open` records which of the three really happened.
+        Chrome first, Edge second; **each browser gets its sandboxed attempt first**
+        (:data:`NO_SANDBOX_FLAGS` is never part of it), and -- unless the owner forbade it
+        -- one retry of that same browser with the documented relaxation. A plan is a
+        :class:`WindowPlan`, whose argument vector is fixed here, so a caller cannot add a
+        word to it and a test can assert it. Each plan gets its own profile directory,
+        created only when its attempt really starts: Chrome and Edge do not write into one
+        directory, and a fresh one per attempt is what keeps a stale profile from deciding
+        what the window shows. The list is empty when no Chromium browser is installed:
+        the machine's own default browser is then the last resort, and :meth:`open`
+        records which plan really happened.
         """
 
         if not _looks_like_loopback(url):
@@ -395,26 +581,37 @@ class AppWindowOpener:
                 "(127.0.0.1): окно не открыто."
             )
         address = str(url)
-        plans = []
+        plans: List[WindowPlan] = []
         for window, program in (
             (WINDOW_CHROME_APP, self.chrome()),
             (WINDOW_EDGE_APP, self.edge()),
         ):
             if not program:
                 continue
-            profile = self.profile_for(project_id)
-            vector = (
-                program,
-                f"--app={address}",
-                f"--window-size={APP_WINDOW_SIZE}",
-                f"--user-data-dir={profile}",
-            )
-            plans.append((window, program, vector, profile))
+            for sandboxed in ((True, False) if allow_downgrade else (True,)):
+                profile = self._next_profile_path(project_id)
+                vector = (
+                    program,
+                    f"--app={address}",
+                    f"--window-size={APP_WINDOW_SIZE}",
+                    f"--user-data-dir={profile}",
+                    *(() if sandboxed else NO_SANDBOX_FLAGS),
+                )
+                plans.append(
+                    WindowPlan(
+                        window=window,
+                        program=program,
+                        vector=vector,
+                        profile=profile,
+                        sandboxed=sandboxed,
+                    )
+                )
         return tuple(plans)
 
+    # ------------------------------------------------------- the window itself
     @staticmethod
     def _became_a_window(child: Any, grace: float) -> Tuple[bool, Optional[int]]:
-        """``(usable, exit_code)`` for a just-spawned browser.
+        """``(usable, exit_code)`` for a just-spawned browser, without a window scan.
 
         A browser that is still running after the grace period is the window. One that
         exits inside it never became *this* launch's window, whatever its code: a
@@ -441,24 +638,132 @@ class AppWindowOpener:
                 return True, None
             time.sleep(0.025)
 
+    def _visible_titles(self, pid: int) -> Optional[List[Tuple[int, str]]]:
+        """The process's visible browser windows, or ``None`` when the host cannot say."""
+
+        if self._visible_windows is None:  # pragma: no cover - a non-Windows host
+            return None
+        try:
+            found = self._visible_windows(int(pid))
+        except Exception:  # noqa: BLE001 - a scan must never break a launch
+            return None
+        if found is None:
+            return None
+        windows: List[Tuple[int, str]] = []
+        for item in found:
+            try:
+                hwnd, title = item
+            except (TypeError, ValueError):
+                continue
+            windows.append((int(hwnd), str(title or "")))
+        return windows
+
+    def _observe(self, child: Any, pid: int) -> Tuple[str, Optional[int], int, str]:
+        """What one attempt really produced: ``window``, ``exit`` or ``none``.
+
+        The return value is ``(kind, exit_code, hwnd, title)``. A window is only ever
+        reported when the OS names a **visible window of that process whose title is a
+        rendered page**; a process that survived but never showed such a window is
+        ``none``, and the caller tries the next plan. When the host cannot answer the
+        window question (no Win32 scan), the older rule stands: a process that survived
+        the grace period is the window. A child that cannot be asked (an injected test
+        double) is the window it stands for.
+        """
+
+        poll = getattr(child, "poll", None)
+        if not callable(poll):
+            return "window", None, 0, ""
+        titles = self._visible_titles(pid)
+        if titles is None:
+            usable, code = self._became_a_window(child, self._grace_seconds)
+            if usable:
+                return "window", None, 0, ""
+            return "exit", code, 0, ""
+        deadline = time.monotonic() + self._title_seconds
+        seen = ""
+        while True:
+            for hwnd, title in titles or ():
+                if window_title_means_a_page(title):
+                    return "window", None, int(hwnd), title
+                if not seen:
+                    seen = title
+            code = poll()
+            if code is not None:
+                # One last look: the window may have existed a moment before the exit.
+                time.sleep(0.05)
+                for hwnd, title in self._visible_titles(pid) or ():
+                    if window_title_means_a_page(title):
+                        return "window", None, int(hwnd), title
+                return "exit", int(code), 0, seen
+            if time.monotonic() >= deadline:
+                return "none", None, 0, seen
+            time.sleep(0.025)
+            titles = self._visible_titles(pid)
+
+    @staticmethod
+    def _stop(child: Any) -> None:
+        """End an attempt that did not become the window.
+
+        A grey window belongs to the browser that showed it; leaving that process alive
+        after its plan failed is what would leave the owner looking at two windows. The
+        process is this launch's own child, and a termination that fails is not an error.
+        """
+
+        terminate = getattr(child, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate()
+            except (OSError, ValueError):  # pragma: no cover - a dying child
+                pass
+
+    def _downgrade_allowed(self) -> bool:
+        """The owner's «Настройки» switch, read now; absent or broken means allowed."""
+
+        if self._window_policy is None:
+            return True
+        try:
+            return bool(self._window_policy())
+        except Exception:  # noqa: BLE001 - a broken setting never withholds the window
+            return True
+
     # ------------------------------------------------------------- the action
     def open(self, project_id: object, url: object) -> WindowResult:
         """Start the first usable window, or raise :class:`WindowRefusal`.
 
         The fallback chain is the specification and it is applied **at runtime**: a
         Chromium browser that cannot start on this host -- or that hands the request to
-        an instance it does not own and exits -- is not a window, so the next one is
-        tried, and the machine's default browser is the last resort. Nothing is claimed
-        that did not happen: ``window`` names the one that really opened, and
-        ``failures`` names every plan that died before it.
+        an instance it does not own and exits, or that survives without a rendered window
+        -- is not a window. That browser is then retried **once** without its sandbox
+        (:data:`NO_SANDBOX_FLAGS`, the documented relaxation, written into ``log_lines``
+        and from there into the project's ``launch.log``), and only after that the next
+        browser is tried; the machine's default browser is the last resort. Nothing is
+        claimed that did not happen: ``window`` names the one that really opened,
+        ``sandboxed``/``downgraded`` name which attempt did, and ``failures`` names every
+        plan that died before it.
         """
 
         address = str(url)
+        allow_downgrade = self._downgrade_allowed()
         failures: List[str] = []
-        for window, program, vector, profile in self.plans(project_id, address):
+        notes: List[str] = []
+        chain = self.plans(project_id, address, allow_downgrade=allow_downgrade)
+        root = self.project_profile_root(project_id)
+        for plan in chain:
+            if plan.downgraded:
+                notes.append(
+                    f"{SANDBOX_DOWNGRADE_NOTE}: {plan.program_name} "
+                    "(первая попытка не дала окна)"
+                )
+            try:
+                plan.profile.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                failures.append(
+                    f"{plan.program_name}: профиль окна не создан ({type(exc).__name__})"
+                )
+                continue
             try:
                 child = self._spawn(
-                    list(vector),
+                    list(plan.vector),
                     shell=False,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -470,36 +775,61 @@ class AppWindowOpener:
                     creationflags=detached_flags(),
                 )
             except OSError as exc:
-                failures.append(f"{Path(program).name}: {type(exc).__name__}")
+                failures.append(f"{plan.program_name}: {type(exc).__name__}")
                 continue
             pid = int(getattr(child, "pid", 0) or 0)
-            usable, code = self._became_a_window(child, self._grace_seconds)
-            if usable:
+            kind, code, _hwnd, title = self._observe(child, pid)
+            if kind == "window":
+                self._prune_profiles(root, PROFILE_RETENTION)
                 return WindowResult(
-                    window=window,
-                    program=Path(program).name,
+                    window=plan.window,
+                    program=plan.program_name,
                     pid=pid,
                     url=address,
-                    arguments=tuple(str(part) for part in vector[1:]),
-                    profile=str(profile),
+                    arguments=tuple(str(part) for part in plan.vector[1:]),
+                    profile=str(plan.profile),
                     failures=tuple(failures),
+                    sandboxed=plan.sandboxed,
+                    downgraded=plan.downgraded,
+                    title=title,
+                    log_lines=tuple(notes),
                 )
-            # Exit 0 inside the grace period is a handoff, not a window: Chromium's
-            # singleton does that on a profile it already holds. It is recorded as a
-            # dead plan, and the next browser is tried.
-            failures.append(f"{Path(program).name}: exit {code} внутри {self._grace_seconds:g} с")
+            # A plan that produced no window is ended before the next attempt: a grey
+            # window must not survive the plan that failed to render the page.
+            self._stop(child)
+            if kind == "exit":
+                # Exit 0 inside the grace period is a handoff, not a window: Chromium's
+                # singleton does that on a profile it already holds. It is recorded as a
+                # dead plan, and the next attempt is tried.
+                failures.append(
+                    f"{plan.program_name}: exit {code} — окно не подтвердилось"
+                )
+            else:
+                shown = f", заголовок «{title}»" if title else ""
+                failures.append(
+                    f"{plan.program_name}: окно не подтвердилось за "
+                    f"{self._title_seconds:g} с{shown}"
+                )
+            if not allow_downgrade and plan.sandboxed:
+                failures.append(
+                    f"{plan.program_name}: повтор без песочницы запрещён в настройках"
+                )
         # No Chromium browser can run here (or none is installed): the machine's own
         # default browser is the honest last resort. It cannot give a window without an
         # address bar, and the answer says so.
         try:
             self._startfile(address)
         except OSError as exc:
+            self._prune_profiles(root, PROFILE_RETENTION)
             detail = "; ".join(failures) if failures else "no Chromium browser is installed"
             raise WindowRefusal(
                 "Не удалось открыть окно приложения "
                 f"({detail}); браузер по умолчанию тоже не открылся "
-                f"({type(exc).__name__})."
+                f"({type(exc).__name__}).",
+                failures=tuple(failures),
+                log_lines=tuple(notes),
             ) from exc
+        self._prune_profiles(root, PROFILE_RETENTION)
         return WindowResult(
             window=WINDOW_DEFAULT_BROWSER,
             program="",
@@ -508,4 +838,10 @@ class AppWindowOpener:
             arguments=(),
             profile="",
             failures=tuple(failures),
+            # No Chromium plan produced this window, so no sandbox decision was made
+            # here: claiming either attempt would be a fact this module did not observe.
+            sandboxed=False,
+            downgraded=False,
+            title="",
+            log_lines=tuple(notes),
         )

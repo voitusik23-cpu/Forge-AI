@@ -48,6 +48,7 @@ import urllib.request
 
 from app.api.server import create_api_app
 from app.api.service import ForgeApiService
+from app.config.app_settings import AppSettingsStore
 from app.discovery.service import DiscoveryService
 from app.discovery.store import DiscoveryStore
 from app.projects import launcher as launcher_module
@@ -56,7 +57,9 @@ from app.projects import runner as runner_module
 from app.projects.app_window import (
     APP_PROFILE_DIRECTORY,
     APP_WINDOW_SIZE,
+    NO_SANDBOX_FLAGS,
     PROFILE_RETENTION,
+    SANDBOX_DOWNGRADE_NOTE,
     WINDOW_CHROME_APP,
     WINDOW_DEFAULT_BROWSER,
     WINDOW_EDGE_APP,
@@ -241,6 +244,75 @@ class _RecordingStartfile:
         self.urls.append(url)
 
 
+class _RaisingStartfile:
+    """A machine whose default browser cannot be opened at all."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def __call__(self, url: str) -> None:
+        self.urls.append(url)
+        raise OSError("no default browser is registered")
+
+
+class _FakeWindows:
+    """The OS window table of the machine this test pretends to be.
+
+    ``titles`` maps a pid to the ``(hwnd, title)`` pairs that process owns; ``default``
+    is what any *other* pid owns. A pid that maps to an empty list -- or to a title that
+    fell back to the bare host -- has no rendered page, which is the measured grey
+    window. ``alive`` (when given) decides whether a pid is a live process at all: a dead
+    process owns no window, whatever the table says. ``asked`` records every pid the
+    opener asked about.
+    """
+
+    def __init__(
+        self,
+        titles: dict | None = None,
+        default: tuple = ("Почта АИ",),
+        alive=None,
+    ) -> None:
+        self.titles = {int(pid): list(items) for pid, items in (titles or {}).items()}
+        self.default = list(default)
+        self.alive = alive
+        self.asked: list[int] = []
+
+    def __call__(self, pid: int):
+        self.asked.append(int(pid))
+        if self.alive is not None and not self.alive(int(pid)):
+            return []
+        if int(pid) in self.titles:
+            return list(self.titles[int(pid)])
+        return [(100000 + int(pid), title) for title in self.default]
+
+
+class _AliveSpawn:
+    """Every browser it starts stays alive; each gets the next pid.
+
+    The opener must still *confirm* the window, which is what the injected
+    :class:`_FakeWindows` answers. An attempt that is abandoned is terminated and
+    recorded, so a test can see the grey window's process really ended.
+    """
+
+    def __init__(self, first_pid: int = 1001) -> None:
+        self.calls: list[dict] = []
+        self.stopped: list[int] = []
+        self._first_pid = int(first_pid)
+
+    def __call__(self, vector, **kwargs):
+        self.calls.append({"vector": [str(part) for part in vector], "kwargs": dict(kwargs)})
+        pid = self._first_pid + len(self.calls) - 1
+        stopped = self.stopped
+
+        class _Child:
+            poll = staticmethod(lambda: None)
+
+        child = _Child()
+        child.pid = pid
+        child.terminate = lambda pid=pid: stopped.append(pid)
+        return child
+
+
 class _DeadSpawn:
     """A browser that exits immediately, as Chrome does on a host that forbids its sandbox."""
 
@@ -248,6 +320,9 @@ class _DeadSpawn:
         self.code = int(code)
         self.pid = int(pid)
         self.calls: list[dict] = []
+
+    def is_alive(self, pid: int) -> bool:
+        return False
 
     def __call__(self, vector, **kwargs):
         self.calls.append({"vector": [str(part) for part in vector], "kwargs": dict(kwargs)})
@@ -269,17 +344,24 @@ class _FlakySpawn:
         self.dead_calls = int(dead_calls)
         self.code = int(code)
         self.calls: list[dict] = []
+        self.alive_pids: set[int] = set()
+
+    def is_alive(self, pid: int) -> bool:
+        return int(pid) in self.alive_pids
 
     def __call__(self, vector, **kwargs):
         self.calls.append({"vector": [str(part) for part in vector], "kwargs": dict(kwargs)})
         index = len(self.calls)
         code = self.code if index <= self.dead_calls else None
+        pid = 1000 + index
+        if code is None:
+            self.alive_pids.add(pid)
 
         class _Child:
             poll = staticmethod(lambda code=code: code)
 
         child = _Child()
-        child.pid = 1000 + index
+        child.pid = pid
         return child
 
 
@@ -588,8 +670,10 @@ class AppWindowTests(unittest.TestCase):
             startfile=startfile,
             # Nothing beyond what the test names is installed, whatever this host has.
             exists=lambda item: False,
+            visible_windows=_FakeWindows(),
             profile_root=self.profiles,
             grace_seconds=0.01,
+            title_wait_seconds=0.05,
         )
         return opener, spawn, startfile
 
@@ -600,8 +684,11 @@ class AppWindowTests(unittest.TestCase):
             spawn=spawn,
             startfile=startfile,
             exists=lambda item: False,
+            # A dead plan owns no window: the table follows the spawn's liveness.
+            visible_windows=_FakeWindows(alive=getattr(spawn, "is_alive", None)),
             profile_root=self.profiles,
             grace_seconds=0.05,
+            title_wait_seconds=0.05,
         )
         return opener, spawn, startfile
 
@@ -712,7 +799,11 @@ class AppWindowTests(unittest.TestCase):
                 opener.open(hostile, "http://127.0.0.1:5000/")
         self.assertEqual(spawn.calls, [])
 
-    def test_07_a_browser_that_dies_is_skipped_for_the_next_plan(self) -> None:
+    def test_07_a_browser_that_dies_is_retried_without_its_sandbox_before_the_next_one(
+        self,
+    ) -> None:
+        # Chrome exits inside the grace period (a handoff or a refusal). The *same*
+        # browser is retried once without its sandbox before Edge is considered at all.
         opener, spawn, startfile = self._dead_opener(
             {
                 "chrome": r"C:\fake\chrome.exe",
@@ -721,51 +812,139 @@ class AppWindowTests(unittest.TestCase):
             spawn=_FlakySpawn(dead_calls=1),
         )
         result = opener.open(PROJECT_ID, "http://127.0.0.1:9100/")
-        self.assertEqual(result.window, WINDOW_EDGE_APP)
-        self.assertEqual(result.program.lower(), "msedge.exe")
-        self.assertEqual(len(spawn.calls), 2, "the plan after the dead one is tried")
+        self.assertEqual(result.window, WINDOW_CHROME_APP)
+        self.assertEqual(result.program.lower(), "chrome.exe")
+        self.assertFalse(result.sandboxed)
+        self.assertTrue(result.downgraded)
+        self.assertEqual(len(spawn.calls), 2, "the retry of the same browser is the second plan")
         self.assertEqual(spawn.calls[0]["vector"][0], r"C:\fake\chrome.exe")
-        self.assertEqual(spawn.calls[1]["vector"][0], r"C:\fake\msedge.exe")
-        # The edge plan is the same exact vector, with its own fresh profile.
+        self.assertEqual(spawn.calls[1]["vector"][0], r"C:\fake\chrome.exe")
+        # The first attempt is exactly the old vector; the retry adds the documented pair.
+        self.assertEqual(spawn.calls[0]["vector"][4:], [])
+        self.assertEqual(spawn.calls[1]["vector"][4:], list(NO_SANDBOX_FLAGS))
         self.assertEqual(spawn.calls[1]["vector"][1], "--app=http://127.0.0.1:9100/")
         self.assertEqual(spawn.calls[1]["vector"][2], f"--window-size={APP_WINDOW_SIZE}")
         profile = pathlib.Path(spawn.calls[1]["vector"][3][len("--user-data-dir=") :])
         self.assertEqual(profile.parent, self.profiles / PROJECT_ID)
-        self.assertTrue(profile.is_dir())
+        self.assertTrue(profile.is_dir(), "the retry has its own fresh profile")
+        self.assertNotEqual(spawn.calls[0]["vector"][3], spawn.calls[1]["vector"][3])
         self.assertEqual(startfile.urls, [], "the default browser is not needed")
-        # Both dead plans are remembered, and the one that really opened is named.
+        # The dead plan is remembered, and the downgrade is written down for the log.
         self.assertEqual(len(result.failures), 1, result.failures)
         self.assertIn("chrome.exe", result.failures[0])
         self.assertIn("exit", result.failures[0])
+        self.assertTrue(
+            any(SANDBOX_DOWNGRADE_NOTE in line for line in result.log_lines),
+            result.log_lines,
+        )
+        payload = result.to_dict()
+        self.assertFalse(payload["sandboxed"])
+        self.assertTrue(payload["downgraded"])
 
     def test_08_when_every_chromium_plan_dies_the_default_browser_is_the_last_resort(
         self,
     ) -> None:
         opener, spawn, startfile = self._dead_opener(
             {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"},
-            spawn=_FlakySpawn(dead_calls=2, code=1),
+            spawn=_FlakySpawn(dead_calls=4, code=1),
         )
         result = opener.open(PROJECT_ID, "http://127.0.0.1:9200/")
         self.assertEqual(result.window, WINDOW_DEFAULT_BROWSER)
         self.assertEqual(result.pid, 0)
-        self.assertEqual(len(spawn.calls), 2)
+        self.assertEqual(len(spawn.calls), 4, "each browser is tried with and without its sandbox")
+        self.assertEqual(
+            [pathlib.Path(call["vector"][0]).name for call in spawn.calls],
+            ["chrome.exe", "chrome.exe", "msedge.exe", "msedge.exe"],
+        )
+        self.assertEqual(
+            [call["vector"][4:] for call in spawn.calls],
+            [[], list(NO_SANDBOX_FLAGS), [], list(NO_SANDBOX_FLAGS)],
+        )
         self.assertEqual(startfile.urls, ["http://127.0.0.1:9200/"])
+        # No Chromium plan produced a window, so no sandbox claim is made either.
+        self.assertFalse(result.sandboxed)
+        self.assertFalse(result.downgraded)
 
     def test_09_an_exit_zero_inside_the_grace_period_is_a_handoff_not_a_window(self) -> None:
         # Chrome's singleton answers a launch on a profile it already holds with exit 0
         # and no window of its own -- the measured way a launch reported a window while
-        # the owner was looking at a stale one. It is a dead plan, and Edge is tried.
-        opener, spawn, startfile = self._dead_opener(
+        # the owner was looking at a stale one. It is a dead plan: the same browser is
+        # retried without its sandbox, and only then the next browser.
+        spawn = _DeadSpawn(code=0)
+        opener, _spawn, startfile = self._dead_opener(
             {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"},
-            spawn=_DeadSpawn(code=0),
+            spawn=spawn,
         )
         result = opener.open(PROJECT_ID, "http://127.0.0.1:9300/")
         self.assertEqual(result.window, WINDOW_DEFAULT_BROWSER)
-        self.assertEqual(len(spawn.calls), 2, "a clean handoff is not a window; Edge is tried")
+        self.assertEqual(
+            len(spawn.calls), 4, "a clean handoff is not a window; every plan is tried"
+        )
         self.assertEqual(startfile.urls, ["http://127.0.0.1:9300/"])
-        self.assertEqual(len(result.failures), 2, result.failures)
+        self.assertEqual(len(result.failures), 4, result.failures)
         self.assertIn("chrome.exe", result.failures[0])
         self.assertIn("exit 0", result.failures[0])
+
+    def test_10_a_window_without_a_real_title_is_not_the_window(self) -> None:
+        # Edge survives the grace period but shows the measured grey page whose title
+        # bar fell back to the bare host. That is not the owner's application: the same
+        # browser is retried with the documented relaxation, which renders the page.
+        windows = _FakeWindows(
+            titles={1001: [(11, "127.0.0.1_/")], 1002: [(12, "Почта АИ")]},
+            default=(),
+        )
+        spawn = _AliveSpawn(first_pid=1001)
+        startfile = _RecordingStartfile()
+        opener = AppWindowOpener(
+            which=_FakeWhich({"msedge": r"C:\fake\msedge.exe"}),
+            spawn=spawn,
+            startfile=startfile,
+            exists=lambda item: False,
+            visible_windows=windows,
+            profile_root=self.profiles,
+            grace_seconds=0.01,
+            title_wait_seconds=0.05,
+        )
+        result = opener.open(PROJECT_ID, "http://127.0.0.1:9500/")
+        self.assertEqual(result.window, WINDOW_EDGE_APP)
+        self.assertTrue(result.downgraded)
+        self.assertFalse(result.sandboxed)
+        self.assertEqual(result.title, "Почта АИ")
+        self.assertEqual(result.pid, 1002)
+        self.assertEqual(len(spawn.calls), 2)
+        self.assertEqual(spawn.calls[1]["vector"][4:], list(NO_SANDBOX_FLAGS))
+        self.assertIn("127.0.0.1_/", result.failures[0], result.failures)
+        self.assertIn("окно не подтвердилось", result.failures[0])
+        self.assertEqual(spawn.stopped, [1001], "the grey window's process is ended")
+        self.assertEqual(startfile.urls, [])
+
+    def test_11_the_toggle_off_forbids_the_downgrade_and_refuses_honestly(self) -> None:
+        spawn = _DeadSpawn(code=1)
+        startfile = _RaisingStartfile()
+        opener = AppWindowOpener(
+            which=_FakeWhich(
+                {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"}
+            ),
+            spawn=spawn,
+            startfile=startfile,
+            exists=lambda item: False,
+            visible_windows=_FakeWindows(alive=spawn.is_alive),
+            window_policy=lambda: False,
+            profile_root=self.profiles,
+            grace_seconds=0.01,
+            title_wait_seconds=0.05,
+        )
+        with self.assertRaises(WindowRefusal) as raised:
+            opener.open(PROJECT_ID, "http://127.0.0.1:9600/")
+        self.assertEqual(len(spawn.calls), 2, "only the sandboxed attempt of each browser")
+        for call in spawn.calls:
+            self.assertNotIn(
+                "--no-sandbox", call["vector"], "the owner forbade the unsandboxed retry"
+            )
+        self.assertIn("повтор без песочницы запрещён", str(raised.exception))
+        self.assertTrue(raised.exception.failures)
+        self.assertEqual(raised.exception.log_lines, ())
+        self.assertEqual(startfile.urls, ["http://127.0.0.1:9600/"], "still the last resort")
 
 
 # --------------------------------------------------------------------------- #
@@ -788,7 +967,9 @@ class LauncherUnitTests(unittest.TestCase):
             spawn=self.spawn,
             startfile=self.startfile,
             exists=lambda item: False,
+            visible_windows=_FakeWindows(),
             profile_root=base / "profiles",
+            title_wait_seconds=0.05,
         )
 
     def _entry(self, files=("app.py",)):
@@ -1195,20 +1376,24 @@ class LauncherUnitTests(unittest.TestCase):
         self.assertEqual(self.startfile.urls, [], "and not the default browser either")
 
     def test_13d_a_dead_window_plan_is_written_into_the_project_s_own_launch_log(self) -> None:
-        # Chrome exits inside the grace period (a handoff or a refusal); Edge opens the
-        # window. That is a success *with a story*, and the story goes into the project's
-        # launch.log -- the file the next press and the desktop shortcut both read.
+        # Chrome exits inside the grace period (a handoff or a refusal); the same browser
+        # opens the window without its sandbox. That is a success *with a story*, and the
+        # story goes into the project's launch.log -- the file the next press and the
+        # desktop shortcut both read.
+        spawn = _FlakySpawn(dead_calls=1)
         self.windows = AppWindowOpener(
             which=_FakeWhich(
                 {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"}
             ),
-            spawn=_FlakySpawn(dead_calls=1),
+            spawn=spawn,
             startfile=self.startfile,
             exists=lambda item: False,
+            visible_windows=_FakeWindows(alive=spawn.is_alive),
             profile_root=self.base / "profiles",
             grace_seconds=0.05,
+            title_wait_seconds=0.05,
         )
-        entry = self._entry()
+        self._entry()
         (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
         # A static page: the launch route's page branch, which opens the window without
         # starting a process, so this test is about the window and its log only.
@@ -1223,12 +1408,90 @@ class LauncherUnitTests(unittest.TestCase):
             entry=entry,
             files=1,
         )
-        self.assertEqual(result.window, WINDOW_EDGE_APP)
+        self.assertEqual(result.window, WINDOW_CHROME_APP)
+        self.assertTrue(result.window_downgraded)
+        self.assertFalse(result.window_sandboxed)
         text = (self.workspace / "launch.log").read_text(encoding="utf-8")
         self.assertIn("Forge:", text, text)
         self.assertIn("chrome.exe", text, text)
         self.assertIn("exit", text, text)
-        self.assertIn(WINDOW_EDGE_APP, text, text)
+        self.assertIn(SANDBOX_DOWNGRADE_NOTE, text, text)
+
+    def test_13e_the_launch_payload_records_which_attempt_really_opened_the_window(
+        self,
+    ) -> None:
+        spawn = _FlakySpawn(dead_calls=1, code=0)
+        self.windows = AppWindowOpener(
+            which=_FakeWhich({"chrome": r"C:\fake\chrome.exe"}),
+            spawn=spawn,
+            startfile=self.startfile,
+            exists=lambda item: False,
+            visible_windows=_FakeWindows(alive=spawn.is_alive),
+            profile_root=self.base / "profiles",
+            grace_seconds=0.05,
+            title_wait_seconds=0.05,
+        )
+        self._entry()
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        entry = resolve_entry([{"path": "index.html"}]).entry
+        previews = _FakePreviews(
+            running={"running": True, "url": "http://127.0.0.1:8791/"},
+            started={"running": True, "url": "http://127.0.0.1:8791/"},
+        )
+        result = self._launcher(previews=previews, probe=_answering(8791)).launch(
+            project_id=PROJECT_ID,
+            target=self._target(entry),
+            entry=entry,
+            files=1,
+        )
+        payload = result.to_dict()
+        self.assertEqual(payload["window"], WINDOW_CHROME_APP)
+        self.assertTrue(payload["downgraded"])
+        self.assertFalse(payload["sandboxed"])
+        text = (self.workspace / "launch.log").read_text(encoding="utf-8")
+        self.assertIn(SANDBOX_DOWNGRADE_NOTE, text, text)
+
+    def test_13f_when_no_plan_works_the_refusal_is_typed_and_carries_the_log_tail(
+        self,
+    ) -> None:
+        # Every browser plan dies and the machine's default browser refuses too. The
+        # answer is a typed refusal with the dead plans and the launch.log tail -- the
+        # same facts a success would show -- never a claimed window.
+        spawn = _DeadSpawn(code=1)
+        self.windows = AppWindowOpener(
+            which=_FakeWhich(
+                {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"}
+            ),
+            spawn=spawn,
+            startfile=_RaisingStartfile(),
+            exists=lambda item: False,
+            visible_windows=_FakeWindows(alive=spawn.is_alive),
+            profile_root=self.base / "profiles",
+            grace_seconds=0.05,
+            title_wait_seconds=0.05,
+        )
+        self._entry()
+        (self.workspace / "index.html").write_text(STATIC_PAGE, encoding="utf-8")
+        entry = resolve_entry([{"path": "index.html"}]).entry
+        previews = _FakePreviews(
+            running={"running": True, "url": "http://127.0.0.1:8792/"},
+            started={"running": True, "url": "http://127.0.0.1:8792/"},
+        )
+        with self.assertRaises(LaunchRefusal) as raised:
+            self._launcher(previews=previews, probe=_answering(8792)).launch(
+                project_id=PROJECT_ID,
+                target=self._target(entry),
+                entry=entry,
+                files=1,
+            )
+        refusal = raised.exception
+        self.assertEqual(refusal.code, "project_launch_refused")
+        self.assertEqual(refusal.reason_code, "window_refused")
+        self.assertEqual(refusal.facts["refusal_reason"], "window_refused")
+        self.assertEqual(len(refusal.facts["window_failures"]), 4, refusal.facts)
+        tail = "\n".join(refusal.facts["launch_log_tail"])
+        self.assertIn(SANDBOX_DOWNGRADE_NOTE, tail)
+        self.assertIn("chrome.exe", tail)
 
     def test_14_the_notice_names_both_ports_when_the_manifest_differs(self) -> None:
         # The manifest claims 8765; the application chose 8790 and was already running.
@@ -1357,6 +1620,7 @@ class LaunchRouteTests(unittest.TestCase):
             spawn=self.spawn,
             startfile=self.startfile,
             exists=lambda item: False,
+            visible_windows=_FakeWindows(),
             profile_root=self.base / APP_PROFILE_DIRECTORY,
         )
 
@@ -1618,6 +1882,7 @@ class LaunchRouteTests(unittest.TestCase):
             spawn=self.spawn,
             startfile=self.startfile,
             exists=lambda item: False,
+            visible_windows=_FakeWindows(),
             profile_root=self.base / APP_PROFILE_DIRECTORY,
         )
         client = self._client()
@@ -1844,6 +2109,108 @@ class LaunchRouteTests(unittest.TestCase):
         self.assertFalse(run["reused"], run)
         self.assertEqual(run["url"], "", run)
         self.assertEqual(run["observed_port"], 0, run)
+
+    def test_14_a_window_that_never_opens_is_a_typed_refusal_with_the_log_tail(self) -> None:
+        """No plan produced a window: the answer is ``project_launch_refused``, not grey.
+
+        Every browser plan dies -- the sandboxed one and the documented retry -- and the
+        machine's default browser refuses too. The refusal carries every dead plan and
+        the project's own ``launch.log`` tail, which now holds the downgrade sentences.
+        No window is claimed, because none appeared.
+        """
+
+        spawn = _DeadSpawn(code=1)
+        self.window_opener = AppWindowOpener(
+            which=_FakeWhich(
+                {"chrome": r"C:\fake\chrome.exe", "msedge": r"C:\fake\msedge.exe"}
+            ),
+            spawn=spawn,
+            startfile=_RaisingStartfile(),
+            exists=lambda item: False,
+            visible_windows=_FakeWindows(alive=spawn.is_alive),
+            profile_root=self.base / APP_PROFILE_DIRECTORY,
+            grace_seconds=0.01,
+            title_wait_seconds=0.05,
+        )
+        client = self._client()
+        project = self._project(files={"index.html": STATIC_PAGE.encode("utf-8")})
+        answer = self._launch(client, project.project_id, {"confirm": True})
+        self.assertEqual(answer.status_code, 409, answer.text)
+        detail = answer.json()["detail"]
+        self.assertEqual(detail["code"], "project_launch_refused", detail)
+        self.assertEqual(detail["refusal_reason"], "window_refused", detail)
+        self.assertEqual(len(detail["window_failures"]), 4, detail)
+        tail = "\n".join(detail["launch_log_tail"])
+        self.assertIn(SANDBOX_DOWNGRADE_NOTE, tail)
+        self.assertIn("chrome.exe", tail)
+        self.assertEqual(len(spawn.calls), 4, "both browsers, with and without the sandbox")
+
+
+class WindowSettingsTests(unittest.TestCase):
+    """«Настройки → Как открываются окна»: the switch that forbids the downgrade.
+
+    It lives in the same settings file as the projects folder, defaults to **allowed**
+    (the owner asked for the retry), and is read by the launch at every press -- never at
+    composition time, so a toggle takes effect on the next launch without a restart.
+    """
+
+    def setUp(self) -> None:
+        base = REPOSITORY / ".forge" / "test-project-launch-policy" / f"{os.getpid()}-{id(self)}"
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base.resolve()
+        self.store = AppSettingsStore(self.base / "settings.json")
+
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.api.settings_routes import register_settings_routes
+
+        app = FastAPI()
+        register_settings_routes(app, self.store)
+        return TestClient(app)
+
+    def test_01_it_defaults_to_allowed_and_only_that_key_is_written(self) -> None:
+        root = str(self.base / "projects")
+        self.store.set_project_root(root)
+        self.assertTrue(self.store.window_downgrade_allowed(), "the owner asked for the retry")
+        self.assertFalse(self.store.set_window_downgrade_allowed(False))
+        self.assertFalse(self.store.window_downgrade_allowed())
+        # The project root in the same file is untouched by the window switch.
+        self.assertEqual(str(self.store.project_root()), root)
+        self.assertTrue(self.store.set_window_downgrade_allowed(True))
+        self.assertTrue(self.store.window_downgrade_allowed())
+
+    def test_02_the_route_reads_and_writes_it(self) -> None:
+        client = self._client()
+        first = client.get("/api/settings").json()
+        self.assertIs(first["window_downgrade_allowed"], True)
+        written = client.post("/api/settings", json={"window_downgrade_allowed": False})
+        self.assertEqual(written.status_code, 200, written.text)
+        self.assertIs(written.json()["window_downgrade_allowed"], False)
+        self.assertIs(client.get("/api/settings").json()["window_downgrade_allowed"], False)
+        # A value that is not a boolean, or the switch mixed with a projects folder, is
+        # a bad request -- never a guess that silently permits an unsandboxed browser.
+        self.assertEqual(
+            client.post("/api/settings", json={"window_downgrade_allowed": "yes"}).status_code,
+            400,
+        )
+        self.assertEqual(
+            client.post(
+                "/api/settings",
+                json={"window_downgrade_allowed": False, "project_root": "C:\\Windows"},
+            ).status_code,
+            400,
+        )
+
+    def test_03_the_launcher_composes_the_opener_with_that_policy(self) -> None:
+        policy = self.store.window_downgrade_allowed
+        with mock.patch.object(launcher_module, "AppWindowOpener") as composed:
+            launcher_module.ProjectLauncher(window_policy=policy)
+        composed.assert_called_once()
+        self.assertIs(composed.call_args.kwargs.get("window_policy"), policy)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,10 +1,13 @@
-"""The owner's settings: read them, and change where new projects are delivered.
+"""The owner's settings: read them, change where new projects are delivered, and decide
+whether a project window may fall back to a browser without its sandbox.
 
-Two routes and nothing else:
+These routes and nothing else:
 
 ```
-GET  /api/settings   -> the project root, its default, and whether it exists
-POST /api/settings   -> set it: {"project_root": "..."} or {"use_desktop": true}
+GET  /api/settings   -> the project root, its default, whether it exists,
+                        and whether the window retry without a sandbox is allowed
+POST /api/settings   -> {"project_root": "..."} | {"use_desktop": true}
+                        | {"window_downgrade_allowed": false}
 ```
 
 Why this is not ``.env``: the value is the folder the owner's own projects live in, he
@@ -60,11 +63,12 @@ def register_settings_routes(app: Any, settings: Any) -> None:
 
     @app.post("/api/settings")
     def write_settings(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
-        """Set the project root, or restore the desktop default.
+        """Set the project root, restore the desktop default, or forbid a window retry.
 
-        Exactly one of ``project_root`` (a full path) and ``use_desktop`` (``true``) is
-        required. Both are accepted from this route alone, and neither is echoed back
-        beyond the stored value.
+        Exactly one of ``project_root`` (a full path), ``use_desktop`` (``true``) and
+        ``window_downgrade_allowed`` (a boolean) is required. The last one is the
+        «Как открываются окна» switch: ``false`` forbids the one retry without a
+        browser's sandbox, and every other value is refused rather than guessed.
         """
 
         body = dict(payload or {})
@@ -74,13 +78,38 @@ def register_settings_routes(app: Any, settings: Any) -> None:
         request_root = body.get("project_root")
         if request_root is not None and not isinstance(request_root, str):
             raise body_error_exception("'project_root' must be a string")
+        allow_downgrade = body.get("window_downgrade_allowed")
+        if allow_downgrade is not None and not isinstance(allow_downgrade, bool):
+            raise body_error_exception("'window_downgrade_allowed' must be a boolean")
         if bool(use_desktop) and request_root is not None:
             raise body_error_exception(
                 "send either 'project_root' or 'use_desktop', not both"
             )
+        if allow_downgrade is not None and (bool(use_desktop) or request_root is not None):
+            raise body_error_exception(
+                "send 'window_downgrade_allowed' alone, not with a project root"
+            )
+        if allow_downgrade is not None:
+            # The window switch is one key of the same file, and it changes nothing about
+            # where projects live: no root is created or re-decided here.
+            try:
+                settings.set_window_downgrade_allowed(allow_downgrade)
+            except AppSettingsError as exc:
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        **error_body(error_code=exc.code, code=exc.code),
+                        "error": str(exc),
+                        "field": getattr(exc, "field", ""),
+                    },
+                ) from exc
+            return _payload()
         if not bool(use_desktop) and request_root is None:
             raise body_error_exception(
-                "send 'project_root' (a full path) or 'use_desktop': true"
+                "send 'project_root' (a full path), 'use_desktop': true "
+                "or 'window_downgrade_allowed'"
             )
         try:
             if bool(use_desktop):

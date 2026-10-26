@@ -122,6 +122,7 @@ def register_project_routes(
     runner: Any = None,
     opener: Any = None,
     window_opener: Any = None,
+    window_policy: Any = None,
 ) -> None:
     """Attach the lifecycle routes to ``app`` and publish the service on its state.
 
@@ -157,6 +158,11 @@ def register_project_routes(
     have started, without a browser window opening on the test machine. The launcher
     itself is always composed here, so it shares this process's one runner and one
     preview registry.
+
+    ``window_policy`` is the owner's «Как открываются окна» switch: a zero-argument
+    callable answering whether a browser whose own sandbox cannot start may be retried
+    once without it. It is handed to the opener the launcher composes when none was
+    injected; the composition reads it from the same settings store «Настройки» writes.
     """
 
     from fastapi import Body, HTTPException
@@ -190,6 +196,7 @@ def register_project_routes(
         runner=local_runner,
         previews=registry,
         windows=window_opener,
+        window_policy=window_policy,
     )
     app.state.forge_launcher = project_launcher
 
