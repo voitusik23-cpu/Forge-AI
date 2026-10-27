@@ -26,6 +26,8 @@ import { Badge, Button, Card, CardHead, Field, StatusDot } from "../components/P
 import { AliveBar } from "../components/AliveBar";
 import { IconRefresh } from "../components/Icons";
 import { RouteLine } from "../components/RouteLine";
+import { EvidenceBlock } from "../components/EvidenceBlock";
+import type { Evidence } from "../evidence";
 import { t, type Lang } from "../i18n";
 import { stampMs } from "../progress";
 import { PROJECT_LIST_PAGE_SIZE, projectListRows } from "../project-list.js";
@@ -824,6 +826,8 @@ const ProjectCard = ({
   mockSelected,
   controls,
   forgeDid,
+  changeEvidence,
+  evidence,
   onRearmChange,
   onRetryWithRealModel,
   actionFailure,
@@ -948,6 +952,18 @@ const ProjectCard = ({
   controls: ChangeControls;
   /** «Что сделал Forge», from the model's own answer and the files it really wrote. */
   forgeDid: ForgeDid;
+  /**
+   * «Проверено · предположения · неизвестно» for this change: the backend's evidence
+   * block (`app/reports/evidence.py`), from the run response or the reloaded current
+   * version. `null` when neither carried one.
+   */
+  changeEvidence: Evidence | null | undefined;
+  /**
+   * The evidence block for the **current version** (`evidence` on the project
+   * detail): what the project card's own line counts. `null` when the detail carries
+   * none.
+   */
+  evidence: Evidence | null | undefined;
   /** «Внести ещё изменения»: the only way the form comes back after a change. */
   onRearmChange: () => void;
   /** «Повторить с реальной моделью»: switch to the best non-mock provider and re-run. */
@@ -1337,6 +1353,11 @@ const ProjectCard = ({
                           {forgeDid.answerLines.join("\n")}
                         </div>
                       ) : null}
+                      {/* WHAT WAS CHECKED, WHAT WAS ONLY SAID, WHAT IS UNKNOWN. The
+                          backend separates the three (`app/reports/evidence.py`); this
+                          one line counts the lists it opens, so «Проверено: N» is the
+                          number of proofs a reader can see, never a summary of the run. */}
+                      <EvidenceBlock lang={lang} evidence={changeEvidence} testId="change-evidence" />
                     </div>
                   </div>
                 ) : null}
@@ -1981,6 +2002,17 @@ const ProjectCard = ({
               ))}
           </div>
         </div>
+
+        {/* WHAT IS PROVEN, WHAT IS ASSUMED, WHAT IS UNKNOWN about the current
+            version. One line that opens into the backend's three lists
+            (`app/reports/evidence.py`): the version's files with their SHA-256 and
+            sizes, the verification command and the acceptance verdict. It stays
+            collapsed, so nothing technical crowds the owner's word above it; while a
+            change block below carries the newer run's own evidence this block stands
+            down, so two banners never describe the same result twice. */}
+        {changeStrip === null || changeStrip.final === "" ? (
+          <EvidenceBlock lang={lang} evidence={evidence} testId="project-evidence" />
+        ) : null}
 
         {/* THE RECORD'S OWN NOTICES. While a change is in flight they describe the *pending*
             version («Изменения не записаны: новой версии нет») and would contradict the strip
@@ -3932,6 +3964,20 @@ export const Projects = ({
       }),
     [dispatched, changeStrip]
   );
+  /**
+   * «Проверено · предположения · неизвестно» for this change.
+   *
+   * The run response carries it directly (`evidence`), built by the backend from the
+   * version the attach recorded — so the digests and the verdicts are the run's own.
+   * The project detail is the fallback: a screen that reloaded after the change has
+   * no run response, but the current version still has its evidence block. Neither
+   * source is composed here; when both are absent the block renders nothing.
+   */
+  const changeEvidence =
+    dispatched?.response.evidence ??
+    (detail?.status === "ready" ? detail.value.evidence : undefined);
+  /** The current version's own block, shown on the card itself. */
+  const projectEvidence = detail?.status === "ready" ? detail.value.evidence : undefined;
   /** «Внести ещё изменения»: the only way the form comes back after a change. */
   const rearmChange = () => {
     setChangeArmed(true);
@@ -4553,6 +4599,8 @@ export const Projects = ({
           mockSelected={mockSelected}
           controls={controls}
           forgeDid={forgeDid}
+          changeEvidence={changeEvidence}
+          evidence={projectEvidence}
           onRearmChange={rearmChange}
           onRetryWithRealModel={retryWithRealModel}
           actionFailure={actionFailure}

@@ -34,6 +34,7 @@ import { IconAnvil, IconPlay, IconRefresh } from "../components/Icons";
 import { AliveBar } from "../components/AliveBar";
 import { RunProgress } from "../components/RunProgress";
 import { RouteLine, complexityWord, tierWord } from "../components/RouteLine";
+import { EvidenceBlock } from "../components/EvidenceBlock";
 import { t, type Lang } from "../i18n";
 import { selectRunProject } from "../project-selection.js";
 import {
@@ -2181,6 +2182,17 @@ export const Forge = ({
                     ) : null}
                   </div>
                 </div>
+
+                {/* WHAT WAS CHECKED, WHAT WAS ONLY SAID, WHAT IS UNKNOWN. One line that
+                    opens into the backend's three lists (`app/reports/evidence.py`):
+                    the numbers are the list lengths, so a run whose work was never
+                    verified shows «Проверено: 0» beside the sentences the model wrote,
+                    instead of a success the run cannot prove. */}
+                <EvidenceBlock
+                  lang={lang}
+                  evidence={dispatched.response.evidence}
+                  testId="forge-evidence"
+                />
 
                 {/* «Провайдер · Модель · тариф · почему»: the routing decision this run
                     made, above the fold and always visible — the owner never has to open a

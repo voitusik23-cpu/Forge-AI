@@ -92,6 +92,15 @@ CONTRACT_KEYS = [
     "answer_excerpt",
 ]
 
+#: The exact key set, in the exact order, of the HTTP body `POST /api/tasks/run`
+#: answers: the dataclass fields above, then the one key the **route** adds after the
+#: project attach -- `evidence` (what was verified, what was only said, what is
+#: unknown; `app/reports/evidence.py`). It is built at the HTTP boundary on purpose:
+#: it needs the attached version's own SHA-256 digests and verdicts, which the service
+#: cannot know while it assembles the response. Additive and last, like every field
+#: above, so an older client keeps every position it knew.
+HTTP_BODY_KEYS = [*CONTRACT_KEYS, "evidence"]
+
 #: The workspace/Core project this test server is composed for. It is deliberately
 #: not the `proj-…` shape: if the response ever copies it into the lifecycle field,
 #: the assertions below see it.
@@ -287,7 +296,11 @@ class RunProjectIdContractTests(_RunProjectIdCase):
     def test_06_the_http_body_key_order_is_stable(self) -> None:
         client = self._client()
         body = self._write_run(client, None).json()
-        self.assertEqual(list(body), CONTRACT_KEYS)
+        self.assertEqual(list(body), HTTP_BODY_KEYS)
+        # The evidence block is published on every run, even when it has no project:
+        # a run that wrote nothing gets an empty `verified` list, not a missing key.
+        self.assertIn("evidence", body)
+        self.assertEqual(body["evidence"]["verified"], [])
 
 
 class UiSelectionTests(unittest.TestCase):

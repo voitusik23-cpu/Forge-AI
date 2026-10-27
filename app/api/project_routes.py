@@ -90,6 +90,7 @@ from app.projects.preview import (
 from app.execution.containment import sandbox_settings_from_environment
 from app.projects.runner import LocalRunner, RunTarget
 from app.projects.stage import project_stage
+from app.reports.evidence import build_evidence
 __all__ = ["register_project_routes"]
 
 
@@ -504,11 +505,71 @@ def register_project_routes(
             entry_path=str(entry.path) if entry is not None else "",
         ).to_dict()
 
+    def _evidence_of(project: Any) -> Dict[str, Any]:
+        """What is proven, assumed and unknown about the **current** version.
+
+        The facts are the version's own records: its files (path, size and the
+        SHA-256 written when the run recorded them), its verification word with the
+        command a person would repeat, its acceptance verdict and its number. The
+        model's text is *not* stored on a version, so ``assumed`` is empty here --
+        which is the honest answer, not a gap to fill with a guess.
+
+        A URL is deliberately not passed as a served fact: the runner proves that a
+        ``GET /`` answered when it published a URL, but it does not keep the status
+        code, and evidence must name (URL + status) or say it has none. The block
+        therefore reports the live run as unknown instead of dressing a remembered
+        address as a fresh answer.
+        """
+
+        current = project.current()
+        return build_evidence(
+            outcome=_stage_of(project),
+            files=tuple(getattr(current, "files", ()) or ()) if current is not None else (),
+            verification={
+                "status": (
+                    str(getattr(current, "verification", "") or "")
+                    if current is not None
+                    else ""
+                ),
+                "command": (
+                    _verification_command(project.project_path, current)
+                    if current is not None
+                    else ""
+                ),
+            },
+            acceptance=(
+                str(getattr(current, "acceptance", "") or "")
+                if current is not None
+                else ""
+            ),
+            model_summary="",
+            answer_excerpt="",
+            run={
+                "run_id": (
+                    str(getattr(current, "run_id", "") or "")
+                    if current is not None
+                    else ""
+                ),
+                "url": "",
+                "http_status": 0,
+            },
+            project={
+                "version": (
+                    int(getattr(current, "version", 0) or 0)
+                    if current is not None
+                    else 0
+                ),
+                "status": str(getattr(project.status, "value", project.status) or ""),
+            },
+        )
+
     def _detail(project: Any) -> Dict[str, Any]:
         current = project.current()
         files = tuple(current.files) if current is not None else ()
         entry = _entry_of(project)
         folder = _folder_facts(project)
+        preview = _preview_payload(project, entry)
+        run = local_runner.status(_run_target(project))
         return {
             "project": project.to_dict(),
             "versions": [item.summary() for item in reversed(project.versions)],
@@ -521,9 +582,16 @@ def register_project_routes(
             "files_created": len(files),
             "entrypoint": _entry_payload(project, entry),
             "entrypoint_reason": _entry_resolution(project).reason,
-            "preview": _preview_payload(project, entry),
-            "run": local_runner.status(_run_target(project)),
+            "preview": preview,
+            "run": run,
             "verification_command": _verification_command(project.project_path, current),
+            # ------------------------------------------------ what is proven, what is not
+            # The evidence block for the current version: file digests, the verification
+            # command and the acceptance verdict as `verified`; the model's words (none
+            # are stored on a version) as `assumed`; every gap as `unknown`. It is
+            # derived per read, exactly like `stage` and `preview`, so a stale record
+            # cannot make a deleted file or an old verdict look like a fresh proof.
+            "evidence": _evidence_of(project),
             # ------------------------------------------------ the entrance into the project
             # ``folder`` is what the card prints beside its open buttons; ``open`` says,
             # per target, whether anything can really be started and why not. Both are

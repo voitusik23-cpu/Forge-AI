@@ -4134,6 +4134,20 @@ POST /api/tasks/run  { category: "code", write_mode: true }
   model's own answer, collapsed, bounded to 400 characters and screened by the
   repository's credential check (`app.projects.what_forge_did`). A run that wrote no
   file can therefore say what the model replied instead of leaving the card silent.
+- Every run response and every project detail also publishes `evidence`
+  (`app/reports/evidence.py`, pure): `verified` holds only facts the system measured —
+  a written file with path + size + SHA-256, the verification command, the acceptance
+  verdict, the version number, a URL + HTTP status; `assumed` holds the model's own
+  words marked «сказано моделью, не проверено»; `unknown` names every gap (no files,
+  no verification, no live run). The rules are enforced in code: a file without a
+  digest is not a verified file, verification/acceptance are never verified without a
+  proven file, and the run's outcome word never becomes a verified claim — a zero-file
+  run therefore has an empty `verified` list. The write-mode output contract ends with
+  the matching sentence («… что ты проверил, что предполагаешь, что осталось
+  неизвестным …»), so the model is asked for the same three-way split. The interface
+  renders one line, «Проверено: N · предположения: M · неизвестно: K», whose numbers
+  are the lengths of the lists it opens (`ui/src/evidence.ts`), on the project card,
+  inside «Что сделал Forge» for a change, and in the Кузница result card.
 
 ### Verified limitation
 
@@ -4261,6 +4275,20 @@ POST /api/tasks/run  { category: "code", write_mode: true }
   штатной проверкой учётных данных (`app.projects.what_forge_did`). Поэтому запуск,
   не записавший ни одного файла, всё равно может сказать, что ответила модель, вместо
   молчания карточки.
+- Каждый ответ запуска и каждая карточка проекта публикуют `evidence`
+  (`app/reports/evidence.py`, чистая функция): в `verified` только факты, которые
+  измерила система — записанный файл с путём, размером и SHA-256, команда проверки,
+  вердикт приёмки, номер версии, URL + HTTP-статус; в `assumed` — слова самой модели с
+  пометкой «сказано моделью, не проверено»; в `unknown` — каждый пробел (файлов нет,
+  проверки нет, живого запуска нет). Правила закреплены в коде: файл без дайджеста не
+  считается проверенным файлом, проверка и приёмка не подтверждаются без доказанного
+  файла, а слово исхода запуска никогда не становится проверенным утверждением —
+  поэтому у запуска с нулём файлов `verified` пуст. Контракт вывода в режиме записи
+  заканчивается той же фразой («… что ты проверил, что предполагаешь, что осталось
+  неизвестным …»), чтобы модель отвечала по тому же трёхчастному правилу. Интерфейс
+  показывает одну строку «Проверено: N · предположения: M · неизвестно: K», числа
+  которой равны длинам открываемых списков (`ui/src/evidence.ts`), — на карточке
+  проекта, внутри «Что сделал Forge» для изменения и в карточке результата «Кузницы».
 
 ### Проверенное ограничение
 

@@ -16,6 +16,7 @@
 // user and the interface must not merge them into one message.
 
 import { taskRunBody } from "../task-run-body";
+import type { Evidence } from "../evidence";
 
 export type ProjectInfo = {
   project_id?: string;
@@ -128,6 +129,15 @@ export type TaskRunResponse = {
    * quote — the interface then says so instead of inventing a reason.
    */
   answer_excerpt?: string;
+  /**
+   * What was checked, what was assumed, what remained unknown
+   * (`app/reports/evidence.py`). `verified` holds only facts the system measured (file
+   * path + size + SHA-256, the verification command, the acceptance verdict, a
+   * version number, a URL + HTTP status); `assumed` holds the model's own words,
+   * each marked as unchecked; `unknown` names every gap. Absent when the backend
+   * published no block — the screen then shows nothing rather than a false "0 · 0 · 0".
+   */
+  evidence?: Evidence;
 };
 
 /**
@@ -1115,6 +1125,13 @@ export type LifecycleProject = {
   open?: LifecycleOpen;
   /** The absolute paths of this surface, confined to the collapsed diagnostics block. */
   diagnostics?: { folder_absolute?: string; project_root?: string };
+  /**
+   * The evidence block for the current version (`app/reports/evidence.py`): its files
+   * with their sizes and SHA-256, the verification command and the acceptance verdict
+   * as `verified`; the model's words as `assumed` (a version stores none, so this is
+   * usually empty — an honest absence); every gap as `unknown`.
+   */
+  evidence?: Evidence;
 };
 
 /** One openable target (`folder`, `editor`, `terminal`) and whether it is available. */

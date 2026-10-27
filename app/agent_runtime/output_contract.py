@@ -12,8 +12,9 @@ Two texts live here and nothing else:
 * :data:`OUTPUT_CONTRACT` -- appended to every write-mode prompt
   (:func:`append_output_contract`). It states the answer shape, the allowed file
   root, the forbidden paths (``.env``, secrets, ``.git``, ...), the "only what the
-  plan needs" rule, and that a ``code`` run in write mode is expected to produce
-  files rather than a report.
+  plan needs" rule, that a ``code`` run in write mode is expected to produce
+  files rather than a report, and the closing list the answer must end with:
+  what it checked, what it assumes, what it does not know.
 * :data:`RETRY_INSTRUCTION` -- the shorter, harder text used for the single retry
   (:func:`build_retry_prompt`). If an answer carries no file block at all, Forge
   asks exactly once more; :data:`MAX_WRITE_RETRIES` is what caps that, and the rule
@@ -48,7 +49,8 @@ OUTPUT_CONTRACT = """OUTPUT CONTRACT — обязателен для этого 
 Пути в блоках — только относительные, внутри этой папки: абсолютные пути, «..» и выход за папку запрещены.
 Запрещено писать: .env и .env.*, любые файлы с ключами, токенами и секретами, .git, .venv, node_modules, dist.
 Пиши только те файлы, которые нужны плану этой задачи; ничего сверх плана не создавай.
-Это запуск категории code в режиме записи (write_mode): от тебя ожидаются файлы, а не отчёт."""
+Это запуск категории code в режиме записи (write_mode): от тебя ожидаются файлы, а не отчёт.
+В конце ответа перечисли: что ты проверил, что предполагаешь, что осталось неизвестным; не утверждай, что работает, если не проверял."""
 
 #: The one corrective instruction used when an answer carried no file block.
 RETRY_INSTRUCTION = """Ты не вернул ни одного файла. Верни только блоки с path=… — по одному блоку на файл, без плана, без отчёта и без вопросов.

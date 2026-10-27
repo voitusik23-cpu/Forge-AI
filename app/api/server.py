@@ -41,6 +41,7 @@ from app.api.service import (
     PaidModelRequiresConfirmation,
     RunIdempotencyConflict,
 )
+from app.reports.evidence import build_evidence
 from app.runtime.run_store import is_safe_run_id
 
 logger = logging.getLogger("forge.api")
@@ -620,20 +621,20 @@ def create_api_app(
 
     def _attach_project(
         project_id: str, outcome: Any
-    ) -> tuple[str, Optional[dict[str, Any]], str]:
+    ) -> tuple[str, Optional[dict[str, Any]], str, int]:
         """Attach one finished run to the project it belongs to.
 
         ``project_id`` is the project the **composition** resolved before the run was
         dispatched -- from the linked discovery session or from the ``proj-…`` id the
         caller named. It is never taken from the answer, the plan or the task text.
 
-        Returns ``(status, facts, lifecycle_project_id)``. ``status`` is the fact for
-        the ``X-Forge-Project-Attach`` header: ``none`` when no project is known,
-        ``ok`` when the run was recorded, ``already_attached`` when that very run id
-        is already a version (an idempotent replay must not produce a second
-        version), and ``error:<Type>`` when the attachment failed -- in which case
-        the failure is logged here and the run's own response is left exactly as it
-        was.
+        Returns ``(status, facts, lifecycle_project_id, version_number)``. ``status``
+        is the fact for the ``X-Forge-Project-Attach`` header: ``none`` when no
+        project is known, ``ok`` when the run was recorded, ``already_attached`` when
+        that very run id is already a version (an idempotent replay must not produce a
+        second version), and ``error:<Type>`` when the attachment failed -- in which
+        case the failure is logged here and the run's own response is left exactly as
+        it was.
 
         ``facts`` is the project evidence the outcome gate needs *after* the attach:
         the project's status, whether its workspace exists, its artifact manifest,
@@ -646,15 +647,24 @@ def create_api_app(
         adds no version and therefore has no facts to re-derive the outcome from --
         still publishes the id of the project the run already belongs to. It is the
         record's own identifier, never the workspace id and never synthesised.
+
+        ``version_number`` is the number of the version **this run** produced (or
+        already owned, on a replay), and ``0`` when no project was attached. It is
+        the number the evidence block cites as a verified fact; it is never guessed
+        from ``current_version``, because a run that wrote nothing leaves the
+        previous version current.
         """
 
         if not isinstance(project_id, str) or not project_id.strip():
-            return "none", None, ""
+            return "none", None, "", 0
         try:
             run_id = str(getattr(outcome.response, "run_id", "") or "")
             project = projects.open_project(project_id)
-            if any(item.run_id == run_id for item in project.versions):
-                return "already_attached", None, project_id
+            already = next(
+                (item for item in project.versions if item.run_id == run_id), None
+            )
+            if already is not None:
+                return "already_attached", None, project_id, int(already.version)
             # The durable record is the evidence: it carries the classification the
             # run store derived from the persisted snapshot and the writer's own
             # outcome. ``provider_used``/``model_used`` are fields of the response,
@@ -696,6 +706,9 @@ def create_api_app(
                 version = next(
                     (item for item in attached.versions if item.run_id == run_id), None
                 )
+            # The evidence block cites the version THIS RUN produced, so the number is
+            # kept before the fallback below points ``version`` at whatever is current.
+            run_version = int(getattr(version, "version", 0) or 0) if version else 0
             version = version or attached.current() or attached.latest_version
             files = tuple(getattr(version, "files", ()) or ())
             facts = {
@@ -718,12 +731,12 @@ def create_api_app(
                 "run_success": bool(getattr(outcome.response, "success", False)),
                 "error": str(getattr(outcome.response, "error", "") or ""),
             }
-            return "ok", facts, project_id
+            return "ok", facts, project_id, run_version
         except Exception as exc:  # noqa: BLE001 - the run's own result stands
             logger.exception(
                 "project attach failed for lifecycle project %s", project_id
             )
-            return f"error:{type(exc).__name__}", None, ""
+            return f"error:{type(exc).__name__}", None, "", 0
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -1080,7 +1093,7 @@ def create_api_app(
         # to the project's own facts and the response is updated with them. Without
         # this the response would say "specification ready" for a project that was
         # in fact created and completed a moment later.
-        attach_status, attach_facts, lifecycle_project_id = _attach_project(
+        attach_status, attach_facts, lifecycle_project_id, attached_version = _attach_project(
             target_project, outcome
         )
         body = outcome.response.to_dict()
@@ -1097,6 +1110,33 @@ def create_api_app(
                     **attach_facts,
                 )
             )
+        # WHAT WAS CHECKED, WHAT WAS ASSUMED, WHAT IS UNKNOWN. Built last, from the
+        # facts that actually arrived: the version the attach recorded (its files carry
+        # the SHA-256 digests), its verification and its acceptance verdict. A run that
+        # attached no project has no manifest here, so its ``verified`` list is empty by
+        # construction and the model's own words go to ``assumed``. The run's outcome
+        # word is passed for context only and never becomes a verified claim.
+        facts_for_evidence = attach_facts or {}
+        intent = body.get("model_intent")
+        model_summary = (
+            str(intent.get("summary") or "")
+            if isinstance(intent, Mapping)
+            else ""
+        )
+        body["evidence"] = build_evidence(
+            outcome=body.get("outcome", ""),
+            files=facts_for_evidence.get("files") or (),
+            verification=facts_for_evidence.get("verification", ""),
+            acceptance=facts_for_evidence.get("acceptance", ""),
+            model_summary=model_summary,
+            answer_excerpt=body.get("answer_excerpt", ""),
+            run={
+                "run_id": str(body.get("run_id") or ""),
+                "url": "",
+                "http_status": 0,
+            },
+            project={"version": attached_version},
+        )
         response = JSONResponse(body)
         response.headers["X-Forge-Idempotent-Replay"] = "true" if outcome.idempotent_replay else "false"
         response.headers["X-Forge-History-Recorded"] = "true" if outcome.history_recorded else "false"
