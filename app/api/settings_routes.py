@@ -5,9 +5,11 @@ These routes and nothing else:
 
 ```
 GET  /api/settings   -> the project root, its default, whether it exists,
-                        and whether the window retry without a sandbox is allowed
+                        whether the window retry without a sandbox is allowed, and
+                        whether the discovery questions may be helped by a model
 POST /api/settings   -> {"project_root": "..."} | {"use_desktop": true}
                         | {"window_downgrade_allowed": false}
+                        | {"questions_from_model": true}
 ```
 
 Why this is not ``.env``: the value is the folder the owner's own projects live in, he
@@ -63,12 +65,16 @@ def register_settings_routes(app: Any, settings: Any) -> None:
 
     @app.post("/api/settings")
     def write_settings(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
-        """Set the project root, restore the desktop default, or forbid a window retry.
+        """Set the project root, restore the desktop default, forbid a window retry, or
+        decide whether the discovery questions may be helped by a model.
 
-        Exactly one of ``project_root`` (a full path), ``use_desktop`` (``true``) and
-        ``window_downgrade_allowed`` (a boolean) is required. The last one is the
-        «Как открываются окна» switch: ``false`` forbids the one retry without a
-        browser's sandbox, and every other value is refused rather than guessed.
+        Exactly one of ``project_root`` (a full path), ``use_desktop`` (``true``),
+        ``window_downgrade_allowed`` and ``questions_from_model`` (booleans) is
+        required. The third is the «Как открываются окна» switch: ``false`` forbids the
+        one retry without a browser's sandbox. The fourth is «Вопросы по смыслу задачи
+        (через модель)»: ``true`` lets the optional model path write up to three
+        questions, it is off by default, and it spends the owner's tokens. Every other
+        value is refused rather than guessed.
         """
 
         body = dict(payload or {})
@@ -81,6 +87,9 @@ def register_settings_routes(app: Any, settings: Any) -> None:
         allow_downgrade = body.get("window_downgrade_allowed")
         if allow_downgrade is not None and not isinstance(allow_downgrade, bool):
             raise body_error_exception("'window_downgrade_allowed' must be a boolean")
+        from_model = body.get("questions_from_model")
+        if from_model is not None and not isinstance(from_model, bool):
+            raise body_error_exception("'questions_from_model' must be a boolean")
         if bool(use_desktop) and request_root is not None:
             raise body_error_exception(
                 "send either 'project_root' or 'use_desktop', not both"
@@ -89,6 +98,31 @@ def register_settings_routes(app: Any, settings: Any) -> None:
             raise body_error_exception(
                 "send 'window_downgrade_allowed' alone, not with a project root"
             )
+        if from_model is not None and (
+            bool(use_desktop)
+            or request_root is not None
+            or allow_downgrade is not None
+        ):
+            raise body_error_exception(
+                "send 'questions_from_model' alone, not with a project root"
+            )
+        if from_model is not None:
+            # «Вопросы по смыслу задачи (через модель)»: one key of the same file, off by
+            # default, changing nothing about where projects live.
+            try:
+                settings.set_questions_from_model(from_model)
+            except AppSettingsError as exc:
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        **error_body(error_code=exc.code, code=exc.code),
+                        "error": str(exc),
+                        "field": getattr(exc, "field", ""),
+                    },
+                ) from exc
+            return _payload()
         if allow_downgrade is not None:
             # The window switch is one key of the same file, and it changes nothing about
             # where projects live: no root is created or re-decided here.
@@ -108,8 +142,8 @@ def register_settings_routes(app: Any, settings: Any) -> None:
             return _payload()
         if not bool(use_desktop) and request_root is None:
             raise body_error_exception(
-                "send 'project_root' (a full path), 'use_desktop': true "
-                "or 'window_downgrade_allowed'"
+                "send 'project_root' (a full path), 'use_desktop': true, "
+                "'window_downgrade_allowed' or 'questions_from_model'"
             )
         try:
             if bool(use_desktop):

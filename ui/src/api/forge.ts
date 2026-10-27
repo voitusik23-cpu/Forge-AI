@@ -794,6 +794,8 @@ export type DiscoveryQuestion = {
   allow_custom?: boolean;
   /** «Не знаю — выбери оптимальный вариант» is offered only when the Core can honour it. */
   allow_unknown?: boolean;
+  /** Why this decision matters for *this kind of task* («Почему этот вопрос»). */
+  relevance?: string;
 };
 
 export type DiscoveryAnswer = {
@@ -850,6 +852,15 @@ export type DiscoverySession = {
   updated_at?: string;
   skipped?: boolean;
   skip_reason?: string;
+  /**
+   * What the Core understood the idea to be (`mail`, `booking`, `shop`, …), the words
+   * it shows for it, how sure the rule system is, and the words that made it sure.
+   * The questions card prints «Задача понята как: почтовый клиент — 79 %».
+   */
+  domain?: string;
+  domain_label?: string;
+  domain_confidence?: number;
+  domain_evidence?: string[];
 };
 
 /** The session routes answer `{session, questions}`; `questions` is the next round to ask. */
@@ -1708,6 +1719,12 @@ export type ForgeSettings = {
    * into the owner's page — and every downgrade is written into the project's launch log.
    */
   window_downgrade_allowed?: boolean;
+  /**
+   * «Вопросы по смыслу задачи (через модель)»: whether the optional model path may
+   * write up to three clarification questions. **Off by default** — it uses the owner's
+   * tokens, and the deterministic domain questions are asked either way.
+   */
+  questions_from_model?: boolean;
   settings_path?: string;
   schema?: string;
   created?: boolean;
@@ -1728,6 +1745,7 @@ export const saveProjectRoot = (
     | { project_root: string }
     | { use_desktop: true }
     | { window_downgrade_allowed: boolean }
+    | { questions_from_model: boolean }
 ): Promise<Result<ForgeSettings>> => postJson<ForgeSettings>("/api/settings", body);
 
 // --------------------------------------------------------------- providers and keys

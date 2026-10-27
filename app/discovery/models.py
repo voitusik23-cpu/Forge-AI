@@ -120,6 +120,10 @@ class ClarificationQuestion:
     options: Tuple[ClarificationOption, ...] = ()
     allow_custom: bool = True
     allow_unknown: bool = True
+    #: Why this decision matters for *this kind of task* («Почему этот вопрос»). The
+    #: generic ``why`` explains the field; this explains the question. Empty for the
+    #: generic area questions, which carry no domain.
+    relevance: str = ""
 
     @property
     def optional(self) -> bool:
@@ -166,6 +170,7 @@ class ClarificationQuestion:
             "options": [option.to_dict() for option in self.options],
             "allow_custom": bool(self.allow_custom),
             "allow_unknown": bool(self.allow_unknown),
+            "relevance": self.relevance,
         }
 
     @classmethod
@@ -184,6 +189,7 @@ class ClarificationQuestion:
             ),
             allow_custom=bool(data.get("allow_custom", True)),
             allow_unknown=bool(data.get("allow_unknown", True)),
+            relevance=str(data.get("relevance", "") or ""),
         )
 
 
@@ -245,6 +251,25 @@ def _as_text_tuple(value: object) -> Tuple[str, ...]:
     return (str(value).strip(),) if str(value).strip() else ()
 
 
+def _as_confidence(value: object) -> float:
+    """A stored confidence as ``0.0..1.0``; anything else means "not recorded"."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return round(max(0.0, min(1.0, float(value))), 2)
+
+
+def _domain_label(domain: object) -> str:
+    """The human words for a domain, without making this module depend on the rules."""
+
+    from app.discovery.domain import domain_label
+
+    try:
+        return domain_label(domain)
+    except Exception:  # noqa: BLE001 - a label must never fail a session payload
+        return str(domain or "")
+
+
 def _mapping_of_tuples(value: object) -> Dict[str, Tuple[str, ...]]:
     """A stored ``field -> [labels]`` mapping, read back without inventing entries."""
 
@@ -285,6 +310,11 @@ class ProjectSpecification:
     #: What was **auto-selected** by «Не знаю — выбери оптимальный вариант»,
     #: ``field`` -> the recommended labels that were chosen for the user.
     auto_selected_values: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    #: Answers to questions that have no typed specification field -- the domain banks'
+    #: concrete questions and the optional model's. The key is the question as it was
+    #: asked, so the task text hands the decision to the planner in words it can use,
+    #: and the value is the stored answer text. Never a guess: only real answers appear.
+    domain_answers: Mapping[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ view
     def as_task_text(self) -> str:
@@ -318,6 +348,13 @@ class ProjectSpecification:
         add("Constraints", self.constraints)
         add("Acceptance criteria", self.acceptance_criteria)
         add("Priorities", self.priorities)
+        if self.domain_answers:
+            # The concrete decisions of this kind of task, as they were asked.
+            lines.append("Task answers:")
+            for question, answer in self.domain_answers.items():
+                text = str(answer or "").strip()
+                if text:
+                    lines.append(f"  {question}: {text}")
         return "\n".join(lines)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -342,6 +379,10 @@ class ProjectSpecification:
                 key: list(values)
                 for key, values in dict(self.auto_selected_values).items()
             },
+            "domain_answers": {
+                str(key): str(value)
+                for key, value in dict(self.domain_answers).items()
+            },
         }
 
     @classmethod
@@ -351,6 +392,11 @@ class ProjectSpecification:
             str(key): str(value)
             for key, value in dict(raw_sources).items()
         } if isinstance(raw_sources, Mapping) else {}
+        raw_domain = data.get("domain_answers") or {}
+        domain_answers = {
+            str(key): str(value)
+            for key, value in dict(raw_domain).items()
+        } if isinstance(raw_domain, Mapping) else {}
         return cls(
             goal=str(data.get("goal", "")),
             project_type=str(data.get("project_type", "")),
@@ -369,6 +415,7 @@ class ProjectSpecification:
             auto_selected_values=_mapping_of_tuples(
                 data.get("auto_selected_values")
             ),
+            domain_answers=domain_answers,
         )
 
 
@@ -392,6 +439,12 @@ class DiscoverySession:
     #: Why the user chose to skip clarification. Screened like an answer, so it
     #: can never carry a credential either.
     skip_reason: str = ""
+    #: What the idea was understood as (:mod:`app.discovery.domain`), how sure the rule
+    #: system is, and which words made it sure. Published so the questions card can say
+    #: «Задача понята как: почтовый клиент — 72 %» instead of asking blindly.
+    domain: str = ""
+    domain_confidence: float = 0.0
+    domain_evidence: Tuple[str, ...] = ()
 
     # ------------------------------------------------------------------ view
     def answer_for(self, field_name: str) -> Optional[ClarificationAnswer]:
@@ -416,6 +469,13 @@ class DiscoverySession:
             "updated_at": self.updated_at,
             "skipped": bool(self.skipped),
             "skip_reason": self.skip_reason,
+            # The domain is published as four flat fields, never as a nested object:
+            # `domain` is an id a client may switch on, `domain_label` is the words it
+            # shows, and the evidence is what the classification was made from.
+            "domain": self.domain,
+            "domain_label": _domain_label(self.domain),
+            "domain_confidence": round(float(self.domain_confidence or 0.0), 2),
+            "domain_evidence": list(self.domain_evidence),
         }
 
     @classmethod
@@ -443,6 +503,9 @@ class DiscoverySession:
             updated_at=str(data.get("updated_at", "")),
             skipped=bool(data.get("skipped", False)),
             skip_reason=str(data.get("skip_reason", "")),
+            domain=str(data.get("domain", "") or ""),
+            domain_confidence=_as_confidence(data.get("domain_confidence")),
+            domain_evidence=_as_text_tuple(data.get("domain_evidence")),
         )
 
 

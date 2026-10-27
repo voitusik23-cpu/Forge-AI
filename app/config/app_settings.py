@@ -41,6 +41,12 @@ Two values live in it:
     when Forge opens a project's window (default ``true``: the retry is what turned the
     owner's grey window into his real page). «Настройки» can turn it off, and then the
     launch refuses honestly instead of starting an unsandboxed browser.
+
+``questions_from_model``
+    whether the discovery questions may be helped by a model (default ``false``). The
+    deterministic domain banks are the questions; the model is an optional extra that
+    costs the owner's tokens, so it is **off** unless he turns it on and a ready
+    non-mock provider is configured. Turning it off never disables clarification.
 """
 
 from __future__ import annotations
@@ -56,6 +62,7 @@ __all__ = [
     "PROJECT_ROOT_KEY",
     "PROJECT_ROOTS_KNOWN_KEY",
     "PROVIDERS_KEY",
+    "QUESTIONS_FROM_MODEL_KEY",
     "SETTINGS_ENV_VAR",
     "SETTINGS_SCHEMA_VERSION",
     "WINDOW_DOWNGRADE_ALLOWED_KEY",
@@ -93,6 +100,11 @@ PROJECT_ROOT_FALLBACK_KEY = "project_root_fallback"
 #: the owner asked for that retry, and it is what turns a grey window into his page.
 #: «Настройки» writes ``false`` to forbid it, and the launch then refuses honestly.
 WINDOW_DOWNGRADE_ALLOWED_KEY = "window_downgrade_allowed"
+
+#: Whether the discovery questions may be helped by a model. **Off by default**: the
+#: deterministic domain banks are the questions, and the optional path spends the
+#: owner's tokens. An absent or non-boolean value therefore means «off», never «on».
+QUESTIONS_FROM_MODEL_KEY = "questions_from_model"
 
 #: Every key this store owns. Everything else in the file is preserved verbatim, so a
 #: setting written by another module (the provider entries above) is not erased the next
@@ -425,6 +437,38 @@ class AppSettingsStore:
         write_settings_document(self._path, document)
         return bool(value)
 
+    # ------------------------------------------------- questions from a model
+    def questions_from_model(self) -> bool:
+        """Whether the optional model-written questions are allowed.
+
+        **Off unless the owner turned it on.** The raw document is read (not the
+        normalised one), and anything that is not the boolean ``true`` -- a missing key,
+        a corrupt file, a string someone typed -- answers ``false``: the expensive path
+        is never entered by accident.
+        """
+
+        raw = read_settings_document(self._path).get(QUESTIONS_FROM_MODEL_KEY)
+        return raw if isinstance(raw, bool) else False
+
+    def set_questions_from_model(self, value: object) -> bool:
+        """Persist the «вопросы по смыслу задачи (через модель)» switch and return it.
+
+        One key of the same file: the provider entries, the window policy and the
+        projects folder survive unchanged.
+        """
+
+        if not isinstance(value, bool):
+            raise AppSettingsError(
+                "Значение «вопросы через модель» должно быть true или false.",
+                field=QUESTIONS_FROM_MODEL_KEY,
+            )
+        document = read_settings_document(self._path)
+        document[QUESTIONS_FROM_MODEL_KEY] = bool(value)
+        document.setdefault("schema", SETTINGS_SCHEMA_VERSION)
+        document["updated_at"] = _now_iso()
+        write_settings_document(self._path, document)
+        return bool(value)
+
     def set_project_root(self, value: object) -> Path:
         """Store ``value`` as the project root and remember the previous ones.
 
@@ -520,6 +564,8 @@ class AppSettingsStore:
             "project_root_label_grant_command": label_grant_command,
             "project_roots_known": [str(item) for item in self.known_project_roots()],
             "window_downgrade_allowed": self.window_downgrade_allowed(),
+            # Off by default; the card explains that it uses the owner's tokens.
+            "questions_from_model": self.questions_from_model(),
             "settings_path": str(self._path),
             "schema": SETTINGS_SCHEMA_VERSION,
         }

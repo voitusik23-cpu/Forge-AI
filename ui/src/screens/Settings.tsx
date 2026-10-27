@@ -355,6 +355,113 @@ const WindowPolicyCard = ({ lang }: { lang: Lang }) => {
 };
 
 /**
+ * «Вопросы по смыслу задачи (через модель)»: the optional model path of the
+ * clarification card, **off by default**.
+ *
+ * The questions themselves are written by the deterministic domain banks
+ * (`app.discovery.banks`) and cost nothing. This switch only allows a ready provider to
+ * propose up to three extra questions about the same task: they are validated against
+ * the bank (`is_relevant`) and shown first. The switch is read on every clarification
+ * round, so turning it off takes effect on the next round without a restart — and while
+ * it is off, no provider is called at all.
+ *
+ * The cost line is not a decoration: the owner earlier forbade model-written questions,
+ * and this is the one place he can allow them, knowingly.
+ */
+const ModelQuestionsCard = ({ lang }: { lang: Lang }) => {
+  const [allowed, setAllowed] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [failure, setFailure] = useState<Failure | null>(null);
+
+  const load = useCallback(async () => {
+    const outcome = await loadSettings();
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    setFailure(null);
+    setAllowed(outcome.value.questions_from_model === true);
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const save = async (value: boolean) => {
+    setBusy(true);
+    setNotice("");
+    setFailure(null);
+    const outcome = await saveProjectRoot({ questions_from_model: value });
+    setBusy(false);
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    const next = outcome.value.questions_from_model === true;
+    setAllowed(next);
+    setNotice(
+      t(lang, "settings.questions_model.saved").replace(
+        "{state}",
+        t(lang, next ? "settings.questions_model.on" : "settings.questions_model.off")
+      )
+    );
+  };
+
+  const enabled = allowed === true;
+
+  return (
+    <Card className="rise d1">
+      <CardHead
+        title={t(lang, "settings.questions_model.title")}
+        hint={t(lang, "settings.questions_model.hint")}
+        action={
+          <Badge tone={enabled ? "warn" : "neutral"}>
+            {t(lang, enabled ? "settings.questions_model.on" : "settings.questions_model.off")}
+          </Badge>
+        }
+      />
+      <div className="stack" style={{ gap: 12 }} data-testid="settings-question-model">
+        <label className="row" style={{ gap: 10 }}>
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={busy || allowed === null}
+            onChange={(event) => void save(event.target.checked)}
+            data-testid="settings-question-model-toggle"
+          />
+          <span>
+            {t(lang, "settings.questions_model.toggle")}
+            <span className="small muted" style={{ display: "block" }}>
+              {t(lang, "settings.questions_model.toggle.hint")}
+            </span>
+          </span>
+        </label>
+        <div className="small" data-testid="settings-question-model-cost">
+          {t(lang, "settings.questions_model.cost")}
+        </div>
+        {notice !== "" ? (
+          <div className="notice" data-testid="settings-question-model-notice">
+            {notice}
+          </div>
+        ) : null}
+        {failure !== null ? (
+          <div className="notice warn" data-testid="settings-question-model-failure">
+            <div>{`HTTP ${failure.status}${failure.code ? ` · ${failure.code}` : ""}`}</div>
+            {failure.detail ? (
+              <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+                {failure.detail}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="small muted">{t(lang, "settings.questions_model.storage")}</div>
+      </div>
+    </Card>
+  );
+};
+
+/**
  * «Провайдеры и ключи»: the place the owner could not find.
  *
  * His complaint: providers came from `.env`, which he is not supposed to edit, so there
@@ -907,6 +1014,11 @@ export const Settings = ({
           retry. The sandbox always stays on the first attempt; this only forbids the
           documented fallback. */}
       <WindowPolicyCard lang={lang} />
+
+      {/* «Вопросы по смыслу задачи (через модель)»: the optional model path of the
+          questions card, off by default. It uses the owner's tokens, and the card says so
+          on its own line. */}
+      <ModelQuestionsCard lang={lang} />
 
       {/* «Как выбирается модель»: the rule automatic routing applies, with the setting that
           is in force right now. A reader who wonders «где выбрать модель?» finds the answer

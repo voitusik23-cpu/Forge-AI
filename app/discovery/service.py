@@ -28,6 +28,8 @@ from app.discovery.analyzer import (
     analyze_goal,
     missing_areas,
 )
+from app.discovery.banks import bank_question
+from app.discovery.domain import detect_domain
 from app.discovery.models import (
     ClarificationAnswer,
     ClarificationQuestion,
@@ -127,8 +129,18 @@ def apply_specification(
 class DiscoveryService:
     """Create, advance and confirm discovery sessions."""
 
-    def __init__(self, store: Optional[DiscoveryStore] = None) -> None:
+    def __init__(
+        self,
+        store: Optional[DiscoveryStore] = None,
+        *,
+        question_model: Optional[object] = None,
+    ) -> None:
         self._store = store if store is not None else DiscoveryStore()
+        # The optional model path: an object with ``questions(idea, domain, *,
+        # answered_fields=...)``. It is asked on every refresh, is off by default, and
+        # any failure inside it falls back to the deterministic bank -- so a session
+        # behaves identically whether it is ``None`` or a disabled assistant.
+        self._question_model = question_model
 
     # ------------------------------------------------------------------ reads
     @property
@@ -337,7 +349,7 @@ class DiscoveryService:
                     "each answer must be a ClarificationAnswer or a mapping"
                 )
             question_id = str(item.get("question_id", "") or "")
-            field_name = self._field_for_question(question_id)
+            field_name = self._field_for_question(question_id, session)
             if field_name is None:
                 raise InvalidClarificationAnswer(
                     f"'{question_id}' is not a question this layer asks"
@@ -439,19 +451,42 @@ class DiscoveryService:
     def _question_for_field(
         self, session: DiscoverySession, field_name: str
     ) -> Optional[ClarificationQuestion]:
-        """The question this session asked for an area, or the canonical one."""
+        """The question this session asked for a field, or the canonical one."""
 
         for question in session.questions:
             if question.field == field_name:
                 return question
-        return question_for_area(field_name, session.initial_goal)
+        if field_name in AREA_ORDER:
+            return question_for_area(field_name, session.initial_goal)
+        # A domain question from an earlier round is no longer in ``session.questions``;
+        # the bank still knows its text and labels, so a re-answer stays interpretable.
+        return bank_question(session.domain, field_name)
 
-    @staticmethod
-    def _field_for_question(question_id: str) -> Optional[str]:
-        if not question_id.startswith("q-"):
+    def _field_for_question(
+        self, question_id: str, session: DiscoverySession
+    ) -> Optional[str]:
+        """The field an incoming answer names, or ``None`` when it is not one of ours.
+
+        Three sets are accepted, and nothing else: the canonical specification areas,
+        the questions this round asked (the domain banks), and fields this session has
+        already answered -- so correcting an earlier answer keeps working while an
+        invented id is still refused.
+        """
+
+        if not str(question_id).startswith("q-"):
             return None
-        field_name = question_id[2:]
-        return field_name if field_name in AREA_ORDER else None
+        field_name = str(question_id)[2:]
+        if not field_name:
+            return None
+        if field_name in AREA_ORDER:
+            return field_name
+        if any(question.field == field_name for question in session.questions):
+            return field_name
+        if any(
+            answer.question_id == str(question_id) for answer in session.answers
+        ):
+            return field_name
+        return None
 
     @staticmethod
     def _merge_answers(
@@ -479,23 +514,43 @@ class DiscoveryService:
         """Recompute questions, specification and state from the session itself."""
 
         specification = self._specification_for(session)
-        questions = clarification_questions(session.initial_goal, session.answers)
+        questions = clarification_questions(
+            session.initial_goal,
+            session.answers,
+            model_questions=self._model_question_hook(),
+        )
         missing_essential = [
             area for area in AREA_ORDER
             if area in ESSENTIAL_AREAS and not getattr(specification, area, "")
         ]
+        # Ready when every essential area is answered, when the user chose to skip, **or
+        # when there is nothing left to ask**. The last clause is what lets a domain bank
+        # finish a conversation: the bank asks the decisions that matter for this kind of
+        # task, and once it has asked them all, asking a generic area question instead
+        # would be exactly the «не по теме» this layer is fixing.
         state = (
             DiscoveryState.READY_FOR_PLANNING
-            if session.skipped or not missing_essential
+            if session.skipped or not missing_essential or not questions
             else DiscoveryState.NEEDS_CLARIFICATION
         )
+        guess = detect_domain(session.initial_goal)
         return replace(
             session,
             questions=questions,
             specification=specification,
             state=state,
+            domain=guess.domain,
+            domain_confidence=float(guess.confidence),
+            domain_evidence=tuple(guess.evidence),
             updated_at=updated_at or _now(),
         )
+
+    def _model_question_hook(self):
+        """The optional assistant's callable, or ``None`` when there is none."""
+
+        assistant = self._question_model
+        callback = getattr(assistant, "questions", None)
+        return callback if callable(callback) else None
 
     def _specification_for(self, session: DiscoverySession) -> ProjectSpecification:
         """Build the specification: answers first, deterministic derivation second.
@@ -507,9 +562,11 @@ class DiscoveryService:
         """
 
         analysis = analyze_goal(session.initial_goal)
+        domain = session.domain or detect_domain(session.initial_goal).domain
         sources: dict[str, str] = {}
         chosen: dict[str, Tuple[str, ...]] = {}
         auto_selected: dict[str, Tuple[str, ...]] = {}
+        domain_answers: dict[str, str] = {}
         values: dict[str, Any] = {}
         for area in AREA_ORDER:
             answer = session.answer_for(area)
@@ -545,6 +602,21 @@ class DiscoveryService:
                 )
             else:
                 values[area] = analysis.value_for(area)
+        # The domain banks ask decisions that have no typed specification field
+        # («что делать со спамом»). Their answers are recorded here, keyed by the
+        # question as it was asked, so the planner receives them with the specification
+        # instead of losing them in the session file.
+        for answer in session.answers:
+            question_id = str(answer.question_id or "")
+            field_name = question_id[2:] if question_id.startswith("q-") else ""
+            if not field_name or field_name in AREA_ORDER:
+                continue
+            if answer.skipped or answer.redacted or not answer.text.strip():
+                continue
+            question = bank_question(domain, field_name)
+            label = question.text if question is not None else field_name
+            domain_answers[label] = answer.text.strip()
+            sources[field_name] = answer.text
         return ProjectSpecification(
             goal=str(values.get("goal", "")),
             project_type=str(values.get("project_type", "")),
@@ -563,4 +635,5 @@ class DiscoveryService:
             source_answers=sources,
             chosen_values=chosen,
             auto_selected_values=auto_selected,
+            domain_answers=domain_answers,
         )

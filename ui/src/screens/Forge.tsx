@@ -1923,6 +1923,10 @@ export const Forge = ({
                   <ClarificationCard
                     lang={lang}
                     questions={questions}
+                    domain={{
+                      label: session?.domain_label,
+                      confidence: session?.domain_confidence,
+                    }}
                     drafts={drafts}
                     onDraft={(questionId, draft) =>
                       setDrafts((previous) => ({ ...previous, [questionId]: draft }))

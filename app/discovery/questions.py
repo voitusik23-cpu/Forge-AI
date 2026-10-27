@@ -1,10 +1,21 @@
 """Turn missing areas into a few short, practical, *clickable* questions.
 
-Deterministic and offline: the question list for one goal and one set of answers is
-always the same. An optional LLM phrasing hook could be added behind the existing
-``Provider`` interface, but it is deliberately **not** implemented here and is not
-required anywhere: a missing provider, a disabled one, or a test without network must
-all behave identically to what this module does today.
+Two layers, in this order:
+
+1. **What is this task?** :func:`app.discovery.domain.detect_domain` classifies the idea
+   (mail, booking, shop, dashboard, ...). When the reading is confident, the questions
+   come from that domain's own bank (:mod:`app.discovery.banks`) -- «Какие ящики
+   подключаем», «Как принимать оплату» -- so the owner is asked about *his* task and not
+   about a generic project template.
+2. **What is still unknown?** Only areas the idea does not state and the user has not
+   answered are asked about, and only when the domain's bank has nothing more concrete to
+   ask about the same decision. An idea this layer cannot classify keeps the older
+   generic area questions: a wrong domain would be worse than a plain question.
+
+Optional and **off by default**, an injected ``model_questions`` callable may contribute
+up to three model-written questions, which are validated and merged before the
+deterministic ones (see :mod:`app.discovery.llm_questions`). Without it, this module is
+exactly what it was: deterministic and offline.
 
 The rules:
 
@@ -21,7 +32,7 @@ The rules:
 
 from __future__ import annotations
 
-from typing import Mapping, Optional, Tuple
+from typing import Callable, Iterable, Mapping, Optional, Tuple
 
 from app.discovery.analyzer import (
     AREA_ORDER,
@@ -33,6 +44,12 @@ from app.discovery.analyzer import (
     is_short_idea,
     missing_areas,
 )
+from app.discovery.banks import (
+    choose_questions,
+    is_relevant,
+    merge_questions,
+)
+from app.discovery.domain import detect_domain
 from app.discovery.models import ClarificationOption, ClarificationQuestion
 
 __all__ = [
@@ -43,6 +60,9 @@ __all__ = [
     "question_for",
     "question_for_area",
 ]
+
+#: The signature of the optional model hook: idea, domain, already-answered fields.
+ModelQuestions = Callable[..., Iterable[ClarificationQuestion]]
 
 
 #: The hard bound for any idea. A detailed brief may have a few genuinely open
@@ -283,27 +303,15 @@ def question_for(area: str, goal: object = None) -> Optional[ClarificationQuesti
     return question_for_area(area, goal)
 
 
-def clarification_questions(
+def _generic_questions(
     goal: object,
-    answers: object = None,
-    *,
-    limit: Optional[int] = None,
+    analysis: GoalAnalysis,
+    unknown: set[str],
+    already_covered: set[str],
+    effective_limit: int,
 ) -> Tuple[ClarificationQuestion, ...]:
-    """The questions still worth asking, bounded by the idea's own length.
+    """The area questions: the fallback when the task could not be classified."""
 
-    ``answers`` is either a mapping of ``field -> text`` or an iterable of
-    :class:`app.discovery.models.ClarificationAnswer`. Both forms are accepted so
-    a stored session and a caller-supplied mapping cannot diverge.
-    """
-
-    analysis: GoalAnalysis = analyze_goal(goal)
-    unknown = set(missing_areas(analysis, answers))
-    already_covered = set(answered_fields(answers))
-    effective_limit = (
-        (SHORT_IDEA_MAX_QUESTIONS if is_short_idea(goal) else MAX_QUESTIONS)
-        if limit is None
-        else max(0, int(limit))
-    )
     open_areas = [
         area
         for area in AREA_ORDER
@@ -325,3 +333,71 @@ def clarification_questions(
         if len(asked) >= allowed:
             break
     return tuple(asked)
+
+
+def _domain_questions(
+    goal: object,
+    domain: str,
+    answered: set[str],
+    effective_limit: int,
+    model_questions: Optional[ModelQuestions],
+) -> Tuple[ClarificationQuestion, ...]:
+    """The domain's own questions, with the optional model's ones merged first."""
+
+    chosen = choose_questions(goal, domain, answered)
+    extra: Tuple[ClarificationQuestion, ...] = ()
+    if model_questions is not None:
+        try:
+            candidate = tuple(model_questions(goal, domain, answered_fields=tuple(answered)) or ())
+        except Exception:  # noqa: BLE001 - the optional path may never block a session
+            candidate = ()
+        # The same two guards the deterministic selection applies: an answered field is
+        # never asked again, and a question outside the domain's bank never appears.
+        extra = tuple(
+            question
+            for question in candidate
+            if question.field not in answered and is_relevant(question, domain)
+        )
+    if not chosen and not extra:
+        return ()
+    return merge_questions(extra, chosen, limit=effective_limit)
+
+
+def clarification_questions(
+    goal: object,
+    answers: object = None,
+    *,
+    limit: Optional[int] = None,
+    model_questions: Optional[ModelQuestions] = None,
+) -> Tuple[ClarificationQuestion, ...]:
+    """The questions still worth asking, bounded by the idea's own length.
+
+    ``answers`` is either a mapping of ``field -> text`` or an iterable of
+    :class:`app.discovery.models.ClarificationAnswer`. Both forms are accepted so
+    a stored session and a caller-supplied mapping cannot diverge.
+    """
+
+    analysis: GoalAnalysis = analyze_goal(goal)
+    unknown = set(missing_areas(analysis, answers))
+    already_covered = set(answered_fields(answers))
+    effective_limit = (
+        (SHORT_IDEA_MAX_QUESTIONS if is_short_idea(goal) else MAX_QUESTIONS)
+        if limit is None
+        else max(0, int(limit))
+    )
+    if not unknown:
+        # A breakdown that already answers every area is not interrogated at all -- the
+        # behaviour the generic path always had, now also true of the domain banks.
+        return ()
+    guess = detect_domain(goal)
+    if guess.recognised:
+        return _domain_questions(
+            goal,
+            guess.domain,
+            already_covered,
+            effective_limit,
+            model_questions,
+        )
+    return _generic_questions(
+        goal, analysis, unknown, already_covered, effective_limit
+    )

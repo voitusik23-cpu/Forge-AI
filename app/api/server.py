@@ -181,6 +181,63 @@ def _compose_provider_key_service(api_service: object, settings: object) -> obje
     )
 
 
+def _compose_question_model(api_service: object, settings: object) -> object:
+    """The optional «вопросы по смыслу задачи (через модель)» assistant.
+
+    Two independent conditions must hold before anything is called:
+
+    * the owner turned ``questions_from_model`` on (it is read on every refresh, so
+      turning it off takes effect without a restart);
+    * the composition's default provider is ready: registered, enabled, not the offline
+      provider, and its key variable resolves -- the same facts «Провайдеры и ключи»
+      derives its «готов» from.
+
+    The resolver runs only when both hold, and every failure answers ``None``, which the
+    discovery layer treats exactly as "no model": the deterministic bank is asked.
+    Nothing here starts a call at composition time, and nothing here can block a session.
+    """
+
+    from app.discovery.llm_questions import ModelQuestionAssistant
+
+    def _resolve_provider():
+        runtime = getattr(api_service, "runtime", None)
+        runtime_settings = getattr(runtime, "settings", None)
+        name = str(
+            getattr(runtime_settings, "default_provider", "") or ""
+        ).strip().lower()
+        if not name or name == "mock":
+            return None
+        enabled = getattr(runtime_settings, "enabled_providers", ()) or ()
+        if name not in {str(item).strip().lower() for item in enabled}:
+            return None
+        registry = getattr(runtime, "provider_registry", None)
+        getter = getattr(registry, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            provider = getter(name)
+        except Exception:  # noqa: BLE001 - an unregistered provider is not ready
+            return None
+        config = getattr(provider, "config", None)
+        if config is None or not bool(getattr(config, "enabled", False)):
+            return None
+        secret_name = getattr(config, "api_key_env_var", None)
+        if secret_name:
+            secret_store = getattr(provider, "secret_store", None)
+            has_secret = getattr(secret_store, "has_secret", None)
+            try:
+                if not callable(has_secret) or not has_secret(secret_name):
+                    return None
+            except Exception:  # noqa: BLE001 - an unreadable secret is an absent one
+                return None
+        return provider
+
+    return ModelQuestionAssistant(
+        _resolve_provider,
+        enabled=settings.questions_from_model,
+    )
+
+
 def resolve_cors_origins(
     raw: Optional[str] = None, *, environ: Optional[dict[str, str]] = None
 ) -> tuple[str, ...]:
@@ -541,11 +598,14 @@ def create_api_app(
     # One discovery service for this process, composed here exactly like the
     # operating surface: the store root comes from the deployment, never from a
     # request. It creates no executor and starts no run. It is handed the project
-    # service so that confirming a session materialises its project record.
+    # service so that confirming a session materialises its project record, and the
+    # optional model assistant -- which is inert while the setting is off.
     discovery = (
         discovery_service
         if discovery_service is not None
-        else DiscoveryService()
+        else DiscoveryService(
+            question_model=_compose_question_model(api_service, owner_settings)
+        )
     )
     register_discovery_routes(app, discovery, projects)
 

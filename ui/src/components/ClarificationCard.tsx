@@ -16,6 +16,11 @@
 // * the card says in one line what happens after the answers are sent, so nobody has to guess
 //   whether the click started a run.
 //
+// Above the questions sits the **domain chip** («Задача понята как: почтовый клиент — 79 %»): the
+// questions are written for that kind of task, and the owner can see the Core's own reading of his
+// idea instead of trusting that the questions are about it. Each domain question also carries its
+// own «Почему этот вопрос» line (`relevance`) next to the field's «Зачем» (`why`).
+//
 // At most `QUESTIONS_PER_PAGE` (5) questions are drawn at once; the rest are reached by «Далее».
 
 import { useEffect, useMemo, useState } from "react";
@@ -257,6 +262,11 @@ const QuestionRow = ({
       <div className="small muted">
         {t(lang, "forge.discovery.question.why")} {String(question.why ?? "—")}
       </div>
+      {String(question.relevance ?? "").trim() !== "" ? (
+        <div className="small muted" data-testid="discovery-question-relevance">
+          {t(lang, "forge.discovery.question.relevance")} {String(question.relevance)}
+        </div>
+      ) : null}
 
       <div className={disabled ? "forge-answer-disabled" : ""}>
         {control === "text" ? (
@@ -331,6 +341,7 @@ const QuestionRow = ({
 export const ClarificationCard = ({
   lang,
   questions,
+  domain,
   drafts,
   onDraft,
   busy,
@@ -340,6 +351,12 @@ export const ClarificationCard = ({
 }: {
   lang: Lang;
   questions: DiscoveryQuestion[];
+  /**
+   * What the Core understood the idea to be. The chip says so above the questions, so the
+   * owner can see *why* these questions and not the generic ones are in front of him.
+   * Absent or unrecognised (`other`) means no chip.
+   */
+  domain?: { label?: string; confidence?: number } | null;
   drafts: Record<string, AnswerDraft>;
   onDraft: (questionId: string, draft: AnswerDraft) => void;
   busy: string;
@@ -363,9 +380,21 @@ export const ClarificationCard = ({
   const from = current * QUESTIONS_PER_PAGE;
   const visible = questions.slice(from, from + QUESTIONS_PER_PAGE);
   const allOptional = count > 0 && questions.every((question) => question.required !== true);
+  const domainLabel = String(domain?.label ?? "").trim();
+  const domainConfidence = Number(domain?.confidence ?? 0);
+  const showDomain = domainLabel !== "" && Number.isFinite(domainConfidence) && domainConfidence > 0;
 
   return (
     <div className="stack" style={{ gap: 12 }}>
+      {showDomain ? (
+        <div className="row" style={{ gap: 8, flexWrap: "wrap" }} data-testid="discovery-domain">
+          <Badge tone="info">
+            {t(lang, "forge.discovery.domain.chip")
+              .replace("{domain}", domainLabel)
+              .replace("{percent}", String(Math.round(domainConfidence * 100)))}
+          </Badge>
+        </div>
+      ) : null}
       <div className="row between" style={{ gap: 10, flexWrap: "wrap" }}>
         <div className="label">
           {t(lang, "forge.discovery.questions.title").replace("{n}", String(count))}

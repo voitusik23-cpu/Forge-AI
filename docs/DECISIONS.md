@@ -8765,3 +8765,109 @@ project that needs a decision from the owner).
 «Настройки → Как открываются окна» оставляют за владельцем право запретить повтор
 (`window_downgrade_allowed`); тогда запуск, которому не удалось открыть окно, честно отказывает,
 вместо того чтобы запускать браузер без песочницы.
+## 2026-10-27 — The questions are about the task, not about a generic project template
+
+**Decision.** Discovery classifies the idea before it asks anything
+(`app/discovery/domain.py`: fixed rules, deterministic and offline, `mail`, `booking`, `shop`,
+`bot`, `dashboard`, `notes`, `finance`, `site`, `api`, `game`, `files`, `chat`, `other`, with a
+confidence and the matched words as evidence). A confident reading (>= 0.6) selects questions
+from that domain's own bank (`app/discovery/banks.py`, 5-9 questions per domain, each carrying
+`relevance`), not from the twelve generic areas. Selection (`choose_questions`) skips a question
+the idea already answers (`answered_when`), a field already answered, a question the idea
+refuses (`refused_when`, e.g. «без оплаты»), and a conditional question the idea does not
+trigger (`asked_when`); it is deduplicated by field and normalised text, ordered by importance
+and capped at 4 (short idea) / 6 (detailed). `is_relevant` is the guard every non-bank question
+must pass. An unclassifiable idea keeps the generic area questions, and a session becomes
+`READY_FOR_PLANNING` when no question is left, so a finished bank is not followed by a generic
+one. The per-round bound of `clarification_questions` (3/5) is unchanged.
+
+**Optional model path.** `app/discovery/llm_questions.py` may add up to three questions, merged
+before the deterministic ones. It is **off by default** (`questions_from_model=false`,
+«Настройки → Вопросы по смыслу задачи (через модель)», with the line that it uses the owner's
+tokens), it calls only a ready non-mock provider, it validates every question against the same
+schema and `is_relevant`, and any failure (no provider, mock, network, timeout, malformed JSON)
+returns the deterministic questions unchanged. Results are cached in memory per (idea, domain).
+
+**Why.** The owner's complaint was «тупые вопросы, одни и те же, целую кучу, вообще не по
+теме»: one fixed list of areas produced the same questions for a mail client and a booking
+system. A deterministic domain reading is cheap, testable offline, and cannot invent a question
+the bank does not contain; the model stays an explicit, reversible opt-in because the owner
+earlier forbade model-written questions.
+
+**Rejected alternatives.** Letting the model write the questions by default (cost, and it was
+forbidden); asking every bank question without the answered/refused/conditional filters (the
+same questionnaire again); keeping the generic questions *in addition* to the domain ones (that
+is the «целую кучу» complaint); classifying with the model (a network call before the first
+question, and non-deterministic sessions); trusting model output without the schema and
+relevance checks (a generic question would reach a domain card).
+
+**Evidence.** `tests/test_discovery_domain.py` (32 tests, offline; fake provider only):
+domain, evidence and confidence; the mail idea gets mail questions and no payment question; a
+booking idea gets booking questions; a visit-card site gets at most three questions and no
+auth/integrations; answered fields, duplicate fields, the caps and the negative-instruction
+rule; the relevance guard; valid model questions merged first and capped; malformed JSON,
+timeout, mock and disabled settings returning the deterministic questions without an exception;
+and the domain chip data in the HTTP payload. `tests/test_discovery.py`,
+`tests/test_discovery_questions.py`, `tests/test_api.py` and `tests/test_flow_invariants.py`
+stay green.
+
+**Limits.** The domain rules are literal, so an idea that names no recognisable word stays
+`other` and keeps the generic questions; a bank is finite, so a decision nobody wrote down is
+not asked; a domain answer without a typed specification field is carried in
+`ProjectSpecification.domain_answers` and reaches the task text as «Task answers», not as a typed
+field.
+
+## 2026-10-27 — Вопросы о задаче, а не об общем шаблоне проекта
+
+**Решение.** Discovery сначала классифицирует идею, и только потом спрашивает
+(`app/discovery/domain.py`: фиксированные правила, детерминированно и офлайн, `mail`,
+`booking`, `shop`, `bot`, `dashboard`, `notes`, `finance`, `site`, `api`, `game`, `files`,
+`chat`, `other`, с уверенностью и совпавшими словами как доказательством). Уверенное чтение
+(>= 0.6) выбирает вопросы из собственного банка области (`app/discovery/banks.py`, 5–9
+вопросов на область, у каждого `relevance`), а не из двенадцати общих областей. Отбор
+(`choose_questions`) пропускает вопрос, на который идея уже ответила (`answered_when`),
+поле, на которое уже ответили, вопрос, который идея отвергает (`refused_when`, например
+«без оплаты»), и условный вопрос, повода для которого идея не дала (`asked_when`);
+дедуплицирует по полю и нормализованному тексту, упорядочивает по важности и ограничивает
+4 (короткая идея) / 6 (подробный бриф). `is_relevant` — защита, которую обязан пройти любой
+вопрос не из банка. Неопознанная идея сохраняет общие вопросы по областям, а сессия
+становится `READY_FOR_PLANNING`, когда вопросов не осталось: закончившийся банк не
+продолжается общим вопросом. Предел одного раунда в `clarification_questions` (3/5) не
+меняется.
+
+**Необязательный путь через модель.** `app/discovery/llm_questions.py` может добавить до трёх
+вопросов и вставляет их перед детерминированными. Он **выключен по умолчанию**
+(`questions_from_model=false`, «Настройки → Вопросы по смыслу задачи (через модель)», со
+строкой о том, что это использует токены владельца), вызывает только готового не-mock
+провайдера, проверяет каждый вопрос по той же схеме и `is_relevant`, а любой сбой (нет
+провайдера, mock, сеть, таймаут, некорректный JSON) возвращает детерминированные вопросы без
+изменений. Результаты кэшируются в памяти по (идея, область).
+
+**Почему.** Жалоба владельца — «тупые вопросы, одни и те же, целую кучу, вообще не по теме»:
+один фиксированный список областей давал одинаковые вопросы почтовому клиенту и системе
+бронирования. Детерминированное чтение области дешёвое, проверяется офлайн и не может
+придумать вопрос, которого нет в банке; модель остаётся явным и обратимым выбором, потому что
+владелец ранее запретил вопросы от модели.
+
+**Отклонённые варианты.** Писать вопросы моделью по умолчанию (расходы, и это было
+запрещено); спрашивать весь банк без фильтров «уже отвечено/отвергнуто/условно» (та же
+анкета); оставлять общие вопросы *вдобавок* к доменным (это и есть «целую кучу»);
+классифицировать моделью (сетевой вызов до первого вопроса и недетерминированные сессии);
+доверять выводу модели без проверки схемы и релевантности (общий вопрос попал бы в доменную
+карточку).
+
+**Доказательство.** `tests/test_discovery_domain.py` (32 теста, офлайн; только фейковый
+провайдер): область, доказательства и уверенность; почтовая идея получает почтовые вопросы и
+ни одного вопроса об оплате; идея бронирования получает вопросы бронирования; сайт-визитка
+получает не более трёх вопросов и ни одного про авторизацию/интеграции; отвеченные поля,
+дубли полей, пределы и правило отрицания; защита релевантности; корректные вопросы модели
+идут первыми и ограничены; некорректный JSON, таймаут, mock и выключенная настройка
+возвращают детерминированные вопросы без исключения; данные чипа области есть в HTTP-ответе.
+`tests/test_discovery.py`, `tests/test_discovery_questions.py`, `tests/test_api.py` и
+`tests/test_flow_invariants.py` остаются зелёными.
+
+**Ограничения.** Правила областей литеральны, поэтому идея без узнаваемого слова остаётся
+`other` и сохраняет общие вопросы; банк конечен, поэтому решение, которого в нём нет, не
+спрашивается; ответ домена без типизированного поля спецификации переносится в
+`ProjectSpecification.domain_answers` и попадает в текст задачи как «Task answers», а не как
+типизированное поле.

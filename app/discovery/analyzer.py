@@ -25,7 +25,9 @@ __all__ = [
     "analyze_goal",
     "answered_fields",
     "is_short_idea",
+    "mentions",
     "missing_areas",
+    "refutes",
 ]
 
 
@@ -247,6 +249,41 @@ def _has(text: str, *needles: str) -> bool:
                     return True
                 start = text.find(needle, start + 1)
     return False
+
+
+def mentions(text: object, *needles: str) -> bool:
+    """Whether ``text`` *states* any of ``needles`` — the public form of the rule.
+
+    Exposed so the domain detector and the question banks reuse exactly the same
+    notion of "the idea says this" as the derivation: a Latin token matches on word
+    boundaries, a Russian stem matches as a substring, and a mention a negation
+    governs is not a statement.
+    """
+
+    return _has(" ".join(str(text or "").casefold().split()), *needles)
+
+
+def refutes(text: object, *needles: str) -> bool:
+    """Whether ``text`` mentions one of ``needles`` **only** inside a refusal.
+
+    «без оплаты» and «не использовать онлайн-платежи» mention a payment and state
+    that it is not wanted, so ``mentions`` is ``False`` while the concept is present.
+    The pair is what lets a question about payment be dropped instead of asked.
+    """
+
+    normalised = " ".join(str(text or "").casefold().split())
+    if not any(_raw_mentions(normalised, needle) for needle in needles):
+        return False
+    return not _has(normalised, *needles)
+
+
+def _raw_mentions(text: str, needle: str) -> bool:
+    """Whether the needle occurs at all, negation or not."""
+
+    if _is_latin_token(needle):
+        pattern = rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])"
+        return re.search(pattern, text) is not None
+    return needle in text
 
 
 @dataclass(frozen=True)
@@ -511,11 +548,14 @@ def analyze_goal(goal: object) -> GoalAnalysis:
 def answered_fields(
     answers: object = None,
 ) -> Tuple[str, ...]:
-    """The specification fields an answer covers, including explicitly skipped ones.
+    """The question fields an answer covers, including explicitly skipped ones.
 
     ``answers`` may be a mapping of ``field -> text`` or an iterable of
     :class:`app.discovery.models.ClarificationAnswer`. A skipped answer counts as
-    answered: the user declined, so the question must not be asked again.
+    answered: the user declined, so the question must not be asked again. A field need
+    not be one of :data:`AREA_ORDER`: the domain banks ask their own concrete questions
+    («какие ящики подключаем»), and an answer to one of those must retire it just the
+    same -- otherwise a skipped domain question would come back every round.
     """
 
     fields_answered: list[str] = []
@@ -537,7 +577,7 @@ def answered_fields(
             # than silently left with an area nobody can fill.
             continue
         field_name = question_id[2:] if question_id.startswith("q-") else question_id
-        if field_name in AREA_ORDER:
+        if field_name:
             fields_answered.append(field_name)
     return tuple(fields_answered)
 

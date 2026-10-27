@@ -4325,14 +4325,16 @@ user idea
 
 `app/discovery/models.py` holds plain, immutable dataclasses with no I/O:
 `ClarificationQuestion(id, text, field, why, required, control, options,
-allow_custom, allow_unknown)` (`optional` is the readable inverse of `required`),
+allow_custom, allow_unknown, relevance)` (`optional` is the readable inverse of
+`required`; `relevance` is «Почему этот вопрос»),
 `ClarificationOption(value, label, recommended)`,
 `ClarificationAnswer(question_id, text, skipped, redacted, values, custom,
 auto_selected, declined)`,
 `ProjectSpecification(...12 fields..., source_answers, chosen_values,
-auto_selected_values)` and
+auto_selected_values, domain_answers)` and
 `DiscoverySession(session_id, initial_goal, state, questions, answers,
-specification, created_at, updated_at, skipped, skip_reason)`, with the states
+specification, created_at, updated_at, skipped, skip_reason, domain,
+domain_confidence, domain_evidence)`, with the states
 `NEEDS_CLARIFICATION`, `READY_FOR_PLANNING`, `CONFIRMED`, `CANCELLED`.
 
 `app/discovery/analyzer.py` derives what the goal text states outright, with rules
@@ -4359,18 +4361,40 @@ constraints, acceptance_criteria, priorities). `ESSENTIAL_AREAS` is the first fi
 unstated area stays **empty** and is asked about, never guessed. A negated mention
 («не использовать онлайн-платежи») is a refusal, never a derived value.
 
-`app/discovery/questions.py` turns missing areas into at most `MAX_QUESTIONS = 5`
-short Russian questions (one per area, each with a one-line `why`), and at most
-`SHORT_IDEA_MAX_QUESTIONS = 3` for a short idea (`is_short_idea`: at most 240
-characters and four lines). Every question carries the typed form the answer
-deserves -- `radio`, `checkbox`, `select`, `yes_no` or `text` -- with labelled
-options, one `recommended` default, `allow_custom` («Свой вариант») and
-`allow_unknown` («Не знаю — выбери оптимальный вариант»). The list is
-deterministic, essential areas come first so the cap can never drop a required
-question, and an area that already has an answer -- or an explicit skip -- is never
-asked again. An optional LLM phrasing hook behind the existing `Provider` interface
-is deliberately **not** implemented or required: tests, the smoke command, and a
-deployment without a provider all produce identical questions.
+`app/discovery/questions.py` chooses the questions in two layers. First,
+`app/discovery/domain.py` classifies the idea -- `mail`, `booking`, `shop`, `bot`,
+`dashboard`, `notes`, `finance`, `site`, `api`, `game`, `files`, `chat`, `other` -- with a
+confidence and the evidence (`почт`, `письм`, …) that produced it; the rules are fixed,
+Russian/Latin, deterministic and offline. A confident reading (`MIN_CONFIDENCE = 0.6`)
+makes the questions come from that domain's own bank (`app/discovery/banks.py`, five to
+nine concrete questions each, every one carrying `relevance` -- why the decision matters
+for *this* kind of task). The selection (`choose_questions`) asks only what the idea does
+not already answer (`answered_when`), never a field the user has answered, never a
+question the idea explicitly refuses (`refused_when`: «без оплаты» removes every payment
+question), and never a conditional question the idea does not trigger (`asked_when`: a
+visit card is not asked about a contact form unless it mentions one). The list is ordered
+by importance for the domain, deduplicated by field and normalised text, and capped at
+four questions for a short idea and six for a brief; `is_relevant` is the guard a
+question from outside the bank must pass. An idea this layer cannot classify keeps the
+older generic area questions -- at most `MAX_QUESTIONS = 5`, `SHORT_IDEA_MAX_QUESTIONS =
+3` for a short idea -- each with a typed control (`radio`, `checkbox`, `select`,
+`yes_no`, `text`), labelled options, one `recommended` default, `allow_custom` («Свой
+вариант») and `allow_unknown` («Не знаю — выбери оптимальный вариант»). An area that
+already has an answer -- or an explicit skip -- is never asked again. The session is
+`READY_FOR_PLANNING` when the essentials are filled, when the user skips, or when no
+question is left: a domain bank that has asked every question it has does not continue
+with a generic one.
+
+`app/discovery/llm_questions.py` is the **optional, off-by-default** model path
+(«Вопросы по смыслу задачи (через модель)» in «Настройки», `questions_from_model=false`,
+with one line saying it uses the owner's tokens). When it is on and the composition's
+default provider is ready (registered, enabled, non-mock, key present), it asks the model
+for three questions in a strict JSON shape, validates them against the same schema
+(options required; answered fields and foreign fields rejected by `is_relevant`) and
+merges them **before** the deterministic ones. Any failure -- no provider, mock provider,
+network error, timeout, malformed JSON -- returns the deterministic questions unchanged
+and never blocks a session; results are cached in memory per (idea, domain). Tests use a
+fake provider; no real call is made.
 
 ### State machine and the guard
 
@@ -4379,6 +4403,7 @@ deployment without a provider all produce identical questions.
 | `start` | any essential area missing | `NEEDS_CLARIFICATION` |
 | `start` | nothing essential missing | `READY_FOR_PLANNING` |
 | `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `answer()` fills the essentials | `READY_FOR_PLANNING` |
+| `NEEDS_CLARIFICATION` | the domain bank has no unanswered question left | `READY_FOR_PLANNING` |
 | `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `skip(reason)` | `READY_FOR_PLANNING`, `skipped=True` |
 | `READY_FOR_PLANNING` | `confirm()` | `CONFIRMED` |
 | `NEEDS_CLARIFICATION` | `confirm()` | refused (`DiscoveryNotReady`) |
@@ -4530,14 +4555,16 @@ Forge достаточно для планирования, задаёт не б
 
 `app/discovery/models.py` содержит простые неизменяемые dataclass-объекты без I/O:
 `ClarificationQuestion(id, text, field, why, required, control, options,
-allow_custom, allow_unknown)` (`optional` — читаемая противоположность `required`),
+allow_custom, allow_unknown, relevance)` (`optional` — читаемая противоположность
+`required`; `relevance` — «Почему этот вопрос»),
 `ClarificationOption(value, label, recommended)`,
 `ClarificationAnswer(question_id, text, skipped, redacted, values, custom,
 auto_selected, declined)`,
 `ProjectSpecification(...12 полей..., source_answers, chosen_values,
-auto_selected_values)` и
+auto_selected_values, domain_answers)` и
 `DiscoverySession(session_id, initial_goal, state, questions, answers,
-specification, created_at, updated_at, skipped, skip_reason)` с состояниями
+specification, created_at, updated_at, skipped, skip_reason, domain,
+domain_confidence, domain_evidence)` с состояниями
 `NEEDS_CLARIFICATION`, `READY_FOR_PLANNING`, `CONFIRMED`, `CANCELLED`.
 
 `app/discovery/analyzer.py` выводит то, что цель уже говорит прямо, только
@@ -4555,18 +4582,43 @@ Telegram, email, SMS, CRM/1C, календарь), хранение (PostgreSQL/
 спрашивают, её никогда не угадывают. Упоминание под отрицанием («не использовать
 онлайн-платежи») — это отказ, а не выведенное значение.
 
-`app/discovery/questions.py` превращает неизвестные области в не более чем
-`MAX_QUESTIONS = 5` коротких русских вопросов (по одному на область, с одной строкой
-`why`), а для короткой идеи — не более `SHORT_IDEA_MAX_QUESTIONS = 3` (`is_short_idea`:
-до 240 символов и до четырёх строк). Каждый вопрос несёт типизированную форму ответа —
-`radio`, `checkbox`, `select`, `yes_no` или `text` — с подписанными вариантами, одним
-`recommended` по умолчанию, `allow_custom` («Свой вариант») и `allow_unknown`
-(«Не знаю — выбери оптимальный вариант»). Список детерминирован, существенные области
-идут первыми, поэтому ограничение не может отбросить обязательный вопрос, а область, на
-которую уже есть ответ (или явный пропуск), больше не спрашивается. Необязательный
-LLM-хук формулировок за существующим интерфейсом `Provider` намеренно **не** реализован
-и нигде не требуется: тесты, smoke-команда и развёртывание без провайдера дают
-одинаковые вопросы.
+`app/discovery/questions.py` выбирает вопросы в два слоя. Сначала
+`app/discovery/domain.py` классифицирует идею — `mail`, `booking`, `shop`, `bot`,
+`dashboard`, `notes`, `finance`, `site`, `api`, `game`, `files`, `chat`, `other` — с
+уверенностью и доказательствами (`почт`, `письм`, …), которые к ней привели; правила
+фиксированные, русско/латинские, детерминированные и офлайновые. Уверенное чтение
+(`MIN_CONFIDENCE = 0.6`) берёт вопросы из собственного банка этой области
+(`app/discovery/banks.py`, от пяти до девяти конкретных вопросов, у каждого —
+`relevance`, почему это решение важно именно для такой задачи). Отбор
+(`choose_questions`) спрашивает только то, на что идея ещё не ответила
+(`answered_when`), никогда — поле, на которое пользователь уже ответил, никогда —
+вопрос, который идея явно отвергает (`refused_when`: «без оплаты» убирает все вопросы
+об оплате), и никогда — условный вопрос, повода для которого идея не дала
+(`asked_when`: у визитки не спрашивают про форму заявки, если она о ней не говорит).
+Список упорядочен по важности для области, дедуплицирован по полю и нормализованному
+тексту и ограничен четырьмя вопросами для короткой идеи и шестью для подробного
+брифа; `is_relevant` — защита, которую обязан пройти вопрос не из банка. Идея, которую
+слой не смог классифицировать, сохраняет прежние общие вопросы по областям — не более
+`MAX_QUESTIONS = 5`, `SHORT_IDEA_MAX_QUESTIONS = 3` для короткой идеи — каждый с
+типизированной формой (`radio`, `checkbox`, `select`, `yes_no`, `text`),
+подписанными вариантами, одним `recommended` по умолчанию, `allow_custom` («Свой
+вариант») и `allow_unknown` («Не знаю — выбери оптимальный вариант»). Область, на
+которую уже есть ответ — или явный пропуск, — больше не спрашивается. Сессия
+переходит в `READY_FOR_PLANNING`, когда заполнено существенное, когда пользователь
+пропустил уточнения или когда вопросов не осталось: банк области, задавший все свои
+вопросы, не продолжает общим вопросом.
+
+`app/discovery/llm_questions.py` — **необязательный, по умолчанию выключенный** путь
+через модель («Вопросы по смыслу задачи (через модель)» в «Настройках»,
+`questions_from_model=false`, отдельная строка говорит, что это использует токены
+владельца). Когда он включён и провайдер по умолчанию готов (зарегистрирован, включён,
+не mock, ключ есть), модель просят о трёх вопросах в строгой JSON-форме, проверяют их
+по той же схеме (варианты обязательны; отвеченные и чужие поля отвергаются через
+`is_relevant`) и добавляют **перед** детерминированными. Любой сбой — нет провайдера,
+mock-провайдер, сетевая ошибка, таймаут, некорректный JSON — возвращает
+детерминированные вопросы без изменений и никогда не блокирует сессию; результаты
+кэшируются в памяти по (идея, область). Тесты используют фейковый провайдер; реального
+вызова нет.
 
 ### Машина состояний и защита
 
@@ -4575,6 +4627,7 @@ LLM-хук формулировок за существующим интерфе
 | `start` | не хватает существенной области | `NEEDS_CLARIFICATION` |
 | `start` | существенного не хватает | `READY_FOR_PLANNING` |
 | `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `answer()` заполняет существенное | `READY_FOR_PLANNING` |
+| `NEEDS_CLARIFICATION` | в банке области не осталось неотвеченных вопросов | `READY_FOR_PLANNING` |
 | `NEEDS_CLARIFICATION` / `READY_FOR_PLANNING` | `skip(reason)` | `READY_FOR_PLANNING`, `skipped=True` |
 | `READY_FOR_PLANNING` | `confirm()` | `CONFIRMED` |
 | `NEEDS_CLARIFICATION` | `confirm()` | отказ (`DiscoveryNotReady`) |
