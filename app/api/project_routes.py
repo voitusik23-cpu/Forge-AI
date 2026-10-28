@@ -124,6 +124,7 @@ def register_project_routes(
     opener: Any = None,
     window_opener: Any = None,
     window_policy: Any = None,
+    window_memory: Any = None,
 ) -> None:
     """Attach the lifecycle routes to ``app`` and publish the service on its state.
 
@@ -164,6 +165,12 @@ def register_project_routes(
     callable answering whether a browser whose own sandbox cannot start may be retried
     once without it. It is handed to the opener the launcher composes when none was
     injected; the composition reads it from the same settings store «Настройки» writes.
+
+    ``window_memory`` is this machine's memory of browsers whose own sandbox cannot start
+    (``app.projects.window_memory``). The launcher hands it to the opener, which then goes
+    straight to the no-sandbox plan for such a browser instead of showing its blank window
+    first. It is the same settings file as the switch above, so «Забыть» and the launch
+    cannot disagree.
     """
 
     from fastapi import Body, HTTPException
@@ -198,6 +205,7 @@ def register_project_routes(
         previews=registry,
         windows=window_opener,
         window_policy=window_policy,
+        window_memory=window_memory,
     )
     app.state.forge_launcher = project_launcher
 

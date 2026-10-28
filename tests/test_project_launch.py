@@ -35,6 +35,7 @@ this suite. ``shell=False`` and the exact argv are asserted instead.
 from __future__ import annotations
 
 import http.server
+import json
 import os
 import pathlib
 import shutil
@@ -60,11 +61,19 @@ from app.projects.app_window import (
     NO_SANDBOX_FLAGS,
     PROFILE_RETENTION,
     SANDBOX_DOWNGRADE_NOTE,
+    SANDBOX_MEMORY_NOTE,
+    SANDBOX_MEMORY_SAVED_NOTE,
     WINDOW_CHROME_APP,
     WINDOW_DEFAULT_BROWSER,
     WINDOW_EDGE_APP,
     AppWindowOpener,
     WindowRefusal,
+)
+from app.projects.window_memory import (
+    MARK_AFTER_FAILURES,
+    SANDBOX_ABORT_CODE,
+    WINDOW_PLAN_MEMORY_KEY,
+    WindowPlanMemory,
 )
 from app.projects.entrypoint import resolve_entry
 from app.projects.launcher import (
@@ -320,6 +329,9 @@ class _DeadSpawn:
         self.code = int(code)
         self.pid = int(pid)
         self.calls: list[dict] = []
+        # What ``AppWindowOpener._stop`` did: an attempt that produced no window is ended,
+        # and this records that it really was -- a dead plan may not leave a browser behind.
+        self.stopped: list[int] = []
 
     def is_alive(self, pid: int) -> bool:
         return False
@@ -328,12 +340,52 @@ class _DeadSpawn:
         self.calls.append({"vector": [str(part) for part in vector], "kwargs": dict(kwargs)})
         code = self.code
         pid = self.pid
+        stopped = self.stopped
 
         class _Child:
             poll = staticmethod(lambda code=code: code)
 
         child = _Child()
         child.pid = pid
+        child.terminate = lambda pid=pid: stopped.append(pid)
+        return child
+
+
+class _ScriptedSpawn:
+    """A browser whose attempts behave exactly as the test writes them down.
+
+    ``script`` is one entry per spawned attempt: an exit code for an attempt that died, or
+    ``None`` for one that stayed alive and showed the window. It is the only way to write a
+    history like "the sandboxed attempt failed, the retry worked, the next sandboxed attempt
+    worked too" without depending on this machine's own behaviour.
+    """
+
+    def __init__(self, script: list, first_pid: int = 2001) -> None:
+        self.script = list(script)
+        self.calls: list[dict] = []
+        self.stopped: list[int] = []
+        self.alive_pids: set[int] = set()
+        self._first_pid = int(first_pid)
+
+    def is_alive(self, pid: int) -> bool:
+        return int(pid) in self.alive_pids
+
+    def __call__(self, vector, **kwargs):
+        self.calls.append({"vector": [str(part) for part in vector], "kwargs": dict(kwargs)})
+        index = len(self.calls) - 1
+        code = self.script[index] if index < len(self.script) else None
+        pid = self._first_pid + index
+        if code is None:
+            self.alive_pids.add(pid)
+        stopped = self.stopped
+
+        class _Child:
+            pass
+
+        child = _Child()
+        child.pid = pid
+        child.poll = staticmethod(lambda code=code: code)
+        child.terminate = lambda pid=pid: stopped.append(pid)
         return child
 
 
@@ -2211,6 +2263,281 @@ class WindowSettingsTests(unittest.TestCase):
             launcher_module.ProjectLauncher(window_policy=policy)
         composed.assert_called_once()
         self.assertIs(composed.call_args.kwargs.get("window_policy"), policy)
+
+
+class SandboxMemoryTests(unittest.TestCase):
+    """What this machine remembers about browsers that cannot start their own sandbox.
+
+    The owner's sentence this class guards:
+
+        «опять вылезло старое белое меню»
+
+    He was looking at the **sandboxed** attempt of every launch: Chrome aborts with
+    ``0x80000003`` here, and the retry without the sandbox draws his application a moment
+    later. So the failure is remembered per browser (``window_plan_memory`` in
+    ``.forge/settings.json``) and the next launch goes straight to the no-sandbox plan --
+    without the blank white window. Three rules are proved here and nothing else:
+    one measured abort is enough, an ordinary exit needs ``MARK_AFTER_FAILURES`` in a row,
+    and a sandboxed success forgets the failures. The «Разрешать повтор без песочницы»
+    switch stays authoritative: off means the memory is ignored and the sandboxed attempt
+    is tried again, honestly.
+    """
+
+    def setUp(self) -> None:
+        base = REPOSITORY / ".forge" / "test-project-launch-memory" / f"{os.getpid()}-{id(self)}"
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base.resolve()
+        self.profiles = self.base / "profiles"
+        self.settings_path = self.base / "settings.json"
+        self.memory = WindowPlanMemory(self.settings_path)
+
+    def _opener(self, installed, spawn, *, memory=None, policy=None, startfile=None):
+        return AppWindowOpener(
+            which=_FakeWhich(installed),
+            spawn=spawn,
+            startfile=startfile if startfile is not None else _RecordingStartfile(),
+            exists=lambda item: False,
+            # A dead attempt owns no window: the table follows the spawn's own liveness.
+            visible_windows=_FakeWindows(alive=spawn.is_alive),
+            window_policy=policy,
+            plan_memory=self.memory if memory is None else memory,
+            profile_root=self.profiles,
+            # Longer than the 0.05 s the fake window table takes to answer for a dead pid,
+            # so "exited inside the grace period" is what these attempts really are.
+            grace_seconds=0.5,
+            title_wait_seconds=0.05,
+        )
+
+    # -------------------------------------------------------------- the counter
+    def test_01_three_consecutive_sandboxed_failures_mark_the_browser(self) -> None:
+        spawn = _DeadSpawn(code=1)
+        opener = self._opener({"chrome": r"C:\fake\chrome.exe"}, spawn)
+        # Nothing is remembered yet: the sandbox is tried first, as it always was.
+        self.assertEqual(
+            [plan.sandboxed for plan in opener.plans(PROJECT_ID, "http://127.0.0.1:9100/")],
+            [True, False],
+        )
+        for attempt in range(1, MARK_AFTER_FAILURES + 1):
+            opener.open(PROJECT_ID, "http://127.0.0.1:9100/")
+            self.assertEqual(
+                self.memory.entry("chrome.exe")["sandbox_failures"], attempt, attempt
+            )
+            if attempt < MARK_AFTER_FAILURES:
+                # One fluke is not a measurement: nothing is flipped before the third one.
+                self.assertFalse(self.memory.requires_no_sandbox("chrome.exe"), attempt)
+        self.assertTrue(self.memory.requires_no_sandbox("chrome.exe"))
+        self.assertEqual(
+            self.memory.entry("chrome.exe")["sandbox_failures"],
+            MARK_AFTER_FAILURES,
+            "the third exit in a row is the one that counts",
+        )
+        # The fourth plan list is the whole point: only the no-sandbox plan, so no blank
+        # white window of a sandboxed attempt can appear at all.
+        plans = opener.plans(PROJECT_ID, "http://127.0.0.1:9100/")
+        self.assertEqual(len(plans), 1, plans)
+        self.assertFalse(plans[0].sandboxed)
+        self.assertTrue(plans[0].remembered)
+        self.assertEqual(list(plans[0].vector[4:]), list(NO_SANDBOX_FLAGS))
+        self.assertEqual(
+            list(plans[0].vector[1:3]),
+            ["--app=http://127.0.0.1:9100/", f"--window-size={APP_WINDOW_SIZE}"],
+        )
+
+    def test_02_a_sandboxed_success_resets_the_counter(self) -> None:
+        # attempt 1: the sandboxed one dies, the retry draws the window; attempt 2: the
+        # sandboxed one draws it too; attempt 3: one failure again -- and no mark.
+        spawn = _ScriptedSpawn([1, None, None, 1, None])
+        opener = self._opener({"chrome": r"C:\fake\chrome.exe"}, spawn)
+        opener.open(PROJECT_ID, "http://127.0.0.1:9200/")
+        self.assertEqual(self.memory.entry("chrome.exe")["sandbox_failures"], 1)
+        opener.open(PROJECT_ID, "http://127.0.0.1:9200/")
+        self.assertEqual(
+            self.memory.entries(), {}, "a sandboxed window proves the sandbox works"
+        )
+        opener.open(PROJECT_ID, "http://127.0.0.1:9200/")
+        self.assertEqual(self.memory.entry("chrome.exe")["sandbox_failures"], 1)
+        self.assertFalse(self.memory.requires_no_sandbox("chrome.exe"))
+        self.assertEqual(
+            [plan.sandboxed for plan in opener.plans(PROJECT_ID, "http://127.0.0.1:9200/")],
+            [True, False],
+            "a browser that worked is asked for its sandbox again",
+        )
+
+    def test_03_the_documented_abort_marks_at_once_and_survives_a_new_launcher(self) -> None:
+        spawn = _ScriptedSpawn([SANDBOX_ABORT_CODE, None])
+        opener = self._opener({"chrome": r"C:\fake\chrome.exe"}, spawn)
+        result = opener.open(PROJECT_ID, "http://127.0.0.1:9300/")
+        # One measured abort is a measurement, not a fluke: remembered straight away.
+        self.assertTrue(self.memory.requires_no_sandbox("chrome.exe"))
+        self.assertEqual(spawn.stopped, [2001], "the dead attempt is ended")
+        self.assertTrue(
+            any(SANDBOX_MEMORY_SAVED_NOTE in line for line in result.log_lines),
+            result.log_lines,
+        )
+        stored = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        entry = stored[WINDOW_PLAN_MEMORY_KEY]["chrome.exe"]
+        self.assertIs(entry["no_sandbox_required"], True)
+        self.assertEqual(entry["reason"], "0x80000003")
+        self.assertTrue(entry["failed_at"], "the memory says when it was measured")
+        # A brand-new opener, composed after a restart, reads the same file and goes
+        # straight to the no-sandbox plan: nothing of this is in memory only.
+        second = AppWindowOpener(
+            which=_FakeWhich({"chrome": r"C:\fake\chrome.exe"}),
+            spawn=_RecordingSpawn(),
+            startfile=_RecordingStartfile(),
+            exists=lambda item: False,
+            visible_windows=_FakeWindows(),
+            plan_memory=WindowPlanMemory(self.settings_path),
+            profile_root=self.profiles,
+            grace_seconds=0.5,
+            title_wait_seconds=0.05,
+        )
+        self.assertEqual(
+            [
+                (plan.program_name, plan.sandboxed, plan.remembered)
+                for plan in second.plans(PROJECT_ID, "http://127.0.0.1:9300/")
+            ],
+            [("chrome.exe", False, True)],
+        )
+        # And the launcher hands that memory to the opener it composes.
+        policy = lambda: True  # noqa: E731 - a lambda is the switch's real shape
+        memory = WindowPlanMemory(self.settings_path)
+        with mock.patch.object(launcher_module, "AppWindowOpener") as composed:
+            launcher_module.ProjectLauncher(window_policy=policy, window_memory=memory)
+        self.assertIs(composed.call_args.kwargs.get("plan_memory"), memory)
+        self.assertIs(composed.call_args.kwargs.get("window_policy"), policy)
+
+    # --------------------------------------------------------------- the toggle
+    def test_04_the_toggle_off_ignores_the_memory_and_refuses_honestly(self) -> None:
+        self.memory.record_sandbox_failure("chrome.exe", code=SANDBOX_ABORT_CODE)
+        self.assertTrue(self.memory.requires_no_sandbox("chrome.exe"), "the setup must hold")
+        spawn = _DeadSpawn(code=1)
+        opener = self._opener(
+            {"chrome": r"C:\fake\chrome.exe"},
+            spawn,
+            policy=lambda: False,
+            startfile=_RaisingStartfile(),
+        )
+        plans = opener.plans(PROJECT_ID, "http://127.0.0.1:9400/", allow_downgrade=False)
+        self.assertEqual(
+            [plan.sandboxed for plan in plans], [True], "OFF ignores the memory entirely"
+        )
+        with self.assertRaises(WindowRefusal) as raised:
+            opener.open(PROJECT_ID, "http://127.0.0.1:9400/")
+        self.assertEqual(len(spawn.calls), 1, "only the sandboxed attempt is made")
+        self.assertNotIn("--no-sandbox", spawn.calls[0]["vector"])
+        self.assertIn("повтор без песочницы запрещён", str(raised.exception))
+        self.assertIn("chrome.exe", str(raised.exception))
+        self.assertTrue(
+            self.memory.requires_no_sandbox("chrome.exe"),
+            "the memory is ignored by the switch, never erased by it",
+        )
+
+    def test_05_forget_clears_the_memory_for_every_browser(self) -> None:
+        store = AppSettingsStore(self.settings_path)
+        store.set_project_root(str(self.base / "projects"))
+        store.set_window_downgrade_allowed(False)
+        self.memory.record_sandbox_failure("chrome.exe", code=SANDBOX_ABORT_CODE)
+        self.memory.record_sandbox_failure("msedge.exe", code=1)
+        self.memory.record_sandbox_failure("msedge.exe", code=1)
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.api.settings_routes import register_settings_routes
+
+        app = FastAPI()
+        register_settings_routes(app, store)
+        client = TestClient(app)
+        before = client.get("/api/settings").json()
+        self.assertEqual(
+            [item["program"] for item in before["window_plan_memory"]],
+            ["chrome.exe", "msedge.exe"],
+            before["window_plan_memory"],
+        )
+        self.assertIs(before["window_plan_memory"][0]["no_sandbox_required"], True)
+        self.assertRegex(
+            before["window_plan_memory"][0]["failed_at"], r"^\d{4}-\d{2}-\d{2}T"
+        )
+        answer = client.post("/api/settings", json={"forget_window_plan_memory": True})
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertIs(answer.json()["forgotten_window_plan_memory"], True)
+        self.assertEqual(client.get("/api/settings").json()["window_plan_memory"], [])
+        self.assertFalse(WindowPlanMemory(self.settings_path).requires_no_sandbox("chrome.exe"))
+        self.assertFalse(WindowPlanMemory(self.settings_path).requires_no_sandbox("msedge.exe"))
+        document = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertNotIn(WINDOW_PLAN_MEMORY_KEY, document)
+        # «Забыть» touches one key: where projects live and the switch are untouched...
+        self.assertEqual(str(store.project_root()), str(self.base / "projects"))
+        self.assertFalse(store.window_downgrade_allowed())
+        # ...and a value that is not a boolean is a bad request, never a silent clear.
+        self.assertEqual(
+            client.post(
+                "/api/settings", json={"forget_window_plan_memory": "yes"}
+            ).status_code,
+            400,
+        )
+
+    # ------------------------------------------------------ no window left behind
+    def test_06_a_failed_sandboxed_attempt_leaves_no_window_and_no_process(self) -> None:
+        # The sandboxed attempt aborts inside the grace period; the documented retry is the
+        # one that becomes the window. The dead attempt must be gone before it starts.
+        spawn = _ScriptedSpawn([SANDBOX_ABORT_CODE, None])
+        opener = self._opener({"chrome": r"C:\fake\chrome.exe"}, spawn)
+        result = opener.open(PROJECT_ID, "http://127.0.0.1:9500/")
+        self.assertEqual(result.window, WINDOW_CHROME_APP)
+        self.assertTrue(result.downgraded)
+        self.assertEqual(result.pid, 2002)
+        # ``_stop`` ran for the sandboxed attempt, and it ran before the retry: the pid of
+        # the dead attempt is recorded, and it is not alive.
+        self.assertEqual(spawn.stopped, [2001], "the dead attempt is ended immediately")
+        self.assertFalse(spawn.is_alive(2001))
+        self.assertEqual(
+            [call["vector"][4:] for call in spawn.calls],
+            [[], list(NO_SANDBOX_FLAGS)],
+            "the retry is the only unsandboxed attempt",
+        )
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("exit", result.failures[0])
+        self.assertTrue(
+            any(SANDBOX_DOWNGRADE_NOTE in line for line in result.log_lines),
+            result.log_lines,
+        )
+        self.assertTrue(
+            any(SANDBOX_MEMORY_SAVED_NOTE in line for line in result.log_lines),
+            result.log_lines,
+        )
+
+    def test_07_a_grey_window_of_a_dead_plan_is_not_the_window(self) -> None:
+        # The sandboxed attempt survives but only ever shows the measured blank page whose
+        # title fell back to the bare host. It is not the owner's application: it is ended,
+        # and it is NOT counted as evidence about the sandbox (only exits are).
+        windows = _FakeWindows(
+            titles={2001: [(77, "127.0.0.1_/")], 2002: [(78, "Почта АИ")]}, default=()
+        )
+        spawn = _ScriptedSpawn([None, None])
+        opener = AppWindowOpener(
+            which=_FakeWhich({"chrome": r"C:\fake\chrome.exe"}),
+            spawn=spawn,
+            startfile=_RecordingStartfile(),
+            exists=lambda item: False,
+            visible_windows=windows,
+            plan_memory=self.memory,
+            profile_root=self.profiles,
+            grace_seconds=0.5,
+            title_wait_seconds=0.05,
+        )
+        result = opener.open(PROJECT_ID, "http://127.0.0.1:9600/")
+        self.assertEqual(result.pid, 2002)
+        self.assertEqual(result.title, "Почта АИ")
+        self.assertTrue(result.downgraded)
+        self.assertEqual(spawn.stopped, [2001], "the grey window's process is ended")
+        self.assertEqual(
+            self.memory.entries(),
+            {},
+            "a blank page is not proof that the browser's sandbox cannot start",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

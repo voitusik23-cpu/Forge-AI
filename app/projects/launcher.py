@@ -298,6 +298,7 @@ class ProjectLauncher:
         windows: Any = None,
         probe: Any = None,
         window_policy: Any = None,
+        window_memory: Any = None,
         readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
         clock: Any = None,
         sleep: Any = None,
@@ -307,10 +308,13 @@ class ProjectLauncher:
         #: ``window_policy`` answers the owner's «Настройки» question "may a browser whose
         #: own sandbox cannot start be retried without it?". It is handed to the opener
         #: this launcher composes; an injected opener brings its own policy.
+        #: ``window_memory`` is this machine's memory of browsers whose sandbox cannot
+        #: start (``app.projects.window_memory``), so a browser that already measured that
+        #: fact is not asked to show its blank window again.
         self._windows = (
             windows
             if windows is not None
-            else AppWindowOpener(window_policy=window_policy)
+            else AppWindowOpener(window_policy=window_policy, plan_memory=window_memory)
         )
         #: ``None`` means "the module's real probe", resolved at call time so a test can
         #: patch :func:`app.projects.ports.probe_http` and still be asked.

@@ -42,6 +42,12 @@ Two values live in it:
     owner's grey window into his real page). «Настройки» can turn it off, and then the
     launch refuses honestly instead of starting an unsandboxed browser.
 
+``window_plan_memory``
+    what this machine has measured about its browsers: a browser that could not start its
+    own sandbox is remembered here, so the next launch does not show its blank window even
+    for a moment (:mod:`app.projects.window_memory` owns the key). «Забыть» clears it, and
+    the switch above being off makes it irrelevant.
+
 ``questions_from_model``
     whether the discovery questions may be helped by a model (default ``false``). The
     deterministic domain banks are the questions; the model is an optional extra that
@@ -54,7 +60,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     "DEFAULT_PROJECT_ROOT_NAME",
@@ -437,6 +443,33 @@ class AppSettingsStore:
         write_settings_document(self._path, document)
         return bool(value)
 
+    # ------------------------------------------------------ the window memory
+    def window_plan_memory(self) -> List[Dict[str, Any]]:
+        """What this machine remembers about its browsers, as «Настройки» shows it.
+
+        Owned by :mod:`app.projects.window_memory`, in the same file and read through this
+        store's own path, so the screen and the launch can never read two different files.
+        A memory that cannot be read answers an empty list: a settings screen that 500s
+        tells the owner nothing.
+        """
+
+        from app.projects.window_memory import WindowPlanMemory
+
+        try:
+            return WindowPlanMemory(self._path).describe()
+        except Exception:  # noqa: BLE001 - an unreadable memory is "nothing is remembered"
+            return []
+
+    def forget_window_plan_memory(self) -> bool:
+        """«Забыть»: clear every remembered browser, so the next launch measures afresh."""
+
+        from app.projects.window_memory import WindowPlanMemory
+
+        try:
+            return WindowPlanMemory(self._path).forget()
+        except Exception:  # noqa: BLE001 - a memory that cannot be written is not fatal
+            return False
+
     # ------------------------------------------------- questions from a model
     def questions_from_model(self) -> bool:
         """Whether the optional model-written questions are allowed.
@@ -564,6 +597,9 @@ class AppSettingsStore:
             "project_root_label_grant_command": label_grant_command,
             "project_roots_known": [str(item) for item in self.known_project_roots()],
             "window_downgrade_allowed": self.window_downgrade_allowed(),
+            # What this machine has measured about its browsers: the browsers whose own
+            # sandbox cannot start here, and the evidence for it. «Забыть» clears it.
+            "window_plan_memory": self.window_plan_memory(),
             # Off by default; the card explains that it uses the owner's tokens.
             "questions_from_model": self.questions_from_model(),
             "settings_path": str(self._path),

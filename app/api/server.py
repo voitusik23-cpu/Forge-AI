@@ -359,6 +359,7 @@ def create_api_app(
     from app.execution.containment import sandbox_settings_from_environment
     from app.projects.preview import PreviewRegistry
     from app.projects.runner import LocalRunner
+    from app.projects.window_memory import WindowPlanMemory
     from app.api.routes import (
         body_error_exception,
         error_body,
@@ -570,6 +571,12 @@ def create_api_app(
     # a browser whose own sandbox cannot start may be retried without it. The same store
     # backs «Настройки», so the switch and the launch can never disagree.
     owner_settings = settings_store if settings_store is not None else AppSettingsStore()
+    # What this machine has measured about its browsers: a browser whose own sandbox cannot
+    # start here is remembered in the same settings file (``window_plan_memory``), so the
+    # next launch goes straight to its no-sandbox plan and never shows the blank white
+    # window of a doomed attempt again. It is composed once, beside the switch, so
+    # «Забыть» in «Настройки» and the launch cannot disagree.
+    window_memory = WindowPlanMemory(owner_settings.path)
     # The card's technical block needs facts the project store does not hold: the
     # run's own durable record, the provider registry ids and the route list. They
     # are supplied as read-only callables from this composition, so the project
@@ -583,6 +590,7 @@ def create_api_app(
         opener=project_opener,
         window_opener=window_opener,
         window_policy=owner_settings.window_downgrade_allowed,
+        window_memory=window_memory,
         environment_facts=lambda: {
             "provider_registry_ids": _provider_registry_ids(api_service),
             "api_routes": sorted(

@@ -1765,6 +1765,13 @@ export type ForgeSettings = {
    */
   window_downgrade_allowed?: boolean;
   /**
+   * What this machine has measured about its browsers: a browser whose own sandbox cannot
+   * start here is remembered in `.forge/settings.json` (`window_plan_memory`), and the next
+   * launch goes straight to its no-sandbox plan — the blank white window of the doomed
+   * sandboxed attempt is not shown at all. «Забыть» clears the whole list.
+   */
+  window_plan_memory?: WindowPlanMemoryEntry[];
+  /**
    * «Вопросы по смыслу задачи (через модель)»: whether the optional model path may
    * write up to three clarification questions. **Off by default** — it uses the owner's
    * tokens, and the deterministic domain questions are asked either way.
@@ -1775,12 +1782,27 @@ export type ForgeSettings = {
   created?: boolean;
 };
 
+/** One browser this machine remembers as unable to start its own sandbox. */
+export type WindowPlanMemoryEntry = {
+  /** The browser's file name, e.g. `chrome.exe`. */
+  program?: string;
+  /** `true` — the launch starts it without the sandbox, with no blank attempt first. */
+  no_sandbox_required?: boolean;
+  /** How many sandboxed failures in a row were measured (`3` is the counter's threshold). */
+  sandbox_failures?: number;
+  /** When it was measured: ISO-8601 local time with its own offset (`2026-10-29T01:05:20+02:00`). */
+  failed_at?: string;
+  /** The exit code that proved it: `0x80000003` is the documented abort. */
+  reason?: string;
+};
+
 export const loadSettings = (): Promise<Result<ForgeSettings>> =>
   readJson<ForgeSettings>("/api/settings");
 
 /**
- * `POST /api/settings` — set the project root, restore the desktop default, or decide
- * whether a project window may be retried without the browser's sandbox.
+ * `POST /api/settings` — set the project root, restore the desktop default, decide
+ * whether a project window may be retried without the browser's sandbox, or forget what
+ * this machine remembers about its browsers.
  *
  * The value is stored in the application's own settings file (`.forge/settings.json`),
  * not in `.env`, and the folder is created here so a typo fails where it was typed.
@@ -1790,6 +1812,7 @@ export const saveProjectRoot = (
     | { project_root: string }
     | { use_desktop: true }
     | { window_downgrade_allowed: boolean }
+    | { forget_window_plan_memory: true }
     | { questions_from_model: boolean }
 ): Promise<Result<ForgeSettings>> => postJson<ForgeSettings>("/api/settings", body);
 

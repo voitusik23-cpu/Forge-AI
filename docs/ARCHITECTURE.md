@@ -5206,6 +5206,23 @@ invariants, not best effort:
   (`window_downgrade_allowed`, default `true`); then no browser is started without its sandbox, and a
   launch that cannot open a window is the typed `409 project_launch_refused` carrying the failure list
   and the log tail, never a claimed window.
+* **A browser that already proved it cannot start its sandbox is not asked twice.**
+  `app/projects/window_memory.py` keeps that measurement in the `window_plan_memory` key of
+  `.forge/settings.json`, per browser:
+  `{"chrome.exe": {"no_sandbox_required": true, "sandbox_failures": 1, "failed_at": "2026-10-29T01:05:20+02:00", "reason": "0x80000003"}}`.
+  The documented abort (`0x80000003`) marks a browser at once; any other exit inside
+  `WINDOW_GRACE_SECONDS` marks it only on the third one **in a row** (`MARK_AFTER_FAILURES = 3`),
+  and the counter is persisted so it survives a restart; a sandboxed window drops the entry again.
+  `AppWindowOpener.plans()` then returns **only** the no-sandbox plan for that browser, so the blank
+  white window of a doomed sandboxed attempt is never shown: the next launch opens the no-sandbox
+  plan directly and `launch.log` starts with «сразу без песочницы: на этой машине уже измерено».
+  The memory never overrides the owner: with «Разрешать повтор без песочницы» off it is ignored, the
+  sandboxed attempt is tried again, and a launch that cannot open a window refuses honestly.
+  «Настройки → Как открываются окна» prints what is remembered
+  («chrome.exe: без песочницы (после 3 неудач, 29.10)») and «Забыть» clears it for every browser.
+  Every plan that produced no window is ended immediately (`terminate`, a bounded wait, `kill`, and
+  `WM_CLOSE` of the windows that attempt had on screen), so a failed attempt cannot be left behind
+  beside the next one.
 * **The project's own one-click launcher follows the same rules outside Forge.** `tools/open_mail_ai.py`
   starts `pythonw.exe app.py` with `CREATE_NO_WINDOW` unless `/api/health` answers, checks `GET /`,
   opens `--app=<url>` in Chrome then Edge, **confirms the window really rendered** (the window of that
@@ -5273,6 +5290,23 @@ invariants, not best effort:
   запретить повтор (`window_downgrade_allowed`, по умолчанию `true`); тогда браузер без песочницы не
   запускается, а запуск, которому не удалось открыть окно, — это типизированный
   `409 project_launch_refused` со списком отказов и хвостом журнала, но никогда не заявленное окно.
+* **Браузер, который уже доказал, что не запускает песочницу, не спрашивается дважды.**
+  `app/projects/window_memory.py` хранит это измерение в ключе `window_plan_memory` файла
+  `.forge/settings.json`, по каждому браузеру:
+  `{"chrome.exe": {"no_sandbox_required": true, "sandbox_failures": 1, "failed_at": "2026-10-29T01:05:20+02:00", "reason": "0x80000003"}}`.
+  Документированный abort (`0x80000003`) помечает браузер сразу; любой другой выход внутри
+  `WINDOW_GRACE_SECONDS` — только на третий раз **подряд** (`MARK_AFTER_FAILURES = 3`), счётчик
+  сохраняется, поэтому переживает перезапуск; окно, открытое с песочницей, удаляет запись снова.
+  После этого `AppWindowOpener.plans()` возвращает для такого браузера **только** план без песочницы:
+  белое окно обречённой попытки не показывается вовсе — следующий запуск открывает план без
+  песочницы сразу, и `launch.log` начинается с «сразу без песочницы: на этой машине уже измерено».
+  Память никогда не отменяет волю владельца: если «Разрешать повтор без песочницы» выключено, она
+  игнорируется, попытка с песочницей делается снова, а запуск, которому не удалось открыть окно,
+  честно отказывает. «Настройки → Как открываются окна» печатают, что запомнено
+  («chrome.exe: без песочницы (после 3 неудач, 29.10)»), а «Забыть» очищает это для всех браузеров.
+  Каждый план, не давший окна, завершается немедленно (`terminate`, ограниченное ожидание, `kill` и
+  `WM_CLOSE` для окон, которые эта попытка успела показать), поэтому неудачная попытка не может
+  остаться на экране рядом со следующей.
 * **Собственный лаунчер проекта для одного двойного щелчка следует тем же правилам вне Forge.**
   `tools/open_mail_ai.py` поднимает `pythonw.exe app.py` с `CREATE_NO_WINDOW`, если `/api/health` не
   отвечает, проверяет `GET /`, открывает `--app=<url>` в Chrome, затем в Edge, **подтверждает, что окно

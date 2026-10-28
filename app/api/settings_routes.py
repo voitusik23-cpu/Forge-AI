@@ -5,10 +5,13 @@ These routes and nothing else:
 
 ```
 GET  /api/settings   -> the project root, its default, whether it exists,
-                        whether the window retry without a sandbox is allowed, and
-                        whether the discovery questions may be helped by a model
+                        whether the window retry without a sandbox is allowed,
+                        which browsers this machine remembers as unable to start
+                        their sandbox, and whether the discovery questions may be
+                        helped by a model
 POST /api/settings   -> {"project_root": "..."} | {"use_desktop": true}
                         | {"window_downgrade_allowed": false}
+                        | {"forget_window_plan_memory": true}
                         | {"questions_from_model": true}
 ```
 
@@ -65,16 +68,19 @@ def register_settings_routes(app: Any, settings: Any) -> None:
 
     @app.post("/api/settings")
     def write_settings(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
-        """Set the project root, restore the desktop default, forbid a window retry, or
-        decide whether the discovery questions may be helped by a model.
+        """Set the project root, restore the desktop default, forbid a window retry, forget
+        the remembered browsers, or decide whether the discovery questions may be helped by
+        a model.
 
         Exactly one of ``project_root`` (a full path), ``use_desktop`` (``true``),
-        ``window_downgrade_allowed`` and ``questions_from_model`` (booleans) is
-        required. The third is the «Как открываются окна» switch: ``false`` forbids the
-        one retry without a browser's sandbox. The fourth is «Вопросы по смыслу задачи
-        (через модель)»: ``true`` lets the optional model path write up to three
-        questions, it is off by default, and it spends the owner's tokens. Every other
-        value is refused rather than guessed.
+        ``window_downgrade_allowed``, ``forget_window_plan_memory`` and
+        ``questions_from_model`` (booleans) is required. The third is the «Как открываются
+        окна» switch: ``false`` forbids the one retry without a browser's sandbox. The
+        fourth is «Забыть» beside it: it clears what this machine has measured about its
+        browsers, so the next launch tries their sandbox again. The fifth is «Вопросы по
+        смыслу задачи (через модель)»: ``true`` lets the optional model path write up to
+        three questions, it is off by default, and it spends the owner's tokens. Every
+        other value is refused rather than guessed.
         """
 
         body = dict(payload or {})
@@ -87,6 +93,9 @@ def register_settings_routes(app: Any, settings: Any) -> None:
         allow_downgrade = body.get("window_downgrade_allowed")
         if allow_downgrade is not None and not isinstance(allow_downgrade, bool):
             raise body_error_exception("'window_downgrade_allowed' must be a boolean")
+        forget_memory = body.get("forget_window_plan_memory")
+        if forget_memory is not None and not isinstance(forget_memory, bool):
+            raise body_error_exception("'forget_window_plan_memory' must be a boolean")
         from_model = body.get("questions_from_model")
         if from_model is not None and not isinstance(from_model, bool):
             raise body_error_exception("'questions_from_model' must be a boolean")
@@ -98,14 +107,28 @@ def register_settings_routes(app: Any, settings: Any) -> None:
             raise body_error_exception(
                 "send 'window_downgrade_allowed' alone, not with a project root"
             )
-        if from_model is not None and (
+        if forget_memory is not None and (
             bool(use_desktop)
             or request_root is not None
             or allow_downgrade is not None
         ):
             raise body_error_exception(
+                "send 'forget_window_plan_memory' alone, not with a project root"
+            )
+        if from_model is not None and (
+            bool(use_desktop)
+            or request_root is not None
+            or allow_downgrade is not None
+            or forget_memory is not None
+        ):
+            raise body_error_exception(
                 "send 'questions_from_model' alone, not with a project root"
             )
+        if forget_memory is not None:
+            # «Забыть»: one key of the same file. It changes nothing about where projects
+            # live, and it never touches the switch that forbids the retry.
+            forgotten = settings.forget_window_plan_memory()
+            return _payload({"forgotten_window_plan_memory": bool(forgotten)})
         if from_model is not None:
             # «Вопросы по смыслу задачи (через модель)»: one key of the same file, off by
             # default, changing nothing about where projects live.

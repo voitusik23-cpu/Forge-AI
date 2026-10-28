@@ -24,6 +24,7 @@ import {
   type ProviderKeyEntry,
   type ProviderKeySection,
   type ProviderPreset,
+  type WindowPlanMemoryEntry,
 } from "../api/forge";
 
 const THEME_LABEL: Record<Lang, Record<ThemeMode, string>> = {
@@ -251,6 +252,23 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
 };
 
 /**
+ * `2026-10-29T00:43:40+00:00` → `29.10`: the day this machine measured the browser.
+ *
+ * The memory stores an ISO timestamp because a person reading `.forge/settings.json` needs
+ * one; the card shows the day and month, which is what the owner asked to see.
+ */
+const memoryDate = (value?: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value ?? ""));
+  return match ? `${match[3]}.${match[2]}` : "";
+};
+
+/** The entries «Настройки» prints: only the browsers marked as unable to start a sandbox. */
+const rememberedBrowsers = (
+  entries?: WindowPlanMemoryEntry[]
+): WindowPlanMemoryEntry[] =>
+  (entries ?? []).filter((entry) => entry?.no_sandbox_required === true);
+
+/**
  * «Как открываются окна»: the policy of a project's window, and the one switch that can
  * forbid its fallback.
  *
@@ -260,9 +278,16 @@ const ProjectRootCard = ({ lang }: { lang: Lang }) => {
  * `launch.log`. The switch is the owner's veto: off means the launch refuses honestly
  * instead of starting an unsandboxed browser. It is read at every launch, so the next
  * press obeys a change made here without a restart.
+ *
+ * Below the switch is what this machine has **measured** about its browsers
+ * (`window_plan_memory`): a browser whose own sandbox cannot start here is remembered, and
+ * then the next launch goes straight to the no-sandbox plan — no blank white window of a
+ * doomed attempt. «Забыть» clears that memory, so the next launch measures afresh; the
+ * memory is never shown as a promise the owner cannot undo.
  */
 const WindowPolicyCard = ({ lang }: { lang: Lang }) => {
   const [allowed, setAllowed] = useState<boolean | null>(null);
+  const [memory, setMemory] = useState<WindowPlanMemoryEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [failure, setFailure] = useState<Failure | null>(null);
@@ -275,6 +300,7 @@ const WindowPolicyCard = ({ lang }: { lang: Lang }) => {
     }
     setFailure(null);
     setAllowed(outcome.value.window_downgrade_allowed !== false);
+    setMemory(rememberedBrowsers(outcome.value.window_plan_memory));
   }, []);
 
   useEffect(() => {
@@ -293,12 +319,31 @@ const WindowPolicyCard = ({ lang }: { lang: Lang }) => {
     }
     const next = outcome.value.window_downgrade_allowed !== false;
     setAllowed(next);
+    setMemory(rememberedBrowsers(outcome.value.window_plan_memory));
     setNotice(
       t(lang, "settings.windows.saved").replace(
         "{state}",
         t(lang, next ? "settings.windows.allowed" : "settings.windows.forbidden")
       )
     );
+  };
+
+  /**
+   * «Забыть»: clear every remembered browser. The next launch tries the sandbox again and
+   * measures afresh — which is the only honest way to undo a fact this machine measured.
+   */
+  const forget = async () => {
+    setBusy(true);
+    setNotice("");
+    setFailure(null);
+    const outcome = await saveProjectRoot({ forget_window_plan_memory: true });
+    setBusy(false);
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    setMemory(rememberedBrowsers(outcome.value.window_plan_memory));
+    setNotice(t(lang, "settings.windows.forgotten"));
   };
 
   const enabled = allowed !== false;
@@ -333,6 +378,64 @@ const WindowPolicyCard = ({ lang }: { lang: Lang }) => {
             </span>
           </span>
         </label>
+        {/* What this machine remembers, in the owner's own words: which browser, how many
+            failures in a row, and the day it was measured. */}
+        <div className="stack" style={{ gap: 6 }} data-testid="settings-window-memory">
+          <div className="small muted">{t(lang, "settings.windows.memory.title")}</div>
+          {memory.length === 0 ? (
+            <div className="small" data-testid="settings-window-memory-empty">
+              {t(lang, "settings.windows.memory.empty")}
+            </div>
+          ) : (
+            memory.map((entry) => {
+              const program = String(entry.program ?? "");
+              const failures = Number(entry.sandbox_failures ?? 0);
+              return (
+                <div
+                  className="small"
+                  key={program}
+                  data-testid="settings-window-memory-line"
+                >
+                  {t(
+                    lang,
+                    failures === 1
+                      ? "settings.windows.memory.line.one"
+                      : "settings.windows.memory.line"
+                  )
+                    .replace("{program}", program)
+                    .replace("{count}", String(failures))
+                    .replace("{date}", memoryDate(entry.failed_at))}
+                  {entry.reason ? (
+                    <span className="muted">
+                      {" · "}
+                      {t(lang, "settings.windows.memory.reason").replace(
+                        "{reason}",
+                        String(entry.reason)
+                      )}
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })
+          )}
+          <div className="small muted">{t(lang, "settings.windows.memory.hint")}</div>
+          <div
+            className="row"
+            style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}
+          >
+            <span data-testid="settings-window-forget">
+              <Button
+                size="small"
+                tone="ghost"
+                disabled={busy || memory.length === 0}
+                onClick={() => void forget()}
+              >
+                {t(lang, "settings.windows.forget")}
+              </Button>
+            </span>
+            <span className="small muted">{t(lang, "settings.windows.forget.hint")}</span>
+          </div>
+        </div>
         {notice !== "" ? (
           <div className="notice" data-testid="settings-window-notice">
             {notice}

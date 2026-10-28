@@ -54,6 +54,12 @@ Eight rules make that safe and honest:
   never instead of it, and every such downgrade is written into the project's
   ``launch.log`` in so many words. «Настройки» can forbid the retry; then the refusal
   is the honest answer instead of an unsandboxed browser.
+* **A browser that already proved it cannot start its sandbox is not asked twice.** The
+  measured abort is a property of this machine, not of this launch, so it is remembered
+  (:mod:`app.projects.window_memory`) and the next launch goes **straight** to the
+  no-sandbox plan: no half-second of a blank white window that only exists to be replaced.
+  The memory never overrides the owner: with «Разрешать повтор без песочницы» off it is
+  ignored and the sandboxed attempt is tried again, honestly.
 * **A refusal is a sentence.** When no browser can be resolved, or the profile
   cannot be created, or the URL is not loopback, :class:`WindowRefusal` says so and
   nothing is started.
@@ -81,6 +87,9 @@ __all__ = [
     "NO_SANDBOX_FLAGS",
     "PROFILE_RETENTION",
     "SANDBOX_DOWNGRADE_NOTE",
+    "SANDBOX_MEMORY_NOTE",
+    "SANDBOX_MEMORY_SAVED_NOTE",
+    "STOP_GRACE_SECONDS",
     "WINDOW_CHROME_APP",
     "WINDOW_DEFAULT_BROWSER",
     "WINDOW_EDGE_APP",
@@ -141,6 +150,19 @@ NO_SANDBOX_FLAGS: Tuple[str, ...] = ("--no-sandbox", "--test-type")
 #: sandbox. The words are fixed because they are the log line, not a comment.
 SANDBOX_DOWNGRADE_NOTE = "песочница недоступна (0x80000003) — повтор без песочницы"
 
+#: The log line of a launch that went **straight** to the no-sandbox plan because this
+#: machine remembers that the browser cannot start its sandbox. It names the browser, so
+#: the next person reading ``launch.log`` sees that no sandboxed attempt was made at all.
+SANDBOX_MEMORY_NOTE = "сразу без песочницы: на этой машине уже измерено"
+
+#: The log line written the moment the memory is created: a browser has just proved that
+#: its sandbox cannot start here, so the next launch will not try it again.
+SANDBOX_MEMORY_SAVED_NOTE = "запомнено: этот браузер не запускает песочницу на этой машине"
+
+#: How long an abandoned attempt is given to end by itself before it is killed outright,
+#: so the half-created window of a failed plan cannot outlive the plan by a visible moment.
+STOP_GRACE_SECONDS = 0.25
+
 #: How many of a project's per-launch profiles are kept on disk. Each launch gets a
 #: fresh directory (see :meth:`AppWindowOpener.profile_for`); the newest
 #: :data:`PROFILE_RETENTION` are kept and the older ones are removed.
@@ -187,6 +209,12 @@ class WindowPlan:
     one documented retry (:data:`NO_SANDBOX_FLAGS`). ``profile`` is a directory created
     for *this* attempt just before it starts -- never one an earlier attempt left behind,
     and never one a plan that is not reached creates at all.
+
+    ``remembered`` is ``True`` when the plan is the no-sandbox one **because this machine
+    remembers that the browser cannot start its sandbox**
+    (``app.projects.window_memory``), and not because an attempt of this launch just
+    failed. The difference is only what the project's log says: no sandboxed attempt was
+    made at all.
     """
 
     window: str
@@ -194,6 +222,7 @@ class WindowPlan:
     vector: Tuple[str, ...]
     profile: Path
     sandboxed: bool = True
+    remembered: bool = False
 
     @property
     def downgraded(self) -> bool:
@@ -322,6 +351,32 @@ def _default_visible_windows(pid: int) -> Optional[List[Tuple[int, str]]]:
     return found
 
 
+def _close_browser_windows(windows: Optional[Sequence[Tuple[int, str]]]) -> None:
+    """Ask the visible windows of an abandoned attempt to close.
+
+    The window of a failed plan has to be gone before the next one starts, and a terminated
+    process can leave its window on the desktop until the window manager gets to it.
+    ``WM_CLOSE`` is the word the title bar's cross sends, and it is posted only to the
+    handles the opener itself observed for **this launch's own pid**, so it can never reach
+    another application. A host that cannot answer, or a call that fails, changes nothing:
+    this is a courtesy after ``terminate``/``kill``, not the mechanism that ends the process.
+    """
+
+    if os.name != "nt":  # pragma: no cover - this product runs on Windows
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+    except Exception:  # noqa: BLE001 - no Win32 here: nothing to close by hand
+        return
+    for hwnd, _title in windows or ():
+        try:
+            user32.PostMessageW(int(hwnd), 0x0010, 0, 0)  # WM_CLOSE
+        except Exception:  # noqa: BLE001 - a window that cannot be asked is not fatal
+            continue
+
+
 def detached_flags() -> int:
     """Process-creation flags that detach the window, or ``0`` off Windows."""
 
@@ -416,6 +471,13 @@ class AppWindowOpener:
     without the browser's sandbox is allowed. It is the owner's «Настройки» switch, read
     at every launch; an absent (or failing) policy means allowed, because the owner asked
     for the retry. It never turns the *first* attempt into an unsandboxed one.
+
+    ``plan_memory`` is the per-browser, per-machine memory of browsers that cannot start
+    their own sandbox (:class:`app.projects.window_memory.WindowPlanMemory`): an object
+    with ``requires_no_sandbox(program)``, ``record_sandbox_failure(program, ...)`` and
+    ``record_sandbox_success(program)``. When it is ``None`` nothing is remembered and
+    nothing is read, which is what the tests that do not care about the memory want; the
+    composition supplies the real one, sitting in the same settings file as the switch.
     """
 
     def __init__(
@@ -427,6 +489,7 @@ class AppWindowOpener:
         exists: Optional[Callable[[object], bool]] = None,
         visible_windows: Optional[Callable[[int], Optional[Sequence[Tuple[int, str]]]]] = None,
         window_policy: Optional[Callable[[], bool]] = None,
+        plan_memory: Optional[Any] = None,
         profile_root: Optional[object] = None,
         grace_seconds: float = WINDOW_GRACE_SECONDS,
         title_wait_seconds: float = WINDOW_TITLE_WAIT_SECONDS,
@@ -439,6 +502,7 @@ class AppWindowOpener:
             visible_windows if visible_windows is not None else _default_visible_windows
         )
         self._window_policy = window_policy
+        self._plan_memory = plan_memory
         self._profile_root = Path(profile_root) if profile_root is not None else default_profile_root()
         self._grace_seconds = max(0.0, float(grace_seconds))
         self._title_seconds = max(0.0, float(title_wait_seconds))
@@ -573,6 +637,13 @@ class AppWindowOpener:
         what the window shows. The list is empty when no Chromium browser is installed:
         the machine's own default browser is then the last resort, and :meth:`open`
         records which plan really happened.
+
+        **A browser this machine remembers as unable to start its sandbox gets only its
+        no-sandbox plan.** That is the whole point of the memory: the blank white window of
+        the sandboxed attempt is not shown at all, because it was already measured to be
+        wasted. The memory is consulted only when the owner allows the relaxation
+        (``allow_downgrade``): with «Разрешать повтор без песочницы» off it is ignored,
+        and the sandboxed plan is tried again -- and fails honestly.
         """
 
         if not _looks_like_loopback(url):
@@ -588,25 +659,50 @@ class AppWindowOpener:
         ):
             if not program:
                 continue
-            for sandboxed in ((True, False) if allow_downgrade else (True,)):
+            remembered = bool(allow_downgrade) and self._requires_no_sandbox(
+                Path(program).name
+            )
+            if remembered:
+                # No sandboxed attempt for this browser, and no second plan either: it has
+                # already measured that its sandbox cannot start here.
                 profile = self._next_profile_path(project_id)
-                vector = (
-                    program,
-                    f"--app={address}",
-                    f"--window-size={APP_WINDOW_SIZE}",
-                    f"--user-data-dir={profile}",
-                    *(() if sandboxed else NO_SANDBOX_FLAGS),
-                )
                 plans.append(
                     WindowPlan(
                         window=window,
                         program=program,
-                        vector=vector,
+                        vector=self._vector(program, address, profile, sandboxed=False),
+                        profile=profile,
+                        sandboxed=False,
+                        remembered=True,
+                    )
+                )
+                continue
+            for sandboxed in ((True, False) if allow_downgrade else (True,)):
+                profile = self._next_profile_path(project_id)
+                plans.append(
+                    WindowPlan(
+                        window=window,
+                        program=program,
+                        vector=self._vector(program, address, profile, sandboxed=sandboxed),
                         profile=profile,
                         sandboxed=sandboxed,
                     )
                 )
         return tuple(plans)
+
+    @staticmethod
+    def _vector(
+        program: str, address: str, profile: Path, *, sandboxed: bool
+    ) -> Tuple[str, ...]:
+        """The exact argument vector of one attempt; the sandbox pair is the only variable."""
+
+        return (
+            program,
+            f"--app={address}",
+            f"--window-size={APP_WINDOW_SIZE}",
+            f"--user-data-dir={profile}",
+            *(() if sandboxed else NO_SANDBOX_FLAGS),
+        )
 
     # ------------------------------------------------------- the window itself
     @staticmethod
@@ -700,21 +796,62 @@ class AppWindowOpener:
             time.sleep(0.025)
             titles = self._visible_titles(pid)
 
-    @staticmethod
-    def _stop(child: Any) -> None:
-        """End an attempt that did not become the window.
+    def _stop(self, child: Any, pid: int = 0) -> None:
+        """End an attempt that did not become the window -- at once, and completely.
 
         A grey window belongs to the browser that showed it; leaving that process alive
-        after its plan failed is what would leave the owner looking at two windows. The
-        process is this launch's own child, and a termination that fails is not an error.
+        after its plan failed is what would leave the owner looking at two windows. So the
+        attempt is ended **immediately**, and never left to exit in its own time while the
+        next plan starts a second browser beside it:
+
+        * ``terminate()`` first, because that is the polite end;
+        * a short, bounded wait (:data:`STOP_GRACE_SECONDS`) for it to be gone;
+        * ``kill()`` if it is still there -- the half-created window of a failed plan must
+          not outlive the plan by a visible moment;
+        * a close of any visible browser window the pid still owns, because a window can
+          outlive the process that drew it for as long as the desktop keeps its handle.
+
+        This runs for **every** plan that produced no window -- an exit inside the grace
+        period, a survivor with no rendered title, and an observation that itself failed --
+        and a termination that fails is never an error of the launch.
         """
 
+        # What this attempt had on screen, taken *before* it is ended: the handles are the
+        # half-created window the owner would otherwise still be looking at.
+        shown: List[Tuple[int, str]] = list(self._visible_titles(pid) or ()) if pid else []
         terminate = getattr(child, "terminate", None)
         if callable(terminate):
             try:
                 terminate()
             except (OSError, ValueError):  # pragma: no cover - a dying child
                 pass
+        poll = getattr(child, "poll", None)
+        kill = getattr(child, "kill", None)
+        if callable(poll):
+            deadline = time.monotonic() + STOP_GRACE_SECONDS
+            while True:
+                try:
+                    if poll() is not None:
+                        break
+                except (OSError, ValueError):  # pragma: no cover - a dying child
+                    break
+                if time.monotonic() >= deadline:
+                    if callable(kill):
+                        try:
+                            kill()
+                        except (OSError, ValueError):  # pragma: no cover
+                            pass
+                    break
+                time.sleep(0.01)
+        wait = getattr(child, "wait", None)
+        if callable(wait):
+            try:
+                wait(timeout=STOP_GRACE_SECONDS)
+            except TypeError:  # an injected child with a different signature
+                pass
+            except Exception:  # noqa: BLE001 - a child that refuses to be reaped
+                pass
+        _close_browser_windows(shown)
 
     def _downgrade_allowed(self) -> bool:
         """The owner's «Настройки» switch, read now; absent or broken means allowed."""
@@ -725,6 +862,69 @@ class AppWindowOpener:
             return bool(self._window_policy())
         except Exception:  # noqa: BLE001 - a broken setting never withholds the window
             return True
+
+    # ------------------------------------------------------------ the memory
+    def _memory_entry(self, program: str) -> Dict[str, Any]:
+        """What this machine remembers about one browser; ``{}`` when the memory is absent."""
+
+        if self._plan_memory is None:
+            return {}
+        try:
+            return dict(self._plan_memory.entry(program) or {})
+        except Exception:  # noqa: BLE001 - a memory that cannot answer remembers nothing
+            return {}
+
+    def _requires_no_sandbox(self, program: str) -> bool:
+        """Whether the remembered facts say this browser cannot start its sandbox here."""
+
+        if self._plan_memory is None:
+            return False
+        try:
+            return bool(self._plan_memory.requires_no_sandbox(program))
+        except Exception:  # noqa: BLE001 - a broken memory never withholds a window
+            return False
+
+    def _remember_sandbox_failure(
+        self, program: str, code: Optional[int], inside_grace: bool
+    ) -> Optional[Any]:
+        """Record one sandboxed failure, if this memory counts it; ``None`` otherwise."""
+
+        if self._plan_memory is None:
+            return None
+        try:
+            return self._plan_memory.record_sandbox_failure(
+                program, code=code, inside_grace=inside_grace
+            )
+        except Exception:  # noqa: BLE001 - a memory write must never fail a launch
+            return None
+
+    def _remember_sandbox_success(self, program: str) -> None:
+        """A sandboxed attempt really opened a window: forget that browser's failures."""
+
+        if self._plan_memory is None:
+            return
+        try:
+            self._plan_memory.record_sandbox_success(program)
+        except Exception:  # noqa: BLE001 - a memory write must never fail a window
+            return
+
+    def _downgrade_note(self, plan: WindowPlan) -> str:
+        """The ``launch.log`` sentence for a plan that starts without the browser's sandbox.
+
+        Two very different facts produce the same plan. A retry exists because an attempt
+        of *this* launch died a moment ago («песочница недоступна (0x80000003) — повтор без
+        песочницы»); a remembered plan exists because an earlier launch measured it, so no
+        sandboxed attempt was made now («сразу без песочницы»). The log has to say which.
+        """
+
+        if not plan.remembered:
+            return (
+                f"{SANDBOX_DOWNGRADE_NOTE}: {plan.program_name} "
+                "(первая попытка не дала окна)"
+            )
+        entry = self._memory_entry(plan.program_name)
+        failures = int(entry.get("sandbox_failures") or 0)
+        return f"{SANDBOX_MEMORY_NOTE}: {plan.program_name} (неудач подряд: {failures})"
 
     # ------------------------------------------------------------- the action
     def open(self, project_id: object, url: object) -> WindowResult:
@@ -740,6 +940,12 @@ class AppWindowOpener:
         claimed that did not happen: ``window`` names the one that really opened,
         ``sandboxed``/``downgraded`` name which attempt did, and ``failures`` names every
         plan that died before it.
+
+        Every dead plan is ended before the next one starts (:meth:`_stop`, immediately),
+        so the blank window of a failed sandboxed attempt cannot be on screen beside the
+        next attempt. And every sandboxed failure is measured into the memory: the
+        documented abort, or the third exit in a row inside the grace period, means the
+        next launch does not show that blank window at all.
         """
 
         address = str(url)
@@ -750,10 +956,7 @@ class AppWindowOpener:
         root = self.project_profile_root(project_id)
         for plan in chain:
             if plan.downgraded:
-                notes.append(
-                    f"{SANDBOX_DOWNGRADE_NOTE}: {plan.program_name} "
-                    "(первая попытка не дала окна)"
-                )
+                notes.append(self._downgrade_note(plan))
             try:
                 plan.profile.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -761,6 +964,7 @@ class AppWindowOpener:
                     f"{plan.program_name}: профиль окна не создан ({type(exc).__name__})"
                 )
                 continue
+            started = time.monotonic()
             try:
                 child = self._spawn(
                     list(plan.vector),
@@ -778,8 +982,19 @@ class AppWindowOpener:
                 failures.append(f"{plan.program_name}: {type(exc).__name__}")
                 continue
             pid = int(getattr(child, "pid", 0) or 0)
-            kind, code, _hwnd, title = self._observe(child, pid)
+            try:
+                kind, code, _hwnd, title = self._observe(child, pid)
+            except Exception as exc:  # noqa: BLE001 - an unobserved attempt is a dead one
+                # The process is this launch's child, so it is ended here too: an opener
+                # that crashed while watching must not leave a window behind it.
+                self._stop(child, pid)
+                failures.append(
+                    f"{plan.program_name}: окно не наблюдалось ({type(exc).__name__})"
+                )
+                continue
             if kind == "window":
+                if plan.sandboxed:
+                    self._remember_sandbox_success(plan.program_name)
                 self._prune_profiles(root, PROFILE_RETENTION)
                 return WindowResult(
                     window=plan.window,
@@ -794,9 +1009,9 @@ class AppWindowOpener:
                     title=title,
                     log_lines=tuple(notes),
                 )
-            # A plan that produced no window is ended before the next attempt: a grey
-            # window must not survive the plan that failed to render the page.
-            self._stop(child)
+            # A plan that produced no window is ended **before** the next attempt: the
+            # blank window of a failed sandboxed attempt must not be left on screen.
+            self._stop(child, pid)
             if kind == "exit":
                 # Exit 0 inside the grace period is a handoff, not a window: Chromium's
                 # singleton does that on a profile it already holds. It is recorded as a
@@ -810,6 +1025,21 @@ class AppWindowOpener:
                     f"{plan.program_name}: окно не подтвердилось за "
                     f"{self._title_seconds:g} с{shown}"
                 )
+            if plan.sandboxed:
+                # The memory counts only what it is about: the documented abort at any
+                # time, or an exit inside the grace period. A process that survived and
+                # never drew a page is not evidence that the sandbox cannot start.
+                measured = self._remember_sandbox_failure(
+                    plan.program_name,
+                    code if kind == "exit" else None,
+                    kind == "exit" and (time.monotonic() - started) <= self._grace_seconds,
+                )
+                if measured is not None and measured.marked_now:
+                    notes.append(
+                        f"{SANDBOX_MEMORY_SAVED_NOTE}: {plan.program_name} "
+                        f"({measured.reason or 'песочница'}, "
+                        f"неудач подряд: {measured.failures})"
+                    )
             if not allow_downgrade and plan.sandboxed:
                 failures.append(
                     f"{plan.program_name}: повтор без песочницы запрещён в настройках"
