@@ -866,6 +866,117 @@ class ChangeFieldTests(unittest.TestCase):
         self.assertIn('setChange("")', screen)
         self.assertIn("clearAttachments()", screen)
 
+    # ------------------------------------------------- the field after one result
+    def test_21_every_settled_answer_leaves_the_field_live(self) -> None:
+        """applied · already_applied · rolled_back · refused · error all hand it back.
+
+        The measured complaint («Запись пропала, но новую на её месте в поле ввода внести
+        не могу»): the words cleared, but the textarea and the button stayed off until the
+        owner left the screen. A settled answer must never freeze the panel.
+        """
+
+        kinds = self._ask("s.SETTLED_CHANGE_KINDS")
+        self.assertEqual(
+            sorted(kinds),
+            sorted(
+                [
+                    "applied",
+                    "already_applied",
+                    "rolled_back",
+                    "refused",
+                    "error",
+                    "disconnected",
+                ]
+            ),
+        )
+        for kind in kinds:
+            if kind == "disconnected":
+                continue  # the one kind that keeps the words: see test_23
+            with self.subTest(kind=kind):
+                field = self._ask(
+                    "s.changeFieldState({inFlight: false, settled: "
+                    + json.dumps(kind)
+                    + "})"
+                )
+                self.assertIs(field["canEdit"], True, kind)
+                self.assertIs(field["inFlight"], False, kind)
+                self.assertEqual(field["draft"], "clear", kind)
+                self.assertIs(field["ready"], True, kind)
+
+    def test_22_only_a_genuinely_in_flight_run_keeps_it_off(self) -> None:
+        field = self._ask("s.changeFieldState({inFlight: true, settled: ''})")
+        self.assertIs(field["canEdit"], False)
+        self.assertIs(field["inFlight"], True)
+        self.assertIs(field["ready"], False)
+        # In flight wins over any earlier settled kind: the double press stays swallowed.
+        self.assertIs(
+            self._ask(
+                's.changeFieldState({inFlight: true, settled: "applied"})'
+            )["canEdit"],
+            False,
+        )
+
+    def test_23_disconnected_is_the_one_answer_that_keeps_the_words(self) -> None:
+        field = self._ask(
+            's.changeFieldState({inFlight: false, settled: "disconnected"})'
+        )
+        self.assertIs(field["canEdit"], True)
+        self.assertIs(field["inFlight"], False)
+        self.assertEqual(field["draft"], "keep")
+        self.assertIs(field["ready"], True)
+
+    def test_24_the_screen_names_the_settled_answer_from_its_own_facts(self) -> None:
+        """`changeSettledKind` reads the card's three slots; the field uses that name."""
+
+        for expression, expected in (
+            (
+                "s.changeSettledKind({outcome: {}, changeFailure: null,"
+                " dispatchFailure: null})",
+                "applied",
+            ),
+            (
+                "s.changeSettledKind({outcome: {alreadyApplied: true}})",
+                "already_applied",
+            ),
+            (
+                "s.changeSettledKind({outcome: {rolledBack: true}})",
+                "rolled_back",
+            ),
+            (
+                's.changeSettledKind({changeFailure: {kind: "error"}})',
+                "refused",
+            ),
+            (
+                's.changeSettledKind({dispatchFailure: {kind: "error", status: 500}})',
+                "error",
+            ),
+            (
+                's.changeSettledKind({dispatchFailure: {kind: "disconnected", status: 0}})',
+                "disconnected",
+            ),
+            (
+                "s.changeSettledKind({outcome: null, changeFailure: null,"
+                " dispatchFailure: null})",
+                "",
+            ),
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(self._ask(expression), expected)
+
+        screen = PROJECTS_SCREEN.read_text(encoding="utf-8")
+        self.assertIn("const changeSettled = changeSettledKind({", screen)
+        self.assertIn("settled: changeSettled,", screen)
+        # The rolled-back verdict is history: the strip keeps its sentence, and the field
+        # is live, empty and focused for the next instruction.
+        self.assertIn('t(lang, "projects.rollback.notice")', screen)
+        self.assertIn("controls.ready", screen)
+        self.assertIn('"projects.change.ready.placeholder"', screen)
+        self.assertIn("changeWasFrozen", screen)
+        self.assertIn("disabled={controls.formFrozen}", screen)
+        # No "frozen until the owner re-arms it" path is left.
+        for gone in ("changeArmed", "onRearmChange", "secondaryVisible"):
+            self.assertNotIn(gone, screen)
+
 
 if __name__ == "__main__":
     unittest.main()

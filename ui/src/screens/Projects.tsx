@@ -95,12 +95,12 @@ import {
   createChangeGuard,
   refusalDetail,
 } from "../change-flight";
-// THE CHANGE BLOCK'S HONEST STATES: the mock warning, the one-press-then-a-different-
-// button rule, the zero-file retry and the «Что сделал Forge» block. They import
-// nothing, so `tests/test_flow_invariants.py` executes them directly from Node.
+// THE CHANGE BLOCK'S HONEST STATES: the mock warning, the field's own "live again after
+// any settled answer" rule, and the «Что сделал Forge» block. They import nothing, so
+// `tests/test_flow_invariants.py` executes them directly from Node.
 import {
-  bestRealProvider,
   changeControls,
+  changeSettledKind,
   dispatchReachedTheCore,
   effectiveProvider,
   isMockProvider,
@@ -838,8 +838,6 @@ const ProjectCard = ({
   forgeDid,
   changeEvidence,
   evidence,
-  onRearmChange,
-  onRetryWithRealModel,
   actionFailure,
   actionNotice,
   entrypoint,
@@ -955,9 +953,9 @@ const ProjectCard = ({
   modelChoices: string[];
   mockSelected: boolean;
   /**
-   * THE BLOCK'S CONTROLS, decided by `ui/src/change-state.ts` and nothing else: which
-   * action the primary button performs, whether the form is frozen, whether the mock
-   * warning is printed and whether «Внести ещё изменения» is offered.
+   * THE BLOCK'S CONTROLS, decided by `ui/src/change-state.ts` and nothing else: whether the
+   * one action is sending, whether the field is live, whether the mock warning is printed
+   * and whether the field is ready for the next instruction.
    */
   controls: ChangeControls;
   /** «Что сделал Forge», from the model's own answer and the files it really wrote. */
@@ -974,10 +972,6 @@ const ProjectCard = ({
    * none.
    */
   evidence: Evidence | null | undefined;
-  /** «Внести ещё изменения»: the only way the form comes back after a change. */
-  onRearmChange: () => void;
-  /** «Повторить с реальной моделью»: switch to the best non-mock provider and re-run. */
-  onRetryWithRealModel: () => void;
   actionFailure: Failure | null;
   actionNotice: string;
   /** The one entry point the backend detected from the manifest, or null. */
@@ -1165,6 +1159,21 @@ const ProjectCard = ({
   const projectId = String(project.project_id ?? "");
   const canDelete = projectId !== "";
   const changeRef = useRef<HTMLTextAreaElement | null>(null);
+  /**
+   * THE FIELD COMES BACK BY ITSELF.
+   *
+   * When a change settles, `controls.formFrozen` turns false and the textarea is enabled
+   * again -- but the cursor is still wherever the press left it. Watching the freeze come
+   * off lets the field take the cursor the moment it is usable, so the next sentence can
+   * be typed without a click (the measured complaint: the panel was dead until the owner
+   * left the screen). It only fires on a real true->false edge, so mount and project
+   * switches never steal the focus.
+   */
+  const changeWasFrozen = useRef(false);
+  useEffect(() => {
+    if (changeWasFrozen.current && !controls.formFrozen) changeRef.current?.focus();
+    changeWasFrozen.current = controls.formFrozen;
+  }, [controls.formFrozen]);
   /* THE SCREENSHOT INPUT: one hidden <input type="file"> opened by the visible button, and
      a flag that lights the field up while a file is dragged over it. */
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
@@ -1447,11 +1456,16 @@ const ProjectCard = ({
                     event.preventDefault();
                     if (!controls.formFrozen) onPickAttachments(files);
                   }}
-                  placeholder={t(lang, "projects.newversion.placeholder")}
+                  placeholder={t(
+                    lang,
+                    controls.ready
+                      ? "projects.change.ready.placeholder"
+                      : "projects.newversion.placeholder"
+                  )}
                   data-testid="change-textarea"
-                  /* ONE PRESS, THEN A DIFFERENT BUTTON: after a change the words it was
-                     made of are frozen on screen until the owner asks for another change,
-                     so the same sentence cannot be sent twice by a second press. */
+                  /* THE FIELD IS THE OWNER'S BETWEEN CHANGES. It is frozen only while a run
+                     is genuinely in flight; as soon as an answer settles -- applied,
+                     already_applied, rolled_back, refused, error -- it is live again. */
                   readOnly={controls.formFrozen}
                   disabled={controls.formFrozen}
                 />
@@ -1464,7 +1478,7 @@ const ProjectCard = ({
                     disabled={controls.formFrozen || attachmentBusy}
                     disabledReason={
                       controls.formFrozen
-                        ? t(lang, "projects.change.again")
+                        ? t(lang, "projects.newversion.start.busy")
                         : attachmentBusy
                           ? t(lang, "projects.attach.uploading")
                           : undefined
@@ -1541,12 +1555,11 @@ const ProjectCard = ({
                 pressed both, unsure whether either had started anything. There is now one
                 button, one promise, one state.
 
-                ONE PRESS, THEN A DIFFERENT BUTTON. After a change that wrote files the
-                button is off and reads «Изменения внесены (vN)»; the smaller
-                «Внести ещё изменения» is the only thing that re-arms the form. After a
-                change that wrote NOTHING the button reads «Повторить с реальной моделью»
-                and switches the provider in one click -- a zero-file run never looks like
-                a success. */}
+                ONE PRESS, ONE DISPATCH, AND THEN THE FIELD IS HIS AGAIN. The button is off
+                only while that run is genuinely in flight; every settled answer -- applied,
+                already_applied, rolled_back, refused, error -- prints its verdict in the
+                strip above and gives the empty field back. A zero-file or rolled-back run
+                is never labelled a success, and never locks the panel either. */}
             <div className="stack" style={{ gap: 8 }} data-testid="change-actions">
               {/* MOCK IS LOUD: printed above the button, before the press, because the
                   offline engine cannot change a single file. */}
@@ -1561,39 +1574,19 @@ const ProjectCard = ({
                   wide
                   disabled={controls.primaryDisabled}
                   disabledReason={
-                    controls.primary === "start" && changeEmpty
-                      ? t(lang, "projects.newversion.start.reason")
-                      : controls.primary === "sending"
-                        ? t(lang, "projects.newversion.start.busy")
-                        : controls.primary === "retry"
-                          ? t(lang, "projects.change.retry.none")
-                          : undefined
+                    controls.primary === "sending"
+                      ? t(lang, "projects.newversion.start.busy")
+                      : changeEmpty
+                        ? t(lang, "projects.newversion.start.reason")
+                        : undefined
                   }
-                  onClick={
-                    controls.primary === "retry" ? onRetryWithRealModel : onStartChange
-                  }
+                  onClick={onStartChange}
                 >
                   {controls.primary === "sending"
                     ? t(lang, "projects.newversion.sending")
-                    : controls.primary === "applied"
-                      ? t(lang, "projects.change.done.button").replace(
-                          "{version}",
-                          `v${controls.primaryVersion}`
-                        )
-                      : controls.primary === "retry"
-                        ? t(lang, "projects.change.retry")
-                        : t(lang, "projects.newversion.start")}
+                    : t(lang, "projects.newversion.start")}
                 </Button>
               </span>
-              {/* THE SMALLER SECOND ACTION: the form comes back only when the owner says
-                  so, so a second press cannot repeat the sentence just sent. */}
-              {controls.secondaryVisible ? (
-                <span data-testid="change-again">
-                  <Button size="small" tone="ghost" onClick={onRearmChange}>
-                    {t(lang, "projects.change.again")}
-                  </Button>
-                </span>
-              ) : null}
               {/* WHILE THE RUN IS IN FLIGHT the button stays off and the reason is printed
                   beside it, so a second press cannot create a second version. */}
               {changeBusy ? (
@@ -1601,7 +1594,7 @@ const ProjectCard = ({
                   {t(lang, "projects.newversion.start.busy")}
                 </div>
               ) : null}
-              {controls.primary === "start" && changeEmpty && !changeBusy ? (
+              {!changeBusy && changeEmpty ? (
                 <div className="small muted" data-testid="change-start-reason">
                   {t(lang, "projects.newversion.start.reason")}
                 </div>
@@ -3570,7 +3563,6 @@ export const Projects = ({
     setChangeStarting(false);
     setChangeRunId("");
     setChangeRecord(null);
-    setChangeArmed(false);
     // The screenshots belong to the change of the project that was open: another card
     // must not inherit them (their paths name that project's files).
     clearAttachments();
@@ -3614,45 +3606,8 @@ export const Projects = ({
   const defaultProvider =
     backend.status === "live" ? String(backend.core.details?.default_provider ?? "") : "";
   const effectiveProviderName = effectiveProvider(provider, defaultProvider);
-  /**
-   * THE LAST PROVIDER LIST THE CORE REALLY PUBLISHED.
-   *
-   * The shell re-probes the Core every few seconds, and one failed probe publishes an
-   * empty provider list for a moment. Deriving the retry from the *current* list alone
-   * meant a blip disabled «Повторить с реальной моделью» on a screen where the Core had
-   * just listed five providers (measured over CDP right after a change run). The last
-   * non-empty list is kept, so a momentary gap cannot take an action away.
-   */
-  const [knownProviders, setKnownProviders] = useState<string[]>([]);
-  useEffect(() => {
-    if (options.length > 0) setKnownProviders(options);
-  }, [options]);
-
-  /**
-   * THE BEST NON-MOCK PROVIDER, or "" when the deployment has none.
-   *
-   * The zero-file button switches to exactly this one, in one click, and is off with a
-   * printed reason when no real provider is configured at all -- never a button that
-   * silently keeps the offline engine.
-   */
-  const realProvider = useMemo(
-    () =>
-      bestRealProvider(
-        options.length > 0 ? options : knownProviders,
-        defaultProvider
-      ),
-    [options, knownProviders, defaultProvider]
-  );
   /** The effective provider is the offline engine: the press cannot change any file. */
   const effectiveMock = isMockProvider(effectiveProviderName);
-  /**
-   * «Внести ещё изменения» was pressed: the form is live again *deliberately*.
-   *
-   * One press, then a different button. After a change the form stays frozen (and the
-   * primary button says what was recorded) until the owner asks for another change, so
-   * a second press on the same words cannot produce a second version.
-   */
-  const [changeArmed, setChangeArmed] = useState(false);
 
   /**
    * THE OWNER'S WORDS BELONG TO THE CHANGE THAT WAS SENT.
@@ -3717,7 +3672,6 @@ export const Projects = ({
       setChangeStarting(true);
       setChangeObservedAt(Date.now());
       setBusy("version");
-      setChangeArmed(false);
       const fromVersion = currentVersionNumber;
       // THE SCREENSHOTS TRAVEL WITH THE CHANGE: the paths the upload route published.
       // The backend re-derives each one before it reaches the model's task text.
@@ -3739,7 +3693,6 @@ export const Projects = ({
       if (stagedOutcome.value.already_applied === true) {
         setBusy("");
         setChangeStarting(false);
-        setChangeArmed(false);
         const already: ChangeOutcome = {
           runId: String(stagedOutcome.value.previous_run_id ?? ""),
           filesCreated: 0,
@@ -4015,20 +3968,25 @@ export const Projects = ({
   const changeFilesWritten = changeOutcome === null
     ? 0
     : Math.max(Number(changeOutcome.filesCreated ?? 0), changeOutcome.files.length);
+  // HOW THE LAST DISPATCH ENDED: one word, from the card's own three slots. The field's
+  // rule turns it into "live again" for every kind except `disconnected` (see below).
+  const changeSettled = changeSettledKind({
+    outcome: changeOutcome,
+    changeFailure,
+    dispatchFailure,
+  });
   /**
-   * WHAT THE BLOCK RENDERS: one press, then a different button; a zero-file change is
-   * never a success; mock is loud. The rules live in `ui/src/change-state.ts` and are
-   * executed from Node by `tests/test_flow_invariants.py`.
+   * WHAT THE BLOCK RENDERS: only a genuinely running change keeps the field off; a
+   * zero-file or rolled-back change is never a success; mock is loud. The rules live in
+   * `ui/src/change-state.ts` and are executed from Node by
+   * `tests/test_flow_invariants.py` and `tests/test_change_rollback.py`.
    */
   const controls = changeControls({
     empty: change.trim() === "",
     inFlight: changeStarting || changeLocked,
-    finished: changeFinished,
+    settled: changeSettled,
     filesWritten: changeFilesWritten,
-    version: changeOutcome?.stagedVersion ?? 0,
     mocked: effectiveMock,
-    realProvider,
-    armed: changeArmed,
   });
   /**
    * «Что сделал Forge», from the model's own answer and the files it really wrote.
@@ -4061,34 +4019,6 @@ export const Projects = ({
     (detail?.status === "ready" ? detail.value.evidence : undefined);
   /** The current version's own block, shown on the card itself. */
   const projectEvidence = detail?.status === "ready" ? detail.value.evidence : undefined;
-  /** «Внести ещё изменения»: the only way the form comes back after a change. */
-  const rearmChange = () => {
-    setChangeArmed(true);
-    setChangeError("");
-    setChangeFailure(null);
-    setDispatchFailure(null);
-    // A new change starts with its own screenshot, not with the previous one's: the chip
-    // would otherwise silently re-attach a picture of a problem that is already fixed.
-    clearAttachments();
-  };
-  /**
-   * «Повторить с реальной моделью»: switch to the best available non-mock provider and
-   * dispatch the same words again, in one press. The backend keeps the same version
-   * number (idempotency by change text), so a retry never breeds another version.
-   */
-  const retryWithRealModel = () => {
-    if (realProvider === "") return;
-    setProvider(realProvider);
-    setChangeArmed(true);
-    setChangeError("");
-    setChangeFailure(null);
-    setDispatchFailure(null);
-    setDispatched(null);
-    setChangeOutcome(null);
-    setChangeRunId("");
-    setChangeRecord(null);
-    void startChange(realProvider);
-  };
 
   return (
     <div className="content">
@@ -4684,8 +4614,6 @@ export const Projects = ({
           forgeDid={forgeDid}
           changeEvidence={changeEvidence}
           evidence={projectEvidence}
-          onRearmChange={rearmChange}
-          onRetryWithRealModel={retryWithRealModel}
           actionFailure={actionFailure}
           actionNotice={actionNotice}
           entrypoint={entrypoint}

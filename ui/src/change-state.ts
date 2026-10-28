@@ -13,12 +13,14 @@
  *
  * 1. **mock is loud.** A change whose effective provider is the offline engine carries a
  *    warning *before* the press, whatever the form holds.
- * 2. **one press, then a different button.** After a change that wrote files the primary
- *    button is off and reads «Изменения внесены (vN)»; the form is frozen until the owner
- *    presses the smaller «Внести ещё изменения».
- * 3. **a zero-file change is never a success.** Its primary button reads «Повторить с
- *    реальной моделью» and switches the provider to the best available non-mock one; the
- *    strip prints «файлов 0 — код не менялся».
+ * 2. **one press, one dispatch -- and then the field is the owner's again.** A second press
+ *    while the run is genuinely in flight is swallowed; once *any* answer settles (applied,
+ *    already_applied, rolled_back, refused, error) the textarea is live, empty and focused
+ *    and the same button starts the next change. The one exception is a request that never
+ *    reached the Core (`disconnected`): nothing was sent, so the words stay.
+ * 3. **a zero-file change is never a success.** Its strip prints «файлов 0 — код не
+ *    менялся», and a rolled-back run prints the rollback sentence; neither is dressed as
+ *    a success, and neither freezes the field.
  * 4. **the model's own words are surfaced.** `whatForgeDid` builds the «Что сделал
  *    Forge» block from `model_intent.summary`, the written-file list with sizes, and --
  *    when no file came back -- the first two lines of the answer. Nothing is invented:
@@ -52,58 +54,114 @@ export const effectiveProvider = (chosen: unknown, fallback: unknown): string =>
   return String(fallback ?? "").trim();
 };
 
-/**
- * The best available provider that is not the offline engine, or "".
- *
- * "Best" is not a judgement about quality: the deployment's own default is preferred
- * because that is the pair its operator configured, and the first enabled provider is
- * used when the default *is* the mock. Everything else is left alone.
- */
-export const bestRealProvider = (options: readonly unknown[], fallback: unknown): string => {
-  const real = options
-    .map((item) => String(item ?? "").trim())
-    .filter((item) => item !== "" && !isMockProvider(item));
-  if (real.length === 0) return "";
-  const preferred = String(fallback ?? "").trim();
-  if (preferred !== "" && real.includes(preferred)) return preferred;
-  return real[0];
-};
-
 /** What a finished change really was. */
 export type ChangeOutcomeKind = "none" | "applied" | "empty";
 
-/** Everything the change block knows when it decides what the button says. */
+/**
+ * EVERY WAY ONE DISPATCH CAN SETTLE, in the owner's words.
+ *
+ * The field's own behaviour does not depend on *which* of these arrived: once one did, the
+ * run is over and the panel belongs to the owner again. The single exception is
+ * `disconnected` -- the request never reached the Core, so the words were never sent and
+ * must survive for the next press.
+ */
+export type ChangeSettledKind =
+  | "applied"
+  | "already_applied"
+  | "rolled_back"
+  | "refused"
+  | "error"
+  | "disconnected";
+
+/** Every settled kind, in one list, so a test can execute the rule for each of them. */
+export const SETTLED_CHANGE_KINDS: readonly ChangeSettledKind[] = [
+  "applied",
+  "already_applied",
+  "rolled_back",
+  "refused",
+  "error",
+  "disconnected",
+];
+
+/** Narrow an unknown value to a settled kind; "" when it names none. */
+const settledKinds = (value: unknown): ChangeSettledKind | "" => {
+  const word = String(value ?? "").trim().toLowerCase();
+  return (SETTLED_CHANGE_KINDS as readonly string[]).includes(word)
+    ? (word as ChangeSettledKind)
+    : "";
+};
+
+/**
+ * WHAT THE FIELD IS ALLOWED TO DO, as one value.
+ *
+ * Measured defect (the owner's words: «Запись пропала, но новую на её месте в поле ввода
+ * внести не могу»): after a change the sentence was cleared -- and the textarea and the
+ * button stayed **disabled**, so the next instruction could only be given after leaving
+ * the screen. That freeze belonged to a design where the card kept the old words on
+ * purpose; once the words clear, a frozen empty field is simply a dead panel.
+ *
+ * The rule is therefore the obvious one: **only a genuinely running change keeps the panel
+ * off**. Every settled answer -- applied, already_applied, rolled_back, refused, error --
+ * hands the field back, empty, focused and ready for a new sentence. `disconnected` is the
+ * only kind that also keeps the words, because nothing reached the Core.
+ */
+export type ChangeFieldState = {
+  /** The textarea, the send button and the screenshot chips are live. */
+  canEdit: boolean;
+  /** A dispatch or the run it started is genuinely still running. */
+  inFlight: boolean;
+  /** What the settle does with the owner's words: clear them, or keep them. */
+  draft: "clear" | "keep";
+  /** The field waits for the next instruction: it takes the cursor and says so. */
+  ready: boolean;
+};
+
+/** Decide the field's own state from the two facts that can change it. */
+export const changeFieldState = (input: {
+  /** The dispatch or the run it started is still in flight. */
+  inFlight?: unknown;
+  /** How the last dispatch settled, or ""/absent while none has. */
+  settled?: unknown;
+}): ChangeFieldState => {
+  if (input.inFlight === true) {
+    // The words stay in the field while the run travels; the settle decides their fate.
+    return { canEdit: false, inFlight: true, draft: "keep", ready: false };
+  }
+  const settled = settledKinds(input.settled);
+  return {
+    canEdit: true,
+    inFlight: false,
+    draft: settled === "disconnected" ? "keep" : "clear",
+    ready: settled !== "",
+  };
+};
+
+/** Everything the change block knows when it decides what the controls may do. */
 export type ChangeFacts = {
   /** The textarea holds no words. */
   empty: boolean;
   /** The dispatch or the run it started is still in flight. */
   inFlight: boolean;
-  /** A recorded outcome exists for this change (a version or a refusal). */
-  finished: boolean;
+  /** How the last dispatch settled; "" while none has. */
+  settled: ChangeSettledKind | "";
   /** Files the change really wrote; 0 is a fact, not an unknown. */
   filesWritten: number;
-  /** The version the change produced, 0 when it produced none. */
-  version: number;
   /** The effective provider is the offline engine. */
   mocked: boolean;
-  /** At least one non-mock provider is available to switch to ("" when none). */
-  realProvider: string;
-  /** The owner pressed «Внести ещё изменения», so the form is live again. */
-  armed: boolean;
 };
 
 /** What the block must render. */
 export type ChangeControls = {
   /** Which action the primary button performs. */
-  primary: "start" | "sending" | "applied" | "retry";
+  primary: "start" | "sending";
   /** Whether the primary button is off. */
   primaryDisabled: boolean;
-  /** The version the «Внесены» label names, 0 when it names none. */
-  primaryVersion: number;
-  /** Whether the smaller «Внести ещё изменения» control is offered. */
-  secondaryVisible: boolean;
   /** Whether the textarea and the provider selectors are frozen. */
   formFrozen: boolean;
+  /** The textarea and the send button accept a new instruction. */
+  canEdit: boolean;
+  /** The field is ready again and asks for the next sentence. */
+  ready: boolean;
   /** Whether the mock warning is printed above the button. */
   mockWarning: boolean;
   /** What the outcome was, for the strip's tone and words. */
@@ -112,65 +170,25 @@ export type ChangeControls = {
 
 /** Decide the block's controls from the facts above and nothing else. */
 export const changeControls = (facts: ChangeFacts): ChangeControls => {
-  const mockWarning = facts.mocked === true;
-  if (facts.inFlight === true) {
-    return {
-      primary: "sending",
-      primaryDisabled: true,
-      primaryVersion: 0,
-      secondaryVisible: false,
-      formFrozen: true,
-      mockWarning,
-      outcome: "none",
-    };
-  }
-  if (facts.finished !== true) {
-    return {
-      primary: "start",
-      primaryDisabled: facts.empty === true,
-      primaryVersion: 0,
-      secondaryVisible: false,
-      formFrozen: false,
-      mockWarning,
-      outcome: "none",
-    };
-  }
+  const field = changeFieldState({ inFlight: facts.inFlight, settled: facts.settled });
+  const settled = settledKinds(facts.settled);
   const wrote = Number(facts.filesWritten ?? 0) > 0;
-  const outcome: ChangeOutcomeKind = wrote ? "applied" : "empty";
-  if (facts.armed === true) {
-    // The owner asked for another change: the form is live and the primary action is
-    // the ordinary one again. The previous outcome's strip stays, so the record of what
-    // just happened is never wiped by the next attempt.
-    return {
-      primary: "start",
-      primaryDisabled: facts.empty === true,
-      primaryVersion: 0,
-      secondaryVisible: false,
-      formFrozen: false,
-      mockWarning,
-      outcome,
-    };
-  }
-  if (wrote) {
-    return {
-      primary: "applied",
-      primaryDisabled: true,
-      primaryVersion: Number(facts.version ?? 0),
-      secondaryVisible: true,
-      formFrozen: true,
-      mockWarning,
-      outcome,
-    };
-  }
   return {
-    // A change that wrote nothing is not a success and must not be labelled like one.
-    primary: "retry",
-    primaryDisabled: String(facts.realProvider ?? "") === "",
-    primaryVersion: 0,
-    secondaryVisible: true,
-    formFrozen: true,
-    mockWarning,
-    outcome,
+    // ONE PRESS, ONE DISPATCH. While the run is genuinely in flight the button says
+    // «Отправляю…» and is off; the moment an answer settles it is the ordinary action
+    // again, and off only because the field is empty.
+    primary: field.inFlight ? "sending" : "start",
+    primaryDisabled: field.inFlight || facts.empty === true,
+    formFrozen: field.canEdit === false,
+    canEdit: field.canEdit,
+    ready: field.ready,
+    mockWarning: facts.mocked === true,
+    // A change that wrote nothing -- or was rolled back -- is not a success.
+    outcome: field.ready
+      ? wrote && settled !== "rolled_back"
+        ? "applied"
+        : "empty"
+      : "none",
   };
 };
 
@@ -273,6 +291,34 @@ export const dispatchReachedTheCore = (failure: unknown): boolean => {
     .trim()
     .toLowerCase();
   return kind !== "disconnected";
+};
+
+/**
+ * WHICH ANSWER THE CARD HOLDS, as one word, from the card's own three facts.
+ *
+ * The screen keeps exactly three slots for a settled change: the outcome object of the run
+ * that answered, the refusal of the staging request, and the transport failure of the
+ * dispatch. This function names them, so the field, the strip and the tests cannot
+ * disagree about what happened.
+ */
+export const changeSettledKind = (facts: {
+  /** The outcome object the card keeps for the run that answered. */
+  outcome?: { alreadyApplied?: unknown; rolledBack?: unknown } | null;
+  /** The staging request was refused (an answer, so no change was queued). */
+  changeFailure?: unknown;
+  /** The dispatch failed; `dispatchReachedTheCore` separates an answer from a lost request. */
+  dispatchFailure?: unknown;
+}): ChangeSettledKind | "" => {
+  // A refusal of the words themselves is never a transport failure.
+  if (facts.changeFailure !== null && facts.changeFailure !== undefined) return "refused";
+  if (facts.dispatchFailure !== null && facts.dispatchFailure !== undefined) {
+    return dispatchReachedTheCore(facts.dispatchFailure) ? "error" : "disconnected";
+  }
+  const outcome = facts.outcome;
+  if (outcome === null || outcome === undefined) return "";
+  if (outcome.alreadyApplied === true) return "already_applied";
+  if (outcome.rolledBack === true) return "rolled_back";
+  return "applied";
 };
 
 /** Everything one dispatch attempt can tell us about the field, and nothing else. */

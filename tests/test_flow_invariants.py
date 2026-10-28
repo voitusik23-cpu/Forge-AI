@@ -1331,94 +1331,78 @@ class MockIsLoudTests(unittest.TestCase):
         self.assertIn("changeControls({", projects)
         self.assertIn("mocked: effectiveMock,", projects)
 
-    # ------------------------------------------------- one press, then another button
-    def test_03_a_successful_change_replaces_the_button_instead_of_inviting_it(self) -> None:
-        """«Изменения внесены (vN)» + the smaller «Внести ещё изменения»."""
+    # ------------------------------------------- a settled answer frees the field
+    def test_03_a_successful_change_gives_the_field_back(self) -> None:
+        """After «applied» the same button starts the next change; nothing stays frozen."""
 
         applied = self._ask(
-            's.changeControls({empty: false, inFlight: false, finished: true,'
-            " filesWritten: 2, version: 3, mocked: false, realProvider: 'deepseek',"
-            " armed: false})"
+            's.changeControls({empty: false, inFlight: false, settled: "applied",'
+            " filesWritten: 2, mocked: false})"
         )
-        self.assertEqual(applied["primary"], "applied")
-        self.assertIs(applied["primaryDisabled"], True)
-        self.assertEqual(applied["primaryVersion"], 3)
-        self.assertIs(applied["secondaryVisible"], True)
-        self.assertIs(applied["formFrozen"], True)
+        self.assertEqual(applied["primary"], "start")
+        self.assertIs(applied["primaryDisabled"], False)
+        self.assertIs(applied["formFrozen"], False)
+        self.assertIs(applied["canEdit"], True)
+        self.assertIs(applied["ready"], True)
         self.assertEqual(applied["outcome"], "applied")
-        # Only the smaller control re-arms the form, and then the ordinary action is back.
-        armed = self._ask(
-            's.changeControls({empty: false, inFlight: false, finished: true,'
-            " filesWritten: 2, version: 3, mocked: false, realProvider: 'deepseek',"
-            " armed: true})"
+        # The empty field is the *only* reason the button is off once the run is over.
+        blank = self._ask(
+            's.changeControls({empty: true, inFlight: false, settled: "applied",'
+            " filesWritten: 2, mocked: false})"
         )
-        self.assertEqual(armed["primary"], "start")
-        self.assertIs(armed["primaryDisabled"], False)
-        self.assertIs(armed["secondaryVisible"], False)
-        self.assertIs(armed["formFrozen"], False)
+        self.assertEqual(blank["primary"], "start")
+        self.assertIs(blank["primaryDisabled"], True)
+        self.assertIs(blank["formFrozen"], False)
+        self.assertIs(blank["canEdit"], True)
 
-    def test_04_a_zero_file_change_offers_the_real_model_and_never_success(self) -> None:
-        """«Повторить с реальной моделью», the best non-mock provider, honest words."""
+    def test_04_only_an_in_flight_run_keeps_the_panel_off(self) -> None:
+        """Every settled answer -- zero files, rolled back, refused, error -- is usable."""
 
-        empty = self._ask(
-            's.changeControls({empty: false, inFlight: false, finished: true,'
-            " filesWritten: 0, version: 3, mocked: true, realProvider: 'deepseek',"
-            " armed: false})"
-        )
-        self.assertEqual(empty["primary"], "retry")
-        self.assertIs(empty["primaryDisabled"], False)
-        self.assertEqual(empty["outcome"], "empty")
-        self.assertIs(empty["secondaryVisible"], True)
-        self.assertIs(empty["formFrozen"], True)
-        # With no real provider the button is off rather than silently retrying mock.
-        blocked = self._ask(
-            's.changeControls({empty: false, inFlight: false, finished: true,'
-            " filesWritten: 0, version: 3, mocked: true, realProvider: '', armed: false})"
-        )
-        self.assertEqual(blocked["primary"], "retry")
-        self.assertIs(blocked["primaryDisabled"], True)
-        # While the run is in flight nothing but «Отправляю…» is offered.
+        for settled, files, outcome in (
+            ("applied", 0, "empty"),
+            ("already_applied", 0, "empty"),
+            ("rolled_back", 2, "empty"),
+            ("refused", 0, "empty"),
+            ("error", 0, "empty"),
+            ("applied", 2, "applied"),
+        ):
+            with self.subTest(settled=settled, files=files):
+                controls = self._ask(
+                    "s.changeControls({empty: false, inFlight: false, settled: "
+                    + json.dumps(settled)
+                    + ", filesWritten: "
+                    + str(files)
+                    + ", mocked: true})"
+                )
+                self.assertEqual(controls["primary"], "start")
+                self.assertIs(controls["primaryDisabled"], False)
+                self.assertIs(controls["formFrozen"], False)
+                self.assertIs(controls["canEdit"], True)
+                self.assertIs(controls["ready"], True)
+                self.assertEqual(controls["outcome"], outcome)
+        # While the run is genuinely in flight nothing but «Отправляю…» is offered.
         flying = self._ask(
-            's.changeControls({empty: false, inFlight: true, finished: false,'
-            " filesWritten: 0, version: 0, mocked: false, realProvider: 'deepseek',"
-            " armed: false})"
+            "s.changeControls({empty: false, inFlight: true, settled: '',"
+            " filesWritten: 0, mocked: false})"
         )
         self.assertEqual(flying["primary"], "sending")
         self.assertIs(flying["primaryDisabled"], True)
-        self.assertIs(flying["secondaryVisible"], False)
-
-    def test_05_the_best_non_mock_provider_is_the_deployment_default(self) -> None:
-        """One click switches to a provider that can really change files."""
-
-        options = ["mock", "openrouter", "radox", "deepseek", "google"]
-        self.assertEqual(
-            self._ask(f"s.bestRealProvider({json.dumps(options)}, 'deepseek')"),
-            "deepseek",
-        )
-        # A default that IS the mock is skipped instead of being offered again.
-        self.assertEqual(
-            self._ask(f"s.bestRealProvider({json.dumps(['mock', 'openrouter'])}, 'mock')"),
-            "openrouter",
-        )
-        self.assertEqual(
-            self._ask("s.bestRealProvider(['mock', 'deterministic-offline'], 'mock')"), ""
-        )
+        self.assertIs(flying["formFrozen"], True)
+        self.assertIs(flying["canEdit"], False)
+        self.assertIs(flying["ready"], False)
 
     def test_06_the_honest_words_exist_in_both_languages(self) -> None:
-        """«файлов 0 — код не менялся», «Модель не вернула файлы», the retry and the rearm."""
+        """«файлов 0 — код не менялся», «Модель не вернула файлы», the ready cue."""
 
         i18n = I18N.read_text(encoding="utf-8")
         for text in (
             "файлов 0 — код не менялся",
             "Модель не вернула файлы",
-            "Повторить с реальной моделью",
-            "Внести ещё изменения",
-            "Изменения внесены ({version})",
+            "Напишите, что изменить…",
             "пустая запись: файлов 0 — код не менялся",
             "0 files — the code did not change",
             "The model returned no files",
-            "Retry with a real model",
-            "Make one more change",
+            "Write what to change…",
         ):
             self.assertIn(text, i18n)
         # The version table labels an empty record as an empty record.
@@ -1480,14 +1464,23 @@ class MockIsLoudTests(unittest.TestCase):
         self.assertEqual(self._ask("s.versionFilesWord(3)"), "files")
         self.assertEqual(self._ask("s.versionFilesWord(undefined)"), "empty")
 
-    def test_09_the_screen_switches_the_provider_in_the_retry_press(self) -> None:
-        """«Повторить с реальной моделью» is one action: switch and dispatch the same text."""
+    def test_09_the_screen_hands_the_settled_answer_to_the_field(self) -> None:
+        """ONE PRESS, THEN THE FIELD IS LIVE: the screen asks the module, it does not copy it."""
 
         projects = PROJECTS_TSX.read_text(encoding="utf-8")
-        self.assertIn("const retryWithRealModel = () => {", projects)
-        self.assertIn("setProvider(realProvider);", projects)
-        self.assertIn("void startChange(realProvider);", projects)
-        self.assertIn('onClick={\n                    controls.primary === "retry" ? onRetryWithRealModel : onStartChange\n                  }', projects)
+        self.assertIn("changeSettledKind({", projects)
+        self.assertIn("settled: changeSettled,", projects)
+        self.assertIn("const changeSettled = changeSettledKind({", projects)
+        # The field asks for the next sentence once a result is on the card, and takes the
+        # cursor when the freeze comes off.
+        self.assertIn('"projects.change.ready.placeholder"', projects)
+        self.assertIn("controls.ready", projects)
+        self.assertIn("changeWasFrozen", projects)
+        self.assertIn("changeRef.current?.focus()", projects)
+        # The old "frozen until the owner re-arms it" path is gone: nothing freezes a
+        # settled panel and nothing has to be pressed to get the field back.
+        for gone in ("changeArmed", "onRearmChange", "secondaryVisible", "primaryVersion"):
+            self.assertNotIn(gone, projects)
         # The second press of the same words is answered by the backend, not by a new
         # version, and the card says so.
         self.assertIn("stagedOutcome.value.already_applied === true", projects)
