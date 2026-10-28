@@ -336,6 +336,13 @@ class ProjectVersion:
     #: served" is not the same fact as "the owner does not want a preview", and only
     #: the second one may satisfy the completion gate's preview requirement.
     preview_not_required: bool = False
+    #: The change-regression verdict for this version
+    #: (:meth:`app.projects.regression.RollbackRecord.to_dict`), or ``None`` when no
+    #: launch check was made (a first creation, or a project that was never
+    #: launchable). A rolled-back change records the snapshot it was restored from and
+    #: the digest of every file that came back -- so "the files were put back" is
+    #: evidence with a number, never a claim.
+    rollback: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.files, list):
@@ -355,6 +362,16 @@ class ProjectVersion:
             raise ValueError("version must be an integer")
         if self.version < 1:
             raise ValueError("version numbers start at 1")
+        if self.rollback is not None:
+            if not isinstance(self.rollback, Mapping):
+                raise ValueError("a version rollback must be a mapping")
+            object.__setattr__(self, "rollback", dict(self.rollback))
+
+    @property
+    def rolled_back(self) -> bool:
+        """True only for a change that was restored from its own snapshot."""
+
+        return bool(self.rollback) and self.rollback.get("rolled_back") is True
 
     @property
     def is_pending(self) -> bool:
@@ -381,6 +398,8 @@ class ProjectVersion:
             "file_count": self.file_count,
             "pending": self.is_pending,
             "preview_not_required": bool(self.preview_not_required),
+            "rollback": dict(self.rollback) if self.rollback else None,
+            "rolled_back": bool(self.rolled_back),
             "change_request": (
                 self.change_request.to_dict()
                 if self.change_request is not None
@@ -397,6 +416,7 @@ class ProjectVersion:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ProjectVersion":
         raw_change = data.get("change_request")
+        raw_rollback = data.get("rollback")
         return cls(
             version=int(data["version"]),
             created_at=str(data.get("created_at", "")),
@@ -409,6 +429,9 @@ class ProjectVersion:
             provider=str(data.get("provider", "")),
             model=str(data.get("model", "")),
             preview_not_required=bool(data.get("preview_not_required", False)),
+            rollback=(
+                dict(raw_rollback) if isinstance(raw_rollback, Mapping) else None
+            ),
             change_request=(
                 ChangeRequest.from_dict(raw_change)
                 if isinstance(raw_change, Mapping)

@@ -519,6 +519,10 @@ export const STRINGS: Record<Lang, Record<string, string>> = {
     "projects.change.retry": "Повторить с реальной моделью",
     "projects.change.retry.none": "Нет доступного провайдера кроме mock: выберите провайдера в подробностях",
     "projects.change.zero_files": "файлов 0 — код не менялся ({version}: пустая запись)",
+    "projects.rollback.notice":
+      "Изменения откатаны: после правки приложение перестало запускаться",
+    "projects.rollback.hint":
+      "Файлы проекта возвращены из снимка перед правкой, и каждый файл проверен по sha256. Текущая версия осталась прежней: правка в проект не попала.",
     "projects.change.already_applied": "Эта правка уже внесена в {version}: повторный запуск и новая версия не создавались.",
     "projects.change.did.title": "Что сделал Forge",
     "projects.change.did.no_files": "Модель не вернула файлы",
@@ -1658,6 +1662,10 @@ export const STRINGS: Record<Lang, Record<string, string>> = {
     "projects.change.retry": "Retry with a real model",
     "projects.change.retry.none": "No provider besides mock is available: pick a provider under the details",
     "projects.change.zero_files": "0 files — the code did not change ({version}: an empty record)",
+    "projects.rollback.notice":
+      "Changes rolled back: the application stopped launching after the change",
+    "projects.rollback.hint":
+      "The project's files were restored from the snapshot taken before the change, and every file was checked by sha256. The current version is unchanged: the change is not in the project.",
     "projects.change.already_applied": "This change is already in {version}: no run and no new version were created.",
     "projects.change.did.title": "What Forge did",
     "projects.change.did.no_files": "The model returned no files",

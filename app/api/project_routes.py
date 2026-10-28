@@ -522,6 +522,13 @@ def register_project_routes(
         """
 
         current = project.current()
+        latest = project.latest_version
+        # A rolled-back change is never the current version (the previous one stays
+        # current), so its verdict is read from the newest attempt -- that is the
+        # version the card's «изменения откатаны» sentence is about.
+        recorded_rollback = (
+            dict(getattr(latest, "rollback") or {}) if latest is not None else {}
+        )
         return build_evidence(
             outcome=_stage_of(project),
             files=tuple(getattr(current, "files", ()) or ()) if current is not None else (),
@@ -561,6 +568,10 @@ def register_project_routes(
                 ),
                 "status": str(getattr(project.status, "value", project.status) or ""),
             },
+            # THE ROLLBACK OF THE VERSION THE CARD SHOWS. A change that was put back
+            # keeps its proof on its own version, so the block prints the restored
+            # files with their digests instead of pretending the change never existed.
+            rollback=recorded_rollback or None,
         )
 
     def _detail(project: Any) -> Dict[str, Any]:
@@ -585,6 +596,19 @@ def register_project_routes(
             "preview": preview,
             "run": run,
             "verification_command": _verification_command(project.project_path, current),
+            # ------------------------------------------------ the last change's verdict
+            # Published beside the stage so the card can say «Изменения откатаны» in
+            # words instead of inferring it: the files of the change are gone, and the
+            # previous version is current again. ``rolled_back`` is true only for a
+            # restore that completed and was proved by digest.
+            "rollback": (
+                dict(getattr(project.latest_version, "rollback") or {})
+                if getattr(project.latest_version, "rollback", None)
+                else None
+            ),
+            "rolled_back": bool(
+                getattr(project.latest_version, "rolled_back", False)
+            ),
             # ------------------------------------------------ what is proven, what is not
             # The evidence block for the current version: file digests, the verification
             # command and the acceptance verdict as `verified`; the model's words (none

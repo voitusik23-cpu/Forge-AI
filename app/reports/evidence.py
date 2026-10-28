@@ -85,6 +85,9 @@ EVIDENCE_KINDS: Tuple[str, ...] = (
     "acceptance",
     "version",
     "server",
+    #: A change that was put back from its own snapshot, and the files that came
+    #: back with it (their digest is the proof, not the flag).
+    "rollback",
 )
 
 _VERIFICATION_PASSED = "passed"
@@ -249,6 +252,7 @@ def build_evidence(
     answer_excerpt: object = "",
     run: object = None,
     project: object = None,
+    rollback: object = None,
 ) -> Dict[str, Any]:
     """Build the evidence block for one result.
 
@@ -260,6 +264,15 @@ def build_evidence(
     It is here so a caller can pass the result word without tempting the next
     reader to treat it as proof; a test passes ``COMPLETED`` with no files and
     asserts an empty ``verified`` list.
+
+    ``rollback`` is the change-regression verdict
+    (:meth:`app.projects.regression.RollbackRecord.to_dict`). When a change was put
+    back, **the rollback itself is the verified fact**: every restored file is listed
+    with the digest taken from the file on disk after the restore, so "the tree is the
+    previous version's again" is proved rather than asserted. The change that was
+    rolled back goes to ``unknown`` -- none of it is on disk, so nothing about it was
+    checked. A rollback that could not restore every file is an ``unknown`` too, and
+    never a success.
     """
 
     proven, unproven = _proven_files(files)
@@ -470,6 +483,85 @@ def build_evidence(
             }
         )
 
+    # ----------------------------------------------------------------- rollback
+    # A rolled-back change replaces what "verified" means for this result: the files
+    # of the change are gone, and the one thing that *was* measured is the restore.
+    rollback_facts = dict(rollback) if isinstance(rollback, _MappingABC) else {}
+    rolled_back = bool(rollback_facts.get("rolled_back")) and bool(rollback_facts)
+    rollback_outcome = _text(rollback_facts.get("outcome"))
+    rollback_verified: List[Dict[str, Any]] = []
+    if rolled_back:
+        for item in _proven_files(rollback_facts.get("restored") or ())[0]:
+            rollback_verified.append(
+                {
+                    "claim": f"файл восстановлен из снимка: {item['path']}",
+                    "evidence": (
+                        f"{item['path']} · {item['size']} Б · "
+                        f"sha256 {item['sha256']}"
+                    ),
+                    "kind": "file",
+                }
+            )
+        if not rollback_verified:
+            # A rollback that named no restored file proves nothing, even when it
+            # says it happened: the flag alone is a claim.
+            unknown.append(
+                {
+                    "item": "откат без доказательства",
+                    "why": "откат заявлен, но ни один восстановленный файл не назван",
+                }
+            )
+        rollback_reason = _text(rollback_facts.get("message")) or _text(
+            rollback_facts.get("reason")
+        )
+        verified.append(
+            {
+                "claim": (
+                    "изменение откатано: приложение перестало запускаться, "
+                    "файлы возвращены из снимка"
+                ),
+                "evidence": (
+                    f"восстановлено файлов: {len(rollback_verified)}"
+                    + (f" · {rollback_reason}" if rollback_reason else "")
+                ),
+                "kind": "rollback",
+            }
+        )
+        verified.extend(rollback_verified)
+        # The change itself is not on disk, so nothing about it was checked.
+        unknown.append(
+            {
+                "item": "изменение не применено",
+                "why": (
+                    "правка откатана: после неё приложение перестало запускаться, "
+                    "поэтому её результат на диске отсутствует"
+                ),
+            }
+        )
+    elif rollback_outcome == "rollback_failed":
+        unknown.append(
+            {
+                "item": "откат не завершён",
+                "why": (
+                    "не удалось восстановить: "
+                    + ", ".join(
+                        _text(item)
+                        for item in (rollback_facts.get("failed") or ())[:5]
+                    )
+                ).strip(),
+            }
+        )
+    elif rollback_outcome == "not_verified":
+        unknown.append(
+            {
+                "item": "запуск после правки не проверен",
+                "why": (
+                    _text(rollback_facts.get("reason"))
+                    or "проверка не смогла запустить приложение"
+                ),
+            }
+        )
+
     # ----------------------------------------------------------------- assumed
     summary = _text(model_summary)
     if summary:
@@ -498,5 +590,18 @@ def build_evidence(
             },
             "run_id": run_id,
             "commands": commands,
+            "rollback": (
+                {
+                    "outcome": rollback_outcome,
+                    "rolled_back": rolled_back,
+                    "reason": _text(rollback_facts.get("reason")),
+                    "restored": [dict(item) for item in _proven_files(
+                        rollback_facts.get("restored") or ()
+                    )[0]],
+                    "failed": [_text(item) for item in (rollback_facts.get("failed") or ())],
+                }
+                if rollback_facts
+                else None
+            ),
         },
     }

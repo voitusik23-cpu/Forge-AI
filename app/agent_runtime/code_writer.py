@@ -166,10 +166,21 @@ class WriteResult:
     diff: str = ""
     reason: str = ""
     verification: str = VERIFICATION_NOT_RUN
+    #: The change-regression verdict of this write
+    #: (:meth:`app.projects.regression.RollbackRecord.to_dict`), or ``None`` when no
+    #: launch check was made. It travels with the outcome because "the files were
+    #: written and then put back" is a fact about this write, not about the run.
+    rollback: dict[str, object] | None = None
 
     @property
     def is_applied(self) -> bool:
         return self.status == STATUS_APPLIED
+
+    @property
+    def was_rolled_back(self) -> bool:
+        """True only for a rollback that completed and was proved by digest."""
+
+        return bool(self.rollback) and bool(self.rollback.get("rolled_back"))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -178,6 +189,7 @@ class WriteResult:
             "diff": self.diff,
             "reason": self.reason,
             "verification": self.verification,
+            "rollback": dict(self.rollback) if self.rollback else None,
         }
 
 
@@ -1095,6 +1107,16 @@ def render_write_report(result: WriteResult) -> str:
         lines.append("Verification: py_compile FAILED; every file of this run was rolled back")
     else:
         lines.append("Verification: not run")
+    if result.rollback:
+        rollback_outcome = str(result.rollback.get("outcome", "") or "")
+        if result.rollback.get("rolled_back"):
+            files_restored = len(list(result.rollback.get("restored") or ()))
+            lines.append(
+                "Rollback: the application stopped launching, so "
+                f"{files_restored} file(s) were restored from the snapshot"
+            )
+        else:
+            lines.append(f"Rollback: {rollback_outcome or 'not applied'}")
     if result.reason:
         lines.append(f"Reason: {result.reason}")
     if result.diff:

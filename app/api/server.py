@@ -769,6 +769,14 @@ def create_api_app(
             # The evidence block cites the version THIS RUN produced, so the number is
             # kept before the fallback below points ``version`` at whatever is current.
             run_version = int(getattr(version, "version", 0) or 0) if version else 0
+            # The change-regression verdict is the run's own fact, so it is read from
+            # the version this run produced -- never from whatever version happens to
+            # be current after a rollback (which is the *previous* one).
+            run_rollback: dict[str, Any] = {}
+            if version is not None:
+                recorded = getattr(version, "rollback", None)
+                if isinstance(recorded, Mapping):
+                    run_rollback = dict(recorded)
             version = version or attached.current() or attached.latest_version
             files = tuple(getattr(version, "files", ()) or ())
             facts = {
@@ -781,6 +789,12 @@ def create_api_app(
                 "files": files,
                 "verification": getattr(version, "verification", "") if version else "",
                 "acceptance": getattr(version, "acceptance", "") if version else "",
+                # THE HONEST WORD FOR A ROLLED-BACK CHANGE. ``rolled_back`` is derived
+                # from this verdict in ``record_project_attach`` (one source, one
+                # truth), and it is true only when every written file was restored and
+                # proved by digest -- so a refusal («изменения откатаны») can never be
+                # read as a success.
+                "rollback": run_rollback,
                 # The record's own state word, not the response's. The response's
                 # ``state`` has already been downgraded by the outcome gate, so feeding
                 # it back in would make the re-derivation keep the downgraded word even
@@ -1196,6 +1210,11 @@ def create_api_app(
                 "http_status": 0,
             },
             project={"version": attached_version},
+            # THE ROLLBACK IS EVIDENCE IN ITSELF. When a change was put back, the
+            # restored files are a *verified* fact (their digests match the snapshot)
+            # and the change is an *unknown* one (nothing of it is on disk) -- so the
+            # block cannot present a rolled-back run as a checked result.
+            rollback=facts_for_evidence.get("rollback") or None,
         )
         response = JSONResponse(body)
         response.headers["X-Forge-Idempotent-Replay"] = "true" if outcome.idempotent_replay else "false"

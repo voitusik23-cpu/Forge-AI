@@ -101,6 +101,7 @@ import {
 import {
   bestRealProvider,
   changeControls,
+  dispatchReachedTheCore,
   effectiveProvider,
   isMockProvider,
   versionFilesWord,
@@ -225,6 +226,15 @@ type ChangeOutcome = {
    * created. It is an answer, not a failure, and the card says exactly that.
    */
   alreadyApplied?: boolean;
+  /**
+   * True when the change was applied and then **rolled back** because the project
+   * stopped launching. It is read from the refreshed card's own `rolled_back`, so the
+   * strip prints the rollback sentence instead of «файлов 0»: the two are different
+   * facts, and the second one would read like a hiccup instead of a refusal.
+   */
+  rolledBack?: boolean;
+  /** The rollback's own sentence, when the refreshed card carried one. */
+  rollbackMessage?: string;
 };
 
 /**
@@ -2014,6 +2024,37 @@ const ProjectCard = ({
           <EvidenceBlock lang={lang} evidence={evidence} testId="project-evidence" />
         ) : null}
 
+        {/* THE CHANGE THAT WAS PUT BACK. When the backend applied a change and the
+            project then stopped launching, it restored every written file from the
+            change's own snapshot and proved the restore by digest. That change is NOT
+            in the project, so this block sits above the ordinary notices and prints the
+            owner's sentence, the snapshot and the digest of every file that came back —
+            «готово» is impossible here, and the reason is never hidden. */}
+        {presentation.rolled_back === true ? (
+          <div className="notice danger" data-testid="project-rollback">
+            <div className="label">{t(lang, "projects.rollback.notice")}</div>
+            <div className="small" style={{ marginTop: 6 }}>
+              {t(lang, "projects.rollback.hint")}
+            </div>
+            {(presentation.rollback ?? []).length > 0 ? (
+              <table className="table" style={{ marginTop: 8 }} data-testid="project-rollback-proof">
+                <tbody>
+                  {(presentation.rollback ?? []).map((row) => (
+                    <tr key={String(row?.[0] ?? "")}>
+                      <td className="small muted" style={{ width: 210 }}>
+                        {String(row?.[0] ?? "")}
+                      </td>
+                      <td className="mono small" style={{ overflowWrap: "anywhere" }}>
+                        {String(row?.[1] ?? "")}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : null}
+          </div>
+        ) : null}
+
         {/* THE RECORD'S OWN NOTICES. While a change is in flight they describe the *pending*
             version («Изменения не записаны: новой версии нет») and would contradict the strip
             that says the run has just started; the run's own outcome replaces them the moment
@@ -3614,6 +3655,23 @@ export const Projects = ({
   const [changeArmed, setChangeArmed] = useState(false);
 
   /**
+   * THE OWNER'S WORDS BELONG TO THE CHANGE THAT WAS SENT.
+   *
+   * After one dispatch completes — a success *or* a refusal — the textarea and the
+   * screenshot chips are cleared, so the next request can be typed immediately instead
+   * of clearing the old sentence by hand (the owner had to switch sections to make the
+   * field usable again). The one exception is a request that never reached the Core:
+   * `dispatchReachedTheCore` is false only for the measured "server down / socket
+   * failed" kind, and then the words stay, because nothing was sent and losing them
+   * would mean retyping.
+   */
+  const settleChangeDraft = (failure: unknown): void => {
+    if (!dispatchReachedTheCore(failure)) return;
+    setChange("");
+    clearAttachments();
+  };
+
+  /**
    * THE ONE ACTION: stage the change and run it, in one click.
    *
    * It used to take two buttons («Начать изменения» then «Исправить проект»), and the
@@ -3669,6 +3727,9 @@ export const Projects = ({
         setBusy("");
         setChangeStarting(false);
         setChangeFailure(stagedOutcome.failure);
+        // A refusal is an answer: the field is free again. A request that never
+        // reached the Core keeps the owner's words.
+        settleChangeDraft(stagedOutcome.failure);
         return null;
       }
       // THE SAME WORDS ARE ONE CHANGE. The backend refuses to record a second version
@@ -3690,6 +3751,8 @@ export const Projects = ({
           alreadyApplied: true,
         };
         setChangeOutcome(already);
+        // The backend already holds this change: the field has nothing left to send.
+        settleChangeDraft(null);
         await loadDetail(selectedId, { quiet: true });
         return already;
       }
@@ -3703,6 +3766,7 @@ export const Projects = ({
           path: `/api/projects/${selectedId}/versions`,
           detail: t(lang, "projects.newversion.error"),
         });
+        settleChangeDraft(null);
         return null;
       }
       // The staged version is a real fact (the record now carries a pending version), so the
@@ -3734,6 +3798,7 @@ export const Projects = ({
       setChangeStarting(false);
       if (!outcome.ok) {
         setDispatchFailure(outcome.failure);
+        settleChangeDraft(outcome.failure);
         return null;
       }
       setDispatched(outcome.value);
@@ -3762,8 +3827,15 @@ export const Projects = ({
         toVersion,
         stagedVersion: Number(stagedOutcome.value.version ?? toVersion),
         files: changed,
+        // THE ROLLBACK IS THE REASON THE VERSION DID NOT MOVE, so it is read from the
+        // refreshed card's own verdict rather than inferred from «0 files».
+        rolledBack: refreshed?.rolled_back === true,
+        rollbackMessage: String(refreshed?.rollback?.message ?? ""),
       };
       setChangeOutcome(finished);
+      // The dispatch completed (success or a rolled-back/zero-file refusal): the field
+      // is empty again, so the next request needs no section switching.
+      settleChangeDraft(null);
       await loadList();
       onRefresh();
       // The outcome is also *returned*: the repair panel decides from these very numbers
@@ -3854,16 +3926,27 @@ export const Projects = ({
             "{version}",
             `v${changeOutcome.stagedVersion || changeOutcome.toVersion}`
           )
-        : !changeOutcome.attached
-          ? t(lang, "projects.newversion.outcome.unattached")
-          : advanced
-            ? t(lang, "projects.change.done").replace("{version}", `v${changeOutcome.toVersion}`)
-            : t(lang, "projects.change.zero_files").replace(
-                "{version}",
-                `v${changeOutcome.stagedVersion || changeOutcome.toVersion}`
-              );
+        : changeOutcome.rolledBack === true
+          // THE CHANGE WAS PUT BACK. The run's own answer is the rollback sentence plus
+          // the reason from the log, never «готово» and never a bare «файлов 0».
+          ? (changeOutcome.rollbackMessage ?? "") !== ""
+            ? String(changeOutcome.rollbackMessage)
+            : t(lang, "projects.rollback.notice")
+          : !changeOutcome.attached
+            ? t(lang, "projects.newversion.outcome.unattached")
+            : advanced
+              ? t(lang, "projects.change.done").replace("{version}", `v${changeOutcome.toVersion}`)
+              : t(lang, "projects.change.zero_files").replace(
+                  "{version}",
+                  `v${changeOutcome.stagedVersion || changeOutcome.toVersion}`
+                );
       if (changeOutcome.alreadyApplied === true) {
         tone = "info";
+      } else if (changeOutcome.rolledBack === true) {
+        // A ROLLED-BACK CHANGE IS NOT A CONTEXT REFUSAL. The files were really written
+        // and then put back because the project stopped starting, so the refusal block
+        // must not claim the change text was rejected.
+        tone = "warn";
       } else if (!advanced && !wroteFiles) {
         // THE PLAIN LANGUAGE FIRST. The backend's refusal is a diagnostic sentence
         // («Critical Tier 1 context item … security_forbidden_content:secret …»); the owner

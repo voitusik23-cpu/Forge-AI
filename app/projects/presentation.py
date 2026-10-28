@@ -68,6 +68,7 @@ __all__ = [
     "OWNER_STATE_LABELS",
     "ProjectPresentation",
     "RUN_NO_CHANGE_NOTICE",
+    "RUN_ROLLED_BACK_NOTICE",
     "SAVE_FACT_KEYS",
     "SAVE_FACT_LABELS",
     "SaveFact",
@@ -169,6 +170,14 @@ NO_FILES_NOTICE = "Папка создана, но проект ещё не со
 #: Printed when a change run was recorded but wrote no file, so the version it
 #: targeted was not advanced. The previous version stays current.
 RUN_NO_CHANGE_NOTICE = "Изменения не записаны: новой версии нет"
+
+#: Printed when a change was applied and then **rolled back** because the project
+#: stopped launching. It is a refusal, not a warning, and it can never sit beside
+#: «ГОТОВО»: the change is not in the project any more.
+RUN_ROLLED_BACK_NOTICE = (
+    "Изменения откатаны: после правки приложение перестало запускаться, "
+    "файлы возвращены из снимка"
+)
 
 #: The verification sentences. "Not run" is a state, never a pass word.
 VERIFICATION_NOT_RUN_LINE = "Проверка ещё не выполнялась"
@@ -341,6 +350,13 @@ class ProjectPresentation:
     technical: Tuple[TechnicalField, ...]
     technical_collapsed: bool = True
     change_not_written: bool = False
+    #: True only when the last change was applied and then **rolled back** because the
+    #: project stopped launching. Such a card can never say ``ГОТОВО``: the change is
+    #: not in the project any more, and the previous version is current again.
+    rolled_back: bool = False
+    #: The rollback's own proof: the snapshot it was restored from and every restored
+    #: file with the digest that was re-read from disk after the restore.
+    rollback: Tuple[Tuple[str, str], ...] = ()
     #: What can be launched, if anything: ``"open"`` for an HTML page, ``"run"`` for
     #: an entry file, ``""`` when the manifest holds neither. ``launch_path`` is the
     #: artifact's workspace-relative path. The card uses it to name the file and to
@@ -393,6 +409,8 @@ class ProjectPresentation:
                 "fields": [item.to_dict() for item in self.technical],
             },
             "change_not_written": bool(self.change_not_written),
+            "rolled_back": bool(self.rolled_back),
+            "rollback": _pair_list(self.rollback),
             "launch_role": self.launch_role,
             "launch_path": self.launch_path,
         }
@@ -503,6 +521,39 @@ def _save_fact(key: str, answer: Optional[bool]) -> SaveFact:
 # --------------------------------------------------------------------------- #
 
 
+def _rollback_facts(rollback: Mapping[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    """The rollback's proof as card rows: the snapshot and every restored digest.
+
+    Only facts the record really holds are printed. A rollback with no restored file
+    shows none, so the card cannot dress a bare flag as a checked restore.
+    """
+
+    rows: list[Tuple[str, str]] = []
+    snapshot = str(rollback.get("snapshot", "") or "").strip()
+    if snapshot:
+        rows.append((".forge/backups", snapshot))
+    lines: list[str] = []
+    for item in _as_list(rollback.get("restored")):
+        record = _mapping(item)
+        path = str(record.get("path", "") or "").strip()
+        if not path:
+            continue
+        digest = str(record.get("sha256", "") or "").strip()
+        size = _int(record.get("size"))
+        lines.append(
+            f"{path} · {size} Б · sha256 {digest[:16]}" if digest else f"{path} · {size} Б"
+        )
+    if lines:
+        rows.append(("Восстановлено", "; ".join(lines)))
+    removed = [str(item) for item in _as_list(rollback.get("removed")) if str(item)]
+    if removed:
+        rows.append(("Удалено (создано правкой)", ", ".join(removed)))
+    reason = str(rollback.get("reason", "") or "").strip()
+    if reason:
+        rows.append(("Причина", reason))
+    return tuple(rows)
+
+
 def build_project_presentation(
     *,
     project: Optional[Mapping[str, Any]] = None,
@@ -550,11 +601,23 @@ def build_project_presentation(
     acceptance_word = str(current.get("acceptance", "") or "").strip().lower() if current else ""
     verification_not_run = verification_word in ("", "not_run")
 
+    # ------------------------------------------- a change that was put back
+    # Read first, because it changes what the card may claim: a rolled-back change is
+    # never «ГОТОВО», whatever the previous version's facts say. The verdict lives on
+    # the version the change produced, which is never the current one after a
+    # rollback -- so it is read from the newest attempt. ``rolled_back`` is only ever
+    # true for a restore that completed and was proved by digest.
+    latest = _newest_version(version_lines)
+    latest_rollback = _mapping(latest.get("rollback")) if latest is not None else {}
+    rolled_back = bool(latest_rollback.get("rolled_back")) and bool(latest_rollback)
+    rollback_facts = _rollback_facts(latest_rollback) if rolled_back else ()
+
     # ---------------------------------------------------------------- the state
     # ``ready`` is the completion fact set, all of it. Anything missing is False.
     workspace_present = workspace_exists is True
     ready = bool(
         not archived
+        and not rolled_back
         and status == "COMPLETED"
         and files_count > 0
         and verification_word == "passed"
@@ -582,7 +645,6 @@ def build_project_presentation(
     # A version carrying a change request whose run recorded no file never became
     # current: the previous version is still what the workspace contains, and the
     # card says exactly that instead of showing a newer, empty version.
-    latest = _newest_version(version_lines)
     change_not_written = bool(
         latest is not None
         and latest.get("change_request") is not None
@@ -620,6 +682,7 @@ def build_project_presentation(
         specification_present=specification_present,
         change_not_written=change_not_written,
         archived=archived,
+        rolled_back=rolled_back,
     )
     next_step = _next_step(
         status=status,
@@ -629,12 +692,17 @@ def build_project_presentation(
         questions_open=questions_open or status == "NEEDS_CLARIFICATION",
         archived=archived,
         change_not_written=change_not_written,
+        rolled_back=rolled_back,
     )
 
     notices: List[str] = []
     if files_count == 0:
         notices.append(NO_FILES_NOTICE)
-    if change_not_written:
+    if rolled_back:
+        # The rollback's own sentence wins over the generic "no change" one: the
+        # change WAS written and then put back, which is a different fact.
+        notices.append(RUN_ROLLED_BACK_NOTICE)
+    elif change_not_written:
         notices.append(RUN_NO_CHANGE_NOTICE)
 
     # ------------------------------------------------------------------ the actions
@@ -726,6 +794,8 @@ def build_project_presentation(
         technical=technical,
         technical_collapsed=True,
         change_not_written=change_not_written,
+        rolled_back=rolled_back,
+        rollback=rollback_facts,
         launch_role=launch_role,
         launch_path=launch_path,
     )
@@ -803,9 +873,13 @@ def _last_action(
     specification_present: bool,
     change_not_written: bool,
     archived: bool,
+    rolled_back: bool = False,
 ) -> str:
     if archived:
         return "проект отправлен в архив"
+    if rolled_back:
+        # Never «изменения внесены»: the files of this change are not on disk.
+        return "изменения откатаны: после правки приложение перестало запускаться"
     if change_not_written:
         return "получен ответ модели, но изменения не записаны"
     if files_count > 0 and verification_word in ("passed", "failed", "not_applicable"):
@@ -832,6 +906,7 @@ def _next_step(
     questions_open: bool,
     archived: bool,
     change_not_written: bool,
+    rolled_back: bool = False,
 ) -> str:
     if archived:
         return "восстановить проект из архива"
@@ -844,6 +919,8 @@ def _next_step(
         return "подтвердить план"
     if files_count == 0:
         return "запустить создание проекта"
+    if rolled_back:
+        return "сформулировать другую правку: эта откатана"
     if verification_not_run:
         return "запустить проверку"
     if change_not_written:

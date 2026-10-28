@@ -1071,6 +1071,10 @@ export type LifecycleVersion = {
   preview_not_required?: boolean;
   change_request?: LifecycleChangeRequest | null;
   files?: LifecycleArtifact[];
+  /** The change-regression verdict of this attempt (`app/projects/regression.py`). */
+  rollback?: ChangeRollback | null;
+  /** True only for a restore that completed and was proved by digest. */
+  rolled_back?: boolean;
 };
 
 /** `Project.summary()`: the one-line projection of the lifecycle list. */
@@ -1143,6 +1147,38 @@ export type LifecycleProject = {
    * usually empty — an honest absence); every gap as `unknown`.
    */
   evidence?: Evidence;
+  /**
+   * THE LAST CHANGE'S OWN VERDICT (`app/projects/regression.py`).
+   *
+   * `rolled_back` is true only when a change was applied, the project then failed to
+   * start, and every written file was restored from the change's own snapshot and
+   * proved by digest. Such a change is **not** in the project, so the card can never
+   * present it as done — `rollback` carries the owner's sentence, the snapshot name and
+   * the digest of every restored file.
+   */
+  rolled_back?: boolean;
+  rollback?: ChangeRollback | null;
+};
+
+/** The rollback proof of a change: what came back, from which snapshot, and why. */
+export type ChangeRollback = {
+  outcome?: string;
+  status?: string;
+  rolled_back?: boolean;
+  checked?: boolean;
+  launchable_before?: boolean;
+  launchable_after?: boolean;
+  http_status?: number;
+  /** The run's own reason, e.g. «процесс завершился с кодом 1». */
+  reason?: string;
+  /** The owner's sentence plus that reason and the log tail. */
+  message?: string;
+  /** `.forge/backups/<run_id>` the files were restored from. */
+  snapshot?: string;
+  restored?: Array<{ path?: string; sha256?: string; size?: number }>;
+  removed?: string[];
+  failed?: string[];
+  log_tail?: string[];
 };
 
 /** One openable target (`folder`, `editor`, `terminal`) and whether it is available. */
@@ -1383,6 +1419,15 @@ export type ProjectPresentation = {
   actions?: PresentationAction[];
   technical?: { collapsed?: boolean; fields?: PresentationField[] };
   change_not_written?: boolean;
+  /**
+   * True when the last change was applied and then **rolled back** because the project
+   * stopped launching. It can never sit beside `ГОТОВО`: the change is not in the
+   * project, and the previous version is current again.
+   */
+  rolled_back?: boolean;
+  /** `[label, value]` rows: the snapshot the change was restored from, the restored
+   * files with their digests, what was removed, and the reason the launch failed. */
+  rollback?: string[][];
   /** `open` for an HTML page, `run` for an entry file, `""` when nothing is launchable. */
   launch_role?: string;
   /** The artifact's workspace-relative path (joined to `project_path` for display). */

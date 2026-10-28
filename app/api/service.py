@@ -56,6 +56,8 @@ from app.agent_runtime.outcome import (
 from app.agent_runtime.code_writer import (
     STATUS_APPLIED,
     STATUS_NO_CHANGES,
+    STATUS_VERIFICATION_FAILED,
+    VERIFICATION_FAILED,
     WriteResult,
     apply_changes,
     build_workspace_context,
@@ -3675,7 +3677,16 @@ class ForgeApiService:
 
         if project_workspace is not None:
             from app.projects.materialize import materialize_into
+            from app.projects.regression import (
+                capture_launch_state,
+                verify_change,
+            )
 
+            # THE PRE-CHANGE FACT. Recorded before a single byte is written: was this
+            # project launchable at all? A project that never started is exempt from
+            # the launch gate (a first creation cannot break a launch it never had),
+            # and a project that did start must start again afterwards.
+            before = capture_launch_state(project_workspace)
             try:
                 materialization = materialize_into(
                     project_workspace,
@@ -3694,6 +3705,39 @@ class ForgeApiService:
                 result = materialization.write_result or WriteResult(
                     status=STATUS_REJECTED,
                     reason=f"materialization_{materialization.status.lower()}",
+                )
+            # THE POST-CHANGE PROOF. A change that was really applied to a project
+            # that was really launchable has to keep it launchable. The writer's own
+            # backup directory is the snapshot, so the rollback restores exactly the
+            # bytes that were there before this run wrote anything.
+            if result.status == STATUS_APPLIED and result.files:
+                verdict = verify_change(
+                    workspace=project_workspace,
+                    before=before,
+                    written_paths=[
+                        str(item.get("path", "") or "")
+                        for item in result.files
+                        if str(item.get("path", "") or "").strip()
+                    ],
+                    run_id=run_id,
+                    project_id=str(project_id or "proj-forge-change-check"),
+                )
+                result = replace(
+                    result,
+                    rollback=verdict.to_dict(),
+                    **(
+                        {
+                            # A rolled-back change is not an applied one: the tree is
+                            # the previous version's again, so the writer must not
+                            # report files it no longer has.
+                            "status": STATUS_VERIFICATION_FAILED,
+                            "verification": VERIFICATION_FAILED,
+                            "files": (),
+                            "reason": verdict.message or verdict.reason,
+                        }
+                        if verdict.rolled_back
+                        else {}
+                    ),
                 )
             if materialization is not None:
                 self._record_materialization(
@@ -3978,6 +4022,7 @@ class ForgeApiService:
         run_state: object = "",
         run_success: bool = True,
         error: object = "",
+        rollback: object = None,
     ) -> Dict[str, Any]:
         """Re-derive the outcome now that the run's project attachment is known.
 
@@ -4035,6 +4080,13 @@ class ForgeApiService:
             # workspace ``project_id``.
             "lifecycle_project_id": lifecycle_id,
         }
+        # A CHANGE THAT WAS PUT BACK IS NOT A SUCCESS, and the response says so in the
+        # same block that carries every other outcome: ``rolled_back`` is true only
+        # when the restore completed and was proved by digest, and the reason is the
+        # owner's sentence plus the run's own log tail.
+        rollback_facts = dict(rollback) if isinstance(rollback, Mapping) else {}
+        fields["rollback"] = rollback_facts or None
+        fields["rolled_back"] = bool(rollback_facts.get("rolled_back"))
         store: Optional[RunStore] = None
         if run_id:
             try:

@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -183,6 +183,10 @@ class RunFacts:
     wrote_files: bool
     written_files: Tuple[Mapping[str, Any], ...] = ()
     recorded_at: str = ""
+    #: The change-regression verdict the writer recorded for this run, when it made
+    #: one (:class:`app.projects.regression.RollbackRecord`). Empty for a first
+    #: creation, a read-only run, and every run that made no launch check.
+    rollback: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _field(source: object, *names: str) -> Any:
@@ -314,6 +318,8 @@ def run_facts(run: object) -> RunFacts:
         str(code_write.get("status", "") or "").strip() == "applied" and bool(written)
     )
 
+    raw_rollback = code_write.get("rollback") if code_write else None
+
     return RunFacts(
         run_id=run_id,
         run_state=run_state,
@@ -326,6 +332,7 @@ def run_facts(run: object) -> RunFacts:
         wrote_files=wrote_files,
         written_files=tuple(written),
         recorded_at=recorded_at,
+        rollback=dict(raw_rollback) if isinstance(raw_rollback, Mapping) else {},
     )
 
 
@@ -1337,6 +1344,10 @@ class ProjectService:
             model=facts.model,
             change_request=change_request,
             preview_not_required=preview_not_required,
+            # The change-regression verdict belongs to the version it judged: a
+            # rolled-back change keeps the proof that its files were put back, so the
+            # card and the run's own record cannot tell two different stories.
+            rollback=(dict(facts.rollback) if facts.rollback else None),
         )
         versions = sorted(others + [filled], key=lambda item: item.version)
         return replace(

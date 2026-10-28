@@ -251,3 +251,47 @@ export const versionFilesWord = (fileCount: unknown): "empty" | "files" => {
   const count = Number(fileCount ?? 0);
   return Number.isFinite(count) && count > 0 ? "files" : "empty";
 };
+
+/**
+ * Did one dispatch of a change actually reach the Core?
+ *
+ * The owner's complaint: after sending a change the textarea kept his words, so asking
+ * for the next change meant clearing it by hand. The words belong to the change that
+ * was sent, so they are cleared once the answer arrives — but **only** then. A request
+ * that never reached the Core (`kind: "disconnected"`: the server is down, the socket
+ * failed, DNS failed) did not send anything, and throwing the owner's sentence away
+ * there would lose work he would have to retype.
+ *
+ * A failure with no `kind` at all is treated as an answer, because the Core answered
+ * something (an HTTP status, a refusal body): only the measured "never arrived" kind
+ * keeps the text.
+ */
+export const dispatchReachedTheCore = (failure: unknown): boolean => {
+  if (failure === null || failure === undefined) return true;
+  if (typeof failure !== "object") return true;
+  const kind = String((failure as { kind?: unknown }).kind ?? "")
+    .trim()
+    .toLowerCase();
+  return kind !== "disconnected";
+};
+
+/** Everything one dispatch attempt can tell us about the field, and nothing else. */
+export type ChangeDispatchResult = {
+  /** The request reached the Core and was answered (a success **or** a refusal). */
+  ok?: unknown;
+  /** The transport failure, when the request did not succeed. */
+  failure?: unknown;
+};
+
+/**
+ * What happens to the owner's words after one dispatch: `clear` or `keep`.
+ *
+ * `clear` for every completed dispatch — a success and a refusal are both "sent, and
+ * answered". `keep` only when the request never reached the Core, so nothing was lost.
+ */
+export const changeDraftAfterDispatch = (
+  result: ChangeDispatchResult | null | undefined
+): "clear" | "keep" => {
+  if (result !== null && result !== undefined && result.ok === true) return "clear";
+  return dispatchReachedTheCore(result ? result.failure : null) ? "clear" : "keep";
+};
