@@ -135,6 +135,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: None". An absent routing value must never be replaced by a guess.
 _MISSING = object()
 
+#: The sample task «Настройки» previews a COMPLEX decision with. It is deliberately the
+#: owner's own mail-centre wording (several engineering surfaces in one sentence), so the
+#: ceiling is measured against the kind of task that actually burned his balance -- not
+#: against a friendly one-liner that would never reach a paid tier anyway.
+MAX_TIER_SAMPLE_TASK = (
+    "Хочу центр почты: создай приложение, база данных для писем, авторизация, "
+    "интеграция с Exchange, тесты и миграция существующих писем"
+)
+
 
 def _dispatcher_route_value(dispatcher: object, name: str) -> object:
     """Read one routing value the caller's orchestrator actually dispatches with.
@@ -646,6 +655,12 @@ class ForgeApiService:
             loop_coordinator_factory or create_loop_coordinator
         )
         self._verification_resolver = verification_resolver
+        # The owner's own settings store (`.forge/settings.json`), composed by the server
+        # beside «Настройки». The routing ceiling lives there and nowhere else: the router
+        # reads it on every decision, so a change in the panel takes effect on the next
+        # task without a restart. A service composed without one answers the documented
+        # default (`CHEAP`), never the most permissive tier.
+        self._owner_settings: object = None
 
         # One registry serves both execution and discovery, so capability
         # enumeration can never report a tool that execution cannot reach.
@@ -1269,6 +1284,10 @@ class ForgeApiService:
                 # and whether paid models are permitted at all.
                 "default_model": self._runtime.settings.default_model,
                 "allow_paid_providers": self._allow_paid_providers(),
+                # The owner's ceiling on the automatic choice. The launch screen reads it
+                # from here to warn when a manually named pair is more expensive than
+                # that ceiling -- the router honours the pair, but never silently.
+                "max_cost_tier": self._max_cost_tier(),
                 "routing_policy": {
                     level: TIER_FOR_COMPLEXITY[level] for level in COMPLEXITY_LEVELS
                 },
@@ -3085,8 +3104,9 @@ class ForgeApiService:
         """The settings the automatic chooser reads, and nothing else.
 
         ``allow_paid_providers`` is the dispatcher's own value (the one routing honours),
-        the defaults are the operator's configuration, and the enabled set is the
-        composition's own narrow list. No credential and no environment value is read.
+        the defaults are the operator's configuration, the enabled set is the
+        composition's own narrow list, and ``max_cost_tier`` is the owner's ceiling from
+        his settings file. No credential and no environment value is read.
         """
 
         settings = getattr(self._runtime, "settings", None)
@@ -3095,11 +3115,65 @@ class ForgeApiService:
             "default_provider": str(getattr(settings, "default_provider", "") or ""),
             "default_model": str(getattr(settings, "default_model", "") or ""),
             "allow_paid_providers": self._allow_paid_providers(),
+            "max_cost_tier": self._max_cost_tier(),
             "enabled_providers": (
                 tuple(str(name) for name in enabled)
                 if isinstance(enabled, (tuple, list))
                 else ()
             ),
+        }
+
+    def use_owner_settings(self, store: object) -> None:
+        """Compose the owner's settings file as the source of the routing ceiling.
+
+        Called once by :func:`app.api.server.create_api_app` after the store is created,
+        so «Настройки», the router and the status panel read the same file. It grants no
+        authority: the store only answers which tier caps the automatic choice.
+        """
+
+        self._owner_settings = store
+
+    def _max_cost_tier(self) -> str:
+        """The ceiling on the automatic choice, or the documented default.
+
+        Read from the owner's store when the composition supplied one, and from the
+        router's own default otherwise. An unreadable store is the default, never the
+        most permissive tier: a ceiling that cannot be read must not become ``PAID``.
+        """
+
+        from app.agent_runtime.routing import DEFAULT_MAX_COST_TIER, normalise_cost_tier
+
+        getter = getattr(getattr(self, "_owner_settings", None), "max_cost_tier", None)
+        if callable(getter):
+            try:
+                return normalise_cost_tier(getter())
+            except Exception:  # noqa: BLE001 - an unreadable ceiling is the default
+                return DEFAULT_MAX_COST_TIER
+        return DEFAULT_MAX_COST_TIER
+
+    def preview_max_cost_tier(self) -> Dict[str, Any]:
+        """What the router would do right now for one **sample** complex task.
+
+        It answers the question «Настройки» has to make tangible: *which model does my
+        ceiling produce, and what does that model cost per 1M tokens?* The task text and
+        category are the panel's own constants, the catalogue and the ceiling are the live
+        ones, and nothing is dispatched -- no provider call, no run, no idempotency claim.
+        """
+
+        choice = self.choose_route(MAX_TIER_SAMPLE_TASK, "code")
+        payload = self._runnable_choice(choice).to_dict()
+        return {
+            "sample_task": MAX_TIER_SAMPLE_TASK,
+            "provider": payload.get("provider", ""),
+            "model": payload.get("model", ""),
+            "tier": payload.get("tier", ""),
+            "complexity": payload.get("complexity", ""),
+            # The chosen row's published rate per 1M input tokens (0.0 for a free row,
+            # null when no rate is published): the same number the decision carries.
+            "unit_price_per_1m": payload.get("estimated_cost"),
+            "max_cost_tier": payload.get("max_cost_tier", ""),
+            "ceiling_limited": bool(payload.get("ceiling_limited")),
+            "reasons": list(payload.get("reasons", ())),
         }
 
     def choose_route(

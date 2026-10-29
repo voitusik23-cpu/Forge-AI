@@ -22,12 +22,15 @@ dispatch test uses a fake provider registered under the real provider's name.
 
 from __future__ import annotations
 
+import pathlib
+import tempfile
 import unittest
 
 from app.agent_runtime.routing import (
     CHEAP,
     COMPLEX,
     COMPLEXITY_LEVELS,
+    DEFAULT_MAX_COST_TIER,
     FREE,
     MEDIUM,
     PAID,
@@ -37,7 +40,9 @@ from app.agent_runtime.routing import (
     assess_complexity,
     catalogue_rows,
     choose_model,
+    normalise_cost_tier,
 )
+from app.config.app_settings import AppSettingsStore
 
 
 # --------------------------------------------------------------------------- catalogue
@@ -299,7 +304,9 @@ class TierPolicyTests(unittest.TestCase):
         # Within the tier the strongest published row wins (price, then capabilities).
         self.assertEqual(choice.provider, "deepseek")
         self.assertEqual(choice.model, "deepseek-reasoner")
-        self.assertIsNone(choice.estimated_cost)
+        # The decision carries the chosen row's published rate per 1M input tokens, so a
+        # capped choice can name what it will cost instead of saying "unknown".
+        self.assertEqual(choice.estimated_cost, 0.55)
 
     def test_04_paid_is_used_only_for_complex_work_and_only_when_allowed(self) -> None:
         text = MAIL_CENTRE  # the mail-centre idea
@@ -314,15 +321,21 @@ class TierPolicyTests(unittest.TestCase):
             refused.reasons,
         )
 
+        # With the ceiling explicitly unlimited, paid permission is the only remaining cap.
         allowed = choose_model(
             text,
             "code",
             catalogue=MIXED,
-            settings={**OFFLINE_SETTINGS, "allow_paid_providers": True},
+            settings={
+                **OFFLINE_SETTINGS,
+                "allow_paid_providers": True,
+                "max_cost_tier": PAID,
+            },
         )
         self.assertEqual(allowed.tier, PAID)
         self.assertIn(allowed.provider, {"anthropic", "openrouter"})
-        self.assertIsNone(allowed.estimated_cost)
+        self.assertEqual(allowed.estimated_cost, 3.0)
+        self.assertFalse(allowed.ceiling_limited)
 
     def test_05_cheap_work_never_reaches_paid_even_when_allowed(self) -> None:
         allowed = choose_model(
@@ -456,6 +469,270 @@ class TierPolicyTests(unittest.TestCase):
         self.assertEqual(choice.tier, FREE)
         self.assertEqual(choice.provider, "openrouter")
         self.assertEqual(choice.model, "cohere/north-mini-code:free")
+
+
+class CostCeilingTests(unittest.TestCase):
+    """The owner's ceiling: COMPLEX work cannot auto-escalate above it, and never silently.
+
+    The owner's balance was burned by a `COMPLEX` task routed to a paid model at $16.61 per
+    1M. `max_cost_tier` is the ceiling he asked for: automatic routing never goes above it,
+    the reason names the ceiling and the chosen model's price, an explicit pair is still
+    honoured (flagged), and an absent or unknown value is the documented default, never the
+    most permissive reading.
+    """
+
+    #: The priciest CHEAP row in :data:`MIXED`; the capped decision must not exceed it.
+    MIXED_CHEAP_PRICE = 0.55
+
+    def _complex(self, *, ceiling, allow_paid: bool = True):
+        settings = {**OFFLINE_SETTINGS, "allow_paid_providers": allow_paid}
+        if ceiling is not None:
+            settings["max_cost_tier"] = ceiling
+        return choose_model(MAIL_CENTRE, "code", catalogue=MIXED, settings=settings)
+
+    def test_01_a_cheap_ceiling_caps_a_complex_task_and_says_so_with_the_price(self) -> None:
+        choice = self._complex(ceiling=CHEAP)
+        self.assertEqual(choice.complexity, COMPLEX)
+        self.assertEqual(choice.tier, CHEAP)
+        self.assertEqual(choice.max_cost_tier, CHEAP)
+        self.assertTrue(choice.ceiling_limited)
+        sentence = "сложная задача, но тариф ограничен CHEAP → выбрана дешёвая модель"
+        self.assertTrue(
+            any(sentence in reason for reason in choice.reasons), choice.reasons
+        )
+        # The price is in the reason, and the decision's own estimate is no higher than the
+        # priciest cheap row: the ceiling is a number, not an abstract word.
+        self.assertTrue(
+            any("$0.55" in reason for reason in choice.reasons), choice.reasons
+        )
+        self.assertIsNotNone(choice.estimated_cost)
+        self.assertLessEqual(choice.estimated_cost, self.MIXED_CHEAP_PRICE)
+        self.assertGreater(choice.estimated_cost, 0.0)
+        # The operative sentence is one of the three lines the card shows.
+        self.assertIn(sentence, choice.reasons[0])
+
+    def test_02_a_free_ceiling_caps_a_complex_task_at_zero(self) -> None:
+        choice = self._complex(ceiling=FREE)
+        self.assertEqual(choice.complexity, COMPLEX)
+        self.assertEqual(choice.tier, FREE)
+        self.assertTrue(choice.ceiling_limited)
+        self.assertEqual(choice.estimated_cost, 0.0)
+        self.assertTrue(
+            any(
+                "тариф ограничен FREE" in reason and "бесплатная модель" in reason
+                for reason in choice.reasons
+            ),
+            choice.reasons,
+        )
+        self.assertTrue(
+            any("$0 за 1M" in reason for reason in choice.reasons), choice.reasons
+        )
+
+    def test_03_a_paid_ceiling_leaves_the_existing_choice_unchanged(self) -> None:
+        choice = self._complex(ceiling=PAID)
+        self.assertEqual(choice.tier, PAID)
+        self.assertFalse(choice.ceiling_limited)
+        self.assertEqual(choice.max_cost_tier, PAID)
+        self.assertFalse(
+            any("тариф ограничен" in reason for reason in choice.reasons), choice.reasons
+        )
+
+    def test_04_an_override_above_the_ceiling_is_honoured_and_flagged(self) -> None:
+        choice = choose_model(
+            MAIL_CENTRE,
+            "code",
+            catalogue=MIXED,
+            settings={
+                **OFFLINE_SETTINGS,
+                "allow_paid_providers": True,
+                "max_cost_tier": CHEAP,
+            },
+            override={
+                "provider": "anthropic",
+                "model": "claude-3-7-sonnet-20250219",
+            },
+        )
+        # Honoured: he may choose consciously.
+        self.assertFalse(choice.automatic)
+        self.assertEqual(
+            (choice.provider, choice.model),
+            ("anthropic", "claude-3-7-sonnet-20250219"),
+        )
+        self.assertEqual(choice.tier, PAID)
+        # Flagged, first, with its own price -- never a silent overspend.
+        self.assertIn("это дороже вашего потолка", choice.reasons[0])
+        self.assertIn("CHEAP", choice.reasons[0])
+        self.assertEqual(choice.estimated_cost, 3.0)
+        self.assertFalse(choice.ceiling_limited)
+
+    def test_05_an_absent_ceiling_uses_the_documented_default(self) -> None:
+        self.assertEqual(DEFAULT_MAX_COST_TIER, CHEAP)
+        choice = choose_model(
+            MAIL_CENTRE,
+            "code",
+            catalogue=MIXED,
+            settings={**OFFLINE_SETTINGS, "allow_paid_providers": True},
+        )
+        self.assertEqual(choice.max_cost_tier, DEFAULT_MAX_COST_TIER)
+        self.assertEqual(choice.tier, CHEAP)
+        self.assertTrue(choice.ceiling_limited)
+
+    def test_06_an_unknown_ceiling_is_the_default_not_the_permissive_reading(self) -> None:
+        for value in (None, "", "PLATINUM", 42, {"tier": CHEAP}):
+            self.assertEqual(normalise_cost_tier(value), DEFAULT_MAX_COST_TIER, value)
+        choice = choose_model(
+            MAIL_CENTRE,
+            "code",
+            catalogue=MIXED,
+            settings={
+                **OFFLINE_SETTINGS,
+                "allow_paid_providers": True,
+                "max_cost_tier": "platinum",
+            },
+        )
+        self.assertEqual(choice.max_cost_tier, DEFAULT_MAX_COST_TIER)
+        self.assertEqual(choice.tier, CHEAP)
+        self.assertTrue(choice.ceiling_limited)
+
+    def test_07_the_ceiling_never_narrows_a_choice_below_it(self) -> None:
+        # A ceiling is a cap, not a promotion: SIMPLE stays FREE, MEDIUM stays CHEAP, and
+        # neither is reported as capped.
+        simple = choose_model(
+            "скажи в одном слове: работает?",
+            "analysis",
+            catalogue=MIXED,
+            settings={**OFFLINE_SETTINGS, "max_cost_tier": PAID},
+        )
+        self.assertEqual(simple.tier, FREE)
+        self.assertFalse(simple.ceiling_limited)
+        medium = choose_model(
+            "сделай рефакторинг модуля импорта и добавь тесты",
+            "code",
+            catalogue=MIXED,
+            settings={**OFFLINE_SETTINGS, "max_cost_tier": CHEAP},
+        )
+        self.assertEqual(medium.tier, CHEAP)
+        self.assertFalse(medium.ceiling_limited)
+        self.assertTrue(
+            any("средняя сложность → дешёвая модель" in reason for reason in medium.reasons),
+            medium.reasons,
+        )
+
+    def test_08_an_override_at_or_below_the_ceiling_is_not_flagged(self) -> None:
+        choice = choose_model(
+            "простая задача",
+            "analysis",
+            catalogue=MIXED,
+            settings={**OFFLINE_SETTINGS, "max_cost_tier": CHEAP},
+            override={"provider": "deepseek", "model": "deepseek-chat"},
+        )
+        self.assertEqual(choice.tier, CHEAP)
+        self.assertFalse(
+            any("дороже вашего потолка" in reason for reason in choice.reasons),
+            choice.reasons,
+        )
+        self.assertEqual(choice.estimated_cost, 0.14)
+
+
+class CostCeilingSettingTests(unittest.TestCase):
+    """The setting itself: the app's own file, default CHEAP, preserved keys, the route."""
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.path = pathlib.Path(self._temporary.name) / "settings.json"
+
+    def test_01_a_fresh_store_answers_the_default(self) -> None:
+        self.assertFalse(self.path.exists())
+        store = AppSettingsStore(self.path)
+        self.assertEqual(store.max_cost_tier(), DEFAULT_MAX_COST_TIER)
+        # Reading the default must not write the file: a fresh install is not silently
+        # given a value the owner never chose.
+        self.assertFalse(self.path.exists())
+
+    def test_02_the_choice_round_trips_and_survives_another_writer(self) -> None:
+        store = AppSettingsStore(self.path)
+        self.assertEqual(store.set_max_cost_tier("cheap"), CHEAP)
+        self.assertEqual(AppSettingsStore(self.path).max_cost_tier(), CHEAP)
+        # The stored word is the lowercase one the owner reads in the file.
+        self.assertIn('"max_cost_tier": "cheap"', self.path.read_text(encoding="utf-8"))
+        # A different writer of the same file (the projects folder) must not drop it.
+        root = pathlib.Path(self._temporary.name) / "projects"
+        store.set_project_root(str(root))
+        self.assertEqual(AppSettingsStore(self.path).max_cost_tier(), CHEAP)
+        # Mixed case is accepted; the answer is always the router's uppercase word.
+        self.assertEqual(store.set_max_cost_tier("Paid"), PAID)
+        self.assertEqual(AppSettingsStore(self.path).max_cost_tier(), PAID)
+        self.assertEqual(store.set_max_cost_tier("FREE"), FREE)
+
+    def test_03_an_unknown_value_is_refused_and_the_stored_one_survives(self) -> None:
+        from app.config.app_settings import AppSettingsError
+
+        store = AppSettingsStore(self.path)
+        store.set_max_cost_tier("cheap")
+        with self.assertRaises(AppSettingsError):
+            store.set_max_cost_tier("platinum")
+        self.assertEqual(AppSettingsStore(self.path).max_cost_tier(), CHEAP)
+
+    def test_04_a_corrupt_stored_value_is_the_default(self) -> None:
+        self.path.write_text('{"max_cost_tier": "PLATINUM"}', encoding="utf-8")
+        self.assertEqual(
+            AppSettingsStore(self.path).max_cost_tier(), DEFAULT_MAX_COST_TIER
+        )
+        self.path.write_text("not json at all", encoding="utf-8")
+        self.assertEqual(
+            AppSettingsStore(self.path).max_cost_tier(), DEFAULT_MAX_COST_TIER
+        )
+
+    def test_05_the_route_publishes_and_accepts_the_ceiling(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.api.settings_routes import register_settings_routes
+        from app.config.app_settings import AppSettingsError
+
+        class _Store:
+            """The surface the route uses, without probing a real projects folder."""
+
+            def __init__(self) -> None:
+                self.tier = DEFAULT_MAX_COST_TIER.lower()
+
+            def describe(self):
+                return {
+                    "max_cost_tier": self.tier,
+                    "max_cost_tier_default": DEFAULT_MAX_COST_TIER.lower(),
+                    "max_cost_tier_options": [tier.lower() for tier in TIERS],
+                }
+
+            def set_max_cost_tier(self, value):
+                text = str(value).strip().lower()
+                if text not in {tier.lower() for tier in TIERS}:
+                    raise AppSettingsError("bad tier", field="max_cost_tier")
+                self.tier = text
+                return text.upper()
+
+        app = FastAPI()
+        register_settings_routes(app, _Store())
+        client = TestClient(app)
+
+        first = client.get("/api/settings").json()
+        self.assertEqual(first["max_cost_tier"], DEFAULT_MAX_COST_TIER.lower())
+        written = client.post("/api/settings", json={"max_cost_tier": "free"})
+        self.assertEqual(written.status_code, 200, written.text)
+        self.assertEqual(written.json()["max_cost_tier"], "free")
+        self.assertEqual(client.get("/api/settings").json()["max_cost_tier"], "free")
+        self.assertEqual(
+            client.post("/api/settings", json={"max_cost_tier": "platinum"}).status_code,
+            400,
+        )
+        self.assertEqual(
+            client.post(
+                "/api/settings",
+                json={"max_cost_tier": "paid", "project_root": str(self.path)},
+            ).status_code,
+            400,
+        )
+        self.assertEqual(client.get("/api/settings").json()["max_cost_tier"], "free")
 
 
 class CatalogueShapeTests(unittest.TestCase):

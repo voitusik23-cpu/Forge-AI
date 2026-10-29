@@ -8466,8 +8466,10 @@ new `model_choice` key.
 can be mis-tiered; the reasons name the signals so a wrong call is visible rather than
 silent. The paid tier is only reachable when the deployment already permits paid providers —
 there is no per-run paid confirmation for an automatic choice (that permission is the
-confirmation), while a manual pair keeps its own checkbox. The reason lines are Russian, the
-owner's language, and are shown verbatim in both interface languages.
+confirmation), while a manual pair keeps its own checkbox. Since 2026-10-29 it is also
+capped by the owner's `max_cost_tier` ceiling (see «The automatic model tier is capped, and
+a fresh install is CHEAP»). The reason lines are Russian, the owner's language, and are
+shown verbatim in both interface languages.
 
 ## 2026-10-27 — Модель выбирается по сложности задачи, по умолчанию и на виду
 
@@ -8532,8 +8534,10 @@ estimated_cost).
 сформулированная задача может попасть в другой уровень; причины называют признаки, поэтому
 ошибка видна, а не молчит. Платный тариф достижим только когда развёртывание уже разрешает
 платные модели — отдельного подтверждения на каждый автоматический платный запуск нет (это
-разрешение и есть подтверждение), а ручная пара сохраняет свою галочку. Строки причин —
-русские, на языке владельца, и показываются дословно в обоих языках интерфейса.
+разрешение и есть подтверждение), а ручная пара сохраняет свою галочку. С 2026-10-29 его
+дополнительно ограничивает потолок владельца `max_cost_tier` (см. «Потолок автоматического
+тарифа, и новая установка — CHEAP»). Строки причин — русские, на языке владельца, и
+показываются дословно в обоих языках интерфейса.
 
 ## 2026-10-25 — A project is launched as its program, not as its page
 
@@ -9035,3 +9039,118 @@ launchable → запуск не требуется и пробник не вы�
 дополнительного запуска: те же порт и бюджет, что и раньше, а список файлов ограничен
 (`MAX_PAGE_ASSETS`), поэтому страница с десятками ссылок проверяется по первым из них, и
 именно проверенные перечисляются в доказательствах.
+
+## 2026-10-29 — The automatic model tier is capped, and a fresh install is CHEAP
+
+**Decision.** `app/agent_runtime/routing.py::choose_model` gains a ceiling read from the
+owner's own settings file (`.forge/settings.json`, key `max_cost_tier` through
+`AppSettingsStore`; never `.env`): `FREE`, `CHEAP` or `PAID`. Values above the ceiling are
+never auto-selected: a `COMPLEX` task under `CHEAP` takes the best cheap-or-free row, and
+the reasons say «сложная задача, но тариф ограничен CHEAP → выбрана дешёвая модель», name
+the chosen pair and its published price per 1M input tokens. `ModelChoice.estimated_cost`
+is now the chosen row's published rate per 1M input tokens (`0.0` for a free row, `null`
+when no rate is published) — a unit price from the catalogue, still not a forecast — and
+two additive fields publish the ceiling in force (`max_cost_tier`) and whether it moved the
+choice (`ceiling_limited`). An explicit provider+model is still honoured above the ceiling
+(the deployment's paid gate still applies) and the reasons carry «это дороже вашего
+потолка». «Настройки → Как выбирается модель» draws the segmented control «Бесплатно /
+Дёшево / Без ограничений», the line «Сейчас: не дороже CHEAP», the effect sentence, and
+the **live** sample decision (`GET /api/settings` → `routing_preview`: provider · model ·
+price per 1M) computed by the same router with no dispatch; the launch step warns when a
+manually named pair costs more than the ceiling. The default is `CHEAP` — the safer product
+default. An absent or unknown value is `CHEAP`, never `PAID`: a ceiling that cannot be read
+must not widen.
+
+**Why.** The owner's balance was burned by `COMPLEX` tasks routed to paid models (measured
+on this deployment: `radox/claude-fable-5.1` at $16.61 per 1M) while
+`allow_paid_providers` was true. He asked: «поставь недорогой тариф CHEAP». That flag says
+"paid calls are allowed", not "any price is fine"; the ceiling is the missing second cap,
+and it is his own setting rather than a deployment flag. `CHEAP` as the fresh-install
+default is the safe direction: enabling paid providers later still cannot auto-escalate to
+an expensive tier until the owner raises the ceiling deliberately.
+
+**Rejected alternatives.** Keeping `PAID` as the default (it preserves the exact path that
+billed him, and a fresh install would repeat it the moment paid providers were enabled);
+hard-coding `CHEAP` in the router (he may consciously raise it; a code change is not a
+setting); refusing an explicit pair above the ceiling (he may choose consciously — the
+requirement is to warn, not to forbid; the paid gate still decides permission); routing by
+the dollar rate instead of the tier (the requirement is a tier ceiling, and the catalogue's
+tier label is what the product speaks; a tier cap is not a budget).
+
+**Evidence.** `tests/test_model_routing.py` — `CostCeilingTests` (CHEAP + `COMPLEX` → tier
+`CHEAP`, the sentence present first, estimate ≤ the priciest cheap row, `ceiling_limited`;
+FREE → FREE at $0; PAID → unchanged; an override above the ceiling honoured and flagged;
+absent/unknown → the default; the ceiling never promotes) and `CostCeilingSettingTests`
+(fresh store answers the default without writing, round-trip survives another writer,
+unknown values refused, corrupt file is the default, the route publishes and accepts the
+key). `tests/test_paid_model_policy.py`, `tests/test_api.py`,
+`tests/test_flow_invariants.py` stay green. Live on the owner's app: `GET /api/settings`
+answers `max_cost_tier: "cheap"`, and `POST /api/tasks/run` with `estimate: true` on the
+mail-centre task answers `deepseek · deepseek-chat`, tier `CHEAP`, `$0.14` per 1M with the
+ceiling reason — instead of the previous paid pair at $16.61.
+
+**Limits.** The ceiling caps the catalogue's **tier**, not the bill: a `CHEAP` row may
+publish no price, and a `PAID` row can be cheaper per 1M than a `CHEAP` one
+(`radox/deepseek-v4-flash-0731` publishes $0.12 but is tiered `PAID`), so it is excluded
+under `CHEAP` even though its rate is lower. That is deliberate — the tier is the product's
+own category — but it means the ceiling is not a per-token price guarantee. The sample
+decision is one fixed complex task, not a forecast for a particular request.
+
+## 2026-10-29 — Потолок автоматического тарифа, и новая установка — CHEAP
+
+**Решение.** `app/agent_runtime/routing.py::choose_model` получает потолок из собственного
+файла настроек владельца (`.forge/settings.json`, ключ `max_cost_tier` через
+`AppSettingsStore`; не `.env`): `FREE`, `CHEAP` или `PAID`. Значения выше потолка никогда
+не выбираются автоматически: задача `COMPLEX` при потолке `CHEAP` берёт лучшую дешёвую или
+бесплатную строку, а причины говорят «сложная задача, но тариф ограничен CHEAP → выбрана
+дешёвая модель», называют выбранную пару и её опубликованную цену за 1M входных токенов.
+`ModelChoice.estimated_cost` теперь — опубликованная ставка выбранной строки за 1M входных
+токенов (`0.0` для бесплатной, `null` когда цена не опубликована): это цена из каталога, а
+не прогноз запуска. Два аддитивных поля публикуют действующий потолок (`max_cost_tier`) и
+то, изменил ли он выбор (`ceiling_limited`). Явно названные провайдер и модель по-прежнему
+выполняются и выше потолка (платный шлюз развёртывания при этом действует), а причины несут
+«это дороже вашего потолка». «Настройки → Как выбирается модель» рисуют сегментированный
+переключатель «Бесплатно / Дёшево / Без ограничений», строку «Сейчас: не дороже CHEAP»,
+предложение о последствии и **живое** решение для образца сложной задачи
+(`GET /api/settings` → `routing_preview`: провайдер · модель · цена за 1M), которое считает
+тот же маршрутизатор и ничего не отправляет; шаг запуска предупреждает, когда вручную
+выбранная пара дороже потолка. По умолчанию — `CHEAP`, более безопасное продуктовое
+умолчание. Отсутствующее или неизвестное значение — `CHEAP`, никогда `PAID`: потолок,
+который не удалось прочитать, не должен расширяться.
+
+**Почему.** Баланс владельца сгорал на задачах `COMPLEX`, уходивших на платные модели
+(измерено на этом развёртывании: `radox/claude-fable-5.1` по $16.61 за 1M), пока
+`allow_paid_providers` был включён. Он сказал: «поставь недорогой тариф CHEAP». Этот флаг
+означает «платные вызовы разрешены», а не «любая цена допустима»; потолок — недостающий
+второй ограничитель, и это его собственная настройка, а не флаг развёртывания. `CHEAP` как
+умолчание новой установки — безопасное направление: даже если позже включить платных
+провайдеров, автоматического подъёма на дорогой тариф не будет, пока владелец сознательно не
+поднимет потолок.
+
+**Отклонённые варианты.** Оставить `PAID` умолчанием (это сохраняет ровно тот путь, который
+его и списал, и новая установка повторила бы его при первом же включении платных
+провайдеров); жёстко зашить `CHEAP` в маршрутизатор (он вправе сознательно поднять потолок;
+изменение кода — не настройка); отказывать явной паре выше потолка (он может выбрать
+сознательно — требование предупредить, а не запретить; разрешение по-прежнему решает
+платный шлюз); маршрутизировать по цене в долларах вместо тарифа (требование — потолок
+тарифа, и продукт говорит категориями каталога; потолок тарифа — не бюджет).
+
+**Доказательство.** `tests/test_model_routing.py` — `CostCeilingTests` (CHEAP + `COMPLEX` →
+тариф `CHEAP`, предложение присутствует первым, оценка не выше самой дорогой дешёвой строки,
+`ceiling_limited`; FREE → FREE за $0; PAID → без изменений; явный выбор выше потолка
+сохранён и помечен; отсутствующее/неизвестное → умолчание; потолок никогда не повышает) и
+`CostCeilingSettingTests` (свежее хранилище отвечает умолчанием, ничего не записывая;
+значение переживает запись другим модулем; неизвестные значения отклоняются; испорченный
+файл — умолчание; маршрут публикует и принимает ключ). `tests/test_paid_model_policy.py`,
+`tests/test_api.py`, `tests/test_flow_invariants.py` остаются зелёными. Живая проверка на
+приложении владельца: `GET /api/settings` отвечает `max_cost_tier: "cheap"`, а
+`POST /api/tasks/run` с `estimate: true` на задаче про центр почты отвечает
+`deepseek · deepseek-chat`, тариф `CHEAP`, `$0.14` за 1M с причиной про потолок — вместо
+прежней платной пары за $16.61.
+
+**Ограничения.** Потолок ограничивает **тариф** каталога, а не счёт: дешёвая строка может не
+публиковать цену, а платная может быть дешевле за 1M, чем дешёвая
+(`radox/deepseek-v4-flash-0731` публикует $0.12, но помечен `PAID`), поэтому при `CHEAP`
+она исключена, хотя её ставка ниже. Это сделано намеренно — тариф есть категория продукта,
+— но значит, что потолок не является гарантией цены за токен. Образец решения — одна
+фиксированная сложная задача, а не прогноз для конкретного запроса.

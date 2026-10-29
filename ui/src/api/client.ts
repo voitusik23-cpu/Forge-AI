@@ -26,13 +26,16 @@ export type Status = {
     default_provider?: unknown;
     /**
      * The automatic routing facts `GET /api/status` publishes beside the provider list:
-     * the configured default model, whether paid models are permitted at all, and the
-     * tier policy itself (`{SIMPLE: "FREE", MEDIUM: "CHEAP", COMPLEX: "PAID"}`), read by
-     * the «Как выбирается модель» panel so it documents the rule the code really applies.
+     * the configured default model, whether paid models are permitted at all, the tier
+     * policy itself (`{SIMPLE: "FREE", MEDIUM: "CHEAP", COMPLEX: "PAID"}`) and the
+     * owner's ceiling on the automatic choice (`max_cost_tier`). The «Как выбирается
+     * модель» panel reads them so it documents the rule the code really applies, and the
+     * launch step uses the ceiling to warn about a manually named pair that costs more.
      */
     default_model?: unknown;
     allow_paid_providers?: unknown;
     routing_policy?: unknown;
+    max_cost_tier?: unknown;
     version?: string;
     commit?: string;
     commit_short?: string;

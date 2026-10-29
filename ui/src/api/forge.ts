@@ -144,9 +144,11 @@ export type TaskRunResponse = {
  * One automatic routing decision (`app/agent_runtime/routing.py::ModelChoice`).
  *
  * The six facts are the ones the backend guarantees; `automatic` says whether the router
- * chose the pair or the caller named it. `estimated_cost` is `0` for a free row and
- * `null` otherwise, because a run's cost is unknown before it runs — a unit price is not a
- * forecast and this type never invents one.
+ * chose the pair or the caller named it. `estimated_cost` is the chosen row's published
+ * rate per 1M **input** tokens (`0` for a free row, `null` when no rate is published): it
+ * is a unit price, not a forecast. `max_cost_tier` is the ceiling that was in force and
+ * `ceiling_limited` says whether it moved the choice down — so a capped decision can never
+ * look like a naturally cheap one.
  */
 export type ModelChoice = {
   provider?: string;
@@ -156,6 +158,8 @@ export type ModelChoice = {
   reasons?: string[];
   estimated_cost?: number | null;
   automatic?: boolean;
+  max_cost_tier?: string;
+  ceiling_limited?: boolean;
 };
 
 
@@ -1812,9 +1816,41 @@ export type ForgeSettings = {
    * tokens, and the deterministic domain questions are asked either way.
    */
   questions_from_model?: boolean;
+  /**
+   * «Потолок тарифа»: the highest model tier automatic routing may choose — `free`,
+   * `cheap` or `paid` (the lowercase word the settings file stores). Default `cheap`;
+   * values above the ceiling are never auto-selected, and an explicit provider+model is
+   * still honoured but flagged as more expensive than the ceiling.
+   */
+  max_cost_tier?: string;
+  max_cost_tier_default?: string;
+  max_cost_tier_options?: string[];
+  /**
+   * What the router would choose **right now** for one sample COMPLEX task, with the
+   * chosen model's published price per 1M input tokens. It dispatches nothing; it exists
+   * so the ceiling is tangible instead of an abstract word.
+   */
+  routing_preview?: RoutingPreview;
   settings_path?: string;
   schema?: string;
   created?: boolean;
+};
+
+/**
+ * The sample decision «Настройки» shows under the cost ceiling
+ * (`ForgeApiService.preview_max_cost_tier`): the pair, its tier, the price per 1M input
+ * tokens, and whether the ceiling is what bounded it.
+ */
+export type RoutingPreview = {
+  sample_task?: string;
+  provider?: string;
+  model?: string;
+  tier?: string;
+  complexity?: string;
+  unit_price_per_1m?: number | null;
+  max_cost_tier?: string;
+  ceiling_limited?: boolean;
+  reasons?: string[];
 };
 
 /** One browser this machine remembers as unable to start its own sandbox. */
@@ -1836,8 +1872,8 @@ export const loadSettings = (): Promise<Result<ForgeSettings>> =>
 
 /**
  * `POST /api/settings` — set the project root, restore the desktop default, decide
- * whether a project window may be retried without the browser's sandbox, or forget what
- * this machine remembers about its browsers.
+ * whether a project window may be retried without the browser's sandbox, forget what
+ * this machine remembers about its browsers, or cap the automatic model tier.
  *
  * The value is stored in the application's own settings file (`.forge/settings.json`),
  * not in `.env`, and the folder is created here so a typo fails where it was typed.
@@ -1849,6 +1885,7 @@ export const saveProjectRoot = (
     | { window_downgrade_allowed: boolean }
     | { forget_window_plan_memory: true }
     | { questions_from_model: boolean }
+    | { max_cost_tier: "free" | "cheap" | "paid" }
 ): Promise<Result<ForgeSettings>> => postJson<ForgeSettings>("/api/settings", body);
 
 // --------------------------------------------------------------- providers and keys

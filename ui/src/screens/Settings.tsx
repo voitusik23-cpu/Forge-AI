@@ -911,17 +911,35 @@ const ProviderKeysCard = ({ lang }: { lang: Lang }) => {
 };
 
 /**
- * «Как выбирается модель» — the automatic routing rule, and the setting in force now.
+ * «Как выбирается модель» — the automatic routing rule, the setting in force now, and
+ * the owner's cost ceiling.
  *
- * The three lines are the policy `app/agent_runtime/routing.py` applies, and they are read
- * from the Core's own `status.details.routing_policy` rather than repeated here, so the
- * panel cannot describe a rule the code does not use. The «сейчас действует» block names
- * the configured default provider/model and whether paid models are permitted at all —
- * the one flag that decides whether `COMPLEX` work may ever reach a paid model.
+ * The three policy lines are read from the Core's own `status.details.routing_policy`
+ * rather than repeated here, so the panel cannot describe a rule the code does not use.
+ * The «сейчас действует» block names the configured default provider/model and whether
+ * paid models are permitted at all.
+ *
+ * «Потолок тарифа» is the owner's ceiling on that automatic choice (`.forge/settings.json`
+ * → `max_cost_tier`, never `.env`): `FREE` / `CHEAP` / `PAID`. It is drawn from
+ * `GET /api/settings` together with one **live** sample decision — the model the router
+ * would pick right now for a complex task and that model's published price per 1M input
+ * tokens — because a ceiling is only tangible next to a number. Changing it takes effect
+ * on the next task without a restart; an explicitly named model is still honoured and the
+ * launch step warns that it costs more than the ceiling.
  *
  * When the Core answered no policy (an old build, or a disconnected backend) the panel says
  * so instead of inventing the three rows.
  */
+const CEILINGS = ["free", "cheap", "paid"] as const;
+type Ceiling = (typeof CEILINGS)[number];
+
+/** The price as the owner reads it: `$0`, `$0.14`, `$16.61`; empty when unpublished. */
+const usd = (value: number | null | undefined): string => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  if (value <= 0) return "$0";
+  return `$${value}`;
+};
+
 const RoutingPolicyCard = ({ lang, status }: { lang: Lang; status: Status | null }) => {
   const details = (status?.details ?? {}) as Record<string, unknown>;
   const policy =
@@ -932,18 +950,93 @@ const RoutingPolicyCard = ({ lang, status }: { lang: Lang; status: Status | null
   const defaultModel = String(details.default_model ?? "").trim();
   const paid = details.allow_paid_providers;
 
+  const [ceiling, setCeiling] = useState<string>("");
+  const [preview, setPreview] = useState<NonNullable<ForgeSettings["routing_preview"]> | null>(
+    null
+  );
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [failure, setFailure] = useState<Failure | null>(null);
+
+  const load = useCallback(async () => {
+    const outcome = await loadSettings();
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    setFailure(null);
+    setCeiling(String(outcome.value.max_cost_tier ?? "").toLowerCase());
+    setPreview(outcome.value.routing_preview ?? null);
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const save = async (value: Ceiling) => {
+    setBusy(true);
+    setNotice("");
+    setFailure(null);
+    const outcome = await saveProjectRoot({ max_cost_tier: value });
+    setBusy(false);
+    if (!outcome.ok) {
+      setFailure(outcome.failure);
+      return;
+    }
+    // The response carries the value the store really holds and the decision it now
+    // produces, so the panel never renders a choice the backend refused.
+    setCeiling(String(outcome.value.max_cost_tier ?? "").toLowerCase());
+    setPreview(outcome.value.routing_preview ?? null);
+    setNotice(
+      t(lang, "settings.routing.ceiling.saved").replace(
+        "{tier}",
+        String(outcome.value.max_cost_tier ?? "").toUpperCase()
+      )
+    );
+  };
+
   const rows: Array<[string, string, string]> = [
     ["SIMPLE", t(lang, "settings.routing.simple"), "route.tier.free"],
     ["MEDIUM", t(lang, "settings.routing.medium"), "route.tier.cheap"],
     ["COMPLEX", t(lang, "settings.routing.complex"), "route.tier.paid"],
   ];
 
+  const current = ceiling === "" ? "" : ceiling.toUpperCase();
+  const price = usd(preview?.unit_price_per_1m);
+  const pair = preview
+    ? [preview.provider ?? "", preview.model === "" ? "—" : (preview.model ?? "—")]
+        .filter((part) => part !== "")
+        .join(" · ")
+    : "";
+  const effectKey = `settings.routing.ceiling.effect.${ceiling || "cheap"}${
+    price === "" && ceiling !== "free" ? ".noprice" : ""
+  }`;
+  const effect = t(lang, effectKey).replace("{price}", price);
+  const previewLine = preview
+    ? t(
+        lang,
+        preview.tier === "FREE"
+          ? "settings.routing.ceiling.preview.free"
+          : price === ""
+            ? "settings.routing.ceiling.preview.unknown"
+            : "settings.routing.ceiling.preview"
+      )
+        .replace("{pair}", pair === "" ? "—" : pair)
+        .replace("{price}", price)
+    : "";
+
   return (
     <Card className="rise d1">
       <CardHead
         title={t(lang, "settings.routing.title")}
         hint={t(lang, "settings.routing.hint")}
-        action={<Badge tone={paid === true ? "warn" : "ok"}>allow_paid_providers</Badge>}
+        action={
+          <Badge
+            tone={current === "PAID" ? "warn" : current === "" ? "neutral" : "ok"}
+          >
+            {current === "" ? "allow_paid_providers" : `≤ ${current}`}
+          </Badge>
+        }
       />
       <div className="stack" style={{ gap: 10 }}>
         {policy === null ? (
@@ -978,10 +1071,75 @@ const RoutingPolicyCard = ({ lang, status }: { lang: Lang; status: Status | null
             </Badge>
           </div>
         </div>
+
+        {/* «Потолок тарифа»: the one control of this card. Its three words are the owner's,
+            the numbers under it are the router's own live decision. */}
+        <div className="field" style={{ marginTop: 4 }}>
+          <span className="label">
+            {`${t(lang, "settings.routing.ceiling.title")}: ${t(lang, "settings.routing.ceiling.free")} / ${t(lang, "settings.routing.ceiling.cheap")} / ${t(lang, "settings.routing.ceiling.paid")}`}
+          </span>
+          <div className="segment" data-testid="settings-cost-ceiling">
+            {CEILINGS.map((value) => (
+              <button
+                key={value}
+                type="button"
+                className={ceiling === value ? "on" : ""}
+                disabled={busy || ceiling === ""}
+                onClick={() => void save(value)}
+                data-testid={`settings-cost-ceiling-${value}`}
+              >
+                {t(lang, `settings.routing.ceiling.${value}`)}
+              </button>
+            ))}
+          </div>
+          <div className="small" data-testid="settings-cost-ceiling-current">
+            {ceiling === "paid"
+              ? lang === "ru"
+                ? "Сейчас: без ограничений"
+                : "Now: no limit"
+              : t(lang, "settings.routing.ceiling.current").replace(
+                  "{tier}",
+                  current === "" ? t(lang, "runs.unknown") : current
+                )}
+          </div>
+          <div className="small muted" data-testid="settings-cost-ceiling-effect">
+            {effect}
+          </div>
+        </div>
+
+        {preview ? (
+          <div data-testid="settings-cost-ceiling-preview">
+            <div className="small">{previewLine}</div>
+            <div className="small muted" style={{ marginTop: 2 }}>
+              {t(lang, "settings.routing.ceiling.sample").replace(
+                "{task}",
+                String(preview.sample_task ?? "")
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        {notice !== "" ? (
+          <div className="notice" data-testid="settings-cost-ceiling-notice">
+            {notice}
+          </div>
+        ) : null}
+        {failure !== null ? (
+          <div className="notice warn" data-testid="settings-cost-ceiling-failure">
+            <div>{`HTTP ${failure.status}${failure.code ? ` · ${failure.code}` : ""}`}</div>
+            {failure.detail ? (
+              <div className="small mono" style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+                {failure.detail}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="small muted">{t(lang, "settings.routing.ceiling.note")}</div>
         <div className="small muted">
           {lang === "ru"
-            ? "Простая задача уходит на бесплатную модель, средняя — на дешёвую, сложная — на платную и только при разрешённых платных моделях. Выбирать модель вручную не нужно; это остаётся возможным в шаге запуска."
-            : "A simple task goes to a free model, a medium one to a cheap model, and a complex one to a paid model — only when paid models are permitted. There is nothing to pick by hand; naming a pair remains possible in the launch step."}
+            ? "Простая задача уходит на бесплатную модель, средняя — на дешёвую, сложная — на платную и только при разрешённых платных моделях и потолке без ограничений. Выбирать модель вручную не нужно; это остаётся возможным в шаге запуска."
+            : "A simple task goes to a free model, a medium one to a cheap model, and a complex one to a paid model — only when paid models are permitted and the ceiling is unlimited. There is nothing to pick by hand; naming a pair remains possible in the launch step."}
         </div>
       </div>
     </Card>

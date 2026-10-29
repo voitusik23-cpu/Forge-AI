@@ -571,6 +571,15 @@ def create_api_app(
     # a browser whose own sandbox cannot start may be retried without it. The same store
     # backs «Настройки», so the switch and the launch can never disagree.
     owner_settings = settings_store if settings_store is not None else AppSettingsStore()
+    # The ceiling on the automatic model choice lives in that same file, and the router
+    # reads it on every decision. Binding the store here -- once, at composition -- is what
+    # makes «Настройки» and the decision agree: a change in the panel takes effect on the
+    # next task without a restart, and no request can supply a ceiling of its own. A
+    # service double without the binder (a contract test) simply keeps the router's own
+    # documented default rather than being replaced by an invented store.
+    bind_owner_settings = getattr(api_service, "use_owner_settings", None)
+    if callable(bind_owner_settings):
+        bind_owner_settings(owner_settings)
     # What this machine has measured about its browsers: a browser whose own sandbox cannot
     # start here is remembered in the same settings file (``window_plan_memory``), so the
     # next launch goes straight to its no-sandbox plan and never shows the blank white
@@ -621,7 +630,14 @@ def create_api_app(
     # consumed by the launcher (``app/api/main.py``), which builds the project store with
     # it, and by the launch route's window policy, composed above -- so «Настройки» and
     # where a project lands, and how its window opens, cannot disagree.
-    register_settings_routes(app, owner_settings)
+    register_settings_routes(
+        app,
+        owner_settings,
+        # The panel's sample COMPLEX decision: the ceiling, the model it produces and the
+        # model's published price per 1M tokens. A read-only callable -- it dispatches
+        # nothing -- supplied by the same service the runs use, never computed twice.
+        routing_preview=getattr(api_service, "preview_max_cost_tier", None),
+    )
 
     # «Провайдеры и ключи»: the place the owner could not find. The non-secret half of an
     # entry is written to the *same* settings file as the projects folder; the API key goes

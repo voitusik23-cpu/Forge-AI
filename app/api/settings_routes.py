@@ -1,5 +1,6 @@
-"""The owner's settings: read them, change where new projects are delivered, and decide
-whether a project window may fall back to a browser without its sandbox.
+"""The owner's settings: read them, change where new projects are delivered, decide
+whether a project window may fall back to a browser without its sandbox, and cap the
+automatic model tier.
 
 These routes and nothing else:
 
@@ -7,12 +8,15 @@ These routes and nothing else:
 GET  /api/settings   -> the project root, its default, whether it exists,
                         whether the window retry without a sandbox is allowed,
                         which browsers this machine remembers as unable to start
-                        their sandbox, and whether the discovery questions may be
-                        helped by a model
+                        their sandbox, whether the discovery questions may be
+                        helped by a model, the ceiling on the automatic model
+                        tier, and the decision that ceiling produces right now
+                        for one sample COMPLEX task (model + price per 1M)
 POST /api/settings   -> {"project_root": "..."} | {"use_desktop": true}
                         | {"window_downgrade_allowed": false}
                         | {"forget_window_plan_memory": true}
                         | {"questions_from_model": true}
+                        | {"max_cost_tier": "free" | "cheap" | "paid"}
 ```
 
 Why this is not ``.env``: the value is the folder the owner's own projects live in, he
@@ -32,19 +36,29 @@ refusal never changes the stored value.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from app.config.app_settings import AppSettingsError
 
 __all__ = ["register_settings_routes"]
 
 
-def register_settings_routes(app: Any, settings: Any) -> None:
+def register_settings_routes(
+    app: Any,
+    settings: Any,
+    *,
+    routing_preview: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> None:
     """Attach the settings routes to ``app`` for one settings store.
 
     ``settings`` is the composition's own :class:`app.config.app_settings.AppSettingsStore`.
     It is created once, at composition, so the screen and the project store read the same
     file. The store publishes on ``app.state`` so a test can assert what was composed.
+
+    ``routing_preview`` is the composition's read-only answer to *what would the router
+    choose right now for a sample complex task, and what does that model cost?* It
+    dispatches nothing; a composition that supplies none simply omits the preview, and the
+    panel then shows the ceiling without a price rather than inventing one.
     """
 
     from fastapi import Body
@@ -53,8 +67,20 @@ def register_settings_routes(app: Any, settings: Any) -> None:
 
     app.state.forge_settings = settings
 
+    def _preview() -> Optional[Dict[str, Any]]:
+        if not callable(routing_preview):
+            return None
+        try:
+            payload = routing_preview()
+        except Exception:  # noqa: BLE001 - a missing preview is not a broken settings screen
+            return None
+        return dict(payload) if isinstance(payload, dict) else None
+
     def _payload(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         body: Dict[str, Any] = dict(settings.describe())
+        preview = _preview()
+        if preview is not None:
+            body["routing_preview"] = preview
         body["ok"] = True
         if extra:
             body.update(extra)
@@ -69,18 +95,21 @@ def register_settings_routes(app: Any, settings: Any) -> None:
     @app.post("/api/settings")
     def write_settings(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
         """Set the project root, restore the desktop default, forbid a window retry, forget
-        the remembered browsers, or decide whether the discovery questions may be helped by
-        a model.
+        the remembered browsers, decide whether the discovery questions may be helped by a
+        model, or cap the automatic model tier.
 
         Exactly one of ``project_root`` (a full path), ``use_desktop`` (``true``),
         ``window_downgrade_allowed``, ``forget_window_plan_memory`` and
-        ``questions_from_model`` (booleans) is required. The third is the «Как открываются
+        ``questions_from_model`` (booleans), or ``max_cost_tier`` (``"free"`` |
+        ``"cheap"`` | ``"paid"``) is required. The third is the «Как открываются
         окна» switch: ``false`` forbids the one retry without a browser's sandbox. The
         fourth is «Забыть» beside it: it clears what this machine has measured about its
         browsers, so the next launch tries their sandbox again. The fifth is «Вопросы по
         смыслу задачи (через модель)»: ``true`` lets the optional model path write up to
-        three questions, it is off by default, and it spends the owner's tokens. Every
-        other value is refused rather than guessed.
+        three questions, it is off by default, and it spends the owner's tokens. The sixth
+        is «Потолок тарифа»: the highest model tier automatic routing may choose, stored in
+        this application's own settings file (never ``.env``). Every other value is refused
+        rather than guessed.
         """
 
         body = dict(payload or {})
@@ -99,9 +128,22 @@ def register_settings_routes(app: Any, settings: Any) -> None:
         from_model = body.get("questions_from_model")
         if from_model is not None and not isinstance(from_model, bool):
             raise body_error_exception("'questions_from_model' must be a boolean")
+        max_cost_tier = body.get("max_cost_tier")
+        if max_cost_tier is not None and not isinstance(max_cost_tier, str):
+            raise body_error_exception("'max_cost_tier' must be 'free', 'cheap' or 'paid'")
         if bool(use_desktop) and request_root is not None:
             raise body_error_exception(
                 "send either 'project_root' or 'use_desktop', not both"
+            )
+        if max_cost_tier is not None and (
+            bool(use_desktop)
+            or request_root is not None
+            or allow_downgrade is not None
+            or forget_memory is not None
+            or from_model is not None
+        ):
+            raise body_error_exception(
+                "send 'max_cost_tier' alone, not with a project root"
             )
         if allow_downgrade is not None and (bool(use_desktop) or request_root is not None):
             raise body_error_exception(
@@ -146,6 +188,23 @@ def register_settings_routes(app: Any, settings: Any) -> None:
                     },
                 ) from exc
             return _payload()
+        if max_cost_tier is not None:
+            # «Потолок тарифа»: one key of the same file. It changes nothing about where
+            # projects live, and the router reads it on the next decision -- no restart.
+            try:
+                settings.set_max_cost_tier(max_cost_tier)
+            except AppSettingsError as exc:
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        **error_body(error_code=exc.code, code=exc.code),
+                        "error": str(exc),
+                        "field": getattr(exc, "field", ""),
+                    },
+                ) from exc
+            return _payload()
         if allow_downgrade is not None:
             # The window switch is one key of the same file, and it changes nothing about
             # where projects live: no root is created or re-decided here.
@@ -166,7 +225,7 @@ def register_settings_routes(app: Any, settings: Any) -> None:
         if not bool(use_desktop) and request_root is None:
             raise body_error_exception(
                 "send 'project_root' (a full path), 'use_desktop': true, "
-                "'window_downgrade_allowed' or 'questions_from_model'"
+                "'window_downgrade_allowed', 'questions_from_model' or 'max_cost_tier'"
             )
         try:
             if bool(use_desktop):

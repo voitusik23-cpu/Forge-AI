@@ -53,6 +53,15 @@ Two values live in it:
     deterministic domain banks are the questions; the model is an optional extra that
     costs the owner's tokens, so it is **off** unless he turns it on and a ready
     non-mock provider is configured. Turning it off never disables clarification.
+
+``max_cost_tier``
+    the ceiling on the **automatic** model choice: ``free``, ``cheap`` or ``paid``. A
+    task classified ``COMPLEX`` cannot be auto-routed above it; values above the ceiling
+    are never auto-selected, and the router's reasons say when the ceiling changed the
+    choice and name the price. Default ``cheap`` -- the safer product default, because the
+    owner's balance was burned by a ``COMPLEX`` task routed to a $16.61/1M model. An
+    explicit provider+model named by the owner is still honoured (he may choose
+    consciously) and «Настройки» warns that it is more expensive than the ceiling.
 """
 
 from __future__ import annotations
@@ -62,8 +71,15 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from app.agent_runtime.routing import (
+    DEFAULT_MAX_COST_TIER,
+    MAX_COST_TIER_SETTING,
+    TIERS,
+)
+
 __all__ = [
     "DEFAULT_PROJECT_ROOT_NAME",
+    "MAX_COST_TIER_KEY",
     "PROJECT_ROOT_FALLBACK_KEY",
     "PROJECT_ROOT_KEY",
     "PROJECT_ROOTS_KNOWN_KEY",
@@ -111,6 +127,11 @@ WINDOW_DOWNGRADE_ALLOWED_KEY = "window_downgrade_allowed"
 #: deterministic domain banks are the questions, and the optional path spends the
 #: owner's tokens. An absent or non-boolean value therefore means «off», never «on».
 QUESTIONS_FROM_MODEL_KEY = "questions_from_model"
+
+#: The ceiling on the automatic model choice, in the same file and under the name the
+#: router reads (:data:`app.agent_runtime.routing.MAX_COST_TIER_SETTING`). One spelling,
+#: so the store and the decision cannot disagree about which key is the ceiling.
+MAX_COST_TIER_KEY = MAX_COST_TIER_SETTING
 
 #: Every key this store owns. Everything else in the file is preserved verbatim, so a
 #: setting written by another module (the provider entries above) is not erased the next
@@ -502,6 +523,41 @@ class AppSettingsStore:
         write_settings_document(self._path, document)
         return bool(value)
 
+    # ------------------------------------------------------- the cost ceiling
+    def max_cost_tier(self) -> str:
+        """The ceiling on the automatic model choice, as ``FREE``/``CHEAP``/``PAID``.
+
+        Read from the raw document (not :meth:`read`, which normalises the project-root
+        keys). A missing, non-string or unknown value answers the default ``CHEAP``: the
+        ceiling is a cost control, so an unrecognised value must not widen it.
+        """
+
+        from app.agent_runtime.routing import normalise_cost_tier
+
+        return normalise_cost_tier(read_settings_document(self._path).get(MAX_COST_TIER_KEY))
+
+    def set_max_cost_tier(self, value: object) -> str:
+        """Persist the ceiling and return it as the uppercase word the router speaks.
+
+        The stored form is the lowercase word (``"cheap"``) -- it is read by the owner in
+        the settings file -- and every other key in the same file survives unchanged.
+        A value outside ``free``/``cheap``/``paid`` is refused: an unknown ceiling must
+        not silently become the most permissive one.
+        """
+
+        text = str(value or "").strip().upper()
+        if text not in TIERS:
+            raise AppSettingsError(
+                "Потолок тарифа должен быть free, cheap или paid.",
+                field=MAX_COST_TIER_KEY,
+            )
+        document = read_settings_document(self._path)
+        document[MAX_COST_TIER_KEY] = text.lower()
+        document.setdefault("schema", SETTINGS_SCHEMA_VERSION)
+        document["updated_at"] = _now_iso()
+        write_settings_document(self._path, document)
+        return text
+
     def set_project_root(self, value: object) -> Path:
         """Store ``value`` as the project root and remember the previous ones.
 
@@ -602,6 +658,12 @@ class AppSettingsStore:
             "window_plan_memory": self.window_plan_memory(),
             # Off by default; the card explains that it uses the owner's tokens.
             "questions_from_model": self.questions_from_model(),
+            # The ceiling on the automatic model choice, as the lowercase word the settings
+            # file stores, plus its documented default and the words that are accepted.
+            # «Настройки» reads these to draw the control without guessing the vocabulary.
+            "max_cost_tier": self.max_cost_tier().lower(),
+            "max_cost_tier_default": DEFAULT_MAX_COST_TIER.lower(),
+            "max_cost_tier_options": [tier.lower() for tier in TIERS],
             "settings_path": str(self._path),
             "schema": SETTINGS_SCHEMA_VERSION,
         }

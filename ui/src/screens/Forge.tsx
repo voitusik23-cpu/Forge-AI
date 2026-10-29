@@ -1275,6 +1275,17 @@ export const Forge = ({
   // the pair is not on screen to look up in the catalogue.
   const effectiveTier = autoRoute ? String(autoChoice?.tier ?? "") : costTier;
   const effectivePaid = effectiveTier === "PAID";
+  // «Это дороже вашего потолка». An explicitly named pair is always honoured -- the owner
+  // may choose consciously -- but a pair above the ceiling he set in «Настройки» must not
+  // be chosen in silence. The ceiling is the router's own value from
+  // `/api/status.details.max_cost_tier`, not a second policy computed here.
+  const tierRank: Record<string, number> = { FREE: 0, CHEAP: 1, PAID: 2 };
+  const ceilingWord = String(status?.details?.max_cost_tier ?? "").toUpperCase();
+  const aboveCeiling =
+    !autoRoute &&
+    typeof tierRank[effectiveTier] === "number" &&
+    typeof tierRank[ceilingWord] === "number" &&
+    tierRank[effectiveTier] > tierRank[ceilingWord];
   // The automatic path never asks for a second confirmation: the deployment's
   // `allow_paid_providers` is the permission, and routing only reaches PAID because of it.
   // A manual choice keeps the deliberate per-run box it always had.
@@ -1563,6 +1574,15 @@ export const Forge = ({
               />
             )}
           </label>
+        </div>
+      ) : null}
+
+      {/* A pair the owner named above his own ceiling: still runnable, never silent. */}
+      {aboveCeiling ? (
+        <div className="notice warn" data-testid="forge-ceiling-override">
+          {t(lang, "settings.routing.ceiling.override")
+            .replace("{ceiling}", ceilingWord)
+            .replace("{tier}", tierWord(lang, effectiveTier))}
         </div>
       ) : null}
 

@@ -19,9 +19,15 @@ was chosen instead of being told a verdict.
 The tier policy
 ---------------
 ``SIMPLE -> FREE`` (the free/mock rows only), ``MEDIUM -> CHEAP``, ``COMPLEX -> PAID``.
-The paid tier is used for :data:`COMPLEX` work **and only when**
-``allow_paid_providers`` is true; when it is not, the best cheap-or-free model is chosen
-and the reasons say so. A configured ``default_provider`` wins when its tier matches, so a
+The paid tier is used for :data:`COMPLEX` work **and only when** two facts hold: the
+deployment permits paid calls (``allow_paid_providers``) and the owner's own ceiling
+(:data:`MAX_COST_TIER_SETTING`, ``FREE`` | ``CHEAP`` | ``PAID``) is not below it. The
+ceiling is the owner's answer to a burned balance: a task classified ``COMPLEX`` under a
+``CHEAP`` ceiling goes to the best cheap-or-free row, and the reasons say so **and name
+the chosen model's published price per 1M input tokens**, so a downgrade is never silent.
+:data:`DEFAULT_MAX_COST_TIER` is ``CHEAP``: a fresh install cannot auto-escalate to an
+expensive tier by accident, and raising the ceiling to ``PAID`` is a deliberate act in
+«Настройки». A configured ``default_provider`` wins when its tier matches, so a
 deployment that deliberately runs everything on one provider keeps doing that. Within a
 tier a provider that needs **no account** (the offline engine) is preferred, then the
 highest-quality row (published price, then capability count, then context window — a
@@ -30,7 +36,10 @@ route is still a real network call and a rate limit, while `SIMPLE` work that op
 socket cannot fail, cannot be billed and cannot change model id under the owner's feet.
 
 An explicit ``override`` (a provider *and* a model named by the caller) always wins. It is
-the existing manual path, kept for power users; it is no longer required.
+the existing manual path, kept for power users; it is no longer required. It is still
+subject to the deployment's paid gate (a paid pair needs ``allow_paid_providers``), and
+the ceiling never overrides it: a named pair above the ceiling is honoured and the reasons
+carry «это дороже вашего потолка», because the owner may choose consciously.
 
 Availability
 ------------
@@ -56,7 +65,11 @@ __all__ = [
     "CHEAP",
     "PAID",
     "TIERS",
+    "TIER_RANK",
     "TIER_FOR_COMPLEXITY",
+    "MAX_COST_TIER_SETTING",
+    "DEFAULT_MAX_COST_TIER",
+    "normalise_cost_tier",
     "ROUTABLE_PROVIDER_STATES",
     "LONG_TASK_CHARS",
     "MANY_CLAUSES",
@@ -82,9 +95,25 @@ CHEAP = "CHEAP"
 PAID = "PAID"
 TIERS = (FREE, CHEAP, PAID)
 
+#: The order the ceiling is compared in. It is the only place "above the ceiling" is
+#: defined, so a reader cannot disagree with the code about which tier is dearer.
+TIER_RANK = {FREE: 0, CHEAP: 1, PAID: 2}
+
+#: The name of the owner's own setting (``.forge/settings.json``, not ``.env``) that caps
+#: the automatic choice, and the ceiling a fresh install starts with. ``CHEAP`` is the
+#: safer product default: the owner's balance was burned by a ``COMPLEX`` task routed to
+#: ``radox/claude-fable-5.1`` at $16.61 per 1M, and no accidental click should be able to
+#: repeat that. Raising it to ``PAID`` is a deliberate act in «Настройки».
+MAX_COST_TIER_SETTING = "max_cost_tier"
+DEFAULT_MAX_COST_TIER = CHEAP
+
 #: The one tier policy, published to the interface from here (``GET /api/status``'s
 #: ``routing_policy``) so the panel and this function cannot disagree.
 TIER_FOR_COMPLEXITY = {SIMPLE: FREE, MEDIUM: CHEAP, COMPLEX: PAID}
+
+#: How a tier reads inside a Russian reason line (the product language of the reasons).
+_TIER_WORD_RU = {FREE: "бесплатная", CHEAP: "дешёвая", PAID: "платная"}
+_LEVEL_WORD_RU = {SIMPLE: "простая", MEDIUM: "средняя", COMPLEX: "сложная"}
 
 # --------------------------------------------------------------------- thresholds
 #: A task this long carries more than one request in it. Measured against the owner's own
@@ -237,6 +266,18 @@ def _get(source: object, *names: str) -> object:
 
 def _as_text(value: object) -> str:
     return str(value or "").strip()
+
+
+def normalise_cost_tier(value: object) -> str:
+    """A stored or typed ceiling as one of :data:`TIERS`, else :data:`DEFAULT_MAX_COST_TIER`.
+
+    The stored value is the lowercase word (``"cheap"``); the decision speaks the uppercase
+    one. Anything else -- an absent key, a fragment, a word nobody defined -- is the
+    default rather than the most permissive reading, because a ceiling is a cost control.
+    """
+
+    text = _as_text(value).upper()
+    return text if text in TIERS else DEFAULT_MAX_COST_TIER
 
 
 def _as_float(value: object) -> Optional[float]:
@@ -522,8 +563,18 @@ class ModelChoice:
     tier: str
     complexity: str
     reasons: Tuple[str, ...] = ()
+    #: The chosen row's published rate per 1M **input** tokens in USD: ``0.0`` for a free
+    #: row (nothing can be billed there), ``None`` when the catalogue publishes no price.
+    #: It is a unit price from the catalogue, never a forecast of a run.
     estimated_cost: Optional[float] = None
     automatic: bool = True
+    #: The ceiling that was in force when the decision was made (``FREE``/``CHEAP``/
+    #: ``PAID``), so a reader can tell a deliberate cheap choice from a capped expensive
+    #: one. Empty only for a decision made before this field existed.
+    max_cost_tier: str = ""
+    #: True when the ceiling moved the choice down from the tier complexity asked for.
+    #: The downgrade is never silent: a reason says so and names the price.
+    ceiling_limited: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -532,17 +583,40 @@ class ModelChoice:
             "tier": self.tier,
             "complexity": self.complexity,
             "reasons": list(self.reasons),
-            # ``0.0`` for a free row: nothing can be billed there. ``None`` otherwise,
-            # because a run's cost is unknown before it runs -- a unit price is not a
-            # forecast, and this module does not invent one.
+            # The chosen row's published rate per 1M input tokens (0.0 for a free row), or
+            # ``None`` when no rate is published. It is a unit price, not a forecast.
             "estimated_cost": self.estimated_cost,
             "automatic": bool(self.automatic),
+            # Additive: the ceiling in force, and whether it changed the choice. Without
+            # them a capped decision and a naturally cheap one would look identical.
+            "max_cost_tier": self.max_cost_tier,
+            "ceiling_limited": bool(self.ceiling_limited),
         }
 
 
 def _setting(settings: object, name: str, default: object) -> object:
     value = _get(settings, name)
     return default if value is None else value
+
+
+def _unit_estimate(row: Optional[ModelRow], tier: str) -> Optional[float]:
+    """The chosen row's published rate per 1M input tokens (``0.0`` when it is free)."""
+
+    if tier == FREE:
+        return 0.0
+    if row is not None and row.input_cost_per_1m is not None:
+        return float(row.input_cost_per_1m)
+    return None
+
+
+def _price_phrase(tier: str, price: Optional[float]) -> str:
+    """The price as a reason line reads it, so the ceiling is tangible in the decision."""
+
+    if tier == FREE:
+        return "оценка $0 за 1M входных токенов (бесплатно)"
+    if price is None:
+        return "цена этой модели не опубликована в каталоге"
+    return f"оценка ${price:g} за 1M входных токенов"
 
 
 def _allowed_tiers(desired: str) -> Tuple[str, ...]:
@@ -571,9 +645,10 @@ def choose_model(
 
     ``catalogue`` is the deployment's own answer (``GET /api/models``'s payload, a
     sequence of rows, or registry objects — see :func:`catalogue_rows`), ``settings`` is
-    anything carrying ``default_provider`` / ``default_model`` / ``allow_paid_providers``
-    (a mapping or the ``RuntimeSettings`` object itself). ``override`` is the explicit
-    ``{"provider": ..., "model": ...}`` a caller named; it always wins.
+    anything carrying ``default_provider`` / ``default_model`` / ``allow_paid_providers`` /
+    ``max_cost_tier`` (a mapping or the ``RuntimeSettings`` object itself). ``override``
+    is the explicit ``{"provider": ..., "model": ...}`` a caller named; it always wins,
+    and it is flagged when it sits above the ceiling.
     """
 
     assessment = assess_complexity(
@@ -587,6 +662,9 @@ def choose_model(
     default_provider = _as_text(_setting(settings, "default_provider", "")).lower()
     default_model = _as_text(_setting(settings, "default_model", ""))
     allow_paid = bool(_setting(settings, "allow_paid_providers", False))
+    ceiling = normalise_cost_tier(
+        _setting(settings, MAX_COST_TIER_SETTING, DEFAULT_MAX_COST_TIER)
+    )
     enabled = _setting(settings, "enabled_providers", ()) or ()
     routable_providers = tuple(
         _as_text(name).lower() for name in enabled if _as_text(name)
@@ -607,28 +685,51 @@ def choose_model(
         )
         tier = known.tier if known is not None and known.tier in TIERS else ""
         reasons.append(f"ручной выбор: {override_provider} · {override_model}")
+        above_ceiling = bool(tier) and TIER_RANK[tier] > TIER_RANK[ceiling]
+        if above_ceiling:
+            # The owner named this pair on purpose, so it still runs. Saying nothing would
+            # make the ceiling look unlimited; the sentence is the warning «Настройки»
+            # repeats, and the price is the row's own published rate.
+            reasons.insert(
+                0,
+                f"ручной выбор выше потолка тарифа {ceiling}: это дороже вашего потолка — "
+                f"модель сохранена, {_price_phrase(tier, _unit_estimate(known, tier))}",
+            )
         return ModelChoice(
             provider=override_provider,
             model=override_model,
             tier=tier,
             complexity=assessment.level,
             reasons=tuple(reasons),
-            estimated_cost=0.0 if tier == FREE else None,
+            estimated_cost=_unit_estimate(known, tier),
             automatic=False,
+            max_cost_tier=ceiling,
+            ceiling_limited=False,
         )
 
     desired = TIER_FOR_COMPLEXITY[assessment.level]
-    reasons.append(
-        {
-            FREE: "простая задача → бесплатная модель",
-            CHEAP: "средняя сложность → дешёвая модель",
-            PAID: "сложная задача → платная модель",
-        }[desired]
-    )
-    if desired == PAID and not allow_paid:
+    # The paid permission and the ceiling are two independent caps. Apply the paid gate
+    # first (its sentence is the one that explains "no paid call at all"), then the
+    # owner's ceiling, so a COMPLEX task under CHEAP says exactly which cap moved it.
+    paid_blocked = desired == PAID and not allow_paid
+    if paid_blocked:
         desired = CHEAP
         reasons.append(
             "платные модели запрещены настройкой → дешёвая модель, платного вызова нет"
+        )
+    capped_from: Optional[str] = (
+        desired if TIER_RANK[desired] > TIER_RANK[ceiling] else None
+    )
+    if capped_from is not None:
+        desired = ceiling
+    elif not paid_blocked:
+        # Nothing capped the tier: state the policy sentence that produced it.
+        reasons.append(
+            {
+                FREE: "простая задача → бесплатная модель",
+                CHEAP: "средняя сложность → дешёвая модель",
+                PAID: "сложная задача → платная модель",
+            }[desired]
         )
 
     routable = [
@@ -662,14 +763,27 @@ def choose_model(
                 reasons.append(
                     f"лучшая доступная модель тарифа {tier}: {chosen.provider} · {chosen.model}"
                 )
+        price = _unit_estimate(chosen, chosen.tier)
+        if capped_from is not None:
+            # The operative sentence, first, so it is one of the three lines the card
+            # shows. It names the ceiling, the tier that was chosen instead, the model and
+            # its published price: no silent downgrade.
+            reasons.insert(
+                0,
+                f"{_LEVEL_WORD_RU[assessment.level]} задача, но тариф ограничен {ceiling} "
+                f"→ выбрана {_TIER_WORD_RU[chosen.tier]} модель: "
+                f"{chosen.provider} · {chosen.model}, {_price_phrase(chosen.tier, price)}",
+            )
         return ModelChoice(
             provider=chosen.provider,
             model=chosen.model,
             tier=chosen.tier,
             complexity=assessment.level,
             reasons=tuple(reasons),
-            estimated_cost=0.0 if chosen.tier == FREE else None,
+            estimated_cost=price,
             automatic=True,
+            max_cost_tier=ceiling,
+            ceiling_limited=capped_from is not None,
         )
 
     # Nothing routable at all: keep the deployment's own default provider in force (the
@@ -686,4 +800,5 @@ def choose_model(
         reasons=tuple(reasons),
         estimated_cost=None,
         automatic=True,
+        max_cost_tier=ceiling,
     )
