@@ -525,8 +525,7 @@ export const STRINGS: Record<Lang, Record<string, string>> = {
     "projects.change.finished": "запуск завершён",
     "projects.change.done": "Готово: {version} записана",
     "projects.change.zero_files": "файлов 0 — код не менялся ({version}: пустая запись)",
-    "projects.rollback.notice":
-      "Изменения откатаны: после правки приложение перестало запускаться",
+    "projects.rollback.notice": "Изменения откатаны",
     "projects.rollback.hint":
       "Файлы проекта возвращены из снимка перед правкой, и каждый файл проверен по sha256. Текущая версия осталась прежней: правка в проект не попала.",
     "projects.change.already_applied": "Эта правка уже внесена в {version}: повторный запуск и новая версия не создавались.",
@@ -1674,8 +1673,7 @@ export const STRINGS: Record<Lang, Record<string, string>> = {
     "projects.change.finished": "the run finished",
     "projects.change.done": "Done: {version} was written",
     "projects.change.zero_files": "0 files — the code did not change ({version}: an empty record)",
-    "projects.rollback.notice":
-      "Changes rolled back: the application stopped launching after the change",
+    "projects.rollback.notice": "Changes rolled back",
     "projects.rollback.hint":
       "The project's files were restored from the snapshot taken before the change, and every file was checked by sha256. The current version is unchanged: the change is not in the project.",
     "projects.change.already_applied": "This change is already in {version}: no run and no new version were created.",

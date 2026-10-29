@@ -191,6 +191,14 @@ def _code(value: object) -> str:
     return _text(getattr(value, "code", ""))
 
 
+def _mapping(value: object) -> Dict[str, Any]:
+    """A mapping's own keys, or an empty mapping: a malformed fact is an absent one."""
+
+    if isinstance(value, _MappingABC):
+        return {str(key): item for key, item in value.items()}
+    return {}
+
+
 # --------------------------------------------------------------------------- #
 # the proven files
 # --------------------------------------------------------------------------- #
@@ -237,6 +245,51 @@ def _python_paths(proven: Sequence[Mapping[str, Any]]) -> List[str]:
     return [str(item["path"]) for item in proven if str(item["path"]).endswith(".py")]
 
 
+def _page_counts(
+    page: Mapping[str, Any], rollback: Mapping[str, Any]
+) -> str:
+    """The measured page, as one line a person can check: size and three counts.
+
+    Only facts the verdict really holds are printed. When the page was never read the
+    line is empty and the caller reports the quality as *not measured* instead of
+    printing zeros that could be read as "a page with no styles".
+    """
+
+    before = _mapping(page.get("before"))
+    after = _mapping(page.get("after"))
+    if not before and not after:
+        return ""
+
+    def count(value: Any) -> str:
+        number = _positive_int(value)
+        return str(number) if value not in (None, "") else "0"
+
+    status = _positive_int(rollback.get("http_status"))
+    parts: List[str] = []
+    if status:
+        parts.append(f"GET / → {status}")
+    if after:
+        parts.append(f"{count(before.get('size'))} → {count(after.get('size'))} Б")
+        parts.append(f"id: {count(before.get('ids'))} → {count(after.get('ids'))}")
+        parts.append(
+            f"стили: {count(before.get('stylesheets'))} → "
+            f"{count(after.get('stylesheets'))}"
+        )
+        parts.append(
+            f"скрипты: {count(before.get('scripts'))} → "
+            f"{count(after.get('scripts'))}"
+        )
+    assets = [
+        _mapping(item) for item in (page.get("assets") or ())
+    ]
+    if assets:
+        served = sum(
+            1 for item in assets if _positive_int(item.get("status")) == 200
+        )
+        parts.append(f"файлы страницы: {served}/{len(assets)} ответили 200")
+    return " · ".join(parts)
+
+
 # --------------------------------------------------------------------------- #
 # the block
 # --------------------------------------------------------------------------- #
@@ -273,6 +326,12 @@ def build_evidence(
     rolled back goes to ``unknown`` -- none of it is on disk, so nothing about it was
     checked. A rollback that could not restore every file is an ``unknown`` too, and
     never a success.
+
+    A verdict that judged the **page** carries its own facts (``page`` and
+    ``degradation``): what the page was before the change, what it became, and what
+    broke. A page that broke is named in the owner's words; a page that could not be
+    compared is an ``unknown`` ("the quality of the page was not measured"), never a
+    silent pass.
     """
 
     proven, unproven = _proven_files(files)
@@ -489,6 +548,14 @@ def build_evidence(
     rollback_facts = dict(rollback) if isinstance(rollback, _MappingABC) else {}
     rolled_back = bool(rollback_facts.get("rolled_back")) and bool(rollback_facts)
     rollback_outcome = _text(rollback_facts.get("outcome"))
+    degradation = [
+        _text(item)
+        for item in (rollback_facts.get("degradation") or ())
+        if _text(item)
+    ]
+    page_proof = _mapping(rollback_facts.get("page"))
+    page_checked = bool(page_proof.get("checked"))
+    page_counts = _page_counts(page_proof, rollback_facts)
     rollback_verified: List[Dict[str, Any]] = []
     if rolled_back:
         for item in _proven_files(rollback_facts.get("restored") or ())[0]:
@@ -517,7 +584,10 @@ def build_evidence(
         verified.append(
             {
                 "claim": (
-                    "изменение откатано: приложение перестало запускаться, "
+                    "изменение откатано: страница приложения сломалась, "
+                    "файлы возвращены из снимка"
+                    if degradation
+                    else "изменение откатано: приложение перестало запускаться, "
                     "файлы возвращены из снимка"
                 ),
                 "evidence": (
@@ -528,13 +598,46 @@ def build_evidence(
             }
         )
         verified.extend(rollback_verified)
+        if page_checked and page_counts:
+            # What the page became is a measurement too, and it is the reason the
+            # change is not on disk: it is stated as a fact, not as a suspicion.
+            verified.append(
+                {
+                    "claim": "страница после правки измерена",
+                    "evidence": page_counts,
+                    "kind": "page",
+                }
+            )
         # The change itself is not on disk, so nothing about it was checked.
         unknown.append(
             {
                 "item": "изменение не применено",
                 "why": (
-                    "правка откатана: после неё приложение перестало запускаться, "
-                    "поэтому её результат на диске отсутствует"
+                    "правка откатана: страница приложения сломалась — "
+                    + "; ".join(degradation[:5])
+                    if degradation
+                    else "правка откатана: после неё приложение перестало "
+                    "запускаться, поэтому её результат на диске отсутствует"
+                ),
+            }
+        )
+    elif rollback_outcome == "kept" and page_checked:
+        # The page passed: the counts are the proof, so "the change was applied" is
+        # not dressed up as "the page is fine" without them.
+        verified.append(
+            {
+                "claim": "страница не деградировала после правки",
+                "evidence": page_counts or "страница прочитана и сравнена со снимком",
+                "kind": "page",
+            }
+        )
+    elif rollback_outcome == "kept":
+        unknown.append(
+            {
+                "item": "качество страницы не проверено",
+                "why": (
+                    "ответ GET / не содержал тела страницы, поэтому сравнивать было "
+                    "нечего: проверен только ответ сервера"
                 ),
             }
         )
@@ -595,6 +698,8 @@ def build_evidence(
                     "outcome": rollback_outcome,
                     "rolled_back": rolled_back,
                     "reason": _text(rollback_facts.get("reason")),
+                    "degradation": degradation,
+                    "page": dict(page_proof) if page_proof else None,
                     "restored": [dict(item) for item in _proven_files(
                         rollback_facts.get("restored") or ()
                     )[0]],

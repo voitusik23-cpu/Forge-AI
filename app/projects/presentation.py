@@ -172,11 +172,12 @@ NO_FILES_NOTICE = "Папка создана, но проект ещё не со
 RUN_NO_CHANGE_NOTICE = "Изменения не записаны: новой версии нет"
 
 #: Printed when a change was applied and then **rolled back** because the project
-#: stopped launching. It is a refusal, not a warning, and it can never sit beside
-#: «ГОТОВО»: the change is not in the project any more.
+#: stopped working. It is a refusal, not a warning, and it can never sit beside
+#: «ГОТОВО»: the change is not in the project any more. It names only the fact that is
+#: true in every case -- the files came back -- because the *reason* (a launch that
+#: failed, or a page that degraded) is the record's own sentence, printed beside it.
 RUN_ROLLED_BACK_NOTICE = (
-    "Изменения откатаны: после правки приложение перестало запускаться, "
-    "файлы возвращены из снимка"
+    "Изменения откатаны: файлы проекта возвращены из снимка"
 )
 
 #: The verification sentences. "Not run" is a state, never a pass word.
@@ -351,9 +352,14 @@ class ProjectPresentation:
     technical_collapsed: bool = True
     change_not_written: bool = False
     #: True only when the last change was applied and then **rolled back** because the
-    #: project stopped launching. Such a card can never say ``ГОТОВО``: the change is
-    #: not in the project any more, and the previous version is current again.
+    #: project stopped working (it did not launch, or its page degraded). Such a card
+    #: can never say ``ГОТОВО``: the change is not in the project any more, and the
+    #: previous version is current again.
     rolled_back: bool = False
+    #: The reason in the record's own words, e.g. «Изменения откатаны: страница
+    #: приложения сломалась (пропали стили: styles.css больше не подключён)». One line:
+    #: the run's log tail belongs to the run's own block, not to the card's headline.
+    rollback_message: str = ""
     #: The rollback's own proof: the snapshot it was restored from and every restored
     #: file with the digest that was re-read from disk after the restore.
     rollback: Tuple[Tuple[str, str], ...] = ()
@@ -410,6 +416,7 @@ class ProjectPresentation:
             },
             "change_not_written": bool(self.change_not_written),
             "rolled_back": bool(self.rolled_back),
+            "rollback_message": self.rollback_message,
             "rollback": _pair_list(self.rollback),
             "launch_role": self.launch_role,
             "launch_path": self.launch_path,
@@ -438,6 +445,26 @@ def _as_list(value: object) -> List[Mapping[str, Any]]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [item for item in value if isinstance(item, Mapping)]
     return []
+
+
+def _words(value: object) -> List[str]:
+    """A list of plain strings from a record (paths, reasons), without raising."""
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        kept = [str(item).strip() for item in value]
+        return [item for item in kept if item]
+    return []
+
+
+def _first_line(value: object) -> str:
+    """The first non-empty line of a text, bounded -- a headline, never a log dump."""
+
+    text = str(value or "")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:500]
+    return ""
 
 
 def _int(value: object, default: int = 0) -> int:
@@ -545,11 +572,16 @@ def _rollback_facts(rollback: Mapping[str, Any]) -> Tuple[Tuple[str, str], ...]:
         )
     if lines:
         rows.append(("Восстановлено", "; ".join(lines)))
-    removed = [str(item) for item in _as_list(rollback.get("removed")) if str(item)]
+    removed = _words(rollback.get("removed"))
     if removed:
         rows.append(("Удалено (создано правкой)", ", ".join(removed)))
+    # A page that broke is said as such, not folded into a generic "Причина": the
+    # owner's own sentence is about the page, and the row names what broke.
+    degradation = _words(rollback.get("degradation"))
+    if degradation:
+        rows.append(("Что сломалось", "; ".join(degradation[:5])))
     reason = str(rollback.get("reason", "") or "").strip()
-    if reason:
+    if reason and reason != "; ".join(degradation):
         rows.append(("Причина", reason))
     return tuple(rows)
 
@@ -611,6 +643,7 @@ def build_project_presentation(
     latest_rollback = _mapping(latest.get("rollback")) if latest is not None else {}
     rolled_back = bool(latest_rollback.get("rolled_back")) and bool(latest_rollback)
     rollback_facts = _rollback_facts(latest_rollback) if rolled_back else ()
+    rollback_message = _first_line(latest_rollback.get("message")) if rolled_back else ""
 
     # ---------------------------------------------------------------- the state
     # ``ready`` is the completion fact set, all of it. Anything missing is False.
@@ -795,6 +828,7 @@ def build_project_presentation(
         technical_collapsed=True,
         change_not_written=change_not_written,
         rolled_back=rolled_back,
+        rollback_message=rollback_message,
         rollback=rollback_facts,
         launch_role=launch_role,
         launch_path=launch_path,

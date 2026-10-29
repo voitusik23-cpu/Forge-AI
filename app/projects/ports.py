@@ -34,7 +34,10 @@ wins and the difference is said out loud (the launcher's notice, «Порт из
 8765, фактический 8790»). Nothing here ever turns a claim into a URL.
 
 Nothing in this module opens a socket into anything but loopback, starts a process,
-reads a file, or knows about a project. It is observation only.
+reads a file, or knows about a project. It is observation only. :func:`fetch_http`
+additionally reads a **bounded** body for the caller that has to compare what a page
+answered before a change with what it answers after it
+(:mod:`app.projects.regression`); nothing read here is stored, rendered or executed.
 """
 
 from __future__ import annotations
@@ -45,9 +48,11 @@ import urllib.error
 import urllib.request
 
 __all__ = [
+    "MAX_FETCH_BYTES",
     "PORT_MAX",
     "PORT_MIN",
     "PROBE_TIMEOUT_SECONDS",
+    "fetch_http",
     "first_answering",
     "is_usable_port",
     "loopback_url",
@@ -69,6 +74,12 @@ PORT_MAX = 65535
 #: answers refuses the connection immediately, so the cost is paid only by a server
 #: that is genuinely slow to speak.
 PROBE_TIMEOUT_SECONDS = 1.0
+
+#: The most bytes :func:`fetch_http` will read from one answer. A page and its assets
+#: are read to be *judged* (a change guard compares them), never to be stored or shown,
+#: so the read is bounded and a larger answer is truncated rather than refused: the
+#: bytes that decided the verdict are the bytes that were actually seen.
+MAX_FETCH_BYTES = 512 * 1024
 
 #: The loopback names a project address can carry. ``0.0.0.0`` is included because a
 #: banner that says "listening on 0.0.0.0:8790" names a port this machine answers on.
@@ -247,6 +258,74 @@ def loopback_url(port: object) -> str:
     return f"http://127.0.0.1:{int(port)}/" if is_usable_port(port) else ""
 
 
+def _request(port: object, path: object):
+    """An ``opener`` and a ``request`` for one loopback ``GET``, or ``None``.
+
+    The URL is always ``http://127.0.0.1:<port>`` plus a path that starts with ``/``:
+    this module has exactly one shape of address, and a caller cannot hand it a host.
+    """
+
+    if not is_usable_port(port):
+        return None
+    base = loopback_url(port)
+    raw = str(path or "/").strip() or "/"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    # A path may not carry a scheme, a host, or a second origin: the only host a
+    # request here can reach is the loopback address of the port that was given.
+    if "://" in raw or raw.startswith("//"):
+        return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(
+        base.rstrip("/") + raw,
+        method="GET",
+        headers={"User-Agent": "forge-port-probe/1", "Accept": "*/*"},
+    )
+    return opener, request
+
+
+def fetch_http(
+    port: object,
+    path: object = "/",
+    *,
+    timeout: float = PROBE_TIMEOUT_SECONDS,
+    max_bytes: int = MAX_FETCH_BYTES,
+) -> Tuple[int, bytes]:
+    """``(status, body)`` of one loopback ``GET <path>``; ``(0, b"")`` if none answers.
+
+    This is the read a change guard needs and :func:`probe_http` deliberately was not:
+    "does the page answer" cannot tell a complete page from a stripped one, so the
+    bytes are read too -- bounded, never stored, never shown.
+
+    The status is the server's own, including a status urllib treats as an error (a
+    404 asset is an answer and the guard must see the 404). ``0`` means nothing spoke
+    HTTP there within ``timeout``. A body larger than ``max_bytes`` is truncated, and
+    an unreadable body is ``b""`` with the status kept: the status is a separate fact.
+    """
+
+    prepared = _request(port, path)
+    if prepared is None:
+        return 0, b""
+    opener, request = prepared
+    try:
+        with opener.open(request, timeout=float(timeout)) as response:
+            status = int(getattr(response, "status", 0) or 0)
+            try:
+                body = response.read(max(0, int(max_bytes)))
+            except Exception:  # noqa: BLE001 - a status without bytes is still an answer
+                body = b""
+            return status, bytes(body or b"")
+    except urllib.error.HTTPError as exc:
+        # The server answered, with a status urllib treats as an error. Still an answer.
+        try:
+            body = exc.read(max(0, int(max_bytes)))
+        except Exception:  # noqa: BLE001
+            body = b""
+        return int(getattr(exc, "code", 0) or 0), bytes(body or b"")
+    except Exception:  # noqa: BLE001 - refused, timed out, not HTTP: no answer
+        return 0, b""
+
+
 def probe_http(port: object, *, timeout: float = PROBE_TIMEOUT_SECONDS) -> int:
     """The HTTP status one loopback ``GET /`` produced, or ``0`` when nothing answers.
 
@@ -260,23 +339,7 @@ def probe_http(port: object, *, timeout: float = PROBE_TIMEOUT_SECONDS) -> int:
     belongs to nobody.
     """
 
-    if not is_usable_port(port):
-        return 0
-    url = loopback_url(port)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    request = urllib.request.Request(
-        url,
-        method="GET",
-        headers={"User-Agent": "forge-port-probe/1", "Accept": "*/*"},
-    )
-    try:
-        with opener.open(request, timeout=float(timeout)) as response:
-            return int(getattr(response, "status", 0) or 0)
-    except urllib.error.HTTPError as exc:
-        # The server answered, with a status urllib treats as an error. Still an answer.
-        return int(getattr(exc, "code", 0) or 0)
-    except Exception:  # noqa: BLE001 - refused, timed out, not HTTP: no answer
-        return 0
+    return fetch_http(port, "/", timeout=timeout, max_bytes=0)[0]
 
 
 def first_answering(

@@ -1179,6 +1179,33 @@ export type ChangeRollback = {
   removed?: string[];
   failed?: string[];
   log_tail?: string[];
+  /**
+   * What the page lost, in the owner's words («пропали стили: styles.css больше не
+   * подключён», «не отдаётся app.js»). Empty for a page that passed; a rolled-back
+   * page change always carries at least one reason here.
+   */
+  degradation?: string[];
+  /**
+   * The page facts the quality gate compared: size, title, `id`/`<link>`/`<script>`
+   * counts and the status every referenced asset answered. `checked: false` means the
+   * page was never read, so nothing about its quality was measured.
+   */
+  page?: {
+    checked?: boolean;
+    before?: PageFacts;
+    after?: PageFacts;
+    assets?: Array<{ path?: string; status?: number }>;
+  } | null;
+};
+
+/** What one page was, read from its own bytes -- never from a browser. */
+export type PageFacts = {
+  size?: number;
+  title?: string;
+  ids?: number;
+  stylesheets?: number;
+  scripts?: number;
+  assets?: string[];
 };
 
 /** One openable target (`folder`, `editor`, `terminal`) and whether it is available. */
@@ -1421,12 +1448,20 @@ export type ProjectPresentation = {
   change_not_written?: boolean;
   /**
    * True when the last change was applied and then **rolled back** because the project
-   * stopped launching. It can never sit beside `ГОТОВО`: the change is not in the
-   * project, and the previous version is current again.
+   * stopped working: it stopped launching, or its page degraded. It can never sit
+   * beside `ГОТОВО`: the change is not in the project, and the previous version is
+   * current again.
    */
   rolled_back?: boolean;
+  /**
+   * The record's own sentence for that rollback, e.g. «Изменения откатаны: страница
+   * приложения сломалась (пропали стили: styles.css больше не подключён)». Printed as
+   * the block's headline so the card cannot say "it stopped launching" about a page
+   * that still answered.
+   */
+  rollback_message?: string;
   /** `[label, value]` rows: the snapshot the change was restored from, the restored
-   * files with their digests, what was removed, and the reason the launch failed. */
+   * files with their digests, what was removed, and what broke. */
   rollback?: string[][];
   /** `open` for an HTML page, `run` for an entry file, `""` when nothing is launchable. */
   launch_role?: string;

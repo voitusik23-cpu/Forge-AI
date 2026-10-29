@@ -22,12 +22,22 @@ What is asserted here, against a real temporary project and the real writer:
 4. a rollback that cannot restore a file is reported as **failed** and never as a
    success, and the card's evidence block says the restore is incomplete;
 5. a launch check that could not start the project at all does not roll anything back
-   (a refused spawn is not evidence about the project's own code).
+   (a refused spawn is not evidence about the project's own code);
+6. **the page quality gate** (the second measured failure): a change that keeps the
+   server answering `200` but drops the `<link rel=stylesheet>` to a stylesheet that is
+   still on disk is rolled back with «пропали стили»; a page that references an asset
+   the server does not serve is rolled back («не отдаётся …»); a page that halves its
+   elements with an `id` is rolled back; a page that shrinks below 60 % of its former
+   size is rolled back; a page that keeps and extends itself is **applied**; a page
+   that never had links (plain text) is not penalised; a page that could not be read is
+   reported as *not checked*, never as passed; and a static project is judged by the
+   same gate through the real read-only preview, with no fake at all.
 
 Everything is offline: the launch probe is a fake injected into the real
 :func:`app.projects.regression.verify_change`, while the writer, the snapshot directory,
-the rollback and the version record are the product's own code. The real probe is
-proved live, with the running application, outside this suite.
+the rollback and the version record are the product's own code. The only socket opened
+is the loopback preview in the static-project case. The real probe is proved live, with
+the running application, outside this suite.
 """
 
 from __future__ import annotations
@@ -70,10 +80,12 @@ from app.projects.regression import (
     OUTCOME_NOT_VERIFIED,
     OUTCOME_ROLLED_BACK,
     OUTCOME_ROLLBACK_FAILED,
+    PAGE_ROLLBACK_PREFIX,
     ProbeAnswer,
     ROLLBACK_PREFIX,
     SNAPSHOT_DIRECTORY,
     capture_launch_state,
+    page_facts,
     restore_snapshot,
     verify_change,
 )
@@ -140,10 +152,41 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _answers(status: int, *, ran: bool = True, reason: str = "", tail=()) -> ProbeAnswer:
+def _answers(
+    status: int,
+    *,
+    ran: bool = True,
+    reason: str = "",
+    tail=(),
+    page: bytes = b"",
+    port: int = 0,
+    assets=(),
+) -> ProbeAnswer:
     """A probe answer with the same shape the real probe returns."""
 
-    return ProbeAnswer(status=status, ran=ran, reason=reason, log_tail=tuple(tail))
+    return ProbeAnswer(
+        status=status,
+        ran=ran,
+        reason=reason,
+        log_tail=tuple(tail),
+        page=page,
+        port=port,
+        assets=tuple(assets),
+    )
+
+
+def _measured(html: str, table: dict = None) -> tuple:
+    """What the scripted server answered for every asset the page references.
+
+    The real probe reads the page and then asks for its own references; this is the
+    same list, taken from the same parser, with a status per file. A path the table
+    does not name is a 404 -- a file the server does not serve.
+    """
+
+    served = dict(table or {})
+    return tuple(
+        (item, int(served.get(item, 404))) for item in page_facts(html).assets
+    )
 
 
 class _WorkspaceCase(unittest.TestCase):
@@ -392,6 +435,429 @@ class RollbackTests(_WorkspaceCase):
         from app.projects.launcher import READINESS_TIMEOUT_SECONDS
 
         self.assertEqual(CHANGE_LAUNCH_BUDGET_SECONDS, float(READINESS_TIMEOUT_SECONDS))
+
+
+# --------------------------------------------------------------------------- #
+# 1b. the page quality gate: answering 200 is necessary and not sufficient
+# --------------------------------------------------------------------------- #
+
+#: The page the owner's own project served: a title, a stylesheet, a script and
+#: enough structure for a fingerprint. The filler makes the page a real page (>1 KB),
+#: so a stripped replacement is visibly a collapse rather than a small edit.
+PAGE_FILLER = "<!-- " + ("наполнение страницы " * 220) + "-->"
+PAGE_SECTIONS = "".join(
+    f'<section id="s{index}">Раздел {index}</section>\n' for index in range(1, 7)
+)
+PAGE_HTML = (
+    "<!DOCTYPE html>\n"
+    '<html lang="ru">\n<head>\n<meta charset="utf-8">\n'
+    "<title>Почта АИ</title>\n"
+    '<link rel="stylesheet" href="/styles.css">\n'
+    "</head>\n<body>\n"
+    '<div id="app">\n' + PAGE_SECTIONS + "</div>\n"
+    '<script src="/app.js"></script>\n'
+    "</body>\n</html>\n" + PAGE_FILLER + "\n"
+)
+
+#: The page that keeps its structure and grows: the change that must be applied.
+PAGE_EXTENDED = PAGE_HTML.replace(
+    '<div id="app">\n',
+    '<div id="app">\n<section id="s7">Новый раздел</section>\n',
+)
+
+#: The page that lost its stylesheet link but kept everything else.
+PAGE_WITHOUT_STYLES = PAGE_HTML.replace(
+    '<link rel="stylesheet" href="/styles.css">\n', ""
+)
+
+#: The page that kept its links and most of its bytes but halved its structure.
+PAGE_HALVED_IDS = (
+    PAGE_HTML.replace('<section id="s1">', '<section class="s1">')
+    .replace('<section id="s2">', '<section class="s2">')
+    .replace('<section id="s3">', '<section class="s3">')
+    .replace('<section id="s4">', '<section class="s4">')
+    .replace('<section id="s5">', '<section class="s5">')
+)
+
+#: The page that became a stub: its links are still there, its body is not.
+PAGE_SHRUNK = (
+    "<!DOCTYPE html>\n"
+    '<html lang="ru">\n<head>\n<meta charset="utf-8">\n'
+    "<title>Почта АИ</title>\n"
+    '<link rel="stylesheet" href="/styles.css">\n'
+    "</head>\n<body>\n"
+    '<div id="app"><section id="s1">Раздел</section>'
+    '<section id="s2">Раздел</section><section id="s3">Раздел</section></div>\n'
+    '<script src="/app.js"></script>\n'
+    "</body>\n</html>\n"
+)
+
+#: A project whose page never had links: plain text is not a degraded page.
+PLAIN_PAGE = "Заметки проекта.\n" + ("строка заметок\n" * 120)
+
+
+class _PageCase(_WorkspaceCase):
+    """A real project with a real page on disk, and a scripted server answer."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write("styles.css", b"body { color: #111; }\n")
+        self._write("app.js", b"console.log('ready');\n")
+
+    def _serve(self, html: str, *, extra: dict = None) -> dict:
+        """The table the scripted server answers with, for a page and its assets."""
+
+        table = {"styles.css": 200, "app.js": 200}
+        table.update(extra or {})
+        return table
+
+    def _apply(self, html: str, run_id: str):
+        answer = "```html path=index.html\n" + html + "\n```\n"
+        applied = apply_changes(
+            answer, workspace=Workspace(root=self.workspace), run_id=run_id
+        )
+        self.assertEqual(applied.status, STATUS_APPLIED, applied.reason)
+        return applied
+
+    def _verify(self, html: str, run_id: str, table: dict, before):
+        return verify_change(
+            workspace=self.workspace,
+            before=before,
+            written_paths=["index.html"],
+            run_id=run_id,
+            probe=lambda root, entry: _answers(
+                200,
+                page=html.encode("utf-8"),
+                port=8790,
+                assets=_measured(html, table),
+            ),
+        )
+
+
+class PageGateTests(_PageCase):
+    def test_25_a_change_that_drops_the_stylesheet_link_is_rolled_back(self) -> None:
+        """THE OWNER'S SCREENSHOT: 200, plain text, no CSS. The link is what broke."""
+
+        self._write("index.html", PAGE_HTML.encode("utf-8"))
+        original = self._read("index.html")
+        original_digest = _digest(original)
+        before = capture_launch_state(self.workspace)
+        # The page that was served before the change was read from the snapshot source.
+        self.assertGreater(before.page.size, 1024, before.to_dict())
+        self.assertEqual(before.page.stylesheets, 1)
+        self.assertEqual(before.page.scripts, 1)
+        self.assertEqual(before.page.assets, ("styles.css", "app.js"))
+        self.assertEqual(before.page_source, "index.html")
+
+        run_id = "run-page-styles"
+        self._apply(PAGE_WITHOUT_STYLES, run_id)
+        verdict = self._verify(
+            PAGE_WITHOUT_STYLES, run_id, self._serve(PAGE_WITHOUT_STYLES), before
+        )
+
+        self.assertTrue(verdict.rolled_back, verdict.to_dict())
+        self.assertEqual(verdict.status, "rolled_back")
+        self.assertTrue(verdict.message.startswith(PAGE_ROLLBACK_PREFIX), verdict.message)
+        self.assertIn("пропали стили", verdict.message)
+        self.assertIn("styles.css", verdict.message)
+        # The reasons are a list, and the same list is in the record and the response.
+        self.assertTrue(verdict.degradation)
+        self.assertIn("пропали стили", " ".join(verdict.degradation))
+        self.assertEqual(verdict.to_dict()["degradation"], list(verdict.degradation))
+        # The page came back byte-identically, proved by the digest on disk now.
+        self.assertEqual(_digest(self._read("index.html")), original_digest)
+        self.assertEqual(verdict.restored[0].path, "index.html")
+        self.assertEqual(verdict.restored[0].sha256, original_digest)
+        # The measurement is kept: before and after, and what every asset answered.
+        self.assertTrue(verdict.page_checked)
+        self.assertEqual(verdict.before_page.stylesheets, 1)
+        self.assertEqual(verdict.after_page.stylesheets, 0)
+        self.assertIn(("app.js", 200), verdict.assets)
+
+        # The evidence block says the page broke, in the owner's words, and does not
+        # claim the change was applied.
+        evidence = build_evidence(
+            files=(),
+            verification=VERIFICATION_FAILED,
+            rollback=verdict.to_dict(),
+        )
+        claims = " ".join(str(item.get("claim", "")) for item in evidence["verified"])
+        self.assertIn("страница приложения сломалась", claims)
+        why = " ".join(str(item.get("why", "")) for item in evidence["unknown"])
+        self.assertIn("пропали стили", why)
+
+        # The card repeats it as its own row instead of a generic reason.
+        presentation = build_project_presentation(
+            project={"status": "COMPLETED", "current_version": 1},
+            versions=[
+                ProjectVersion(
+                    version=1, created_at=utc_now(), run_id="run-before", files=(),
+                    verification=VERIFICATION_PASSED, acceptance=ACCEPTANCE_PASSED,
+                ).to_dict(),
+                ProjectVersion(
+                    version=2, created_at=utc_now(), run_id=run_id, files=(),
+                    verification=VERIFICATION_FAILED,
+                    change_request=ChangeRequest(text="добавь кнопку", version=2),
+                    rollback=verdict.to_dict(),
+                ).to_dict(),
+            ],
+            workspace_exists=True,
+        )
+        rows = dict(presentation.rollback)
+        self.assertIn("Что сломалось", rows)
+        self.assertIn("пропали стили", rows["Что сломалось"])
+        # The card's own headline is the record's sentence, so it cannot say "it
+        # stopped launching" about a page that still answered 200.
+        self.assertTrue(
+            str(presentation.rollback_message).startswith(PAGE_ROLLBACK_PREFIX),
+            presentation.rollback_message,
+        )
+        self.assertIn("пропали стили", presentation.rollback_message)
+        self.assertNotIn(
+            "перестало запускаться",
+            presentation.rollback_message,
+        )
+        self.assertNotIn("перестало запускаться", " ".join(presentation.notices))
+
+    def test_26_a_change_that_references_an_asset_that_404s_is_rolled_back(self) -> None:
+        """The page points at a file the server does not serve: the page is broken."""
+
+        self._write("index.html", PAGE_HTML.encode("utf-8"))
+        before = capture_launch_state(self.workspace)
+        renamed = PAGE_HTML.replace("/styles.css", "/theme.css")
+        run_id = "run-page-404"
+        self._apply(renamed, run_id)
+        # The rename is real -- the old file is gone and the new one is on disk -- but
+        # the server does not serve the new one, so the page's reference is a 404.
+        self._path("styles.css").unlink()
+        self._write("theme.css", b"body { color: #222; }\n")
+        verdict = self._verify(renamed, run_id, self._serve({}), before)
+
+        self.assertTrue(verdict.rolled_back, verdict.to_dict())
+        self.assertEqual(
+            verdict.degradation, ("не отдаётся theme.css (HTTP 404)",), verdict.to_dict()
+        )
+        self.assertIn("не отдаётся theme.css", verdict.message)
+        self.assertIn(("theme.css", 404), verdict.assets)
+        self.assertEqual(
+            _digest(self._read("index.html")), _digest(PAGE_HTML.encode("utf-8"))
+        )
+
+    def test_27_a_change_that_halves_the_ids_is_rolled_back(self) -> None:
+        """The structure collapsed while the links stayed: that is still a broken page."""
+
+        self._write("index.html", PAGE_HTML.encode("utf-8"))
+        before = capture_launch_state(self.workspace)
+        self.assertEqual(before.page.ids, 7)
+        run_id = "run-page-ids"
+        self._apply(PAGE_HALVED_IDS, run_id)
+        verdict = self._verify(
+            PAGE_HALVED_IDS, run_id, self._serve(PAGE_HALVED_IDS), before
+        )
+
+        self.assertTrue(verdict.rolled_back, verdict.to_dict())
+        self.assertIn("структура страницы разрушилась", verdict.message)
+        self.assertEqual(verdict.after_page.ids, 2)
+        self.assertEqual(verdict.before_page.ids, 7)
+        self.assertIn("styles.css", verdict.after_page.assets)
+
+    def test_28_a_change_that_shrinks_the_page_below_60_percent_is_rolled_back(
+        self,
+    ) -> None:
+        """The stub keeps its links, so only the size tells the truth."""
+
+        self._write("index.html", PAGE_HTML.encode("utf-8"))
+        before = capture_launch_state(self.workspace)
+        self.assertGreater(before.page.size, len(PAGE_SHRUNK) * 2)
+        run_id = "run-page-shrink"
+        self._apply(PAGE_SHRUNK, run_id)
+        verdict = self._verify(PAGE_SHRUNK, run_id, self._serve(PAGE_SHRUNK), before)
+
+        self.assertTrue(verdict.rolled_back, verdict.to_dict())
+        self.assertIn("страница уменьшилась", verdict.message)
+        self.assertLess(verdict.after_page.size, verdict.before_page.size * 0.6)
+
+    def test_29_a_change_that_keeps_and_extends_the_page_is_applied(self) -> None:
+        self._write("index.html", PAGE_HTML.encode("utf-8"))
+        before = capture_launch_state(self.workspace)
+        run_id = "run-page-kept"
+        self._apply(PAGE_EXTENDED, run_id)
+        changed = self._read("index.html")
+        verdict = self._verify(
+            PAGE_EXTENDED, run_id, self._serve(PAGE_EXTENDED), before
+        )
+
+        self.assertEqual(verdict.outcome, OUTCOME_KEPT, verdict.to_dict())
+        self.assertFalse(verdict.rolled_back)
+        self.assertEqual(verdict.degradation, ())
+        self.assertTrue(verdict.page_checked)
+        self.assertEqual(verdict.after_page.ids, 8)
+        self.assertEqual(verdict.after_page.stylesheets, 1)
+        self.assertEqual(verdict.http_status, 200)
+        self.assertEqual(verdict.restored, ())
+        # What the answer wrote is what is on disk: nothing was put back.
+        self.assertEqual(self._read("index.html"), changed)
+        self.assertNotEqual(_digest(changed), _digest(PAGE_HTML.encode("utf-8")))
+        # The page passed, and the counts are the proof of that.
+        evidence = build_evidence(
+            files=(),
+            verification=VERIFICATION_PASSED,
+            rollback=verdict.to_dict(),
+        )
+        page_claims = [
+            item
+            for item in evidence["verified"]
+            if str(item.get("kind", "")) == "page"
+        ]
+        self.assertEqual(len(page_claims), 1, evidence["verified"])
+        self.assertIn("id: 7 → 8", str(page_claims[0]["evidence"]))
+        self.assertIn("файлы страницы: 2/2 ответили 200", str(page_claims[0]["evidence"]))
+
+    def test_30_a_page_that_never_had_links_is_not_penalised(self) -> None:
+        """A plain-text project keeps its compile gate; the page gate invents nothing."""
+
+        self._write("index.html", PLAIN_PAGE.encode("utf-8"))
+        before = capture_launch_state(self.workspace)
+        self.assertEqual(before.page.stylesheets, 0)
+        self.assertEqual(before.page.scripts, 0)
+        self.assertEqual(before.page.ids, 0)
+        self.assertEqual(before.page.assets, ())
+        self.assertGreater(before.page.size, 1024)
+
+        extended = PLAIN_PAGE + "ещё одна строка заметок\n"
+        run_id = "run-page-plain"
+        self._apply(extended, run_id)
+        changed = self._read("index.html")
+        verdict = self._verify(extended, run_id, {}, before)
+
+        self.assertEqual(verdict.outcome, OUTCOME_KEPT, verdict.to_dict())
+        self.assertFalse(verdict.rolled_back)
+        self.assertEqual(verdict.degradation, ())
+        # The change is what is on disk: nothing was put back.
+        self.assertEqual(self._read("index.html"), changed)
+
+    def test_31_a_project_that_was_never_launchable_is_unchanged(self) -> None:
+        """The page gate never runs for a project that had no launch to break."""
+
+        empty = self.base / "no-entry"
+        empty.mkdir(parents=True, exist_ok=True)
+        (empty / "notes.txt").write_bytes(PLAIN_PAGE.encode("utf-8"))
+        before = capture_launch_state(empty)
+        self.assertFalse(before.launchable)
+        self.assertEqual(before.reason, "no_entry_point")
+        called: list[str] = []
+
+        def _probe(root, entry):  # pragma: no cover - it must never be called
+            called.append(str(root))
+            return _answers(200, page=b"<h1>x</h1>")
+
+        verdict = verify_change(
+            workspace=empty,
+            before=before,
+            written_paths=["notes.txt"],
+            run_id="run-page-not-required",
+            probe=_probe,
+        )
+        self.assertEqual(verdict.outcome, OUTCOME_NOT_REQUIRED)
+        self.assertFalse(verdict.page_checked)
+        self.assertFalse(verdict.rolled_back)
+        self.assertEqual(verdict.degradation, ())
+        self.assertEqual(called, [])
+
+    def test_32_a_page_that_could_not_be_read_is_reported_as_not_checked(self) -> None:
+        """No page to compare: the run is kept and the evidence says it was not measured."""
+
+        # A process project that serves no page file at all: there is nothing to read
+        # before the change, so the gate has no baseline and must not invent one.
+        self._path("index.html").unlink(missing_ok=True)
+        before = capture_launch_state(self.workspace)
+        self.assertTrue(before.launchable, before.to_dict())
+        self.assertTrue(before.page.empty)
+        run_id = "run-page-unread"
+        applied = apply_changes(
+            "```python path=helper.py\nprint('x')\n```\n",
+            workspace=Workspace(root=self.workspace),
+            run_id=run_id,
+        )
+        self.assertEqual(applied.status, STATUS_APPLIED, applied.reason)
+        verdict = verify_change(
+            workspace=self.workspace,
+            before=before,
+            written_paths=[str(item["path"]) for item in applied.files],
+            run_id=run_id,
+            probe=lambda root, entry: _answers(200),  # answered, but with no body
+        )
+
+        self.assertEqual(verdict.outcome, OUTCOME_KEPT, verdict.to_dict())
+        self.assertFalse(verdict.page_checked)
+        self.assertEqual(verdict.after_page.size, 0)
+        self.assertEqual(verdict.degradation, ())
+        evidence = build_evidence(
+            files=(), verification=VERIFICATION_PASSED, rollback=verdict.to_dict()
+        )
+        self.assertNotIn(
+            "page", [str(item.get("kind", "")) for item in evidence["verified"]]
+        )
+        unknown = " ".join(str(item.get("item", "")) for item in evidence["unknown"])
+        self.assertIn("качество страницы не проверено", unknown)
+
+
+class StaticPageGateTests(_WorkspaceCase):
+    """A static project: the same gate, served by the real read-only preview.
+
+    No fake probe and no fake fetch: the project's page is really served on loopback,
+    its assets are really asked for, and the change that strips the stylesheet is
+    really rolled back. This is the "file-type agnostic" claim of the module.
+
+    The script is ``site.js`` and not ``app.js``: ``app.js`` at a project root is a
+    ``node_script`` entry point (:mod:`app.projects.entrypoint`), which would make this
+    a process project instead of a page.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._path("app.py").unlink()  # a page, not a program
+        self.page = PAGE_HTML.replace("/app.js", "/site.js")
+        self._write("index.html", self.page.encode("utf-8"))
+        self._write("styles.css", b"body { color: #111; }\n")
+        self._write("site.js", b"console.log('ready');\n")
+
+    def test_33_a_static_page_that_loses_its_stylesheet_is_rolled_back(self) -> None:
+        original = self._read("index.html")
+        before = capture_launch_state(self.workspace)
+        self.assertTrue(before.launchable, before.to_dict())
+        self.assertEqual(before.serve_kind, "static")
+        # The page facts came from the page the preview really served.
+        self.assertEqual(before.page.stylesheets, 1)
+        self.assertEqual(before.page.assets, ("styles.css", "site.js"))
+
+        run_id = "run-static-page"
+        stripped = PAGE_WITHOUT_STYLES.replace("/app.js", "/site.js")
+        applied = apply_changes(
+            "```html path=index.html\n" + stripped + "```\n",
+            workspace=Workspace(root=self.workspace),
+            run_id=run_id,
+        )
+        self.assertEqual(applied.status, STATUS_APPLIED, applied.reason)
+        verdict = verify_change(
+            workspace=self.workspace,
+            before=before,
+            written_paths=["index.html"],
+            run_id=run_id,
+        )
+
+        self.assertTrue(verdict.rolled_back, verdict.to_dict())
+        self.assertIn("пропали стили", verdict.message)
+        self.assertEqual(verdict.http_status, 200)
+        self.assertEqual(_digest(self._read("index.html")), _digest(original))
+        # The stripped page's own references were measured while the preview was open.
+        self.assertIn(("site.js", 200), verdict.assets)
+        self.assertNotIn("styles.css", [item for item, _ in verdict.assets])
+        # ... and the restored page really serves again, through the same preview.
+        restored = capture_launch_state(self.workspace)
+        self.assertTrue(restored.launchable, restored.to_dict())
+        self.assertEqual(restored.page.stylesheets, 1)
+        self.assertEqual(restored.page.assets, ("styles.css", "site.js"))
 
 
 # --------------------------------------------------------------------------- #
@@ -762,11 +1228,14 @@ class ScreenTests(unittest.TestCase):
         )
         self.assertIn("rolled_back", forge)
         self.assertIn("rollback", forge)
-        # The sentence is the backend's own, printed from i18n, not composed inline.
+        # The sentence is the backend's own, printed from the record, not composed inline.
         i18n = I18N.read_text(encoding="utf-8")
         self.assertIn("projects.rollback.notice", i18n)
         self.assertIn("Изменения откатаны", i18n)
         self.assertIn("projects.rollback.notice", screen)
+        # A rollback that kept the application answering is not described as "it
+        # stopped launching": the block prints the record's own sentence when it has one.
+        self.assertIn("presentation.rollback_message", screen)
 
 
 # --------------------------------------------------------------------------- #

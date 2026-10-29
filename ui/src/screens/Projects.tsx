@@ -2025,7 +2025,11 @@ const ProjectCard = ({
             «готово» is impossible here, and the reason is never hidden. */}
         {presentation.rolled_back === true ? (
           <div className="notice danger" data-testid="project-rollback">
-            <div className="label">{t(lang, "projects.rollback.notice")}</div>
+            <div className="label">
+              {String(presentation.rollback_message ?? "") !== ""
+                ? String(presentation.rollback_message)
+                : t(lang, "projects.rollback.notice")}
+            </div>
             <div className="small" style={{ marginTop: 6 }}>
               {t(lang, "projects.rollback.hint")}
             </div>
