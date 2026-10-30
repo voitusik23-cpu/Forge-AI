@@ -1,30 +1,38 @@
 """FastAPI / HTTP server construction for Forge API.
 
-Trust boundary, stated plainly because the code cannot enforce it yet
---------------------------------------------------------------------
-**This surface has no authentication.** No route requires a credential, and no route
-verifies an identity. It exists for a local, trusted operator: the desktop client and the
-CLI talk to it in-process or over loopback. The Platform's own authentication work
-(``app/platform/principal.py`` and the Stage 1 contract) covers a *different* surface and
-does not protect these routes.
+Trust boundary, stated plainly
+------------------------------
+**This surface has no identity model.** No route requires an account, a session or a role.
+It exists for a single operator: the desktop client and the CLI talk to it in-process or
+over loopback. The Platform's own authentication work (``app/platform/principal.py`` and
+the Stage 1 contract) covers a *different* surface and does not protect these routes.
 
-What this module therefore does, and refuses to do:
+What protects it instead is a **single shared access token**
+(:mod:`app.api.access`), and only when a deployment configures one:
 
-* binds to **loopback by default** and refuses non-loopback binds because the surface has
-  no authentication;
+* with a token, every ``/api/*`` request must carry it (``Authorization: Bearer`` or
+  ``X-Forge-Token``), health and the build identity stay open, and the body ceiling and
+  the per-address rate limits are installed;
+* without a token, the middleware is not installed at all -- the loopback surface behaves
+  exactly as it always has -- and the launcher refuses any non-loopback bind, so "no
+  token" can never mean "public without a token".
+
+What this module refuses to do:
+
 * refuses a wildcard CORS origin, and never enables credentialed CORS, because
   ``allow_origins=["*"]`` together with ``allow_credentials=True`` is the configuration
   that turns a browser into a confused deputy for whoever can reach the port;
-* does **not** invent authentication. Adding an identity mechanism here would be a new
-  architecture decision (open decision O-2) and would create a second trust model
-  alongside the Platform's. The residual risk is recorded in
-  ``docs/SOURCE_OF_TRUTH.md`` and in the audit report rather than papered over.
+* does **not** invent accounts. A token is not an identity: it grants the whole surface
+  and rotating it is the only revocation. That is stated in the deployment guide rather
+  than dressed up as an authentication system.
 
 Reading the CORS setting
 ------------------------
 ``FORGE_API_CORS_ORIGINS`` is an optional comma-separated allow-list. A ``*`` entry is
 rejected rather than normalized, because silently narrowing a wildcard would leave the
-operator believing a wider policy is active.
+operator believing a wider policy is active. ``Authorization`` and ``X-Forge-Token`` are
+allowed headers when a deployment does set a token, so a same-origin page and an explicitly
+allowed origin can both present it.
 """
 
 from __future__ import annotations
@@ -58,7 +66,6 @@ __all__ = [
     "resolve_ui_assets",
     "create_api_app",
 ]
-
 
 def _provider_registry_ids(api_service: Any) -> list[str]:
     """The provider ids this composition actually registered, or ``[]``.
@@ -273,14 +280,20 @@ def resolve_cors_origins(
     return tuple(origins)
 
 
-def warn_if_exposed(host: str) -> Optional[str]:
-    """Reject non-loopback binds because this surface has no authentication."""
+def warn_if_exposed(host: str, token: object = "") -> Optional[str]:
+    """Refuse a wider-than-loopback bind unless an access token guards the surface.
 
-    if is_loopback_host(host):
-        return None
-    raise RuntimeError(
-        "Forge API refuses non-loopback binding because authentication is not configured"
-    )
+    One rule, one message, in :func:`app.api.access.refuse_if_exposed`: a non-loopback bind
+    without a token raises ``RuntimeError`` **before** the application is built and before
+    ``uvicorn`` starts, so an operator who asked for a public port without a token sees the
+    reason in the terminal instead of a server that answers everybody. A token, or a
+    loopback bind, returns ``None`` and serving continues.
+    """
+
+    from app.api.access import refuse_if_exposed
+
+    refuse_if_exposed(host, token)
+    return None
 
 
 def create_api_app(
@@ -297,6 +310,7 @@ def create_api_app(
     project_opener: Optional[object] = None,
     window_opener: Optional[object] = None,
     provider_key_service: Optional[object] = None,
+    access: Optional[object] = None,
 ) -> Any:
     """Create a FastAPI application exposing Forge API endpoints.
 
@@ -344,6 +358,13 @@ def create_api_app(
     this runtime's provider registry and this runtime's enabled set, so a provider added
     through the routes is visible to the existing provider layer on the next request. A
     test supplies its own with an in-memory vault, so no real credential is written.
+
+    ``access`` is the deployment's access policy (:class:`app.api.access.AccessPolicy`).
+    When it carries a token, every ``/api/*`` request must present it and the body ceiling
+    and rate limits are installed; when it is ``None`` or carries no token, nothing is
+    installed and the surface behaves exactly as before. It is a parameter rather than an
+    environment read on purpose: composing an app must be reproducible, and the launcher
+    (``app/api/main.py``) is the one place that resolves the deployment's token.
     """
 
     from fastapi import FastAPI, HTTPException, Request, Header
@@ -493,15 +514,27 @@ def create_api_app(
             content={"detail": error_body(error_code="internal_execution_error")},
         )
 
+    # THE ACCESS LAYER, installed BEFORE CORS so that CORS stays the outermost middleware:
+    # a 401 must still carry the allow-origin headers, and a browser preflight must be
+    # answered by the CORS layer rather than by the token check. With no token in the
+    # policy nothing is installed at all (see ``install_access_control``).
+    from app.api.access import AccessPolicy, install_access_control
+
+    access_policy = access if isinstance(access, AccessPolicy) else AccessPolicy()
+    app.state.forge_access = access_policy
+    app.state.forge_rate_limiter = install_access_control(app, access_policy)
+
     # Credentialed CORS is off, and cannot be turned on here: with no authentication
     # there is no credential for a browser to attach, so enabling it would only widen
     # exposure. ``allow_origins`` is an explicit list (see ``resolve_cors_origins``).
+    # The two token headers are allowed so a page on an explicitly allowed origin can
+    # present the same token the interface sends on its own origin.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(cors_origins or resolve_cors_origins()),
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Authorization", "X-Forge-Token"],
     )
 
     # The UI asset allow-list is resolved once, at construction, from a directory

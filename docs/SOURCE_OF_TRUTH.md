@@ -177,7 +177,7 @@ review-engine module; the reviewer exists as an agent inside
 | Wall-clock timeout enforced by process wait, not by pipe EOF; process tree terminated on timeout **and** after a normal exit | **CURRENT / VERIFIED** | `app/execution/adapter.py` — `tests/test_execution_timeout_and_tree_kill.py` |
 | Frozen `workspace_root` checked unconditionally, independent of adapter isolation | **CURRENT / VERIFIED** | `app/execution/authorizer.py` — `tests/test_workspace_root_always_checked.py` |
 | Profile environment values redacted on every prompt-bound serialization | **CURRENT / VERIFIED** | `app/execution/profile.py` (`to_context_dict`) — `tests/test_profile_prompt_redaction.py` |
-| Core API exposure configuration: explicit CORS allow-list, no credentialed CORS, loopback-bound launcher that refuses non-loopback exposure without authentication | **CURRENT / VERIFIED** (no authentication) | `app/api/server.py`, `app/api/main.py` — `tests/test_api_exposure.py` |
+| Core API exposure configuration: explicit CORS allow-list, no credentialed CORS, loopback-bound launcher that refuses non-loopback exposure without an access token; with a configured token every `/api/*` route requires it (constant-time compare), health and the build identity stay open, and the body ceiling plus per-address rate limits are installed | **CURRENT / VERIFIED** (one shared token, no accounts — see §4.9) | `app/api/server.py`, `app/api/access.py`, `app/api/main.py`, `tools/ui_preview_server.py` — `tests/test_api_exposure.py`, `tests/test_remote_access.py` |
 | Frozen workspace identity binding | **CURRENT / VERIFIED** | `app/execution/identity.py`, `app/runtime/run_scope.py` — `tests/test_run_scope_trust_boundary.py` |
 | Bounded discovery includes a deterministic directory-depth limit | **CURRENT / VERIFIED** | `app/understanding/models.py`, `app/understanding/scanner.py` — `tests/test_understanding_security.py` |
 | Program path is pinned in the immutable execution intent | **CURRENT / VERIFIED** (small resolution-to-spawn TOCTOU window remains) | `app/execution/intent.py`, `app/execution/adapter.py` — `tests/test_execution_authorization_hardening_v03.py` |
@@ -907,10 +907,10 @@ than adding a parallel path.
 | `/` | GET | none — the shell contains no data; every panel it renders calls a guarded route |
 | `/app.css`, `/app.js` | GET | none — an explicit three-file allow-list, never a directory mount |
 
-**What the boundary is, stated precisely.** There is still **no authentication** on this
-surface; the residual risk recorded in §3.4 and in the audit is unchanged and this block
-does not claim to close it. What each route above enforces is the boundary that does
-exist:
+**What the boundary is, stated precisely.** There are still **no accounts** on this
+surface; what exists is the single-token access layer described in §4.9, and it is only in
+force when a deployment configures a token. What each route above enforces is the boundary
+that exists:
 
 * **project boundary** — the app is bound to one authoritative `project_id` at
   construction, from the service's own composition. A request naming a different project
@@ -1384,7 +1384,8 @@ derives an execution input from a memory record.
   hard-coded back to `True`; `test_31` pins the other direction (exit 0, no artifact ⇒
   `FAILED`); `test_an_unevaluable_artifact_check_is_an_error_not_a_failure` pins `ERROR`
   when the adapter neither isolates nor declares harvesting.
-* **No authentication.** See above: this is a loopback surface for a local operator.
+* **No accounts.** This is a single-operator surface: one shared access token (§4.9) guards
+  it when a deployment configures one, and there is no identity, role or per-user boundary.
 * **No process isolation.** These are text and contract checks inside one operating-system
   process. A process already running as this user is not confined by them, and no route
   here claims otherwise.
@@ -1715,30 +1716,50 @@ recording (`NOT_STARTED`/`STARTED`/`COMMITTED`/`FAILED`, plus the derived
 module, so `UNKNOWN_AFTER_CRASH` is not reachable from the current production run
 path. GAP-I and GAP-R are PARTIAL.
 
-### 4.9 The Core API has no authentication, and the launcher says so
+### 4.9 The Core API has no accounts; a single access token guards a remote deployment
 
-The Core API surface (`app/api/server.py`) has **no authentication**: no route requires a
-credential and no route verifies an identity. It exists for a local, trusted operator, and
-the Platform's authentication work covers a different surface. Three things were changed in
-this pass and one deliberately was not:
+The Core API surface (`app/api/server.py`) has **no identity model**: no route requires an
+account, a session or a role, and no route verifies who is calling. It exists for a single
+operator. What changed is that the surface can now be *reached* from a network safely,
+because the deployment the owner asked for (Forge runs on a server, he opens its UI in a
+browser) required exactly that.
 
-- CORS no longer uses `allow_origins=["*"]` with `allow_credentials=True`. The allow-list
+* CORS no longer uses `allow_origins=["*"]` with `allow_credentials=True`. The allow-list
   is explicit and local by default, credentialed CORS is off and cannot be turned on from
   this module, and a `*` in `FORGE_API_CORS_ORIGINS` is **refused** rather than silently
   narrowed, because an operator who wrote `*` believes the surface is open.
-- `app/api/main.py` is the launcher. There was none before: `create_api_app` existed and
-  tests imported it, but nothing bound a host, which is how the permissive CORS survived
-  review. It binds to loopback by default and refuses non-loopback binds because the
-  surface has no authentication.
-- Authentication was **not** invented. Adding an identity mechanism here is open decision
-  O-2 and would create a second trust model alongside the Platform's. The residual risk is
-  recorded here, and `tests/test_api_exposure.py::test_14` asserts that no route has gained
-  an authentication dependency, so the situation cannot change silently in either
-  direction.
+* `app/api/main.py` is the launcher. It reads the bind host and port from the owner's
+  settings file (`api_bind_host` / `api_port`; `FORGE_API_HOST` / `FORGE_API_PORT` still
+  override them), and **refuses a non-loopback bind when no token is configured**, before
+  the application is built and before `uvicorn` starts. The interface server
+  (`tools/ui_preview_server.py`) applies the same rule with `ui_bind_host` / `ui_port`.
+* `app/api/access.py` is the access layer. One shared token, resolved through the existing
+  secrets layer (`FORGE_ACCESS_TOKEN`: environment, `.env`, then the OS vault) and only
+  then from the settings file's `access_token`. A caller presents it as
+  `Authorization: Bearer <token>` or `X-Forge-Token: <token>`, compared with
+  `hmac.compare_digest`; a wrong or missing token is `401` with a plain message. `/health`,
+  `/api/health` and `/api/version` stay open. When a token is configured, the layer also
+  enforces an 8 MiB declared-body ceiling (413), 30 mutations a minute and 240 reads a
+  minute per address (429 with `Retry-After`), and publishes exactly one startup line: the
+  bind address, whether auth is on, and the token's **fingerprint** (six hex characters of
+  its SHA-256). The token value is never logged, never in a payload and never in an error
+  body.
+* With **no** token, nothing is installed: a loopback deployment behaves exactly as it did
+  before, and the launcher's refusal is what keeps "no token" from meaning "public".
+* Accounts are still **not** invented. One token grants the whole surface, and rotating it
+  is the only revocation; `app/platform/principal.py` remains the separate Platform
+  contract and open decision O-2 remains open.
 
-**Status: PARTIAL — an owner decision is required.** Either the Core API gains an
-authentication layer, or it must not be exposed beyond loopback, or the product surface
-becomes the Platform and this API stays internal.
+**Limits, stated rather than glossed.** The body ceiling is read from `Content-Length`, so
+a chunked body without that header is not measured by the Core (the nginx sample is the
+outer bound). The rate limit is an in-memory token bucket per address and a restart forgets
+it. The token is a bearer credential: anyone who has it can write files and start processes
+on that machine, which is why `deploy/DEPLOY.md` requires TLS and why
+`deploy/README-SSH-TUNNEL.md` exists as the option with no public port at all.
+
+**Status: CURRENT / VERIFIED** for the token, the refusal, the limits and the fingerprint —
+`tests/test_remote_access.py` (46 tests) plus `tests/test_api_exposure.py`. The absence of
+accounts is a product decision, stated above, not an unfinished feature.
 
 ### 4.10 Secret staging is a name-based filter, not a declared-input allow-list
 
@@ -4001,7 +4022,9 @@ id, произведённый слоем understanding, а запрос не м
   снова жёстко задан как `True`; `test_31` фиксирует обратное направление (exit 0, артефакта
   нет ⇒ `FAILED`); `test_an_unevaluable_artifact_check_is_an_error_not_a_failure`
   фиксирует `ERROR`, когда адаптер ни изолирует, ни объявляет harvesting.
-* **Аутентификации нет.** См. выше: это loopback-поверхность для локального оператора.
+* **Учётных записей нет.** Это поверхность одного оператора: один общий токен доступа
+  (§4.9) защищает её, когда развёртывание его задаёт, а идентичности, роли и границы
+  между пользователями нет.
 * **Изоляции процессов нет.** Это текстовые и контрактные проверки внутри одного
   процесса операционной системы. Процесс, уже работающий от имени этого пользователя,
   ими не ограничивается, и ни один маршрут здесь не заявляет обратного.
@@ -4373,30 +4396,49 @@ Resume — **только контракт**. `ResumeContract` и durable state 
 поэтому `UNKNOWN_AFTER_CRASH` недостижим из текущего production-пути run. GAP-I и
 GAP-R — PARTIAL.
 
-### 4.9 У Core API нет аутентификации, и launcher об этом говорит
+### 4.9 У Core API нет учётных записей; удалённое развёртывание защищает один токен доступа
 
-Поверхность Core API (`app/api/server.py`) **не имеет аутентификации**: ни один маршрут
-не требует учётных данных и не проверяет идентичность. Она существует для локального
-доверенного оператора; работа Platform над аутентификацией покрывает другую
-поверхность. В этом проходе изменены три вещи, и одна намеренно не изменена:
+Поверхность Core API (`app/api/server.py`) **не имеет модели идентичности**: ни один
+маршрут не требует учётной записи, сессии или роли и не проверяет, кто вызывает. Она
+существует для одного оператора. Изменилось то, что поверхность теперь может быть
+**доступна** из сети безопасно, потому что развёртывание, о котором попросил владелец
+(Forge работает на сервере, он открывает его интерфейс в браузере), требовало именно этого.
 
-- CORS больше не использует `allow_origins=["*"]` вместе с `allow_credentials=True`.
+* CORS больше не использует `allow_origins=["*"]` вместе с `allow_credentials=True`.
   Allow-list явный и локальный по умолчанию, credentialed CORS выключен и не может быть
   включён из этого модуля, а `*` в `FORGE_API_CORS_ORIGINS` **отклоняется**, а не сужается
   молча, потому что оператор, написавший `*`, считает поверхность открытой.
-- `app/api/main.py` — launcher. Раньше его не было: `create_api_app` существовал, тесты
-  его импортировали, но ничто не привязывало хост, — именно поэтому разрешающий CORS
-  пережил ревью. По умолчанию он привязывается к loopback и отказывает до запуска, если
-  запрошен другой адрес, поскольку у поверхности нет аутентификации.
-- Аутентификация **не изобретена**. Добавление здесь механизма идентичности — открытое
-  решение O-2, и оно создало бы вторую модель доверия рядом с моделью Platform.
-  Остаточный риск зафиксирован здесь, а `tests/test_api_exposure.py::test_14` утверждает,
-  что ни один маршрут не получил зависимости аутентификации, поэтому ситуация не может
-  измениться молча ни в одну из сторон.
+* `app/api/main.py` — launcher. Он читает адрес и порт привязки из файла настроек владельца
+  (`api_bind_host` / `api_port`; `FORGE_API_HOST` / `FORGE_API_PORT` по-прежнему их
+  перекрывают) и **отказывает в привязке не к loopback, если токен не задан**, до сборки
+  приложения и до запуска `uvicorn`. Сервер интерфейса
+  (`tools/ui_preview_server.py`) применяет то же правило с `ui_bind_host` / `ui_port`.
+* `app/api/access.py` — слой доступа. Один общий токен, разрешаемый через существующий слой
+  секретов (`FORGE_ACCESS_TOKEN`: окружение, `.env`, затем хранилище ОС) и только потом из
+  `access_token` в файле настроек. Вызывающий предъявляет его как
+  `Authorization: Bearer <token>` либо `X-Forge-Token: <token>`, сравнение —
+  `hmac.compare_digest`; неверный или отсутствующий токен — это `401` с понятным сообщением.
+  `/health`, `/api/health` и `/api/version` остаются открытыми. При заданном токене слой
+  также применяет потолок объявленного тела 8 МиБ (413), 30 мутаций в минуту и 240 чтений в
+  минуту на адрес (429 с `Retry-After`) и публикует ровно одну стартовую строку: адрес
+  привязки, включена ли аутентификация и **отпечаток** токена (шесть hex-символов его
+  SHA-256). Значение токена никогда не попадает ни в лог, ни в payload, ни в тело ошибки.
+* При **отсутствии** токена не устанавливается ничего: развёртывание на loopback ведёт себя
+  ровно как раньше, а отказ launcher'а не даёт «без токена» означать «публично».
+* Учётные записи по-прежнему **не изобретены**. Один токен открывает всю поверхность, и
+  ротация — единственный отзыв; `app/platform/principal.py` остаётся отдельным контрактом
+  Platform, а открытое решение O-2 остаётся открытым.
 
-**Статус: PARTIAL — требуется решение владельца.** Либо Core API получает слой
-аутентификации, либо он не должен выводиться за loopback, либо продуктовой поверхностью
-становится Platform, а этот API остаётся внутренним.
+**Ограничения названы прямо.** Потолок тела читается из `Content-Length`, поэтому
+chunked-тело без этого заголовка Core не измеряет (внешняя граница — образец nginx).
+Ограничитель скорости — это корзина токенов в памяти на адрес, и перезапуск её забывает.
+Токен — bearer-credential: у кого он есть, тот может писать файлы и запускать процессы на
+этой машине, поэтому `deploy/DEPLOY.md` требует TLS, а `deploy/README-SSH-TUNNEL.md`
+существует как вариант вообще без публичного порта.
+
+**Статус: CURRENT / VERIFIED** для токена, отказа, ограничений и отпечатка —
+`tests/test_remote_access.py` (46 тестов) плюс `tests/test_api_exposure.py`. Отсутствие
+учётных записей — продуктовое решение, названное выше, а не незаконченная возможность.
 
 ### 4.10 Подготовка секретов — это фильтр по именам, а не allow-list объявленных входов
 

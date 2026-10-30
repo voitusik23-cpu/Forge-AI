@@ -7,22 +7,29 @@ surface was never actually run through a launcher that would have made its expos
 concrete, and an operator who wanted it had to write their own uvicorn invocation with
 whatever settings they guessed.
 
-This module is the one place the bind address and port are decided:
+This module is the one place the bind address, the port and the access token are decided:
 
-* **loopback by default** (``FORGE_API_HOST`` / ``FORGE_API_PORT``);
-* a **refusal** to bind beyond loopback: :func:`app.api.server.warn_if_exposed` raises
-  before the application is built and before ``uvicorn`` starts, because this surface
-  has no authentication and exposing it is not something this launcher does on request;
-* no deployment topology is invented. Choosing a real production serving model is the
-  owner's decision, recorded as an open question, not something this file settles.
+* **the owner's settings file decides** (``api_bind_host`` / ``api_port`` / ``access_token``
+  in ``.forge/settings.json``), because that is deployment shape, not a credential. An
+  explicitly set ``FORGE_API_HOST`` / ``FORGE_API_PORT`` still wins, so the desktop launcher
+  -- which passes both -- keeps working unchanged, and **loopback is the default** either way;
+* the token is resolved through the existing secrets layer (``FORGE_ACCESS_TOKEN``:
+  environment, then ``.env``, then the operating system's vault) and only then from the
+  settings file, in that order, so a real deployment keeps its secret in ``.env``;
+* **a bind beyond loopback without a token refuses to start**, before the application is
+  built and before ``uvicorn`` runs, and the exact reason is printed to `stderr` as well
+  as raised -- the operator reads it in a terminal and in ``journalctl``;
+* one startup line states the bind address, whether auth is on and the token's
+  **fingerprint** (six hex characters of its SHA-256, never the token).
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import sys
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Tuple
 
 from app.api.server import (
     DEFAULT_API_HOST,
@@ -31,24 +38,84 @@ from app.api.server import (
     warn_if_exposed,
 )
 
-__all__ = ["resolve_bind", "main"]
+__all__ = [
+    "compose_access_policy",
+    "main",
+    "resolve_bind",
+    "resolve_workspace_project_id",
+]
+
+logger = logging.getLogger("forge.api")
 
 
-def resolve_bind(environ: Optional[dict[str, str]] = None) -> tuple[str, int]:
-    """Return ``(host, port)`` from the environment, defaulting to loopback."""
+def resolve_bind(
+    environ: Optional[dict[str, str]] = None,
+    settings: Optional[object] = None,
+) -> Tuple[str, int]:
+    """Return ``(host, port)`` for this deployment.
+
+    Precedence, stated once here because two independent readers -- this launcher and a
+    test -- must not be able to disagree about which value wins:
+
+    1. an **explicitly set** ``FORGE_API_HOST`` / ``FORGE_API_PORT`` (what the desktop
+       launcher passes, and what a service manager may override);
+    2. the owner's settings file, when one is supplied (the production launcher always
+       supplies it);
+    3. loopback and the documented port.
+
+    A variable that is present but empty is an error for the port and the default for the
+    host: ``FORGE_API_PORT=""`` used to mean "port 0" to nobody, and refusing it keeps the
+    launcher from binding something the operator did not name.
+    """
 
     environment = os.environ if environ is None else environ
-    host = str(environment.get("FORGE_API_HOST", DEFAULT_API_HOST)).strip()
-    if not host:
-        host = DEFAULT_API_HOST
-    raw_port = str(environment.get("FORGE_API_PORT", DEFAULT_API_PORT)).strip()
-    try:
-        port = int(raw_port)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"FORGE_API_PORT must be an integer, got {raw_port!r}") from exc
+
+    host = DEFAULT_API_HOST
+    if "FORGE_API_HOST" in environment:
+        host = str(environment.get("FORGE_API_HOST") or "").strip() or DEFAULT_API_HOST
+    elif settings is not None:
+        reader = getattr(settings, "api_bind_host", None)
+        if callable(reader):
+            try:
+                host = str(reader()).strip() or DEFAULT_API_HOST
+            except Exception:  # noqa: BLE001 - an unreadable setting is the default
+                host = DEFAULT_API_HOST
+
+    if "FORGE_API_PORT" in environment:
+        raw_port = str(environment.get("FORGE_API_PORT") or "").strip()
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"FORGE_API_PORT must be an integer, got {raw_port!r}"
+            ) from exc
+    elif settings is not None:
+        reader = getattr(settings, "api_port", None)
+        try:
+            port = int(reader()) if callable(reader) else DEFAULT_API_PORT
+        except Exception:  # noqa: BLE001 - an unreadable setting is the default
+            port = DEFAULT_API_PORT
+    else:
+        port = DEFAULT_API_PORT
     if not 1 <= port <= 65535:
         raise ValueError(f"FORGE_API_PORT must be 1..65535, got {port}")
     return host, port
+
+
+def compose_access_policy(
+    *, settings: Optional[object] = None, secret_store: Optional[object] = None
+) -> Any:
+    """The access policy this process serves with, from the token it can resolve.
+
+    No token means no policy enforcement **and** no public bind -- the refusal is made by
+    :func:`app.api.server.warn_if_exposed` immediately after this returns, so the two facts
+    cannot drift apart.
+    """
+
+    from app.api.access import AccessPolicy, resolve_access_token
+
+    token = resolve_access_token(secret_store=secret_store, settings=settings)
+    return AccessPolicy(token=token)
 
 
 def build_idempotency_guard() -> Any:
@@ -130,10 +197,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     import uvicorn
 
+    from app.api.access import access_log_line
     from app.config.app_settings import AppSettingsStore
 
-    host, port = resolve_bind()
-    warn_if_exposed(host)
+    # The owner's settings are read once and shared: they decide the bind, whether a token
+    # from that same file is in force, the projects folder and everything the interface can
+    # change. Composed before the bind is resolved, because both readers must agree.
+    settings = AppSettingsStore()
+    host, port = resolve_bind(settings=settings)
+    access = compose_access_policy(settings=settings)
+    # THE REFUSAL, BEFORE ANYTHING IS BUILT. A non-loopback bind without a token is not a
+    # configuration this product starts; the reason is printed as well as raised, because a
+    # service manager shows stderr and an operator reads it there.
+    try:
+        warn_if_exposed(host, access.token)
+    except RuntimeError as refusal:
+        print(f"Forge API: {refusal}", file=sys.stderr, flush=True)
+        logger.error("%s", refusal)
+        raise
     # One guard, created here from the durable root, so every task path this server exposes
     # shares one ledger while the process-wide default stays untouched.
     guard = build_idempotency_guard()
@@ -142,13 +223,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # without that the service stays unbound and every task is refused (which is the correct
     # fail-closed behaviour, but it also means the application can never run anything).
     project_id = resolve_workspace_project_id()
-    # The owner's settings are read once and shared: the settings routes write this file
-    # and the project store reads it through the same instance. The configured projects
-    # folder is created here, at startup, so it is visible on his desktop before the first
-    # project exists ("я вставляю промт и в конце получаю на рабочий стол готовый проект"
-    # -- the destination has to be there to be a destination). A folder that cannot be
-    # created is not fatal: the first project reports the refusal where it happens.
-    settings = AppSettingsStore()
+    # The configured projects folder is created here, at startup, so it is visible before
+    # the first project exists ("я вставляю промт и в конце получаю на рабочий стол готовый
+    # проект" -- the destination has to be there to be a destination). A folder that cannot
+    # be created is not fatal: the first project reports the refusal where it happens.
     try:
         settings.ensure_root()
     except Exception:  # noqa: BLE001 - an unusable root must not stop the API from serving
@@ -158,7 +236,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         authorized_project_id=project_id,
         project_service=compose_project_service(settings),
         settings_store=settings,
+        access=access,
     )
+    # The one line an operator needs after a restart: where it listens, whether auth is on,
+    # and which token (by fingerprint only) this process holds.
+    line = access_log_line(host=host, port=port, policy=access)
+    print(line, flush=True)
+    logger.info("%s", line)
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
 

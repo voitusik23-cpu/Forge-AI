@@ -1,8 +1,28 @@
 """Serve the built command center and proxy /api to the real Forge Core.
 
-Used for the prototype screenshots and for local review: the frontend is served from
-``ui/dist`` while ``/api/*`` is forwarded to the running API on 127.0.0.1:8011, so the
-interface shows real core data on a single origin and no backend change is needed.
+Used for the prototype screenshots, for local review, and on a server: the frontend is
+served from ``ui/dist`` while ``/api/*`` is forwarded to the running API on
+``127.0.0.1:8011``, so the interface shows real core data on a single origin and no
+backend change is needed.
+
+Bind rules, the same as the Core API's
+--------------------------------------
+Both servers can be reached by strangers the moment the host is not loopback, so the same
+rule is applied here:
+
+* ``ui_bind_host`` / ``ui_port`` in the owner's settings file decide where this listens
+  (defaults ``127.0.0.1`` / ``8020``); ``--host`` / ``--port`` override them;
+* a **non-loopback host without an access token refuses to start**, with the exact reason
+  printed, because the surface can write files and start processes;
+* with a token configured (``FORGE_ACCESS_TOKEN`` through the secrets layer, or
+  ``access_token`` in the settings file), every dynamic route here -- ``/api/*``,
+  ``/diag``, ``/ui-defaults.json`` and ``/docs/*`` -- requires it, and the token is
+  forwarded to the Core instead of being replaced by this proxy. Static assets stay open:
+  they are the page that has to load before it can send the token, and they contain no
+  data.
+
+The UI learns the token from a one-time ``?token=...`` URL, keeps it in ``sessionStorage``
+and sends it as ``X-Forge-Token`` on every call (``ui/src/api/access-token.ts``).
 """
 
 from __future__ import annotations
@@ -25,15 +45,80 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from app.api.access import (  # noqa: E402 - the sys.path line above has to run first
+    AccessPolicy,
+    access_log_line,
+    extract_token,
+    is_protected_path,
+    refuse_if_exposed,
+    resolve_access_token,
+    tokens_match,
+)
+
+#: Paths this shell answers itself that carry data or diagnostics. They require the token
+#: when one is configured; the static bundle does not.
+_DYNAMIC_PATHS = ("/diag", "/ui-defaults.json", "/docs/")
+
+
+def path_needs_token(path: str) -> bool:
+    """Whether one request path is a data/diagnostic route rather than a static asset."""
+
+    clean = path.split("?", 1)[0]
+    if is_protected_path(clean):
+        return True
+    return any(clean == item or clean.startswith(item) for item in _DYNAMIC_PATHS)
+
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    #: The access policy of this process, set by :func:`main` before it serves. The default
+    #: carries no token, which is exactly the loopback deployment.
+    access: AccessPolicy = AccessPolicy()
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory="ui/dist", **kwargs)
 
     def log_message(self, *args):  # keep the console readable
         return
 
+    def _authorized(self) -> bool:
+        """Whether this request may reach a dynamic route on this deployment.
+
+        The two spellings the Core accepts are accepted here too, and the comparison is the
+        same constant-time helper -- one rule, two processes.
+        """
+
+        policy = type(self).access
+        if not policy.enabled:
+            return True
+        return any(tokens_match(value, policy.token) for value in extract_token(self.headers))
+
+    def _refuse_unauthorized(self) -> None:
+        body = json.dumps(
+            {
+                "detail": {
+                    "refused": True,
+                    "error_code": "unauthorized",
+                    "code": "unauthorized",
+                    "message": (
+                        "unauthorized: this Forge server requires its access token, sent "
+                        "as 'Authorization: Bearer <token>' or 'X-Forge-Token: <token>'"
+                    ),
+                    "executed": False,
+                }
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("WWW-Authenticate", 'Bearer realm="forge"')
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802 - the base class names it this way
+        if path_needs_token(self.path) and not self._authorized():
+            self._refuse_unauthorized()
+            return
         if self.path.startswith("/diag"):
             self._diagnose()
             return
@@ -176,16 +261,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # Write methods must reach the Core API. Without these, POST /api/tasks/run answered
     # 501 from the base class and the run form could never dispatch anything.
     def do_POST(self) -> None:  # noqa: N802
-        self._proxy("POST")
+        self._guard_then_proxy("POST")
 
     def do_PUT(self) -> None:  # noqa: N802
-        self._proxy("PUT")
+        self._guard_then_proxy("PUT")
 
     def do_PATCH(self) -> None:  # noqa: N802
-        self._proxy("PATCH")
+        self._guard_then_proxy("PATCH")
 
     def do_DELETE(self) -> None:  # noqa: N802
-        self._proxy("DELETE")
+        self._guard_then_proxy("DELETE")
+
+    def _guard_then_proxy(self, method: str) -> None:
+        """Check the token, then forward the request with that same token intact."""
+
+        if path_needs_token(self.path) and not self._authorized():
+            self._refuse_unauthorized()
+            return
+        self._proxy(method)
 
     def _body(self) -> bytes:
         try:
@@ -201,6 +294,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         headers = {"accept": "application/json"}
         if body:
             headers["content-type"] = self.headers.get("Content-Type", "application/json")
+        # The caller's own credential travels with the request. The Core compares it
+        # against its own token, so this proxy never has to hold or inject one -- and a
+        # deployment that put the token in ``.env`` for the Core alone would still work.
+        for name in ("Authorization", "X-Forge-Token"):
+            value = self.headers.get(name)
+            if value:
+                headers[name] = value
+        # The reverse proxy's client address is passed on so the Core's per-address rate
+        # limit charges the real caller instead of this process.
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded:
+            headers["X-Forwarded-For"] = forwarded
         request = urllib.request.Request(
             UPSTREAM + self.path, data=body or None, headers=headers, method=method
         )
@@ -246,13 +351,38 @@ class _Server(socketserver.ThreadingTCPServer):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8020)
+    parser.add_argument("--host", default=None, help="bind address (default: the ui_bind_host setting)")
+    parser.add_argument("--port", type=int, default=None, help="bind port (default: the ui_port setting)")
     args = parser.parse_args()
+
+    # Where to listen and whether a token guards it: exactly one reader, shared with the
+    # Core API, so the two processes cannot disagree about the deployment's shape. The
+    # safety refusal comes BEFORE the bundle check: a misconfigured deployment should learn
+    # the dangerous thing first, not that its build output is missing.
+    from app.config.app_settings import AppSettingsStore
+
+    settings = AppSettingsStore()
+    host = (args.host or settings.ui_bind_host()).strip() or "127.0.0.1"
+    port = int(args.port if args.port is not None else settings.ui_port())
+    token = resolve_access_token(settings=settings)
+    policy = AccessPolicy(token=token)
+    try:
+        refuse_if_exposed(host, policy.token, surface="Forge UI")
+    except RuntimeError as refusal:
+        # The exact reason, on stderr, and a non-zero exit: a service manager shows this
+        # line and the operator reads it there instead of finding an open port later.
+        print(refusal, file=sys.stderr, flush=True)
+        return 2
+
     if not pathlib.Path("ui/dist/index.html").exists():
         print("ui/dist is missing: run the frontend build first")
         return 2
-    with _Server(("127.0.0.1", args.port), Handler) as httpd:
-        print(f"command center on http://127.0.0.1:{args.port}/")
+
+    Handler.access = policy
+    with _Server((host, port), Handler) as httpd:
+        line = access_log_line(host=host, port=port, policy=policy, surface="Forge UI shell")
+        print(line, flush=True)
+        print(f"command center on http://{host}:{port}/", flush=True)
         httpd.serve_forever()
     return 0
 

@@ -1,0 +1,49 @@
+[Unit]
+Description=Forge AI Core API
+Documentation=file:///opt/forge/deploy/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A dedicated unprivileged account: `useradd --system --create-home --shell /usr/sbin/nologin forge`.
+User=forge
+Group=forge
+WorkingDirectory=/opt/forge
+# THE CREDENTIAL FILE. `.env` holds FORGE_ACCESS_TOKEN and the provider keys; it is
+# read by the service, not by a shell profile. `chmod 600` and owned by `forge`.
+EnvironmentFile=/opt/forge/.env
+# The repository must be importable and Python must not try to write bytecode into a
+# read-only tree (ProtectSystem=strict below).
+Environment=PYTHONPATH=/opt/forge
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Where the durable state lives (runs, projects, versions, settings, idempotency ledger).
+# The launcher reads the bind host and port from `.forge/settings.json`.
+Environment=FORGE_RUN_STORE_ROOT=/opt/forge/.forge/run-store
+ExecStart=/opt/forge/.venv/bin/python -m app.api.main
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+
+# ---------------------------------------------------------------------------- hardening
+NoNewPrivileges=true
+# Everything is read-only except the paths named below: the checkout itself, /usr, /etc.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# THE ONLY WRITABLE PATHS. `.forge` holds runs, projects, versions, settings and the
+# idempotency ledger. Add the projects folder here too if it is outside `.forge` --
+# for example `/srv/forge`, chosen in «Настройки» as the projects folder.
+ReadWritePaths=/opt/forge/.forge
+ReadWritePaths=/srv/forge
+
+[Install]
+WantedBy=multi-user.target

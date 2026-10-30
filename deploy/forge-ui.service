@@ -1,0 +1,40 @@
+[Unit]
+Description=Forge AI command center (interface bundle + /api proxy)
+Documentation=file:///opt/forge/deploy/DEPLOY.md
+After=network-online.target forge.service
+Wants=network-online.target
+# The interface proxies `/api/*` to the Core, so it starts after it. It does not need the
+# Core to be ready: a request that arrives first answers 503 from the proxy and the page
+# retries.
+
+[Service]
+Type=simple
+User=forge
+Group=forge
+WorkingDirectory=/opt/forge
+EnvironmentFile=/opt/forge/.env
+Environment=PYTHONPATH=/opt/forge
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Binds 127.0.0.1:8020 by default (the `ui_bind_host`/`ui_port` settings). nginx is what
+# faces the internet; this process never does. It still requires the access token for every
+# dynamic route when one is configured.
+ExecStart=/opt/forge/.venv/bin/python tools/ui_preview_server.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# This process writes nothing: it serves `ui/dist`, reads `docs/` and proxies `/api`.
+
+[Install]
+WantedBy=multi-user.target

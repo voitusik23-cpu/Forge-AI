@@ -1,0 +1,92 @@
+# Forge AI -- nginx reverse proxy with TLS.
+#
+# Copy to /etc/nginx/sites-available/forge, edit the two `server_name` lines and the
+# certificate paths, then:
+#
+#   sudo ln -s /etc/nginx/sites-available/forge /etc/nginx/sites-enabled/forge
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# What this file is responsible for, and what it is NOT:
+#
+#   * TLS termination, so the access token and every file never cross the network in clear
+#     text. Without TLS the token is a password shouted in a corridor.
+#   * Forwarding the two token headers untouched, so the Core API's own comparison is what
+#     decides. nginx does NOT authenticate anything: a request without a token reaches the
+#     Core and is refused there with 401.
+#   * A body ceiling (8m) that matches the Core's own (`FORGE` body limit is 8 MiB). The
+#     proxy refuses first, with its own readable "413 Request Entity Too Large".
+#   * Timeouts long enough for a task: a run can take minutes and the interface polls.
+#
+# The token is NOT written in this file. If you ever put a credential here, it lands in
+# /etc/nginx and in every `nginx -T` output.
+
+# ------------------------------------------------------------------ HTTP -> HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name forge.example.com;
+
+    # Leave the ACME challenge on plain HTTP so certbot can renew without a redirect loop.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ------------------------------------------------------------------------ HTTPS
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name forge.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/forge.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/forge.example.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # The same ceiling the Core enforces (8 MiB). Both, on purpose: this one answers before
+    # a byte is buffered, and the Core's one still holds if somebody puts another proxy in
+    # front of this one or talks to 127.0.0.1:8011 directly.
+    client_max_body_size 8m;
+    client_body_timeout 60s;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    # One origin: the interface bundle and `/api/*` are both served by the shell server,
+    # which proxies `/api` to the Core on 127.0.0.1:8011. `ui/dist` must be built first
+    # (`cd ui && pnpm install && pnpm build`), and both Forge services bind loopback only.
+    location / {
+        proxy_pass http://127.0.0.1:8020;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The Core's per-address rate limit reads the LAST entry of this header, and this
+        # line appends the address nginx actually saw -- so a client that sends its own
+        # X-Forwarded-For cannot choose the bucket it is charged to.
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # THE AUTH HEADERS. Both spellings the Core accepts are passed through unchanged;
+        # nginx must not consume, rewrite or add them.
+        proxy_set_header Authorization     $http_authorization;
+        proxy_set_header X-Forge-Token     $http_x_forge_token;
+
+        # A run can take minutes and the interface polls while it does. Buffering off so a
+        # long answer is streamed rather than held until it completes.
+        proxy_connect_timeout 15s;
+        proxy_send_timeout    600s;
+        proxy_read_timeout    600s;
+        proxy_buffering       off;
+
+        # The interface sends no cookies; the token is a header, kept in sessionStorage.
+        proxy_set_header Cookie "";
+    }
+}

@@ -17,6 +17,7 @@
 
 import { taskRunBody } from "../task-run-body";
 import type { Evidence } from "../evidence";
+import { withAccessToken } from "./access-token";
 
 export type ProjectInfo = {
   project_id?: string;
@@ -486,7 +487,7 @@ const disconnected = (path: string, error: unknown): Failure => ({
 const readJson = async <T>(path: string): Promise<Result<T>> => {
   let response: Response;
   try {
-    response = await fetch(path, { headers: { accept: "application/json" } });
+    response = await fetch(path, { headers: withAccessToken({ accept: "application/json" }) });
   } catch (error) {
     return { ok: false, failure: disconnected(path, error) };
   }
@@ -618,7 +619,7 @@ export const dispatchTask = async (input: {
   try {
     response = await fetch(path, {
       method: "POST",
-      headers,
+      headers: withAccessToken(headers),
       body: JSON.stringify(body),
       signal: input.signal,
     });
@@ -693,7 +694,10 @@ export const estimateRoute = async (input: {
   try {
     response = await fetch(path, {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: withAccessToken({
+        "content-type": "application/json",
+        accept: "application/json",
+      }),
       body: JSON.stringify(body),
       signal: input.signal,
     });
@@ -947,6 +951,9 @@ const sendJson = async <T>(
     headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
   }
+  // The token travels with the same headers as everything else, so one call site cannot
+  // forget it: `withAccessToken` is applied to the whole object just before the request.
+  init.headers = withAccessToken(headers);
   let response: Response;
   try {
     response = await fetch(path, init);

@@ -62,6 +62,23 @@ Two values live in it:
     owner's balance was burned by a ``COMPLEX`` task routed to a $16.61/1M model. An
     explicit provider+model named by the owner is still honoured (he may choose
     consciously) and «Настройки» warns that it is more expensive than the ceiling.
+
+``api_bind_host`` / ``api_port`` / ``ui_bind_host`` / ``ui_port``
+    where the two servers listen (defaults ``127.0.0.1``, ``8011`` for the Core API and
+    ``127.0.0.1``, ``8020`` for the interface). These belong here rather than in ``.env``
+    because they are *deployment shape*, not credentials, and the owner sets them once on
+    a server: a non-loopback host without an access token makes both servers refuse to
+    start (:func:`app.api.access.refuse_if_exposed`). ``FORGE_API_HOST``/``FORGE_API_PORT``
+    remain as the fallback a launcher may pass, so the existing desktop launcher keeps
+    working unchanged.
+
+``access_token``
+    an optional access token for a **self-hosted** box, read only when
+    ``FORGE_ACCESS_TOKEN`` is not resolvable through :class:`app.config.secrets.SecretStore`
+    (process environment, ``.env``, then the operating system's vault). It is deliberately
+    last: on a real deployment the token lives in ``.env`` with the other credentials, and
+    this key exists so a small box does not have to keep one. A token held here is stored
+    in plain text in this file -- the deployment guide says to prefer ``.env``.
 """
 
 from __future__ import annotations
@@ -78,7 +95,14 @@ from app.agent_runtime.routing import (
 )
 
 __all__ = [
+    "ACCESS_TOKEN_KEY",
+    "API_BIND_HOST_KEY",
+    "API_PORT_KEY",
+    "DEFAULT_API_BIND_HOST",
+    "DEFAULT_API_PORT",
     "DEFAULT_PROJECT_ROOT_NAME",
+    "DEFAULT_UI_BIND_HOST",
+    "DEFAULT_UI_PORT",
     "MAX_COST_TIER_KEY",
     "PROJECT_ROOT_FALLBACK_KEY",
     "PROJECT_ROOT_KEY",
@@ -87,6 +111,8 @@ __all__ = [
     "QUESTIONS_FROM_MODEL_KEY",
     "SETTINGS_ENV_VAR",
     "SETTINGS_SCHEMA_VERSION",
+    "UI_BIND_HOST_KEY",
+    "UI_PORT_KEY",
     "WINDOW_DOWNGRADE_ALLOWED_KEY",
     "AppSettingsError",
     "AppSettingsStore",
@@ -132,6 +158,25 @@ QUESTIONS_FROM_MODEL_KEY = "questions_from_model"
 #: router reads (:data:`app.agent_runtime.routing.MAX_COST_TIER_SETTING`). One spelling,
 #: so the store and the decision cannot disagree about which key is the ceiling.
 MAX_COST_TIER_KEY = MAX_COST_TIER_SETTING
+
+#: Where the two servers listen. Deployment shape, so it lives in the owner's own file
+#: rather than in ``.env`` -- and a non-loopback host without an access token makes both
+#: servers refuse to start.
+API_BIND_HOST_KEY = "api_bind_host"
+API_PORT_KEY = "api_port"
+UI_BIND_HOST_KEY = "ui_bind_host"
+UI_PORT_KEY = "ui_port"
+
+#: An optional access token for a self-hosted box, read only when
+#: ``FORGE_ACCESS_TOKEN`` cannot be resolved from the environment, ``.env`` or the vault.
+#: See :func:`app.api.access.resolve_access_token` for the order and the reason.
+ACCESS_TOKEN_KEY = "access_token"
+
+#: The defaults of the four bind settings: loopback, on the ports the product runs on.
+DEFAULT_API_BIND_HOST = "127.0.0.1"
+DEFAULT_API_PORT = 8011
+DEFAULT_UI_BIND_HOST = "127.0.0.1"
+DEFAULT_UI_PORT = 8020
 
 #: Every key this store owns. Everything else in the file is preserved verbatim, so a
 #: setting written by another module (the provider entries above) is not erased the next
@@ -284,6 +329,24 @@ def normalise_project_root(value: object) -> Path:
             f"По этому пути лежит файл, а не папка: {expanded}", field="project_root"
         )
     return expanded
+
+
+def _port_setting(value: object, default: int) -> int:
+    """A stored port number, or ``default`` when the value is not one this host can bind.
+
+    A port that cannot be parsed or lies outside 1..65535 is not repaired into a derived
+    value: the deployment's documented default is used, so a typo costs the operator the
+    default port rather than an unexpected one. ``True``/``False`` are refused explicitly
+    because ``int(True) == 1`` would otherwise silently mean "port 1".
+    """
+
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if 1 <= number <= 65535 else default
 
 
 def _as_path(value: object) -> Optional[Path]:
@@ -557,6 +620,56 @@ class AppSettingsStore:
         document["updated_at"] = _now_iso()
         write_settings_document(self._path, document)
         return text
+
+    # ---------------------------------------------------- where it listens
+    def api_bind_host(self) -> str:
+        """The address the Core API binds: loopback unless the owner wrote another one.
+
+        Read from the raw document. A missing, blank or non-string value answers the
+        default instead of an empty host -- an empty host means "every interface" to some
+        servers, which is the one value this setting must never produce by accident.
+        """
+
+        raw = read_settings_document(self._path).get(API_BIND_HOST_KEY)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return DEFAULT_API_BIND_HOST
+
+    def api_port(self) -> int:
+        """The Core API port, as the owner set it, else ``8011``."""
+
+        return _port_setting(
+            read_settings_document(self._path).get(API_PORT_KEY), DEFAULT_API_PORT
+        )
+
+    def ui_bind_host(self) -> str:
+        """The address the interface server binds, loopback by default."""
+
+        raw = read_settings_document(self._path).get(UI_BIND_HOST_KEY)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return DEFAULT_UI_BIND_HOST
+
+    def ui_port(self) -> int:
+        """The interface server port, as the owner set it, else ``8020``."""
+
+        return _port_setting(
+            read_settings_document(self._path).get(UI_PORT_KEY), DEFAULT_UI_PORT
+        )
+
+    def access_token(self) -> str:
+        """The optional access token this deployment keeps in its own file, or ``""``.
+
+        Only the raw document is read, and only a non-blank string is a token: a value of
+        another type is not "some token", it is no token. This is the **last** source --
+        :func:`app.api.access.resolve_access_token` asks the secrets layer first -- so a
+        token in ``.env`` wins, exactly as it does for a provider key.
+        """
+
+        raw = read_settings_document(self._path).get(ACCESS_TOKEN_KEY)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return ""
 
     def set_project_root(self, value: object) -> Path:
         """Store ``value`` as the project root and remember the previous ones.

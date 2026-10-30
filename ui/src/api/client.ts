@@ -2,6 +2,8 @@
 // Nothing is invented: if /api/status cannot be read, the interface says the backend is
 // unreachable and every number is replaced by a dash.
 
+import { withAccessToken } from "./access-token";
+
 export type Status = {
   core?: string;
   api?: string;
@@ -239,7 +241,9 @@ export type BackendState =
   | { status: "offline"; reason: string };
 
 const getJson = async <T>(path: string): Promise<T> => {
-  const response = await fetch(path, { headers: { accept: "application/json" } });
+  // The access token (when this deployment has one) is attached here, at the single place
+  // this module talks to the Core, so no caller can forget it.
+  const response = await fetch(path, { headers: withAccessToken({ accept: "application/json" }) });
   if (!response.ok) {
     throw new Error(`${path} → HTTP ${response.status}`);
   }

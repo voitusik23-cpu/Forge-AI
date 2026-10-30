@@ -9154,3 +9154,121 @@ decision is one fixed complex task, not a forecast for a particular request.
 она исключена, хотя её ставка ниже. Это сделано намеренно — тариф есть категория продукта,
 — но значит, что потолок не является гарантией цены за токен. Образец решения — одна
 фиксированная сложная задача, а не прогноз для конкретного запроса.
+
+## 2026-10-29 — Remote deployment: one shared access token instead of accounts
+
+**Decision.** Forge can run on a server and be used from a browser. What makes that safe is
+a single shared access token (`app/api/access.py`), not an identity system:
+
+* the bind host and port are **deployment shape** and live in the owner's settings file
+  (`api_bind_host`, `api_port`, `ui_bind_host`, `ui_port`), not in `.env`; an explicitly set
+  `FORGE_API_HOST` / `FORGE_API_PORT` still wins, so the desktop launcher is unchanged;
+* a bind beyond loopback **without a token refuses to start** — in the API launcher and in
+  the interface server — before the application is built, with the exact reason on stderr;
+* the token is resolved through the existing secrets layer (`FORGE_ACCESS_TOKEN`:
+  environment, `.env`, then the OS vault) and only then from the settings file's
+  `access_token`; a caller presents it as `Authorization: Bearer` or `X-Forge-Token`,
+  compared with `hmac.compare_digest`;
+* with a token, every `/api/*` route requires it (401 with a plain message), `/health` and
+  `/api/version` stay open, an 8 MiB declared body ceiling answers 413, and 30 mutations /
+  240 reads a minute per address answer 429 with `Retry-After`;
+* the UI takes the token from a one-time `?token=…` URL, keeps it in `sessionStorage`, strips
+  it from the address bar and sends it on every call (`ui/src/api/access-token.ts`);
+* exactly one startup line states the bind, whether auth is on and the token's
+  **fingerprint** (six hex characters of its SHA-256). The value itself is never logged,
+  never in a payload, never in an error body;
+* with **no** token nothing is installed, so a loopback deployment is exactly as frictionless
+  as before — and the launcher's refusal is what keeps "no token" from meaning "public".
+
+**Why.** The owner's plan is «переносим полностью, вся работа будет идти оттуда»: the models,
+files, projects, versions and rollbacks happen on the server, and his machine is a browser.
+The API binds loopback and has no accounts, so exposing it would have been remote code
+execution on his server (`POST /api/tasks/run` writes files, `POST /api/projects/{id}/run`
+starts processes). A token is the smallest mechanism that closes that: one operator, no
+user database, no sessions, no password reset, and a rotation that is one edit and one
+restart. Accounts would have been a second trust model beside the Platform's, which is open
+decision O-2 and is still open.
+
+**Rejected.** (a) Accounts and sessions — a new identity model for a one-person product, and
+the Platform already owns that contract. (b) Basic auth — the browser would keep the
+credential cached and offer it to every request, and a logout would be a browser setting.
+(c) A token in a cookie — a cookie is attached by the browser to cross-site requests, so CSRF
+protection would have been needed; a header kept in `sessionStorage` is per origin and per
+tab. (d) An IP allow-list only — it fails on a phone and behind CGNAT. (e) Letting the
+operator bind publicly and "remember to add a token" — the failure mode is silent and total,
+so the refusal is in the code, not the documentation.
+
+**Evidence.** `tests/test_remote_access.py` (46 tests): the refusal and its message, both
+accepted headers against 200 and every other spelling against 401, `hmac.compare_digest`
+proven to be the comparison, the open health/version paths, the 31st mutation as 429 with
+`Retry-After`, an oversized body as 413, the token absent from every payload and present only
+as its fingerprint in the startup line, the forwarded-address rule behind a proxy, and the
+settings-file bind precedence. `tests/test_api_exposure.py` is unchanged and green.
+`deploy/` carries the Ubuntu guide, the two systemd units, the nginx TLS sample and the
+SSH-tunnel option.
+
+**Limits.** One token is the whole surface: whoever holds it can write files and start
+processes, so `deploy/DEPLOY.md` requires TLS for topology B and marks a direct public bind
+as "private network only". The body ceiling reads `Content-Length`; a chunked body without
+that header is bounded by nginx, not by the Core. The rate limit is an in-memory bucket per
+address and a restart forgets it.
+
+### 2026-10-29 — Удалённое развёртывание: один общий токен доступа вместо учётных записей
+
+**Решение.** Forge может работать на сервере, а пользоваться им можно из браузера. Безопасным
+это делает один общий токен доступа (`app/api/access.py`), а не система идентичности:
+
+* адрес и порт привязки — это **форма развёртывания**, они живут в файле настроек владельца
+  (`api_bind_host`, `api_port`, `ui_bind_host`, `ui_port`), а не в `.env`; явно заданные
+  `FORGE_API_HOST` / `FORGE_API_PORT` по-прежнему важнее, поэтому настольный launcher не
+  меняется;
+* привязка не к loopback **без токена отказывается запускаться** — и в launcher'е API, и в
+  сервере интерфейса — до сборки приложения, с точной причиной в stderr;
+* токен разрешается через существующий слой секретов (`FORGE_ACCESS_TOKEN`: окружение,
+  `.env`, затем хранилище ОС) и только потом из `access_token` в файле настроек; вызывающий
+  предъявляет его как `Authorization: Bearer` либо `X-Forge-Token`, сравнение —
+  `hmac.compare_digest`;
+* при заданном токене каждый маршрут `/api/*` требует его (401 с понятным сообщением),
+  `/health` и `/api/version` остаются открытыми, объявленное тело больше 8 МиБ получает 413,
+  а 30 мутаций / 240 чтений в минуту на адрес — 429 с `Retry-After`;
+* интерфейс берёт токен из одноразового URL `?token=…`, держит его в `sessionStorage`,
+  убирает из адресной строки и отправляет в каждом вызове (`ui/src/api/access-token.ts`);
+* ровно одна стартовая строка сообщает адрес привязки, включена ли аутентификация и
+  **отпечаток** токена (шесть hex-символов его SHA-256). Само значение не попадает ни в лог,
+  ни в payload, ни в тело ошибки;
+* при **отсутствии** токена не устанавливается ничего, поэтому развёртывание на loopback
+  остаётся ровно таким же удобным, как раньше, — а отказ launcher'а не даёт «без токена»
+  означать «публично».
+
+**Почему.** План владельца — «переносим полностью, вся работа будет идти оттуда»: модели,
+файлы, проекты, версии и откаты происходят на сервере, а его машина — браузер. API
+привязывается к loopback и не имеет учётных записей, поэтому его публикация была бы удалённым
+выполнением кода на его сервере (`POST /api/tasks/run` пишет файлы, `POST
+/api/projects/{id}/run` запускает процессы). Токен — минимальный механизм, который это
+закрывает: один оператор, никакой базы пользователей, сессий и сброса пароля, а ротация — это
+одна правка и один перезапуск. Учётные записи создали бы вторую модель доверия рядом с
+моделью Platform, а это открытое решение O-2, и оно остаётся открытым.
+
+**Отклонённые варианты.** (а) Учётные записи и сессии — новая модель идентичности для
+продукта на одного человека, и этот контракт уже принадлежит Platform. (б) Basic auth —
+браузер кэшировал бы учётные данные и предлагал их каждому запросу, а «выход» был бы
+настройкой браузера. (в) Токен в cookie — cookie браузер прикладывает и к межсайтовым
+запросам, поэтому понадобилась бы защита от CSRF; заголовок в `sessionStorage` привязан к
+origin и к вкладке. (г) Только allow-list по IP — не работает с телефона и за CGNAT.
+(д) Разрешить публичную привязку и «не забыть добавить токен» — отказ был бы молчаливым и
+полным, поэтому отказ находится в коде, а не в документации.
+
+**Доказательство.** `tests/test_remote_access.py` (46 тестов): отказ и его сообщение, оба
+принятых заголовка против 200 и любое другое написание против 401, доказанное использование
+`hmac.compare_digest` как сравнения, открытые пути здоровья и версии, 31-я мутация как 429 с
+`Retry-After`, слишком большое тело как 413, отсутствие токена в любом payload и присутствие
+только его отпечатка в стартовой строке, правило форвардированного адреса за прокси и
+приоритет привязки из файла настроек. `tests/test_api_exposure.py` не изменён и зелёный. В
+`deploy/` лежат гид для Ubuntu, два systemd-юнита, образец nginx с TLS и вариант с
+SSH-тоннелем.
+
+**Ограничения.** Один токен — это вся поверхность: у кого он есть, тот может писать файлы и
+запускать процессы, поэтому `deploy/DEPLOY.md` требует TLS для топологии B и помечает
+прямую публичную привязку как «только частная сеть». Потолок тела читает `Content-Length`;
+chunked-тело без этого заголовка ограничивает nginx, а не Core. Ограничитель скорости —
+корзина в памяти на адрес, и перезапуск её забывает.

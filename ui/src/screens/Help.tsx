@@ -3,6 +3,7 @@ import { Button, Card, CardHead } from "../components/Primitives";
 import { VersionLine } from "../components/VersionLine";
 import { HELP_TOPICS, HELP_TOPIC_BY_ID } from "../help-content";
 import { t, type Lang } from "../i18n";
+import { withAccessToken } from "../api/access-token";
 import type { Status } from "../api/client";
 
 /** Where the owner's manual lives, repository-relative. Never an absolute host path. */
@@ -22,7 +23,9 @@ export const Help = ({ lang, topic, status }: { lang: Lang; topic: string; statu
     let alive = true;
     void (async () => {
       try {
-        const response = await fetch(MANUAL_PATH, { headers: { accept: "text/markdown, text/plain" } });
+        const response = await fetch(MANUAL_PATH, {
+          headers: withAccessToken({ accept: "text/markdown, text/plain" }),
+        });
         if (alive) setManualServed(response.ok);
       } catch {
         if (alive) setManualServed(false);
