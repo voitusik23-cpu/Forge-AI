@@ -12,6 +12,8 @@
 > is authoritative. For **current** architecture in detail, see
 > [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
+> **Correction (2026-10-30).** Every measured statement below is a dated observation: as of commit `3e05e29` the Forge API in `app/api/` is implemented and `app/agents/providers/factory.py` registers nine real providers plus `Mock` — see the dated section at the top of [`README.md`](../README.md).
+>
 > **Verified baseline.** Commit `d1c007a` plus the uncommitted working tree at the
 > time of writing. Every number below was measured on that tree, in a run that did
 > not overlap another test process; the tree has uncommitted work, so treat these as

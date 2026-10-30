@@ -1,5 +1,75 @@
 # Forge AI
 
+## Status — 2026-10-30: what is implemented today
+
+This dated section records the current state. It corrects two statements in the
+older text below, which is **kept unchanged as a historical record**: the Forge
+API **is** implemented, and the provider factory has **nine** real providers, not
+seven. Per-area verified status: [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md).
+
+- **The API is implemented** in [`app/api/`](app/api) — a FastAPI surface started
+  with `python -m app.api.main`, with 72 `/api/*` route paths: health and version,
+  providers, models, balances and costs, settings, tools, agents, runs, task
+  dispatch, discovery sessions, the project lifecycle, and the product surface
+  (goal, plan, graph, verify, accept, evidence graph, memory, recovery, repair
+  plan). Beyond loopback every request needs the access token
+  (`FORGE_ACCESS_TOKEN`), and both servers refuse a non-loopback bind without one.
+- **Providers: nine real integrations plus the offline mock.**
+  `app/agents/providers/factory.py` registers `openai`, `anthropic`, `deepseek`,
+  `google`, `xai`, `openrouter`, `groq`, `together`, `radox` and `mock` — ten
+  entries, nine of them real provider adapters.
+- **Project lifecycle: versions, rollbacks and evidence.** A project is its record
+  plus a workspace of files a run really wrote; every change produces a version,
+  a change that degrades a working project is rolled back from its own snapshot
+  (`app/projects/regression.py`), and versions, history and the traceability graph
+  are published (`/api/projects/{project_id}/versions`, `/history`,
+  `/api/product/evidence-graph`; see also `app/analysis/evidence.py`).
+- **Remote deployment is implemented** in [`deploy/`](deploy): `DEPLOY.md`
+  (Ubuntu, systemd, nginx and TLS, backups, stated limits), `forge.service` and
+  `forge-ui.service` (Core API on `127.0.0.1:8011`, interface bundle on
+  `127.0.0.1:8020`), `nginx.conf.sample`, and `README-SSH-TUNNEL.md` for the
+  tunnel-only topology.
+
+Anything the sections below still describe as not implemented remains not
+implemented; they are dated observations, not the current state.
+
+### 30.10.2026 — что реализовано сегодня — русская версия
+
+Этот раздел с датой фиксирует текущее состояние. Он исправляет два утверждения в
+более старом тексте ниже, который **сохранён без изменений как историческая
+запись**: Forge API **реализован**, а фабрика провайдеров содержит **девять**
+реальных провайдеров, а не семь. Проверенный статус по областям:
+[`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md).
+
+- **API реализован** в [`app/api/`](app/api) — поверхность FastAPI, запускается
+  через `python -m app.api.main`; 72 маршрута `/api/*`: health и версия,
+  провайдеры, модели, балансы и стоимости, настройки, инструменты, агенты,
+  запуски, диспетчеризация задач, сессии discovery, жизненный цикл проектов и
+  продуктовая поверхность (goal, plan, graph, verify, accept, evidence graph,
+  memory, recovery, repair plan). За пределами loopback каждый запрос требует
+  токен доступа (`FORGE_ACCESS_TOKEN`), и оба сервера отказываются стартовать с
+  не-loopback привязкой без него.
+- **Провайдеры: девять реальных интеграций плюс offline mock.** Фабрика
+  `app/agents/providers/factory.py` регистрирует `openai`, `anthropic`,
+  `deepseek`, `google`, `xai`, `openrouter`, `groq`, `together`, `radox` и
+  `mock` — десять записей, девять из них реальные адаптеры.
+- **Жизненный цикл проекта: версии, откаты и свидетельства.** Проект — это запись
+  плюс workspace с файлами, которые запуск действительно записал; каждое изменение
+  создаёт версию, изменение, ухудшающее работающий проект, откатывается из
+  собственного снапшота (`app/projects/regression.py`), а версии, история и граф
+  трассируемости публикуются (`/api/projects/{project_id}/versions`, `/history`,
+  `/api/product/evidence-graph`; см. также `app/analysis/evidence.py`).
+- **Удалённый деплой реализован** в [`deploy/`](deploy): `DEPLOY.md` (Ubuntu,
+  systemd, nginx и TLS, резервные копии, названные ограничения), `forge.service` и
+  `forge-ui.service` (Core API на `127.0.0.1:8011`, бандл интерфейса на
+  `127.0.0.1:8020`), `nginx.conf.sample` и `README-SSH-TUNNEL.md` для топологии
+  только через SSH-туннель.
+
+Всё, что в разделах ниже по-прежнему описано как нереализованное, остаётся
+нереализованным: это датированные наблюдения, а не текущее состояние.
+
+---
+
 Forge AI is a planned **AI Engineering Factory**: a platform that turns a human
 goal, an existing codebase, a website, or a dataset into a specified,
 implemented, verified, ready-to-run project — and then preserves what it learned
